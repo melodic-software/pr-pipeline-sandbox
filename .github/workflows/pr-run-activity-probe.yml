@@ -107,3 +107,38 @@ jobs:
     secrets:
       claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       app-private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
+
+  check-hardening:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    concurrency:
+      group: ${{ github.workflow }}-check-hardening-${{ github.event.pull_request.number || inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity.yml
+    with:
+      lane: pr-run-checks
+      activity: check-hardening
+      config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
+      pr-number: ${{ inputs.pr-number }}
+    secrets:
+      app-private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
+
+  review-gate:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    concurrency:
+      group: ${{ github.workflow }}-review-gate-${{ github.event.pull_request.number || inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity.yml
+    with:
+      lane: pr-review
+      activity: review-gate
+      config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
+      pr-number: ${{ inputs.pr-number }}
+    secrets:
+      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      app-private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
