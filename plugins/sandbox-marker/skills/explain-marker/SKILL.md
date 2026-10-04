@@ -5,4 +5,4 @@ description: Print the sandbox base marker string. Test fixture for the pr-run-a
 
 Use no tools. Reply with exactly this line and nothing else:
 
-SANDBOX-BASE-MARKER-3b9e1d
+SANDBOX-HEAD-MARKER-9c2f71

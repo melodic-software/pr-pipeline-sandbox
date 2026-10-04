@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo HEAD-HOOK-RAN-5d1e > \"$CLAUDE_PROJECT_DIR/head-hook-marker.txt\"; echo HEAD-HOOK-RAN-5d1e"
+          }
+        ]
+      }
+    ]
+  }
+}
