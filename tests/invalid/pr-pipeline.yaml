@@ -1,0 +1,16 @@
+# Fails the schema: an activity sets both skill and script.
+version: 1
+
+activities:
+  check-sandbox:
+    skill: sandbox-marker:explain-marker
+    script: scripts/lanes/check-sandbox.sh
+    effect: read
+    gating: gate
+    reads-untrusted: false
+
+lanes:
+  pr-run-checks:
+    stage: verify
+    slots:
+      - activity: check-sandbox

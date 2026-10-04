@@ -1,0 +1,54 @@
+# yaml-language-server: $schema=pr-pipeline/pr-pipeline.schema.json
+version: 1
+
+activities:
+  check-sandbox:
+    script: scripts/lanes/check-sandbox.sh
+    effect: read
+    gating: gate
+    reads-untrusted: false
+  check-disabled:
+    script: scripts/lanes/check-sandbox.sh
+    effect: read
+    gating: advisory
+    reads-untrusted: false
+  check-token:
+    script: scripts/lanes/check-token.sh
+    effect: read
+    gating: advisory
+    reads-untrusted: false
+  # The skill activities run a model, so they apply only to PRs that touch
+  # their fixtures.
+  fix-marker:
+    skill: sandbox-marker:fix-marker
+    max-turns: 10
+    effect: mutate-branch
+    gating: advisory
+    reads-untrusted: false
+    applies-when:
+      paths: ["sandbox/refine/**"]
+  explain-marker:
+    skill: sandbox-marker:explain-marker
+    max-turns: 5
+    effect: read
+    gating: advisory
+    reads-untrusted: false
+    applies-when:
+      paths: ["plugins/**", ".claude/**", ".claude-plugin/**"]
+
+lanes:
+  pr-run-checks:
+    stage: verify
+    slots:
+      - activity: check-sandbox
+      - activity: check-disabled
+        enabled: false
+      - activity: check-token
+  pr-refine:
+    stage: refine
+    slots:
+      - activity: fix-marker
+  pr-explain:
+    stage: verify
+    slots:
+      - activity: explain-marker
