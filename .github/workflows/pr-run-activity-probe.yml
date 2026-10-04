@@ -142,3 +142,21 @@ jobs:
     secrets:
       claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       app-private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
+
+  audit-env:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    concurrency:
+      group: ${{ github.workflow }}-audit-env-${{ github.event.pull_request.number || inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity.yml
+    with:
+      lane: pr-review
+      activity: audit-env
+      config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
+      pr-number: ${{ inputs.pr-number }}
+    secrets:
+      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      app-private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}

@@ -50,6 +50,15 @@ activities:
     reads-untrusted: false
     applies-when:
       paths: ["sandbox/gate/**"]
+  # Case 14: what a skill's Bash subprocess and its ancestors can see.
+  audit-env:
+    skill: sandbox-marker:audit-env
+    max-turns: 6
+    effect: read
+    gating: advisory
+    reads-untrusted: false
+    applies-when:
+      paths: ["sandbox/env/**"]
 
 lanes:
   pr-run-checks:
@@ -72,3 +81,4 @@ lanes:
     stage: verify
     slots:
       - activity: review-gate
+      - activity: audit-env
