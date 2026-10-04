@@ -1,0 +1,134 @@
+name: probe-trust-root
+
+# Probes P9 and case 19 (token broker design T22): act as the lanes App against
+# the trust-root ruleset. open-pr opens a PR that edits an owned path;
+# try-merge tries a merge, an enqueue and an auto-merge on a PR; push-commit
+# pushes one more commit to a PR branch, to show an owner approval is dismissed.
+# Every outcome goes to the job summary. The token is never printed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: open-pr, try-merge or push-commit
+        type: choice
+        required: true
+        options:
+          - open-pr
+          - try-merge
+          - push-commit
+      pr-number:
+        description: PR number for try-merge and push-commit
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    environment: lanes-key-probe
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Mint a scoped App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.AUTOMATION_LANES_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
+          repositories: pr-pipeline-sandbox
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Run the probe action as the App
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          ACTION: ${{ inputs.action }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          RUN_ID: ${{ github.run_id }}
+          OWNED_PATH: .github/actions/resolve-config/effect-grants.json
+          STATE_QUERY: >-
+            query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){
+            id state reviewDecision mergeStateStatus autoMergeRequest{enabledAt} mergeQueueEntry{state}}}}
+          ENQUEUE: >-
+            mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){mergeQueueEntry{state}}}
+          AUTO_MERGE: >-
+            mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH}){
+            pullRequest{autoMergeRequest{enabledAt}}}}
+        run: |
+          set -uo pipefail
+          report() { echo "$1" | tee -a "$GITHUB_STEP_SUMMARY"; }
+
+          # Print an API call's HTTP status and GitHub's message, never the request.
+          call() {
+            local label=$1; shift
+            local out status
+            out=$(gh api -i "$@" 2>&1)
+            status=$(printf '%s\n' "$out" | sed -n '1s/^HTTP\/[0-9.]* \([0-9]*\).*/\1/p')
+            report "$label: http=${status:-none} $(printf '%s\n' "$out" | grep -o '"message":"[^"]*"' | head -1)"
+          }
+
+          state() {
+            gh api graphql -f query="$STATE_QUERY" \
+              -f o="${REPOSITORY%/*}" -f r="${REPOSITORY#*/}" -F n="$1" \
+              --jq '.data.repository.pullRequest'
+          }
+
+          need_pr() {
+            if ! [[ $PR_NUMBER =~ ^[0-9]+$ ]]; then
+              echo "::error::pr-number must be a PR number for $ACTION."
+              exit 1
+            fi
+          }
+
+          # Append one newline to the owned file on BRANCH, as the App.
+          commit_owned_path() {
+            local branch=$1 sha content
+            sha=$(gh api "repos/$REPOSITORY/contents/$OWNED_PATH?ref=$branch" --jq .sha)
+            content=$( { gh api "repos/$REPOSITORY/contents/$OWNED_PATH?ref=$branch" --jq .content | base64 -d; echo; } | base64 -w0)
+            call "commit to $branch" --method PUT "repos/$REPOSITORY/contents/$OWNED_PATH" \
+              -f message="probe: edit a trust-root path as the App (run $RUN_ID)" \
+              -f content="$content" -f sha="$sha" -f branch="$branch"
+          }
+
+          case $ACTION in
+            open-pr)
+              branch="probe/trust-root-app-$RUN_ID"
+              main_sha=$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq .object.sha)
+              call "create branch $branch" --method POST "repos/$REPOSITORY/git/refs" \
+                -f ref="refs/heads/$branch" -f sha="$main_sha"
+              commit_owned_path "$branch"
+              number=$(gh api --method POST "repos/$REPOSITORY/pulls" \
+                -f title="probe: App-authored trust-root change (run $RUN_ID)" \
+                -f head="$branch" -f base=main \
+                -f body="Case 19 / P9 probe. Do not approve or merge; close unmerged." --jq .number)
+              report "opened PR #$number"
+              sleep 10
+              report "state: $(state "$number")"
+              ;;
+            try-merge)
+              need_pr
+              report "before: $(state "$PR_NUMBER")"
+              id=$(state "$PR_NUMBER" | jq -r .id)
+              call "REST merge (squash)" --method PUT "repos/$REPOSITORY/pulls/$PR_NUMBER/merge" -f merge_method=squash
+              call "enqueue" graphql -f query="$ENQUEUE" -f id="$id"
+              call "enable auto-merge" graphql -f query="$AUTO_MERGE" -f id="$id"
+              sleep 10
+              report "after: $(state "$PR_NUMBER")"
+              ;;
+            push-commit)
+              need_pr
+              report "before: $(state "$PR_NUMBER")"
+              branch=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq .head.ref)
+              commit_owned_path "$branch"
+              sleep 10
+              report "after: $(state "$PR_NUMBER")"
+              ;;
+          esac
