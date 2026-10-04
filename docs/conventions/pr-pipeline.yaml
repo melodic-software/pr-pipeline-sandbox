@@ -70,6 +70,14 @@ activities:
     applies-when:
       paths: ["sandbox/trusted-text/**"]
 
+  # Case 6: no OIDC token, no GitHub token and no push in
+  # pr-run-activity-read.yml.
+  check-read-token:
+    script: scripts/lanes/check-read-token.sh
+    effect: read
+    gating: advisory
+    reads-untrusted: false
+
 lanes:
   pr-run-checks:
     stage: verify
@@ -80,6 +88,7 @@ lanes:
       - activity: check-token
       - activity: check-hardening
       - activity: check-trusted-text
+      - activity: check-read-token
   pr-refine:
     stage: refine
     slots:
