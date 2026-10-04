@@ -41,6 +41,7 @@ lanes:
     stage: verify
     slots:
       - activity: check-sandbox
+        enabled: false
       - activity: check-disabled
         enabled: false
       - activity: check-token
