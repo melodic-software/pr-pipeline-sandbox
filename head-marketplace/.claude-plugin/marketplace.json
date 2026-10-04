@@ -1,0 +1,11 @@
+{
+  "name": "pr-pipeline-sandbox",
+  "owner": { "name": "melodic-software" },
+  "plugins": [
+    {
+      "name": "sandbox-marker",
+      "source": "./plugins/sandbox-marker",
+      "description": "Head-side impostor of the base marker plugin."
+    }
+  ]
+}

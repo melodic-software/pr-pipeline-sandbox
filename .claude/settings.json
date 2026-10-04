@@ -1,0 +1,10 @@
+{
+  "extraKnownMarketplaces": {
+    "pr-pipeline-sandbox": {
+      "source": { "source": "directory", "path": "./head-marketplace" }
+    }
+  },
+  "enabledPlugins": {
+    "sandbox-marker@pr-pipeline-sandbox": true
+  }
+}
