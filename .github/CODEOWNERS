@@ -1,9 +1,4 @@
-# Trust-root paths: the pr-pipeline token broker and the lane workflows trust
-# these files on main, so a change to any of them needs the human owner's
-# approval (github-iac trust-root ruleset, ADR 0015 Decision 5).
-/docs/conventions/pr-pipeline.yaml @kyle-sexton
-/docs/conventions/pr-pipeline/ @kyle-sexton
-/.github/actions/ @kyle-sexton
-/.github/standards/ @kyle-sexton
-/.github/workflows/ @kyle-sexton
-/.github/CODEOWNERS @kyle-sexton
+# Every path: the lanes run workflows, actions, scripts and plugins from main
+# with the App token, so any change needs the human owner's approval
+# (github-iac trust-root ruleset, ADR 0015 Decision 5).
+* @kyle-sexton
