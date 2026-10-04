@@ -1,0 +1,28 @@
+name: probe-canary-skipped-step-job
+
+# Probe P1 variant (i), job A: echoes the canary literal; its only reference to
+# the secret is a step whose condition never holds.
+
+on:
+  workflow_call:
+    secrets:
+      canary:
+        required: true
+
+permissions: {}
+
+jobs:
+  echo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Echo the canary value
+        run: echo "canary=pr-pipeline-sandbox-p1-canary-5e2b9d"
+
+      - name: Reference the canary in a skipped step
+        # No event has this name, so the step is always skipped.
+        if: github.event_name == 'probe-never'
+        env:
+          CANARY: ${{ secrets.canary }}
+        run: echo "secret length=${#CANARY}"

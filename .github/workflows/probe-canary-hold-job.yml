@@ -1,0 +1,23 @@
+name: probe-canary-hold-job
+
+# Probe P1 variant (iii): the job that references the canary, in a reusable
+# other than job A's.
+
+on:
+  workflow_call:
+    secrets:
+      canary:
+        required: true
+
+permissions: {}
+
+jobs:
+  hold:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Reference the canary
+        env:
+          CANARY: ${{ secrets.canary }}
+        run: echo "secret length=${#CANARY}"

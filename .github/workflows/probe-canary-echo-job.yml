@@ -1,0 +1,19 @@
+name: probe-canary-echo-job
+
+# Probe P1 job A: prints the PROBE_CANARY value as a literal and references the
+# secret nowhere. `***` in place of the value means the runner received the
+# secret for this job and masked it.
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  echo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Echo the canary value
+        run: echo "canary=pr-pipeline-sandbox-p1-canary-5e2b9d"

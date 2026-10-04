@@ -1,0 +1,103 @@
+name: probe-revoke-latency
+
+# Probe P5 (token broker design T10): mint a scoped installation token, revoke
+# it, then poll an authenticated API read and git ls-remote every 5 s for 300 s
+# and record when each is first refused. The token is never printed.
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  revoke:
+    if: >-
+      github.event.label.name == 'probe-p5'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Mint a scoped App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.AUTOMATION_LANES_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
+          repositories: pr-pipeline-sandbox
+          permission-contents: read
+          # The next step revokes the token itself; that revoke is the probe.
+          skip-token-revoke: true # zizmor: ignore[github-app]
+
+      - name: Revoke the token and poll until it is refused
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          basic=$(printf 'x-access-token:%s' "$APP_TOKEN" | base64 -w0)
+          echo "::add-mask::$basic"
+          api_status() {
+            curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+              -H "Authorization: Bearer $APP_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPOSITORY"
+          }
+          git_status() {
+            GIT_TERMINAL_PROMPT=0 timeout 20 git -c credential.helper= \
+              -c "http.extraHeader=Authorization: Basic $basic" \
+              ls-remote "https://github.com/$REPOSITORY.git" HEAD >/dev/null 2>&1
+            echo "$?"
+          }
+
+          before_api=$(api_status)
+          before_git=$(git_status)
+          echo "before revoke: api=$before_api git-exit=$before_git"
+          if [ "$before_api" != 200 ] || [ "$before_git" != 0 ]; then
+            echo "::error::The fresh token did not work before revoke."
+            exit 1
+          fi
+
+          revoke=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 -X DELETE \
+            -H "Authorization: Bearer $APP_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/installation/token")
+          start=$(date +%s%3N)
+          echo "revoke status=$revoke (expect 204)"
+          if [ "$revoke" != 204 ]; then
+            echo "::error::Revoke returned $revoke."
+            exit 1
+          fi
+
+          first_api="" first_git="" reaccepted=0 poll0=""
+          for i in $(seq 0 60); do
+            t=$(( $(date +%s%3N) - start ))
+            a=$(api_status)
+            g=$(git_status)
+            echo "poll=$i t_ms=$t api=$a git-exit=$g"
+            if [ "$a" = 000 ]; then
+              echo "::error::Transport failure on the API read; stopping."
+              exit 1
+            fi
+            if [ "$i" = 0 ]; then poll0=$a; fi
+            if [ "$a" = 401 ] && [ -z "$first_api" ]; then first_api=$t; fi
+            if [ "$g" != 0 ] && [ -z "$first_git" ]; then first_git=$t; fi
+            if [ -n "$first_api" ] && [ "$a" != 401 ]; then reaccepted=1; fi
+            if [ "$i" -lt 60 ]; then sleep 5; fi
+          done
+
+          if [ "$poll0" = 401 ] && [ "$reaccepted" = 0 ]; then
+            verdict="revoke is immediate"
+          elif [ -n "$first_api" ]; then
+            verdict="revoke took ${first_api} ms (reaccepted after first 401: $reaccepted)"
+          else
+            verdict="token still accepted 300 s after revoke"
+          fi
+          summary="P5: $verdict; first API 401 at ${first_api:-never} ms; first git refusal at ${first_git:-never} ms"
+          echo "$summary"
+          echo "$summary" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,25 @@
+name: probe-canary-control-direct
+
+# Probe P1 positive control: the echoing job references PROBE_CANARY itself.
+# `***` here proves the secret exists, holds the literal the other variants
+# print, and is masked; without it a clean log in another variant means nothing.
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  echo:
+    if: github.event.label.name == 'probe-p1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Echo the canary value with the secret referenced
+        env:
+          CANARY: ${{ secrets.PROBE_CANARY }}
+        run: |
+          echo "secret length=${#CANARY}"
+          echo "canary=pr-pipeline-sandbox-p1-canary-5e2b9d"

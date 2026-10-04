@@ -1,0 +1,31 @@
+name: probe-canary-sibling-jobs
+
+# Probe P1 variant (ii): job `echo` (A) references no secret; job `hold` (B)
+# references the canary.
+
+on:
+  workflow_call:
+    secrets:
+      canary:
+        required: true
+
+permissions: {}
+
+jobs:
+  echo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Echo the canary value
+        run: echo "canary=pr-pipeline-sandbox-p1-canary-5e2b9d"
+
+  hold:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Reference the canary
+        env:
+          CANARY: ${{ secrets.canary }}
+        run: echo "secret length=${#CANARY}"
