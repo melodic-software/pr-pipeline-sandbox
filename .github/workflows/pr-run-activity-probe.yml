@@ -125,6 +125,23 @@ jobs:
     secrets:
       app-private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
 
+  check-trusted-text:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    concurrency:
+      group: ${{ github.workflow }}-check-trusted-text-${{ github.event.pull_request.number || inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity.yml
+    with:
+      lane: pr-run-checks
+      activity: check-trusted-text
+      config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
+      pr-number: ${{ inputs.pr-number }}
+    secrets:
+      app-private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
+
   review-gate:
     permissions:
       contents: read

@@ -60,6 +60,16 @@ activities:
     applies-when:
       paths: ["sandbox/env/**"]
 
+  # Case 15: a read activity that reads untrusted text, so select-trusted-text
+  # runs on the job's GITHUB_TOKEN.
+  check-trusted-text:
+    script: scripts/lanes/check-trusted-text.sh
+    effect: read
+    gating: advisory
+    reads-untrusted: true
+    applies-when:
+      paths: ["sandbox/trusted-text/**"]
+
 lanes:
   pr-run-checks:
     stage: verify
@@ -69,6 +79,7 @@ lanes:
         enabled: false
       - activity: check-token
       - activity: check-hardening
+      - activity: check-trusted-text
   pr-refine:
     stage: refine
     slots:
