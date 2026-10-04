@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       issues: write
+      pull-requests: write
     outputs:
       comment-id: ${{ steps.post.outputs.comment-id }}
     steps:
