@@ -35,6 +35,21 @@ activities:
     reads-untrusted: false
     applies-when:
       paths: ["plugins/**", ".claude/**", ".claude-plugin/**"]
+  # Case 11: runs after the runner removes sudo and docker access.
+  check-hardening:
+    script: scripts/lanes/check-hardening.sh
+    effect: read
+    gating: advisory
+    reads-untrusted: false
+  # Case 12: a gate skill whose verdict is sandbox/gate/verdict.txt on the head.
+  review-gate:
+    skill: sandbox-marker:review-gate
+    max-turns: 5
+    effect: read
+    gating: gate
+    reads-untrusted: false
+    applies-when:
+      paths: ["sandbox/gate/**"]
 
 lanes:
   pr-run-checks:
@@ -44,6 +59,7 @@ lanes:
       - activity: check-disabled
         enabled: false
       - activity: check-token
+      - activity: check-hardening
   pr-refine:
     stage: refine
     slots:
@@ -52,3 +68,7 @@ lanes:
     stage: verify
     slots:
       - activity: explain-marker
+  pr-review:
+    stage: verify
+    slots:
+      - activity: review-gate
