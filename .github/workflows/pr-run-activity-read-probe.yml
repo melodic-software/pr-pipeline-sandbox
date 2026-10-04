@@ -47,5 +47,5 @@ jobs:
     uses: ./.github/workflows/pr-run-activity-read.yml
     with:
       lane: pr-refine
-      activity: fix-marker
+      activity: check-write-effect
       pr-number: ${{ inputs.pr-number }}
