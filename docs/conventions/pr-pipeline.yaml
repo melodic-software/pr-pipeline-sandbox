@@ -70,6 +70,22 @@ activities:
     applies-when:
       paths: ["sandbox/trusted-text/**"]
 
+  # Case 6: no OIDC token, no GitHub token and no push in
+  # pr-run-activity-read.yml.
+  check-read-token:
+    script: scripts/lanes/check-read-token.sh
+    effect: read
+    gating: advisory
+    reads-untrusted: false
+  # Case 7a: a write activity that applies to every PR, sent to
+  # pr-run-activity-read.yml, must stop with effect-not-read before the head
+  # checkout. Its script never runs.
+  check-write-effect:
+    script: scripts/lanes/check-sandbox.sh
+    effect: mutate-branch
+    gating: advisory
+    reads-untrusted: false
+
 lanes:
   pr-run-checks:
     stage: verify
@@ -80,10 +96,12 @@ lanes:
       - activity: check-token
       - activity: check-hardening
       - activity: check-trusted-text
+      - activity: check-read-token
   pr-refine:
     stage: refine
     slots:
       - activity: fix-marker
+      - activity: check-write-effect
   pr-explain:
     stage: verify
     slots:
