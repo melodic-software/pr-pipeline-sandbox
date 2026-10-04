@@ -1,0 +1,1 @@
+Triggers pr-run-activity-read-probe.yml (cases 6 and 7a).
