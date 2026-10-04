@@ -1,0 +1,166 @@
+name: probe-lane-foundations
+
+# Test-only probe of the PR-pipeline lane job shape against the unmerged
+# claude-code-plugins actions at 48de55441f4644f5e5076b724d17a4a0b0b3440a.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: The sandbox PR to run the lane on.
+        required: true
+        type: string
+      break-gate:
+        description: Replace the trigger gate with a step that exits 1 without outputs.
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: probe-lane-foundations-${{ github.event.pull_request.number || inputs.pr-number }}
+  cancel-in-progress: false
+
+jobs:
+  post-canary:
+    # The lane's own App-token commit fires `synchronize`; skip that run.
+    # Fork PRs get a read-only GITHUB_TOKEN; skip so the trigger gate rejects them cleanly.
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.sender.id != 337595936
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    outputs:
+      comment-id: ${{ steps.post.outputs.comment-id }}
+    steps:
+      - name: Post a random canary comment as github-actions[bot]
+        id: post
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          canary="canary-$(openssl rand -hex 12)"
+          echo "::add-mask::$canary"
+          comment_id=$(gh api "repos/$REPOSITORY/issues/$PR_NUMBER/comments" -f body="$canary" --jq .id)
+          echo "comment-id=$comment_id" >> "$GITHUB_OUTPUT"
+
+  lane:
+    needs: post-canary
+    if: >-
+      always()
+      && (needs.post-canary.result == 'success' || needs.post-canary.result == 'skipped')
+      && !(github.event_name == 'pull_request' && github.event.sender.id == 337595936)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out the base SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          path: .base
+          persist-credentials: false
+
+      - name: Check the kill switch
+        id: kill
+        uses: melodic-software/claude-code-plugins/.github/actions/check-kill-switch@48de55441f4644f5e5076b724d17a4a0b0b3440a
+        with:
+          value: ${{ vars.CLAUDE_LANES_DISABLED }}
+
+      - name: Check the trigger
+        id: gate
+        if: ${{ !inputs.break-gate }}
+        uses: melodic-software/claude-code-plugins/.github/actions/check-trusted-trigger@48de55441f4644f5e5076b724d17a4a0b0b3440a
+        with:
+          trusted-actors-path: .base/.github/standards/trusted-actors/trusted-actors.json
+          pr-number: ${{ inputs.pr-number }}
+
+      - name: Break the trigger gate (run 4)
+        id: gate-broken
+        if: ${{ inputs.break-gate }}
+        run: exit 1
+
+      # The gate's head-sha output is the head recorded before any token exists.
+      - name: Mint the lane App token
+        id: app-token
+        if: steps.kill.outputs.proceed == 'true' && steps.gate.outputs.proceed == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.AUTOMATION_LANES_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
+          owner: melodic-software
+          repositories: pr-pipeline-sandbox
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      # Runs before the head checkout: checking out at the workspace root deletes `.base/`.
+      - name: Select the trusted PR text
+        if: steps.kill.outputs.proceed == 'true' && steps.gate.outputs.proceed == 'true'
+        uses: melodic-software/claude-code-plugins/.github/actions/select-trusted-text@48de55441f4644f5e5076b724d17a4a0b0b3440a
+        with:
+          pr-number: ${{ steps.gate.outputs.pr-number }}
+          trusted-actors-path: .base/.github/standards/trusted-actors/trusted-actors.json
+          output-path: ${{ runner.temp }}/trusted-context.json
+          github-token: ${{ steps.app-token.outputs.token }}
+
+      - name: Check out the PR head
+        if: steps.kill.outputs.proceed == 'true' && steps.gate.outputs.proceed == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.gate.outputs.head-ref }}
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Assert the canary is absent from the trusted context
+        if: >-
+          github.event_name == 'pull_request'
+          && steps.kill.outputs.proceed == 'true' && steps.gate.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMENT_ID: ${{ needs.post-canary.outputs.comment-id }}
+          CONTEXT_FILE: ${{ runner.temp }}/trusted-context.json
+        run: |
+          canary=$(gh api "repos/$REPOSITORY/issues/comments/$COMMENT_ID" --jq .body)
+          echo "::add-mask::$canary"
+          case "$canary" in canary-*) ;; *) echo "canary unreadable"; exit 1 ;; esac
+          if grep -qF "$canary" "$CONTEXT_FILE"; then
+            echo "canary PRESENT"
+            exit 1
+          fi
+          echo "canary absent"
+
+      - name: Run the model
+        if: steps.kill.outputs.proceed == 'true' && steps.gate.outputs.proceed == 'true'
+        uses: anthropics/claude-code-action@ed670b4cf9de2a5a570d130d2f6197b9e543cd64 # v1.0.240
+        env:
+          CLAUDE_BRANCH: ${{ steps.gate.outputs.head-ref }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          use_commit_signing: true
+          prompt: |
+            Append exactly one line, `probe ${{ github.run_id }}`, to the end of probe.txt in the
+            repository root. Change nothing else. Then commit probe.txt with the
+            mcp__github_file_ops__commit_files tool, message `test: probe ${{ github.run_id }}`.
+          claude_args: >-
+            --permission-mode dontAsk
+            --max-turns 8
+            --allowedTools Read,Edit,mcp__github_file_ops__commit_files
+
+      - name: Check the lane's commits are signed
+        if: steps.kill.outputs.proceed == 'true' && steps.gate.outputs.proceed == 'true'
+        uses: melodic-software/claude-code-plugins/.github/actions/check-signed-commits@48de55441f4644f5e5076b724d17a4a0b0b3440a
+        with:
+          pr-number: ${{ steps.gate.outputs.pr-number }}
+          since-sha: ${{ steps.gate.outputs.head-sha }}
+          github-token: ${{ steps.app-token.outputs.token }}
