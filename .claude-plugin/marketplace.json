@@ -1,0 +1,11 @@
+{
+  "name": "pr-pipeline-sandbox",
+  "owner": { "name": "melodic-software" },
+  "plugins": [
+    {
+      "name": "sandbox-marker",
+      "source": "./plugins/sandbox-marker",
+      "description": "Test fixture for the pr-run-activity runner: skills that print or commit a fixed base marker string."
+    }
+  ]
+}

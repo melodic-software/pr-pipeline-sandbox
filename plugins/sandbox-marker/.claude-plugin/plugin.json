@@ -1,0 +1,5 @@
+{
+  "name": "sandbox-marker",
+  "version": "1.0.0",
+  "description": "Test fixture for the pr-run-activity runner: skills that print or commit a fixed base marker string."
+}

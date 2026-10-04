@@ -1,0 +1,109 @@
+name: pr-run-activity-probe
+
+# Test caller of pr-run-activity.yml: one job per activity in
+# docs/conventions/pr-pipeline.yaml. Only a test caller offers config-path.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: The sandbox PR to run the activities on.
+        required: true
+        type: string
+      config-path:
+        description: The config, relative to the base checkout.
+        required: false
+        type: string
+        default: docs/conventions/pr-pipeline.yaml
+
+permissions: {}
+
+jobs:
+  check-sandbox:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    concurrency:
+      group: ${{ github.workflow }}-check-sandbox-${{ github.event.pull_request.number || inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity.yml
+    with:
+      lane: pr-run-checks
+      activity: check-sandbox
+      config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
+      pr-number: ${{ inputs.pr-number }}
+    secrets:
+      app-private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
+
+  check-disabled:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    concurrency:
+      group: ${{ github.workflow }}-check-disabled-${{ github.event.pull_request.number || inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity.yml
+    with:
+      lane: pr-run-checks
+      activity: check-disabled
+      config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
+      pr-number: ${{ inputs.pr-number }}
+    secrets:
+      app-private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
+
+  check-token:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    concurrency:
+      group: ${{ github.workflow }}-check-token-${{ github.event.pull_request.number || inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity.yml
+    with:
+      lane: pr-run-checks
+      activity: check-token
+      config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
+      pr-number: ${{ inputs.pr-number }}
+    secrets:
+      app-private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
+
+  fix-marker:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    concurrency:
+      group: ${{ github.workflow }}-fix-marker-${{ github.event.pull_request.number || inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity.yml
+    with:
+      lane: pr-refine
+      activity: fix-marker
+      config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
+      pr-number: ${{ inputs.pr-number }}
+    secrets:
+      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      app-private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
+
+  explain-marker:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    concurrency:
+      group: ${{ github.workflow }}-explain-marker-${{ github.event.pull_request.number || inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity.yml
+    with:
+      lane: pr-explain
+      activity: explain-marker
+      config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
+      pr-number: ${{ inputs.pr-number }}
+    secrets:
+      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      app-private-key: ${{ secrets.AUTOMATION_LANES_APP_PRIVATE_KEY }}
