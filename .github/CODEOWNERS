@@ -1,0 +1,4 @@
+# Every path: the lanes run workflows, actions, scripts and plugins from main
+# with the App token, so any change needs the human owner's approval
+# (github-iac trust-root ruleset, ADR 0015 Decision 5).
+* @kyle-sexton
