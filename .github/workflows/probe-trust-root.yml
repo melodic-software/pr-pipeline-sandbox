@@ -63,16 +63,25 @@ jobs:
             mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH}){
             pullRequest{autoMergeRequest{enabledAt}}}}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           report() { echo "$1" | tee -a "$GITHUB_STEP_SUMMARY"; }
+          fail() { echo "::error::$1 The probe stops rather than report a false result."; exit 1; }
 
           # Print an API call's HTTP status and GitHub's message, never the request.
+          # Sets status and body; never fails, so a denied probe action is recorded.
           call() {
             local label=$1; shift
-            local out status
-            out=$(gh api -i "$@" 2>&1)
+            local out
+            out=$(gh api -i "$@" 2>&1) || true
             status=$(printf '%s\n' "$out" | sed -n '1s/^HTTP\/[0-9.]* \([0-9]*\).*/\1/p')
+            body=$(printf '%s\n' "$out" | sed '1,/^\r\?$/d')
             report "$label: http=${status:-none} $(printf '%s\n' "$out" | grep -o '"message":"[^"]*"' | head -1)"
+          }
+
+          # A setup call: anything but a 2xx fails the job.
+          must() {
+            call "$@"
+            [[ $status == 2?? ]] || fail "$1 failed (http=${status:-none})."
           }
 
           state() {
@@ -91,9 +100,11 @@ jobs:
           # Append one newline to the owned file on BRANCH, as the App.
           commit_owned_path() {
             local branch=$1 sha content
-            sha=$(gh api "repos/$REPOSITORY/contents/$OWNED_PATH?ref=$branch" --jq .sha)
-            content=$( { gh api "repos/$REPOSITORY/contents/$OWNED_PATH?ref=$branch" --jq .content | base64 -d; echo; } | base64 -w0)
-            call "commit to $branch" --method PUT "repos/$REPOSITORY/contents/$OWNED_PATH" \
+            sha=$(gh api "repos/$REPOSITORY/contents/$OWNED_PATH?ref=$branch" --jq .sha) ||
+              fail "Reading $OWNED_PATH on $branch failed."
+            content=$( { gh api "repos/$REPOSITORY/contents/$OWNED_PATH?ref=$branch" --jq .content | base64 -d; echo; } | base64 -w0) ||
+              fail "Reading $OWNED_PATH on $branch failed."
+            must "commit to $branch" --method PUT "repos/$REPOSITORY/contents/$OWNED_PATH" \
               -f message="probe: edit a trust-root path as the App (run $RUN_ID)" \
               -f content="$content" -f sha="$sha" -f branch="$branch"
           }
@@ -101,14 +112,17 @@ jobs:
           case $ACTION in
             open-pr)
               branch="probe/trust-root-app-$RUN_ID"
-              main_sha=$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq .object.sha)
-              call "create branch $branch" --method POST "repos/$REPOSITORY/git/refs" \
+              main_sha=$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq .object.sha) ||
+                fail "Reading main's head failed."
+              must "create branch $branch" --method POST "repos/$REPOSITORY/git/refs" \
                 -f ref="refs/heads/$branch" -f sha="$main_sha"
               commit_owned_path "$branch"
-              number=$(gh api --method POST "repos/$REPOSITORY/pulls" \
+              must "open PR" --method POST "repos/$REPOSITORY/pulls" \
                 -f title="probe: App-authored trust-root change (run $RUN_ID)" \
                 -f head="$branch" -f base=main \
-                -f body="Case 19 / P9 probe. Do not approve or merge; close unmerged." --jq .number)
+                -f body="Case 19 / P9 probe. Do not approve or merge; close unmerged."
+              number=$(printf '%s\n' "$body" | jq -r .number)
+              [[ $number =~ ^[0-9]+$ ]] || fail "The PR create response carried no PR number."
               report "opened PR #$number"
               sleep 10
               report "state: $(state "$number")"
@@ -116,7 +130,8 @@ jobs:
             try-merge)
               need_pr
               report "before: $(state "$PR_NUMBER")"
-              id=$(state "$PR_NUMBER" | jq -r .id)
+              id=$(state "$PR_NUMBER" | jq -r .id) || fail "Reading PR #$PR_NUMBER failed."
+              [[ -n $id && $id != null ]] || fail "PR #$PR_NUMBER was not found."
               call "REST merge (squash)" --method PUT "repos/$REPOSITORY/pulls/$PR_NUMBER/merge" -f merge_method=squash
               call "enqueue" graphql -f query="$ENQUEUE" -f id="$id"
               call "enable auto-merge" graphql -f query="$AUTO_MERGE" -f id="$id"
@@ -126,7 +141,8 @@ jobs:
             push-commit)
               need_pr
               report "before: $(state "$PR_NUMBER")"
-              branch=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq .head.ref)
+              branch=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq .head.ref) ||
+                fail "Reading PR #$PR_NUMBER's head branch failed."
               commit_owned_path "$branch"
               sleep 10
               report "after: $(state "$PR_NUMBER")"
