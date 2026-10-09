@@ -1,0 +1,55 @@
+name: pr-require-checks
+
+# Emits the `ci-status` check the merge-queue and ci-gate rulesets require.
+# The fleet's pr-require-checks.yml has the same shape: gate jobs, then one
+# `ci-status` aggregate that runs on `!cancelled()` and fails unless every
+# gate succeeded. A job that is not a reusable-workflow call reports a check
+# run named by its job name alone, so the check context is exactly `ci-status`.
+#
+# FORCING RED. The gate passes unless a file named `.ci-force-red` exists at
+# the repository root of the tested commit: the PR's merge commit on
+# `pull_request`, the queued merge commit on `merge_group`. Add the file to a
+# PR branch to make `ci-status` fail; delete it to make it pass again. A file
+# works on both events; a label does not exist on a merge-group run.
+
+on:
+  pull_request:
+    branches: [main]
+  # A merge queue tests each queued merge commit through this event alone; a
+  # required check that never reports on it leaves the queued PR unmergeable.
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+jobs:
+  check-force-red:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fail when .ci-force-red exists
+        run: |
+          if [ -e .ci-force-red ]; then
+            echo "::error file=.ci-force-red::.ci-force-red is present; ci-status is forced red."
+            exit 1
+          fi
+          echo ".ci-force-red is absent."
+
+  ci-status:
+    needs: [check-force-red]
+    # !cancelled(), never a success guard: a failed gate must still run this
+    # job so it turns red. A skipped required check reports success.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Aggregate gate results
+        env:
+          FORCE_RED: ${{ needs.check-force-red.result }}
+        run: |
+          echo "check-force-red: $FORCE_RED"
+          [ "$FORCE_RED" = success ]
