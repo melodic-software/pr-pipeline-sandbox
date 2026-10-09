@@ -1,0 +1,12 @@
+name: forged
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  ci-status:
+    name: ci-status
+    runs-on: ubuntu-24.04
+    steps:
+      - run: sleep 60 && true
