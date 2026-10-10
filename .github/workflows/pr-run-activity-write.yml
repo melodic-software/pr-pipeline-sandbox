@@ -199,35 +199,6 @@ jobs:
           pull-requests: ${{ steps.config.outputs.pull-requests }}
           issues: ${{ steps.config.outputs.issues }}
 
-      # Cases 4/5/18 (test only; removed by the revert PR): a second broker
-      # request from the same job must be denied already-minted.
-      - name: Request the lane token again (case 5)
-        id: lane-token-again
-        if: steps.lane-token.outcome == 'success'
-        continue-on-error: true
-        uses: ./.base/.github/actions/request-lane-token # zizmor: ignore[self-repository]
-        with:
-          broker-url: ${{ vars.LANES_BROKER_URL }}
-          audience: ${{ vars.LANES_BROKER_AUDIENCE }}
-          lane: ${{ inputs.lane }}
-          activity: ${{ inputs.activity }}
-          pr-number: ${{ steps.gate.outputs.pr-number }}
-          effect: ${{ steps.config.outputs.effect }}
-          contents: ${{ steps.config.outputs.contents }}
-          pull-requests: ${{ steps.config.outputs.pull-requests }}
-          issues: ${{ steps.config.outputs.issues }}
-
-      # Case 5: a second token must never exist; if one does, end it and fail.
-      - name: Revoke a second lane token (case 5)
-        if: always() && steps.lane-token-again.outputs.token != ''
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
-        with:
-          github-token: ${{ steps.lane-token-again.outputs.token }}
-          retries: 0
-          script: |
-            const revoked = (await github.request('DELETE /installation/token')).status;
-            core.setFailed(`case 5: the broker issued a second token (revoke ${revoked})`);
-
       - name: Select the trusted PR text
         if: steps.config.outputs.applies == 'true' && steps.config.outputs.reads-untrusted == 'true'
         uses: ./.base/.github/actions/select-trusted-text # zizmor: ignore[self-repository]
