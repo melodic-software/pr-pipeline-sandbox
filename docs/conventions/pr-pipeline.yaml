@@ -86,6 +86,17 @@ activities:
     gating: advisory
     reads-untrusted: false
 
+  # P7: the audit-env skill at a write effect, so it runs in
+  # pr-run-activity-write.yml, whose job holds id-token: write.
+  audit-env-write:
+    skill: sandbox-marker:audit-env
+    max-turns: 6
+    effect: mutate-tracker
+    gating: advisory
+    reads-untrusted: false
+    applies-when:
+      paths: ["sandbox/env/**"]
+
 lanes:
   pr-run-checks:
     stage: verify
@@ -102,6 +113,7 @@ lanes:
     slots:
       - activity: fix-marker
       - activity: check-write-effect
+      - activity: audit-env-write
   pr-explain:
     stage: verify
     slots:

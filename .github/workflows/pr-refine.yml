@@ -1,0 +1,52 @@
+name: pr-refine
+
+# Lane caller for pr-refine: its file stem is the lane, so the lanes token
+# broker accepts its write activities. No App key; the run job's OIDC token is
+# exchanged at LANES_BROKER_URL for audience LANES_BROKER_AUDIENCE.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: The sandbox PR to run the activity on.
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  fix-marker:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      id-token: write
+    concurrency:
+      group: ${{ github.workflow }}-fix-marker-${{ github.event.pull_request.number || inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-write.yml
+    with:
+      lane: pr-refine
+      activity: fix-marker
+      pr-number: ${{ inputs.pr-number }}
+    secrets:
+      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+  audit-env-write:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      id-token: write
+    concurrency:
+      group: ${{ github.workflow }}-audit-env-write-${{ github.event.pull_request.number || inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-write.yml
+    with:
+      lane: pr-refine
+      activity: audit-env-write
+      pr-number: ${{ inputs.pr-number }}
+    secrets:
+      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
