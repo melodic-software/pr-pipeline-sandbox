@@ -91,7 +91,7 @@ activities:
   audit-env-write:
     skill: sandbox-marker:audit-env
     max-turns: 6
-    effect: mutate-tracker
+    effect: publish-artifact # case 18 test only; the revert PR restores mutate-tracker
     gating: advisory
     reads-untrusted: false
     applies-when:
