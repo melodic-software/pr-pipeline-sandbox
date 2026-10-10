@@ -1,7 +1,9 @@
 name: pr-run-activity-probe
 
-# Test caller of pr-run-activity.yml: one job per activity in
-# docs/conventions/pr-pipeline.yaml. Only a test caller offers config-path.
+# Test caller of pr-run-activity-read.yml: one job per read activity in
+# docs/conventions/pr-pipeline.yaml. It passes no App key; the write activity
+# fix-marker runs from pr-refine.yml, whose file stem is its lane. Only a test
+# caller offers config-path.
 
 on:
   pull_request:
@@ -29,14 +31,12 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-check-sandbox-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity.yml
+    uses: ./.github/workflows/pr-run-activity-read.yml
     with:
       lane: pr-run-checks
       activity: check-sandbox
       config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
       pr-number: ${{ inputs.pr-number }}
-    secrets:
-      app-private-key: ''
 
   check-disabled:
     permissions:
@@ -46,14 +46,12 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-check-disabled-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity.yml
+    uses: ./.github/workflows/pr-run-activity-read.yml
     with:
       lane: pr-run-checks
       activity: check-disabled
       config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
       pr-number: ${{ inputs.pr-number }}
-    secrets:
-      app-private-key: ''
 
   check-token:
     permissions:
@@ -63,32 +61,12 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-check-token-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity.yml
+    uses: ./.github/workflows/pr-run-activity-read.yml
     with:
       lane: pr-run-checks
       activity: check-token
       config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
       pr-number: ${{ inputs.pr-number }}
-    secrets:
-      app-private-key: ''
-
-  fix-marker:
-    permissions:
-      contents: read
-      pull-requests: read
-      checks: write
-    concurrency:
-      group: ${{ github.workflow }}-fix-marker-${{ github.event.pull_request.number || inputs.pr-number }}
-      queue: max
-    uses: ./.github/workflows/pr-run-activity.yml
-    with:
-      lane: pr-refine
-      activity: fix-marker
-      config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
-      pr-number: ${{ inputs.pr-number }}
-    secrets:
-      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      app-private-key: ''
 
   explain-marker:
     permissions:
@@ -98,7 +76,7 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-explain-marker-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity.yml
+    uses: ./.github/workflows/pr-run-activity-read.yml
     with:
       lane: pr-explain
       activity: explain-marker
@@ -106,7 +84,6 @@ jobs:
       pr-number: ${{ inputs.pr-number }}
     secrets:
       claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      app-private-key: ''
 
   check-hardening:
     permissions:
@@ -116,14 +93,12 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-check-hardening-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity.yml
+    uses: ./.github/workflows/pr-run-activity-read.yml
     with:
       lane: pr-run-checks
       activity: check-hardening
       config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
       pr-number: ${{ inputs.pr-number }}
-    secrets:
-      app-private-key: ''
 
   check-trusted-text:
     permissions:
@@ -133,14 +108,12 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-check-trusted-text-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity.yml
+    uses: ./.github/workflows/pr-run-activity-read.yml
     with:
       lane: pr-run-checks
       activity: check-trusted-text
       config-path: ${{ inputs.config-path || 'docs/conventions/pr-pipeline.yaml' }}
       pr-number: ${{ inputs.pr-number }}
-    secrets:
-      app-private-key: ''
 
   review-gate:
     permissions:
@@ -150,7 +123,7 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-review-gate-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity.yml
+    uses: ./.github/workflows/pr-run-activity-read.yml
     with:
       lane: pr-review
       activity: review-gate
@@ -158,7 +131,6 @@ jobs:
       pr-number: ${{ inputs.pr-number }}
     secrets:
       claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      app-private-key: ''
 
   audit-env:
     permissions:
@@ -168,7 +140,7 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-audit-env-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity.yml
+    uses: ./.github/workflows/pr-run-activity-read.yml
     with:
       lane: pr-review
       activity: audit-env
@@ -176,4 +148,4 @@ jobs:
       pr-number: ${{ inputs.pr-number }}
     secrets:
       claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      app-private-key: ''
+
