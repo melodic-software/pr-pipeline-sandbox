@@ -50,3 +50,4 @@ jobs:
       pr-number: ${{ inputs.pr-number }}
     secrets:
       claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+# Case 3 test edit: this PR copy differs from main.
