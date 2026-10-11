@@ -1,1 +1,2 @@
 Case 10a fixture under .claude: the PR side edits this file.
+PR-side line.
