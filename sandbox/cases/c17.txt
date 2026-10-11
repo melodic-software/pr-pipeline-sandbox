@@ -1,0 +1,3 @@
+Case 17 fixture: shopping list, one item per line, alphabetical.
+apples
+bread
