@@ -97,6 +97,17 @@ activities:
     applies-when:
       paths: ["sandbox/env/**"]
 
+  # Phase 1 probe (claude-code-plugins pr-pipeline-unblock): a lane App token
+  # without the Workflows permission puts merges of a base into PR branches
+  # by git push, update-branch and Git Data. Applies only to its fixture PR.
+  test-workflow-push:
+    script: scripts/lanes/probe-workflow-push.sh
+    effect: mutate-branch
+    gating: advisory
+    reads-untrusted: false
+    applies-when:
+      paths: ["sandbox/probe/gitdata.txt"]
+
 lanes:
   pr-run-checks:
     stage: verify
@@ -114,6 +125,7 @@ lanes:
       - activity: fix-marker
       - activity: check-write-effect
       - activity: audit-env-write
+      - activity: test-workflow-push
   pr-explain:
     stage: verify
     slots:
