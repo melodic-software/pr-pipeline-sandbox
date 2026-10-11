@@ -50,14 +50,15 @@
       { "name": "require-checks", "status": "in-use" },
       { "name": "review", "status": "in-use" },
       { "name": "review-security", "status": "in-use" },
-      {
-        "name": "run-activity",
-        "status": "reserved",
-        "purpose": "Run one pipeline activity for a PR lane and report its check run; the reusable runner every PR lane calls."
-      },
+      { "name": "run-activity", "status": "in-use" },
       { "name": "run-checks", "status": "in-use" },
       { "name": "scan-dependencies", "status": "in-use" },
       { "name": "test-windows", "status": "in-use" },
+      {
+        "name": "unblock",
+        "status": "reserved",
+        "purpose": "Assess a blocked pull request and take the action that unblocks it."
+      },
       {
         "name": "update",
         "status": "reserved",
@@ -88,12 +89,24 @@
       { "name": "publish-binaries", "status": "in-use" },
       { "name": "publish-image", "status": "in-use" },
       { "name": "publish-packages", "status": "in-use" },
+      {
+        "name": "publish-plugins",
+        "status": "reserved",
+        "purpose": "Publish Claude Code plugins to their marketplace."
+      },
       { "name": "tag", "status": "in-use" }
     ],
     "maintenance": [
       { "name": "audit-code-review-rules", "status": "in-use" },
       { "name": "audit-link-check-excludes", "status": "in-use" },
+      { "name": "audit-org-architecture-pointer", "status": "in-use" },
+      { "name": "audit-pr-convention-pins", "status": "in-use" },
       { "name": "audit-test-selection", "status": "in-use" },
+      {
+        "name": "check-links",
+        "status": "in-use",
+        "purpose": "Check every Markdown link with the network on; audit-link-check-excludes covers only the exclude list."
+      },
       { "name": "reconcile-pr-creation-policy", "status": "in-use" },
       { "name": "repin-account-rotation", "status": "in-use" },
       { "name": "repin-ci-workflows", "status": "in-use" },
@@ -107,6 +120,7 @@
     "address",
     "aggregate",
     "apply",
+    "assess",
     "attest",
     "audit",
     "automerge",
@@ -138,6 +152,7 @@
     "regenerate",
     "repin",
     "report",
+    "request",
     "require",
     "resolve",
     "respond",
@@ -154,6 +169,7 @@
     "test",
     "tidy",
     "triage",
+    "unblock",
     "update",
     "upload",
     "validate",

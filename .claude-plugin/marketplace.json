@@ -6,6 +6,11 @@
       "name": "sandbox-marker",
       "source": "./plugins/sandbox-marker",
       "description": "Test fixture for the pr-run-activity runner: skills that print or commit a fixed base marker string."
+    },
+    {
+      "name": "source-control",
+      "source": "./plugins/source-control",
+      "description": "Copy of claude-code-plugins' source-control plugin, for the pr-unblock lane's resolve-conflicts skill."
     }
   ]
 }

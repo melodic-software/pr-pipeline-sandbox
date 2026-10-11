@@ -1,0 +1,63 @@
+{
+  "requires": [
+    {
+      "id": "node",
+      "kind": "runtime",
+      "need": "required",
+      "for": [
+        "plugin"
+      ],
+      "detect": {
+        "any": [
+          "node"
+        ]
+      },
+      "degrade": "Without node, the source-control hooks cannot launch, so they do nothing.",
+      "install": {
+        "docs": "https://nodejs.org/en/download"
+      },
+      "check": "/source-control:check"
+    },
+    {
+      "id": "jq",
+      "kind": "cli",
+      "need": "required",
+      "for": [
+        "hook:pr-body-linkage-gate.sh",
+        "hook:pr-linkage-mcp-gate.sh",
+        "hook:worktree-add-claim-gate.sh",
+        "hook:worktree-add-containment-gate.sh",
+        "hook:worktree-create-gate.sh"
+      ],
+      "detect": {
+        "any": [
+          "jq"
+        ]
+      },
+      "degrade": "Without jq, the source-control hooks skip their work.",
+      "install": {
+        "docs": "https://jqlang.org/download/"
+      },
+      "check": "/source-control:check"
+    },
+    {
+      "id": "npm",
+      "kind": "cli",
+      "need": "optional",
+      "for": [
+        "skill:worktree",
+        "hook:worktree-create-gate.sh"
+      ],
+      "detect": {
+        "any": [
+          "npm"
+        ]
+      },
+      "degrade": "Without npm, worktree creation still succeeds but skips npm ci for a package-lock.json and warns; run npm ci in the new worktree yourself.",
+      "install": {
+        "docs": "https://docs.npmjs.com/downloading-and-installing-node-js-and-npm"
+      },
+      "check": "/source-control:check"
+    }
+  ]
+}

@@ -1,0 +1,615 @@
+# Phase 3: Monitor (CI + comments + fixes)
+
+## Contents
+
+- [3.0 Expected PR actors and merge readiness](#30-expected-pr-actors-and-merge-readiness)
+- [3.0.0 Cloud session baseline poll](#300-cloud-session-baseline-poll)
+- [3.0.05 Push-channel primary path (local CLI sessions, optional)](#3005-push-channel-primary-path-local-cli-sessions-optional)
+- [3.0.1 Auto-watch setup (Monitor tool)](#301-auto-watch-setup-monitor-tool)
+- [3.0.5 Loop-aware monitoring (self-termination support)](#305-loop-aware-monitoring-self-termination-support)
+- [3.0.6 Multi-PR scan (after readiness-pass, merge, or close)](#306-multi-pr-scan-after-readiness-pass-merge-or-close)
+- [3.1 Monitoring loop (per-push)](#31-monitoring-loop-per-push)
+- [3.1.5 Security scan evaluation (MANDATORY)](#315-security-scan-evaluation-mandatory)
+- [3.2 CI failure resolution (RESEARCH-GATED)](#32-ci-failure-resolution-research-gated)
+- [3.3 PR comment evaluation (WORKFLOW-GATED)](#33-pr-comment-evaluation-workflow-gated)
+- [3.4 Final monitoring report (readiness-gated)](#34-final-monitoring-report-readiness-gated)
+- [3.5 Monitor integration](#35-monitor-integration)
+
+Phase 3 is an **async event loop**, not a sequential pipeline. After every push (initial PR creation, CI fix, comment fix), monitor CI status AND process comments concurrently as they arrive. Don't wait for all CI checks to complete before reading comments. Bots post at different times.
+
+## 3.0 Expected PR actors and merge readiness
+
+**Before polling, know who you're waiting for.** The [readiness checklist](readiness.md) defines the authoritative registry of all expected PR actors: CI workflows, security scanners, AI reviewers, and comment-only bots. Read that file before starting the monitoring loop.
+
+**Key principle: "no comments" ≠ "ready to merge."** An empty comment list may mean reviewers haven't posted yet, not that there are no issues. The readiness checklist includes a **cooldown period** (minimum 2 minutes after the last check-run completion or comment arrival) to prevent the race condition where monitor declares readiness before all actors post.
+
+**Bounded autonomy: monitor does not merge.** It evaluates, classifies, and recommends; merging is Phase 4. In `full` mode the readiness gates are checked automatically, never relaxed. Phase 4 merges or enqueues without asking only under [merge.md](merge.md) §4.2.1: once the PR is `CLEAN` and the AI review checks have passed on the head commit, pinned with `--match-head-commit`, with no strategy flag behind a merge queue. Every other merge waits for the user's approval (`/source-control:pull-request merge` or a manual `gh pr merge`). Never arm auto-merge (`--auto`), and never pass `--admin`, `--merge` or `--rebase`.
+
+## 3.0.0 Cloud session baseline poll
+
+**Platform-conditional:** cloud/headless sessions (`CLAUDE_CODE_REMOTE=true`) poll, and polling is their only PR-activity source here. This skill arms no cloud PR-event route and depends on no undocumented session tool for PR events.
+
+- **Pointer**: when deciding whether a cloud session can receive PR events, or whether a documented route would hand them to this monitor, fetch [Auto-fix pull requests](https://code.claude.com/docs/en/claude-code-on-the-web#auto-fix-pull-requests) live.
+- **As of**: 2026-10-11
+- **Recheck trigger**: upstream documents a PR-activity subscription a cloud session can arm without auto-fix, or that section changes what auto-fix does with an event.
+
+**If `CLAUDE_CODE_REMOTE=true` (cloud session):**
+
+Establish a baseline poll: the §3.0.1 REST read of the PR's checks (`gh pr checks <N>` is for a one-off read only, per §3.1 "Polling CI from more than one worker") + the three comment-surface fetches (per-iteration checklist steps C1-C3) every 60-90s until all readiness gates pass. Run it in the background, never as a foreground `sleep` or `until` loop: arm the §3.0.1 Monitor watch at that interval, or, where the Monitor tool is unavailable, start the same poll script through the Bash tool with `run_in_background` and have it exit on the first line it would emit, which wakes the session; run the iteration, then start it again. Always pass `timeout: 7200000` with that `run_in_background` call. When the stop notice arrives in place of an emitted line, run one iteration and start the poll again with the same `timeout`.
+
+We pass the background-command maximum on every fallback poll and treat the stop notice as a re-arm signal, so we never have to track which sessions carry the limit.
+
+- **Pointer**: when you need the background-command time limit, which sessions it applies to, its maximum, or the stop notice text, fetch [Time limit for background commands](https://code.claude.com/docs/en/tools-reference#time-limit-for-background-commands) live.
+- **As of**: 2026-10-10
+- **Recheck trigger**: that section changes its maximum or the sessions it covers, or a release note names the background-command time limit.
+
+**If local CLI session (`CLAUDE_CODE_REMOTE` not set or `false`):** skip this section. Event delivery is handled by the push-channel primary path (§3.0.05) when available, otherwise by the Monitor watch (§3.0.1).
+
+## 3.0.05 Push-channel primary path (local CLI sessions, optional)
+
+**Preferred over §3.0.1 Monitor watch, when your environment provides it.** Some environments ship a GitHub-events push channel: an MCP server paired with a webhook forwarder (e.g. the `cli/gh-webhook` gh extension) that delivers `check_run` / `workflow_run` / `pull_request*` / `issue_comment` events straight into the active session, with zero idle polling and ~0 request cost between events.
+
+**Activation gate. Verify, never assume:**
+
+1. Confirm the channel's MCP server is registered in this session (its status tool responds).
+2. Verify its delivery pipeline is healthy per the channel's own docs (broker/forwarder process alive, subscriber connected to the LIVE broker. A stale subscriber whose connection looks "open" against a dead or replaced broker is indistinguishable from a healthy one without a health cross-check; when the channel exposes a broker address, cross-check it against the live process before trusting it).
+3. Arm the channel's PR filter for `<N>` so events scope to the monitored PR.
+
+**If all checks pass → channel mode active:**
+
+- Skip §3.0.1 Monitor-watch arming entirely
+- Process channel event arrivals per §3.1 (each event triggers a single iteration; zero polling between events)
+- Continue to honor §3.0.5 loop-aware self-termination. Channel mode does not change merge gating
+
+**If the environment has no such channel, or any check fails and can't be remediated → fall through to §3.0.1 Monitor watch** with a one-line note: `Push notifications unavailable — using Monitor tool (30s poll).`
+
+## 3.0.1 Auto-watch setup (Monitor tool)
+
+**Every monitor invocation ensures a live event watch exists, and every watch is re-armed at its deadline.** Runs immediately after 3.0.0, before terminal state checks, CI polling, and comment processing.
+
+1. Resolve PR identity: `PR_NUMBER=$(gh pr view --json number -q '.number' | tr -d '\r')`, `OWNER=$(gh repo view --json owner -q .owner.login)`, `REPO=$(gh repo view --json name -q .name)`
+2. Check whether this session already holds a live watch for this PR: a task id it got back from its own step-4 arming call for `PR #$PR_NUMBER CI + comments`, with no exit line, deadline notice, stop, or `--resume` since. Do not look the watch up with `TaskList`: it is not offered in every session (record below), and a watch armed before a `--resume` is gone even though the transcript still shows its id.
+3. **If this session holds a live watch for the PR** → skip (watch already active). Proceed to 3.0.5
+4. **Otherwise** → arm the watch:
+
+   ```text
+   Monitor(
+     description: "PR #<N> CI + comments",
+     timeout_ms: 1800000,
+     command: <poll script below>
+   )
+   ```
+
+   **Re-arm at the deadline.** On the deadline notice, if the PR is still `OPEN` and readiness has not passed (§3.0.5), arm the watch again with this same call, then run one full iteration (step 5). That iteration covers anything that landed between the deadline and the new watch: the new watch only reports comments posted after it starts, and its first poll records the current checks and review-thread count without emitting them.
+
+   We pass the Monitor deadline maximum on every arming call and re-arm on the deadline notice for as long as the PR needs watching.
+
+   - **Pointer**: when you need the Monitor deadline's default, its maximum, the lower cap in a non-interactive run, or what happens at the deadline, fetch [Monitor tool](https://code.claude.com/docs/en/tools-reference#monitor-tool) live.
+   - **As of**: 2026-10-10
+   - **Recheck trigger**: the Monitor tool section changes its deadline or its re-arm notice, or a release note names a Monitor input.
+
+   Source conflict: the Claude Code 2.1.271 changelog entry and the Monitor tool section disagree on which inputs a command watch accepts. We follow the live tool schema: no `persistent`, an explicit `timeout_ms`.
+
+   - **Pointer**: when you need the inputs a command watch accepts, fetch the 2.1.271 entry of the [Claude Code changelog](https://code.claude.com/docs/en/changelog) and [Monitor tool](https://code.claude.com/docs/en/tools-reference#monitor-tool) live.
+   - **As of**: 2026-10-10
+   - **Recheck trigger**: the Monitor tool section documents `timeout_ms` for command watches or mentions `persistent`.
+
+   The step-2 check rests on this session's own arming record, not on a task-list lookup, because the task-tracking tools are not offered on every model.
+
+   - **Pointer**: when you need which models and sessions get `TaskList` and how to opt in, fetch [Task tool availability](https://code.claude.com/docs/en/tools-reference#task-tool-availability) live.
+   - **As of**: 2026-10-10
+   - **Recheck trigger**: the Task tool availability section changes which sessions get the task tools, or a release note names task-tool gating.
+
+   The poll script (inline in the `command` parameter):
+
+   ```bash
+   PR_NUMBER=<N>
+   OWNER=$(gh repo view --json owner -q .owner.login)
+   REPO=$(gh repo view --json name -q .name)
+   prev_checks=""
+   last_comment_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   prev_threads=""
+   poll=0
+
+   while true; do
+     # Terminal state check — exit watch if PR closed/merged. REST, like the
+     # CI read below (§3.1 "Polling CI from more than one worker").
+     read -r state head_sha < <(gh api "repos/$OWNER/$REPO/pulls/$PR_NUMBER" \
+       --jq '"\(if .merged then "MERGED" elif .state == "closed" then "CLOSED" else "OPEN" end) \(.head.sha)"' \
+       2>/dev/null | tr -d '\r')
+     if [ "$state" = "MERGED" ] || [ "$state" = "CLOSED" ]; then
+       echo "PR #$PR_NUMBER $state — watch complete"
+       exit 0
+     fi
+
+     # CI changes: one "name: bucket" line per check, the same rows and
+     # buckets `gh pr checks` reports, read over REST. Check runs are
+     # deduplicated as gh does (latest start per name/workflow/event);
+     # commit statuses are always read, since check-runs omit them.
+     b='def b: ascii_upcase | if . == "SUCCESS" then "pass" elif . == "SKIPPED" or . == "NEUTRAL" then "skipping" elif . == "CANCELLED" then "cancel" elif . == "ERROR" or . == "FAILURE" or . == "TIMED_OUT" or . == "ACTION_REQUIRED" then "fail" else "pending" end;'
+     wf=$(gh api --paginate "repos/$OWNER/$REPO/actions/runs?head_sha=$head_sha&per_page=100" \
+       --jq '.workflow_runs[] | {(.check_suite_id | tostring): "\(.name)/\(.event)"}' 2>/dev/null | jq -s -c 'add // {}')
+     cur_checks=$({ gh api --paginate "repos/$OWNER/$REPO/commits/$head_sha/check-runs?per_page=100" \
+         | jq -s -r --argjson wf "$wf" "$b"' [.[].check_runs[] | {k: "\(.name)/\($wf[.check_suite.id | tostring] // "")", name, t: (.started_at // ""), s: (if .status == "completed" then .conclusion else .status end)}] | group_by(.k) | map(max_by(.t))[] | "\(.name): \(.s | b)"'
+       gh api --paginate "repos/$OWNER/$REPO/commits/$head_sha/status?per_page=100" \
+         --jq "$b"' .statuses[] | "\(.context): \(.state | b)"'
+     } 2>/dev/null | tr -d '\r' | grep -v ': pending$' | sort || true)
+     if [ "$cur_checks" != "$prev_checks" ]; then
+       # Bucket values mirror gh pr checks: pass|fail|pending|skipping|cancel.
+       # The first poll only records the checks, so a re-arm at the
+       # deadline does not re-emit every completed check.
+       if [ "$poll" -gt 0 ]; then
+         comm -13 <(echo "$prev_checks") <(echo "$cur_checks") | \
+           grep --line-buffered -E ': (pass|fail|skipping|cancel)$' \
+           || true
+       fi
+       prev_checks="$cur_checks"
+     fi
+
+     # New comments — ALL THREE review surfaces (issue-level, inline
+     # review comments, review bodies). Watching only issues/comments
+     # misses inline findings posted with no CI state change.
+     # Advance the watermark ONLY when every fetch succeeded — a transient
+     # gh failure would otherwise skip past comments that arrived during
+     # the failed poll window and never emit them.
+     now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+     fetch_ok=1
+     if out=$(gh api --paginate "repos/$OWNER/$REPO/issues/$PR_NUMBER/comments?since=$last_comment_ts&per_page=100" \
+       --jq '.[] | "COMMENT \(.user.login): \(.body[:80])"' 2>/dev/null); then
+       printf '%s\n' "$out" | tr -d '\r' | grep --line-buffered . || true
+     else fetch_ok=0; fi
+     if out=$(gh api --paginate "repos/$OWNER/$REPO/pulls/$PR_NUMBER/comments?since=$last_comment_ts&per_page=100" \
+       --jq '.[] | "INLINE-COMMENT \(.user.login): \(.body[:80])"' 2>/dev/null); then
+       printf '%s\n' "$out" | tr -d '\r' | grep --line-buffered . || true
+     else fetch_ok=0; fi
+     # Reviews API has no `since` param — filter client-side on submitted_at.
+     # Client-side filtering makes pagination required: an unpaginated read
+     # returns the 30 OLDEST reviews, so on a PR past that count the new ones
+     # this poll exists to catch are exactly the ones never fetched.
+     if out=$(gh api --paginate "repos/$OWNER/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" \
+       --jq ".[] | select(.submitted_at > \"$last_comment_ts\") | \"REVIEW \(.user.login) [\(.state)]: \(.body[:80])\"" 2>/dev/null); then
+       printf '%s\n' "$out" | tr -d '\r' | grep --line-buffered . || true
+     else fetch_ok=0; fi
+     [ "$fetch_ok" -eq 1 ] && last_comment_ts="$now"
+
+     # Review threads: resolving one moves no check and posts no comment, so
+     # the reads above never see it. The Gate 7 read (readiness.md) costs a
+     # GraphQL call, so it runs every 4th poll (about 2 minutes) and emits
+     # when the unresolved count, or THREADS_UNPROVEN, changes.
+     if [ $((poll % 4)) -eq 0 ]; then
+       cur_threads=$(bash "<scripts-dir>/source-control-review-threads" "$OWNER/$REPO#$PR_NUMBER" 2>/dev/null \
+         | awk 'NR == 1 && /^THREADS_(OK|BLOCKED) unresolved=/ { sub(/.*unresolved=/, ""); sub(/[^0-9].*/, ""); print }')
+       cur_threads=${cur_threads:-THREADS_UNPROVEN}
+       if [ "$cur_threads" != "$prev_threads" ]; then
+         [ "$poll" -gt 0 ] && echo "REVIEW-THREADS unresolved=$cur_threads"
+         prev_threads="$cur_threads"
+       fi
+     fi
+     poll=$((poll + 1))
+
+     sleep 30
+   done
+   ```
+
+   Capture the returned task id. Report: `Monitor watch armed (task <id>, PR #<N>). Fires on CI check completion, new comments, and review-thread count changes. Stop with TaskStop <id> or end session; re-armed at each deadline.` Keep that task id: it is what step 2 and §3.0.5 check.
+
+5. Proceed with the current monitoring iteration normally
+
+**Why Monitor over fixed-interval cron:** a cron fires every N minutes regardless of PR activity. Monitor fires only when the filter emits, typically 5-15 times per PR lifecycle. Zero request cost during idle periods.
+
+**Re-arm after `--resume`:** Monitor is session-scoped and does NOT restore on `--resume`. On any `/source-control:pull-request monitor` invocation in a new or resumed session, the §3.0.1 idempotency check (step 2) detects no watch and re-arms automatically.
+
+## 3.0.5 Loop-aware monitoring (self-termination support)
+
+When `/source-control:pull-request monitor` runs in a loop (either auto-created by 3.0.1 or user-created via `/loop`), each iteration should be lightweight and self-terminating. Runs **after** 3.0.1 on every iteration.
+
+**Terminal state pre-check (MANDATORY first action on every iteration):**
+
+```bash
+gh pr view <pr_number> --json state -q '.state'
+```
+
+| State | Action |
+|-------|--------|
+| `OPEN` | Proceed to 3.1 monitoring loop as normal |
+| `MERGED` | Output final report (see below), self-terminate the loop |
+| `CLOSED` | Output final report (see below), self-terminate the loop |
+
+**Readiness-pass check (OPEN PRs only):** if the previous iteration already presented "All readiness gates passed. Recommend merge." and no new activity has occurred since (no new check-run completions, no new comments, no new pushes), self-terminate the loop using the same protocol below. Continued polling after readiness-pass is a no-op. The user has all information needed to merge. If a new push occurs later, the next `/source-control:pull-request monitor` invocation re-creates the loop via 3.0.1.
+
+**Self-termination protocol** (when PR is MERGED or CLOSED):
+
+1. Output a brief completion message:
+
+   ```text
+   PR #N: MERGED. Monitoring complete. Stopping watch.
+   ```
+
+2. Take the task id this session recorded when it armed the watch for this PR (§3.0.1 step 4), not a `TaskList` lookup
+3. If this session holds a live watch for the PR, call `TaskStop <task_id>` to kill the background watch process, and do not re-arm it at the deadline notice
+4. If it holds none (manual invocation, or the watch already exited, stopped, or reached its deadline): skip steps 2-3, just output the completion message
+
+**Minimal output for no-change iterations.** When the Monitor watch emits nothing and there are no new CI state changes or comments since the last check, output a single status line:
+
+```
+PR #N monitoring: OPEN | CI: 3/8 complete | Comments: 0 new | Next check in ~2m
+```
+
+Keeps context cost low (~50 tokens per iteration) instead of a full monitoring report.
+
+## 3.0.6 Multi-PR scan (after readiness-pass, merge, or close)
+
+When current-PR monitoring ends (readiness gates pass, PR merged, or PR closed), scan for other open PRs needing attention before going idle:
+
+```bash
+gh pr list --state open --json number,title,headRefName,statusCheckRollup \
+  --jq '.[] | "\(.number) \(.headRefName) \(.title)"'
+```
+
+For each open PR found, report a one-line status:
+
+```text
+Other open PRs:
+  #101 feat/add-auth: 2 failing checks, 1 unresolved comment
+  #103 fix/null-check: all checks green, awaiting review
+```
+
+**`statusCheckRollup` pitfall: a running check has `conclusion: ""` (empty string), not `null`.**
+The obvious "did anything fail" filter, `select(.conclusion != null and .conclusion != "SUCCESS")`,
+therefore matches every **in-progress** check and reports still-running CI as failures. Select on
+the values you mean, never on the complement:
+
+```bash
+# failures only
+--jq '[.statusCheckRollup[] | select(.conclusion=="FAILURE" or .conclusion=="TIMED_OUT" or .conclusion=="CANCELLED")]'
+# still running
+--jq '[.statusCheckRollup[] | select(.status!="COMPLETED")]'
+```
+
+**Constraint: Monitor watches are branch-locked.** Monitor MUST run in the session that owns the branch (§3.5). Scanning is READ-ONLY. You cannot arm a Monitor watch for a PR on a different branch from this worktree. Report status and suggest: *"Switch to the worktree for `<branch>` to monitor PR #N."*
+
+**When NO other open PRs found:** report `No other open PRs need attention.` and let the session idle.
+
+**Monitor does the work; it does not report and wait.** Evaluate comments (explore, research, classify), react, reply, fix VALID findings, and push. Pause for user input only at explicit decision gates: a CI fix with multiple viable approaches, and merge confirmation. Do not ask whether to start evaluating; the invocation already answered that. Run the full 3.1-3.4 workflow on every iteration with state changes.
+
+## 3.1 Monitoring loop (per-push)
+
+**PR number**: resolve once at phase entry via `gh pr view --json number -q '.number'` (or `gh pr view "$(git branch --show-current)" --json number -q '.number'` if multiple PRs are open against this checkout). Capture into a shell var and pass explicitly to every subsequent `gh pr checks` / `gh pr view` call within this phase.
+
+After each push, run this loop until convergence (**every** check in a terminal state + all comments addressed):
+
+1. **Mergeable pre-check (MANDATORY before polling):** `gh pr view <N> --json mergeable,mergeStateStatus` FIRST. If `mergeable == "CONFLICTING"`, GitHub will NOT trigger workflows. Integrate the default branch (merge-forward first, per the stale-branch recovery rule in §3.2), resolve conflicts, push, and restart the loop. Only proceed to CI polling when `mergeable == "MERGEABLE"`. **Never blame the platform for missing CI runs before checking this.**
+2. **Poll CI:** wait on the §3.0.1 Monitor watch (30s, the standard monitor cadence), or in a cloud session on the §3.0.0 background poll, and act when it emits. Never wait in a foreground `sleep` or `until` loop. `gh pr checks <N>` is for a one-off read only, never a loop ("Polling CI from more than one worker" below). Never `--watch`; before the first wait, report each pending job as queued or running per "Waiting on a pending check" below. **Wait for ALL checks to reach a terminal state** (pass/fail/skipped) before suggesting merge, no exceptions, regardless of PR type. Never merge while any check is still pending or in_progress
+3. **Check for new comments:** on each poll, also fetch new review comments (`gh api --paginate "repos/<owner>/<repo>/pulls/<N>/comments?per_page=100"`)
+4. **Process comments immediately:** if a bot comments while CI is still running, start evaluating/researching that comment now. Don't wait for CI
+5. **On CI failure:** route to 3.2 (research-driven fix)
+6. **On new comment:** route to 3.3 (evaluate + respond)
+7. **After any fix push:** restart the loop (new push = new monitoring cycle)
+
+### Polling CI from more than one worker
+
+When more than one worker polls CI under the same token (parallel PR monitors, babysit-prs workers,
+subagents each watching a PR), read the PR and its checks over REST instead of `gh pr checks`
+(including `--watch`) or `gh pr view --json`. The §3.0.1 poll script is that REST read: its state
+check and CI block (the `head_sha` read through `cur_checks`) run standalone with `OWNER`, `REPO`,
+and `PR_NUMBER` set. They emit one `name: bucket` line per check with the same rows and
+`pass|fail|pending|skipping|cancel` buckets `gh pr checks` reports (the mapping and the
+latest-per-name/workflow/event dedupe follow gh's `pkg/cmd/pr/checks/aggregate.go`), and they
+always read commit statuses, which the check-runs endpoint omits. So every predicate above that
+keys on a bucket works unchanged. The Monitor watch always uses this read, since babysit-prs arms
+one watch per PR; a one-off read in a single session may keep `gh pr checks`, but a wait never
+uses `--watch` (see "Waiting on a pending check" below).
+
+Why: both `gh` commands query GraphQL (`GH_DEBUG=api` shows `POST /graphql` for `gh pr checks`
+and for `gh pr view --json state`), and
+concurrent workers under one token have hit GraphQL secondary rate limits. GraphQL and REST draw on
+separate per-minute point budgets (2,000 and 900 points per minute) and separate primary limits
+(5,000 points per hour for GraphQL, 5,000 requests per hour for REST), and a REST `GET` costs 1
+point, so moving the polling to REST leaves the GraphQL budget for the calls that have no REST
+equivalent, such as review-thread resolution. The 100-concurrent-request ceiling is shared by
+both APIs, so REST polling does not raise it. Verified 2026-09-25, and 2026-09-26 with gh 2.97.0 for the `gh` behavior, against
+[List check runs for a Git reference](https://docs.github.com/en/rest/checks/runs),
+[Get the combined status for a specific reference](https://docs.github.com/en/rest/commits/statuses),
+[Rate limits for the REST API](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api),
+and [Rate limits for the GraphQL API](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api).
+Recheck when either rate-limits page changes its secondary-limit figures, or when a `gh` release
+note says `pr checks` or `pr view` moved off GraphQL or changes the `pr checks` bucket mapping.
+
+### Waiting on a pending check
+
+Any wait longer than one read is a REST poll on a fixed schedule, never `gh pr checks --watch`,
+whatever the worker count. `--watch` re-runs its GraphQL query every `--interval` seconds (default
+10) until every check settles, so its cost grows with how long the wait lasts, not with how much
+changes. A single session that watched a job sitting in a saturated self-hosted queue exhausted the
+account's GraphQL limit before the job had started. Poll with the §3.0.1 REST read at the monitor
+cadence: 30s in the Monitor watch, 60-90s in the cloud background poll (§3.0.0), and never faster while every
+pending check is queued.
+
+Before the first wait, split `pending` into **queued** and **running**. The bucket cannot tell them
+apart: every status short of `completed` (`queued`, `in_progress`, `waiting`, `requested`,
+`pending`) lands in `pending`. Read the unfinished Actions jobs for the head SHA instead:
+
+```bash
+gh api --paginate "repos/$OWNER/$REPO/actions/runs?head_sha=$head_sha&per_page=100" \
+  --jq '.workflow_runs[] | select(.status != "completed") | .id' | tr -d '\r' |
+  while read -r run_id; do
+    gh api --paginate "repos/$OWNER/$REPO/actions/runs/$run_id/jobs?per_page=100" \
+      --jq '.jobs[] | select(.status != "completed") | "\(.name) | \(.status) | \(.labels | join(",")) | created \(.created_at)"'
+  done | tr -d '\r'
+```
+
+A `queued` job has no runner yet, and its `labels` are its `runs-on` set. Report it as queued, with
+its labels and its age since `created_at` (`test: queued on self-hosted,linux for 41m`), never as a
+slow job. When the token can list runners (`GET /repos/{owner}/{repo}/actions/runners`, or
+`GET /orgs/{org}/actions/runners` for an org pool; both need admin access), add the pool's
+occupancy for that label set. Count the runners whose `labels[].name` include every job label: the
+ones with `busy` true over the ones with `status` `online` (`9/9 busy`). A non-admin token gets a
+403 there; report `runner capacity not readable with this token` rather than guessing. A check that
+is not an Actions job (an app's check run, a commit status) has no job record. Its check-run
+`status` still separates `queued` from `in_progress`, just without a label.
+
+The two states call for different action, so the report names which one it is:
+
+- **Running** (`in_progress`): the wait is a property of the change and its tests. Keep polling; a
+  job well past its usual duration is worth opening its log.
+- **Queued behind a busy pool:** the wait is a capacity property of the runner fleet, and nothing on
+  the branch shortens it. Keep the cadence above, report the queue state when it changes rather than
+  on every poll, and raise capacity with whoever owns the pool instead of touching the change.
+- **Queued with no online runner for the label:** nothing will pick it up. Route it per the
+  babysit-prs [stuck-checks reference](../../babysit-prs/reference/stuck-checks.md)
+  (`stuck_queued`). Age past the stuck threshold routes it there only when occupancy is unreadable
+  or shows a free online runner matching the label: a job queued behind a busy pool stays a
+  capacity report however long it waits (a 63-minute queue on `9/9 busy` is still capacity).
+
+**Claim:** a long CI wait must poll REST on a fixed schedule and must not use `gh pr checks
+--watch`; a `pending` check is reported as queued or running before the wait starts; a queued job
+is routed as stuck only when no online runner matches its label, or when occupancy is unreadable
+or shows a free matching runner past the threshold, never on age alone while the pool is busy.
+**Basis:** `gh pr checks --help` (`--interval` default 10) on gh 2.99.0; [Workflow
+jobs](https://docs.github.com/en/rest/actions/workflow-jobs) (`status`, `labels`, `runner_name`);
+[Self-hosted runners](https://docs.github.com/en/rest/actions/self-hosted-runners) (`busy`,
+`status`, `labels`; admin access); [Check runs](https://docs.github.com/en/rest/checks/runs)
+(six `status` values); [Best practices for using the REST
+API](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)
+("poll only as often as you need to, on a fixed schedule"). Probe on this marketplace's repo the
+same day: jobs read succeeded; both runner-list endpoints returned 403 to a non-admin token.
+Issue #3955 evidence: `--watch` exhausted GraphQL while a self-hosted `test` job was still queued.
+**As of:** 2026-09-28. **Recheck:** when a `gh` release changes `--watch`'s transport or default
+interval, or when either runners endpoint changes its permission requirement.
+
+Compare triggered workflows against the expected set from Phase 2.5. Flag mismatches.
+
+**When ANY check shows `fail`, ALWAYS read actual logs before classifying.** Use the prioritized fetch chain. `gh run view --log-failed` is the LAST resort because it truncates at the CLI display layer (~4MB cap, cli/cli #11059, #10551, #7771, #7642). The REST API path returns complete logs every time:
+
+```bash
+# Tier 1 — Annotations API (path/line/level/title/message — fix-location data)
+# Sometimes alone is enough to classify (lint failures, type errors)
+bash "<skill-dir>/scripts/fetch-annotations.sh" <pr-number> --failed
+
+# Tier 2 — Full failure ZIP via direct gh api (complete, untruncated). When the
+# ${user_config.fetch_logs_max_bytes} option is a number other than the 52428800
+# default (not empty, not a literal unexpanded token), append
+# --max-bytes ${user_config.fetch_logs_max_bytes}
+bash "<skill-dir>/scripts/fetch-failed-logs.sh" <run-id>
+
+# Tier 3 — LAST RESORT interactive eyeball (TRUNCATES on large logs)
+gh run view <run-id> --log-failed 2>&1 | grep '##\[error\]'
+```
+
+**Grep CI logs for `##[error]` annotations first, not `grep -i "error\|fail\|..."`.** GitHub Actions marks real errors with `##[error]`; a broad keyword grep produces false matches from cleanup steps, variable names, and incidental output (e.g., "Bad credentials" from a token cleanup step when the real error is a workflow validation failure). Only fall back to broader searches if `##[error]` returns nothing.
+
+**Stop at the first complete picture.** Tier 1 annotations are usually sufficient for "what failed in this job?". Escalate to the Tier 2 full ZIP only when annotations don't pinpoint the cause.
+
+### Inline vs subagent dispatch decision
+
+Monitor uses two execution paths for log work: inline in the main session for fast classification, and a CI-log-audit subagent (when your environment provides one) for verbose audits. Choose based on uncertainty + token budget:
+
+| Situation | Path | Why |
+|---|---|---|
+| Single failing check with a clear `##[error]` marker | **inline** Tier 1 → Tier 2 | The annotations + full-ZIP path is ~3-5K tokens; the agent needs the result NOW for the next action. Subagent overhead buys nothing |
+| Default `fetch-failed-logs.sh <run-id>` (errors+warnings) | **inline** | Same as above |
+| `--raw` mode (full ZIP dump) | **subagent** (or read selectively) | 50-500K tokens that pollute main context with content the agent only needs to grep through |
+| `--audit` mode (groups + timing + suspicious patterns) | **subagent** | Verbose multi-section output |
+| "Why did this PR pass when something looks off?" | **subagent** | Cross-job mask detection, perf-vs-baseline comparison, annotation-gap analysis |
+
+**Why not a subagent for everything:** spawning a subagent for a single-response classification task is an anti-pattern. The default mode's 3-5K-token output IS the answer the agent needs to act on. A subagent justifies its cost only when (a) verbose output protects main context, (b) persistent memory pays off, or (c) parallel work is happening. No audit subagent available → do the audit inline with the bundled script's `--audit` flags.
+
+**Never guess at failure causes.** Common always-on-review workflow failures and their log signatures:
+
+| Log signature | Meaning | Action |
+|--------------|---------|--------|
+| `Workflow validation failed` on an OIDC-based review action | PR modifies the workflow file, and OIDC requires the file to match the default branch | Informational. Expected when the PR touches that workflow |
+| Usage/quota exhaustion messages (e.g. `out of extra usage`) | The review bot's subscription limit | Informational. Report accurately, wait for reset or merge without the second review |
+| `error_max_turns` or similar truncation | Reviewer ran out of turns before completing | Informational. The review may be incomplete; check whether a comment was posted |
+| OIDC / authentication errors | Token-exchange failure | Informational. Often intermittent; retry or classify |
+| Actual code/tool errors | Real failure | Investigate |
+
+Report the **exact error message** from logs, not a classification label.
+
+## 3.1.5 Security scan evaluation (MANDATORY)
+
+**Security scan results are ALWAYS blocking. They must be evaluated before merge, regardless of PR type.** Applies to any actor performing security scanning. Identify them by check-run names containing "security", "guardian", "CodeQL", "Snyk", "Dependabot", or similar, and by bot comments about secrets or vulnerabilities.
+
+**Discovery, not hardcoding:** security tools change over time. The principle: any check run or bot comment reporting a security finding triggers mandatory triage. Don't skip a finding because the tool isn't in a hardcoded list.
+
+For each security finding:
+
+1. **Read the full PR comment:** scanners post finding details (secret type, file, commit SHA)
+2. **Read the check-run details:** `gh pr checks <pr_number> --json name,state,bucket`
+3. **Classify each finding:**
+   - **True positive** (actual secret leaked / real vulnerability) → BLOCK merge. Remove the secret, rotate credentials, then push a fix. Route through the 3.2 research-driven fix cycle
+   - **False positive** (code examples, test fixtures, documentation) → document the rationale, and note that the repo owner should dismiss it in the scanning tool's UI/dashboard or its ignore config
+   - **Not applicable** → document why
+4. **Every finding must have an explicit classification.** No unclassified findings before merge
+
+**When a security check run shows `FAILURE`:** that does NOT mean the PR is broken. It means the scanner found something needing evaluation. The failure is the *trigger* for triage, not an automatic merge block. After classification, include the disposition in the readiness verdict (Gate 3 in [readiness.md](readiness.md)).
+
+## 3.2 CI failure resolution (RESEARCH-GATED)
+
+**Rule: no edit without research.** For each failed check:
+
+1. **Read full failure context:** the prioritized chain in §3.1 above (annotations → full ZIP → last-resort CLI view). Never broad keyword grep
+2. **Explore:** read source files, check similar code, review the project's own rules, check `git log`
+3. **Research:** research the specific error in the exact framework/version, via your environment's research skill when one exists, otherwise direct doc lookups. Require multi-source consensus (aim for 3 sources)
+4. **Present the proposed fix with evidence:** error, root cause, proposed fix, sources with URLs, confidence level (HIGH/MEDIUM/LOW). If LOW, escalate. If MEDIUM, present trade-offs
+5. **Implement** (only after 1-4): make the change, re-run the project's build/test/lint gate, commit. Push once per cycle, after every failed check is fixed and with any §3.3.2 review fixes, which wait for every reviewer on the head (§3.3.2 step 0)
+6. **Loop restarts:** new push triggers 3.1 again. Track iteration count
+
+**Stale branch recovery.** If CI fails because the branch is out of date with the default branch (merge conflicts, "branch is not up to date" errors, or tests failing due to default-branch-only changes): integrate, resolve conflicts conservatively, push, restart the monitor loop from 3.1. This is distinct from code failures. There is no research gate for the integration itself, only for conflicts requiring intent judgment.
+
+**Merge-forward is the default integration; rebase is the exception.** `git merge <remote>/<default-branch>` *into* the PR branch resolves staleness and pushes **fast-forward**, with no force-push and no history rewrite. A rebase rewrites the branch and demands `git push --force-with-lease`, which permission classifiers commonly deny in autonomous/auto-mode sessions, and a denied force-push is not a reason to open a fresh branch and PR; the stale branch needed a merge-forward, not a rebase. Under a squash-only default branch, the merge commits inside the PR branch collapse to one commit on merge and linear-history requirements stay satisfied. Repeated merge-forwards as the default branch moves cost nothing. Rebase only when the project's convention requires a linear PR branch *and* force-push is actually available.
+
+**Escalation guard.** After **3 fix iterations**, STOP. Present a history table. The root cause may be environmental.
+
+## 3.3 PR comment evaluation (WORKFLOW-GATED)
+
+**Fetch all comments deterministically** via the bundled script. Never select API surfaces by agent judgment:
+
+```bash
+bash "<plugin-root>/scripts/fetch-all-pr-comments.sh" <pr-number>
+```
+
+Output: a JSON array sorted by `created_at`. Each object carries `type` (`general` | `review` | `inline`), `author`, `body`, `path`, `line`, `id`. The script hits all 3 GitHub API surfaces (issue-level comments, review-level comments, inline review comments), so no surface can be accidentally skipped.
+
+Every comment from an AI reviewer or human reviewer gets the **full workflow treatment**, not a quick glance and a thumbs-up. Bot findings are often wrong, and an "obvious" fix can be wrong too; the workflow gate exists so each finding is verified before anything is changed.
+
+### 3.3.1 Phase A: Evaluate ALL comments (batch)
+
+Process every comment before fixing any. Produces a complete picture of what needs attention.
+
+For **every substantive comment from every participant** (bot accounts with the `[bot]` suffix, human reviewers, AND the PR author's own comments, skipping only LGTM/empty/emoji-only):
+
+**Finding extraction for multi-finding comments:** AI review summaries often pack multiple findings into a single comment: markdown tables, numbered severity items, multi-paragraph analyses. Extract each finding as a separate work item. One comment with N findings = N individual evaluate cycles below. Reply with a per-finding classification table, not one blanket reply. See [review-discipline.md](../../../reference/review-discipline.md) §2 for extraction rules (including the mandatory ≥3-finding subagent dispatch).
+
+1. **Explore:** read the referenced file/line, understand the surrounding code, check related files. Don't evaluate a comment about line 42 without understanding lines 1-100
+2. **Research:** verify the specific technical claim against official docs (via a research skill when available). No assumptions, no "this looks right." The sequence is: explore → research → classify. Never: read → classify
+3. **Classify** with evidence:
+   - **VALID (fix now).** Research confirms the finding. Document: what's wrong, why, what the fix is
+   - **VALID (defer).** Research confirms, and the finding is structural (needs its own planning pass), urgent and real but unable to land in this PR, or its fix is blocked on research this lane is not positioned to do (a claim that research cannot confirm stays UNCERTAIN). A small or medium finding is VALID (fix now); one fixed in this PR goes in the §3.3.2 review-fix commit rather than the original work's commits, and where an unrelated one lands is D4.6's scope test. **Provenance test first, before scope or fix size is weighed:** if the defect did not reproduce on the base branch, this change introduced it and it is VALID (fix now), never deferrable, whichever file it surfaced in, including a contract this change altered breaking an unchanged caller (D4.6, [review-discipline.md](../../../reference/review-discipline.md) §3). Only a defect that already reproduced on the base may defer: file it in your work-item tracker with evidence and the PR link, and cite that item's id in the D5 reply. A deferral the thread cannot resolve to an open item is a dropped finding. **No reachable tracker removes the deferral, never the reply:** the tracker is optional here ([SKILL.md](../SKILL.md) §Adapting to your environment) and its absence never blocks a phase. Without one, VALID (defer) is simply not available, so fix the finding now, or reply saying why the fix does not belong in this change, leave the thread unresolved, and report it for the user to place <!-- contract-restatement: D4.6-deferral-provenance --> <!-- contract-restatement: D4.6-deferral-grounding -->
+   - **INCORRECT.** Research disproves the finding. Document: why the comment is wrong, with sources
+   - **UNCERTAIN.** Research inconclusive. Escalate to the user
+
+   **"Non-blocking" / "optional" / "nice-to-have" does NOT mean "ignore".** These modifiers describe merge-blocking status, not whether the finding is worth acting on. When research confirms a finding is valid: small or medium, related or not → VALID (fix now), placed by D4.6's scope test (this PR's §3.3.2 review-fix commit, or its own PR for an unrelated one outside the files this PR touches); structural, urgent-but-cannot-land, or fix-blocked-on-research → VALID (defer) + tracked work item, but only after the D4.6 provenance test passes: a defect this change introduced is VALID (fix now) at any size. **Never merge past a confirmed-valid finding with neither a fix nor a tracked issue.** The choice is always "fix now or ticket it". <!-- contract-restatement: D4.6-deferral-provenance -->
+4. **React to the specific comment** via `gh api` reactions (`+1` VALID, `-1` INCORRECT, `eyes` UNCERTAIN). For **bot accounts** (login ends in `[bot]`): react autonomously. Mixed-finding comments: `+1` if ANY VALID. For **human reviewers**: pause for user approval before reacting. **Verify the reaction posted** via a GET on the same endpoint filtered by your login, since the POST can silently fail (rate limit, permission)
+5. **Reply with evidence:** every comment gets a direct reply with research backing. Use the consuming project's bot-identity wrapper for these writes when it has one; plain `gh` otherwise. **Route by comment source, REQUIRED and not interchangeable:** **inline review comments** (diff-anchored, `pulls/comments`) MUST reply THREADED → `gh api repos/{owner}/{repo}/pulls/<pr_number>/comments/{comment_id}/replies -f body='...'` so the reply lands under the source thread, NEVER a detached issue comment. **General PR comments** (`issues/comments`, no thread) → post a new issue-level comment with thread context in the body. **Review-level comments** (`pulls/reviews`, no thread) → post a new issue-level comment addressing the review. Answering an inline finding with a detached issue comment orphans the reply from the thread the reviewer tracks. That is a routing error
+
+**After evaluating ALL comments**, present a classification table:
+
+```markdown
+| # | Reviewer | Comment | Classification | Evidence |
+|---|----------|---------|---------------|----------|
+| 1 | claude[bot] | "Missing null check on line 42" | INCORRECT: parameter is non-nullable by type | [sources] |
+| 2 | chatgpt-codex-connector[bot] | "Race condition in handler" | VALID (fix now): confirmed by research | [sources] |
+| 3 | human-reviewer | "Consider extracting to helper" | VALID (fix now): small refactor, review-fix commit | [sources] |
+| 4 | claude[bot] | "Split this module's persistence layer" | VALID (defer): structural, needs its own plan | Tracked work item |
+```
+
+### 3.3.2 Phase B: Fix ALL valid findings (batch, then single push)
+
+After all comments are evaluated and responded to, implement all VALID (fix now) fixes in a single batch:
+
+0. **Wait for every reviewer on the current head before pushing.** Every reviewer check run on the head SHA (`gh api "repos/<owner>/<repo>/commits/<head-sha>/check-runs"`) is completed, and every comment-only reviewer has landed its round or reached its Gate 5 bound in [readiness.md](readiness.md). A finding that arrives after the push needs a second push, and each push starts a full CI run and cancels the one in flight. Fix while you wait; hold only the push. Any §3.2 CI fix from this cycle goes in the same push
+1. **For each VALID (fix now) finding**, follow the full workflow: explore the fix context, verify the *fix* approach (not just the finding), implement by changing only the lines the finding names (any other edit needs its own finding; `/review:quality-gate` owns this review-fix rule), re-run the project's build/test gate after each fix
+2. **Stage all fixes together:** `git add <specific-files>` for each changed file
+3. **Single commit.** One commit addressing all review comments: `fix: address PR review findings`
+4. **Single push:** all fixes go up in one push, triggering one new monitoring cycle. Write any PR body or label change before this push, not after it: a body or label edit re-runs every workflow that triggers on `edited` or `labeled`, beside the push's own run
+
+**Why batch?** Each push restarts the monitoring loop (3.1) and a full CI run. Fixing comments one-by-one with individual pushes creates N monitoring cycles and N CI runs instead of 1. Batch fixes, push once, then re-monitor.
+
+### 3.3.3 Phase C: Re-monitor (loop restarts)
+
+After the push:
+
+1. The monitoring loop (3.1) restarts automatically: new push = new cycle
+2. CI runs against the updated code
+3. **Request re-review from comment-only actors:** if a bot posted findings that were fixed, request a fresh review so the bot can validate the fixes:
+   - If the bot's trigger is **"on every push"**: it will re-review automatically. Just wait
+   - If the bot's trigger is **manual/smart**: post a comment with the trigger phrase its record in [reviewer-shapes.md](reviewer-shapes.md) states. Don't assume it will re-fire on its own, and don't guess a phrase for a reviewer with no record
+4. Security scans re-run
+5. **Repeat from 3.3.1** if new substantive comments arrive
+6. Continue until no new comments arrive and all readiness gates pass
+
+**This is the convergence loop:** evaluate → respond → fix → push → re-monitor → repeat until clear. The monitoring report (3.4) is only produced when no more comments need attention and the full readiness checklist passes.
+
+### 3.3.4 Comment evaluation gotchas
+
+- **NEVER react or classify before researching.** No thumbs-up, no thumbs-down, no "VALID" or "INCORRECT" label until exploration and research complete. Not even if a prior cycle researched the same pattern. Each finding gets its own verification. The sequence is always: explore → research → classify → react → reply
+- **Zero false positives in classification.** An INCORRECT classification that's wrong is worse than a VALID classification that's wrong. The first dismisses a real issue, the second just does extra work. When in doubt, classify as UNCERTAIN and escalate
+- **Don't trust AI reviewer confidence.** A bot saying "critical bug" with high confidence doesn't make it critical. Research first, classify second
+- **Don't fix what research says is wrong.** If research disproves a comment, reply with evidence and react with thumbs-down. Don't implement a "fix" for a non-issue just because a bot said so
+- **Verify empirically when possible.** For claims about CLI behavior, API responses, or tool output, run the actual command and check. Empirical evidence > documentation > prior research > intuition
+- **Escalation guard.** After **3 evaluate-fix-push cycles** with the same reviewer posting new comments, STOP. The reviewer may be generating noise, or there may be a fundamental disagreement. Escalate to the user
+- **A reviewer's completion signal is a per-reviewer fact. Read its record, don't assume one.** Where a round lands (check run, review body, inline comments, an emoji reaction, or some mix), which push a comment belongs to, and how long a round takes differ per reviewer and are recorded in [reviewer-shapes.md](reviewer-shapes.md). A reviewer with no record there gets the flat Gate 5 cooldown: waiting on a signal no record says arrives stalls the loop as surely as declaring readiness too early ends it
+- **A reviewer that did not fire needs its own trigger phrase, not a retry.** Silence from a discovered reviewer is a round that never started as often as it is a round with no findings; its record says which artifacts each state produces, so read the state off those before acting. When the round never started, use the phrase its record names to re-fire it. With no record, report the silence rather than inventing a trigger
+- **NEVER select API surfaces by judgment. Use the script.** `gh pr view --json comments,reviews` MISSES inline review comments. Always invoke the bundled `fetch-all-pr-comments.sh`, which deterministically hits all 3 surfaces
+- **Never mark a comment addressed without verifiable evidence on GitHub.** Model memory of "I replied" or "I pushed the fix" is not evidence. Compaction can lose that state between iterations. Re-query GitHub to verify: reaction exists, reply exists, commit pushed, follow-up posted, bot-authored thread resolved (inline only; human/own excluded). "Done" = GitHub shows evidence. See [review-discipline.md](../../../reference/review-discipline.md) §3 verification gates
+- **Resolve BOT-authored inline threads once dispositioned; never human or own.** Once EVERY finding in an inline review comment opened by a bot reviewer carries an eligible disposition, resolve that thread (D7.5, author- and classification-conditional). The eligible dispositions are a D6 fix pushed and cited by the D7 follow-up, a fix in a linked PR the reply cites (D4.6 scope test), a `VALID (defer)` grounded per D4.6 with the item id cited, or `INCORRECT` with counter-evidence posted. One dispositioned finding never makes a multi-finding thread eligible: resolving drops its remaining comments from the readiness count, so an unaddressed finding inside it would vanish. A single `UNCERTAIN` escalates and holds the whole thread open. **A `VALID (defer)` never clears the gate for a merge this same session performs:** route it to an independent adjudicating context, or leave the thread unresolved and do not merge (`review-discipline.md`, "Who authorizes a resolution that ships no fix"). Leave HUMAN-authored threads for the human to close; never resolve your own. Detect bot at resolution time via GraphQL `author.__typename == "Bot"` (GraphQL login omits the `[bot]` suffix REST shows). Open bot-thread count is a visible signal to reviewers. Leaving bot threads unresolved after fixing undermines the audit trail <!-- contract-restatement: D7.5-thread-eligibility --> <!-- contract-restatement: D7.5-merge-authorization -->
+- **Filter your own prior replies during rescan.** Comments from your own posting identity matching the classification-table pattern (`| # | Finding | Classification |`) are NOT findings. They are prior replies. Skip them during finding extraction. See [review-discipline.md](../../../reference/review-discipline.md) §1 step 1
+
+## 3.4 Final monitoring report (readiness-gated)
+
+**Do NOT declare convergence until the full [readiness checklist](readiness.md) passes.** Run all 7 gates from that file before presenting the monitoring report. Hard requirement. No "close enough" for merge readiness.
+
+**The readiness checklist includes a 2-minute cooldown** after the last check-run completion or comment arrival. If a new comment or check result arrives during cooldown, restart the cooldown.
+
+When all readiness gates pass:
+
+```markdown
+## PR Monitoring Complete: All Readiness Gates Passed
+
+**PR:** #N, title
+**Check runs:** X passed, Y skipped, Z failed-informational
+**Security:** [scanner] evaluated, N findings classified
+**Comments:** X from N reviewers, Y fixed, Z deferred (structural, urgent, or fix blocked on research; item ids), W incorrect
+**Review threads:** 0 unresolved
+**Review lanes:** [each lane on the checks roster: productive, or ABSENT with what was run locally in its place]
+**Cooldown:** 2+ min since last activity
+**Fix iterations:** N
+**Failures classified:**
+- `<check>`: FAILURE, [exact reason from logs]
+**All readiness gates passed. Recommend merge.**
+```
+
+**After presenting the readiness report, self-terminate the Monitor watch** (same protocol as 3.0.5). Continued watching after readiness-pass adds no value. If a new push occurs after readiness-pass, the next `/source-control:pull-request monitor` invocation re-arms via 3.0.1.
+
+**If any gate fails**, present which gates failed and what action is needed, leading with any action that needs the user (a decision, an approval, a human reviewer's thread). Never suggest merge with open gates, even in `full` mode.
+
+## 3.5 Monitor integration
+
+The monitor phase automatically arms a background watch via §3.0.1 and re-arms it at each deadline. The user does NOT need to invoke `/loop` manually. The watch is self-configuring and event-driven.
+
+**Where to run it: the same session that owns the branch.**
+
+Monitor MUST run in the session that created the PR. Not a preference but a constraint:
+
+1. Monitor writes to the PR branch (pushes CI fixes, rebases, posts comments)
+2. Writing requires being checked out on that branch
+3. Git enforces one-branch-per-worktree, so no second session can check out the same branch
+4. Therefore: monitor runs in the session that owns the branch
+
+```text
+Session A: feat/feature-x → create PR → /source-control:pull-request monitor (arms watch) → keep working or idle
+Session B: feat/feature-y → different branch, different worktree → code the next thing
+```
+
+Watch notifications arrive between turns. If you're mid-response on a complex task, the notification queues until your turn completes.
+
+**For read-only status checks from any session:** use `/source-control:pull-request status`, a read-only action that only calls `gh` commands. Safe from any terminal, any time, no branch checkout required.
+
+**Key behaviors:**
+
+- **Self-termination on merge/close/readiness-pass:** the poll script exits on MERGED/CLOSED; `TaskStop` also fires from monitoring logic
+- **Zero cost during idle periods:** Monitor fires only when the filter emits
+- **Full monitoring on state changes:** when a check run completes or a new comment lands, the emitted line wakes the model and the full 3.1-3.4 logic runs
+- **Session-scoped:** the watch terminates when the session exits; no orphaned background processes. It does not restore on `--resume`. §3.0.1's idempotency check re-arms it
+- **Manual cancel:** "stop the PR monitor" or `TaskStop <id>`
+
+The non-restore claim is verified 2026-09-06 against Claude Code 2.1.263 and
+[Run prompts on a schedule](https://code.claude.com/docs/en/scheduled-tasks#limitations), which
+states that resuming restores unexpired recurring tasks and pending one-shots, and that
+"Background Bash and monitor tasks are never restored on resume." Recheck when that page stops
+carrying that sentence, or when a release note names Monitor or resume behavior.
+
+**Cloud sessions (`CLAUDE_CODE_REMOTE=true`):** §3.0.0's baseline poll handles event delivery via `gh`; the Monitor tool is not needed. Check `CLAUDE_CODE_REMOTE` before arming.
+
+**`/loop` fallback:** when Monitor is unavailable, `/loop 2m /source-control:pull-request monitor` provides the same coverage at the cost of a full model turn per interval. Monitor is the default for active CLI sessions.

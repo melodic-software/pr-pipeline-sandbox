@@ -18,13 +18,19 @@ permissions: {}
 
 jobs:
   fix-marker:
+    # The lanes App's own pull_request events never start a lane, so a lane
+    # push never waits in the per-PR write queue.
+    if: >-
+      !(github.event_name == 'pull_request'
+      && format('{0}', github.event.sender.id) == vars.AUTOMATION_LANES_APP_SENDER_ID)
     permissions:
       contents: read
       pull-requests: read
       checks: write
       id-token: write
     concurrency:
-      group: ${{ github.workflow }}-fix-marker-${{ github.event.pull_request.number || inputs.pr-number }}
+      # One per-PR queue shared by every write lane: it queues, never cancels.
+      group: pr-pipeline-write-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
     uses: ./.github/workflows/pr-run-activity-write.yml
     with:
@@ -35,13 +41,19 @@ jobs:
       claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
   audit-env-write:
+    # The lanes App's own pull_request events never start a lane, so a lane
+    # push never waits in the per-PR write queue.
+    if: >-
+      !(github.event_name == 'pull_request'
+      && format('{0}', github.event.sender.id) == vars.AUTOMATION_LANES_APP_SENDER_ID)
     permissions:
       contents: read
       pull-requests: read
       checks: write
       id-token: write
     concurrency:
-      group: ${{ github.workflow }}-audit-env-write-${{ github.event.pull_request.number || inputs.pr-number }}
+      # One per-PR queue shared by every write lane: it queues, never cancels.
+      group: pr-pipeline-write-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
     uses: ./.github/workflows/pr-run-activity-write.yml
     with:

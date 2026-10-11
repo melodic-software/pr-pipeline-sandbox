@@ -1,0 +1,1101 @@
+"""Per-PR classifier and fan-out delta engine.
+
+Ports the pull-request classification coverage onto `babysit_delta`: branch
+freshness, the trust-boundary mutation policy, foreign-activity (L3)
+detection, the twelve `worker_actionable_delta` arms (each suppressible arm
+tested on both the direct-gate-ready and not-ready sides), the quiet-recheck
+and branch-uniqueness-cleared paths, and cadence recommendation.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import sys
+import unittest
+from unittest import mock
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+import babysit_delta as delta
+import babysit_review_trigger as review_trigger
+
+HEAD = "a" * 40
+OLD = "c" * 40
+OBS = "2026-07-10T00:00:00Z"
+UPD = "2026-07-09T00:00:00Z"
+CONFIG = delta.ClassifyConfig(allowed_owners=frozenset({"owner"}))
+
+BOT_ERROR = {
+    "author": {"login": "b[bot]", "__typename": "Bot"},
+    "body": "encountered an error running",
+}
+BOT_P1 = {
+    "author": {"login": "b[bot]", "__typename": "Bot"},
+    "body": "P1 must fix regression",
+}
+HUMAN_BLOCKING = {
+    "author": {"login": "person", "__typename": "User"},
+    "body": "must fix this blocking issue",
+}
+
+
+def make_pr(**over: object) -> dict[str, object]:
+    pr = {
+        "repo": "owner/repo",
+        "number": 1,
+        "url": "u",
+        "title": "t",
+        "state": "OPEN",
+        "author": {"login": "someone", "__typename": "User"},
+        "headRefName": "feature",
+        "headRefOid": HEAD,
+        "baseRefName": "main",
+        "headRepository": {"nameWithOwner": "owner/repo"},
+        "headRepositoryOwner": {"login": "owner"},
+        "isCrossRepository": False,
+        "isDraft": False,
+        "maintainerCanModify": True,
+        "baseRepositoryArchived": False,
+        "mergeStateStatus": "CLEAN",
+        "mergeable": "MERGEABLE",
+        "reviewDecision": "",
+        "reviews": [],
+        "latestReviews": [],
+        "comments": [],
+        "statusCheckRollup": [],
+        "updatedAt": UPD,
+    }
+    pr.update(over)
+    return pr
+
+
+def make_prev(**over: object) -> dict[str, object]:
+    prev = {
+        "head_sha": HEAD,
+        "updated_at": UPD,
+        "is_draft": False,
+        "merge_state": "CLEAN",
+        "human_stop": {"required": False},
+        "blocking_feedback_ids": [],
+        "material_feedback_ids": [],
+        "human_feedback_ids": [],
+        "human_blocking_feedback_ids": [],
+        "checks_failing": [],
+        "checks_pending": [],
+        "checks_failing_identities": [],
+        "checks_pending_identities": [],
+        "last_worker_checkin_at": "",
+        "last_worker_checkin_head_sha": HEAD,
+        "pending_worker_dispatch_head_sha": "",
+        "pending_worker_dispatch_unsuppressible": False,
+        "pending_worker_dispatch_recorded_at": "",
+    }
+    prev.update(over)
+    return prev
+
+
+def classify(
+    pr: dict[str, object],
+    prev: dict[str, object] | None,
+    config: delta.ClassifyConfig = CONFIG,
+) -> dict[str, object]:
+    return delta.classify_pr(pr, prev, None, OBS, config=config)
+
+
+class BranchFreshnessTests(unittest.TestCase):
+    def test_behind_merge_state_is_behind(self) -> None:
+        result = delta.compute_branch_freshness(make_pr(mergeStateStatus="BEHIND"))
+        self.assertEqual(result["state"], "behind")
+
+    def test_dirty_or_conflicting_is_conflicting(self) -> None:
+        self.assertEqual(
+            delta.compute_branch_freshness(make_pr(mergeStateStatus="DIRTY"))["state"],
+            "conflicting",
+        )
+        self.assertEqual(
+            delta.compute_branch_freshness(
+                make_pr(mergeStateStatus="CLEAN", mergeable="CONFLICTING")
+            )["state"],
+            "conflicting",
+        )
+
+    def test_unknown_merge_state_is_unknown(self) -> None:
+        self.assertEqual(
+            delta.compute_branch_freshness(make_pr(mergeStateStatus=""))["state"],
+            "unknown",
+        )
+
+    def test_blocked_with_compare_confirmed_divergence_is_behind(self) -> None:
+        pr = make_pr(
+            mergeStateStatus="BLOCKED",
+            _base_compare={"status": "behind", "behind_by": 3},
+        )
+        result = delta.compute_branch_freshness(pr)
+        self.assertEqual(result["state"], "behind")
+        self.assertEqual(result["source"], "compare_api")
+
+    def test_blocked_without_compare_signal_is_not_reported_behind(self) -> None:
+        result = delta.compute_branch_freshness(make_pr(mergeStateStatus="BLOCKED"))
+        self.assertEqual(result["state"], "not_reported_behind")
+
+    def test_clean_head_behind_a_queue_less_base_is_behind(self) -> None:
+        for state in ("CLEAN", "HAS_HOOKS"):
+            with self.subTest(state=state):
+                pr = make_pr(
+                    mergeStateStatus=state,
+                    _base_compare={"status": "diverged", "behind_by": 4},
+                    _base_merge_queue=False,
+                )
+                result = delta.compute_branch_freshness(pr)
+                self.assertEqual(result["state"], "behind")
+                self.assertEqual(result["source"], "compare_api")
+
+    def test_clean_head_behind_a_queue_base_is_not_reported_behind(self) -> None:
+        pr = make_pr(
+            _base_compare={"status": "behind", "behind_by": 4},
+            _base_merge_queue=True,
+        )
+        result = delta.compute_branch_freshness(pr)
+        self.assertEqual(result["state"], "not_reported_behind")
+
+    def test_clean_head_behind_an_unread_queue_answer_is_not_reported_behind(
+        self,
+    ) -> None:
+        # The refresh disarms auto-merge and reruns CI and the AI reviews, so a
+        # failed rules read must not start one on what may be a queue base.
+        for queue in (None, "absent"):
+            with self.subTest(queue=queue):
+                over: dict[str, object] = {
+                    "_base_compare": {"status": "behind", "behind_by": 4}
+                }
+                if queue is None:
+                    over["_base_merge_queue"] = None
+                result = delta.compute_branch_freshness(make_pr(**over))
+                self.assertEqual(result["state"], "not_reported_behind")
+
+    def test_clean_head_up_to_date_is_not_reported_behind(self) -> None:
+        pr = make_pr(_base_compare={"status": "ahead", "behind_by": 0})
+        result = delta.compute_branch_freshness(pr)
+        self.assertEqual(result["state"], "not_reported_behind")
+
+    def test_unstable_head_ignores_a_compare(self) -> None:
+        pr = make_pr(
+            mergeStateStatus="UNSTABLE",
+            _base_compare={"status": "behind", "behind_by": 4},
+        )
+        result = delta.compute_branch_freshness(pr)
+        self.assertEqual(result["state"], "not_reported_behind")
+
+    def test_clean_head_behind_routes_to_the_refresh_not_the_gate(self) -> None:
+        pr = make_pr(
+            _base_compare={"status": "behind", "behind_by": 4},
+            _base_merge_queue=False,
+        )
+        result = classify(pr, make_prev())
+        self.assertIn(
+            "branch behind main; reported CLEAN (confirmed via base compare)",
+            result["blockers"],
+        )
+
+    def test_the_review_request_candidate_sees_the_behind_verdict(self) -> None:
+        for queue, behind in ((False, True), (True, False)):
+            with self.subTest(queue=queue):
+                pr = make_pr(
+                    _base_compare={"status": "behind", "behind_by": 4},
+                    _base_merge_queue=queue,
+                )
+                with mock.patch.object(
+                    delta,
+                    "classify_review_request",
+                    wraps=delta.classify_review_request,
+                ) as spy:
+                    classify(pr, make_prev())
+                self.assertIs(spy.call_args.kwargs["branch_behind"], behind)
+
+
+class MutationPolicyTests(unittest.TestCase):
+    def test_same_repo_pr_allows_branch_writes(self) -> None:
+        policy = delta.head_repository_scope(make_pr(), frozenset({"owner"}))
+        self.assertTrue(policy["branch_write_allowed"])
+        self.assertTrue(policy["review_trigger_allowed"])
+
+    def test_external_fork_is_monitored_but_not_write_allowed(self) -> None:
+        pr = make_pr(
+            isCrossRepository=True,
+            headRepository={"nameWithOwner": "fork/repo"},
+            headRepositoryOwner={"login": "fork"},
+        )
+        policy = delta.head_repository_scope(pr, frozenset({"owner"}))
+        self.assertTrue(policy["review_trigger_allowed"])
+        self.assertFalse(policy["branch_write_allowed"])
+
+    def test_archived_base_disables_mutation(self) -> None:
+        policy = delta.head_repository_scope(
+            make_pr(baseRepositoryArchived=True), frozenset({"owner"})
+        )
+        self.assertFalse(policy["review_trigger_allowed"])
+
+    def test_owner_not_in_allowlist_is_not_allowed(self) -> None:
+        policy = delta.head_repository_scope(make_pr(), frozenset({"other"}))
+        self.assertFalse(policy["base_repo_allowed"])
+
+    def test_owner_repo_login_comparisons_are_case_insensitive(self) -> None:
+        """GitHub owner/repo/login identity is case-insensitive end to end:
+        a differently-cased base repo, headRepository nameWithOwner, and
+        allowlist entry must all still resolve as matching."""
+        pr = make_pr(
+            repo="Owner/Repo",
+            headRepository={"nameWithOwner": "OWNER/REPO"},
+            headRepositoryOwner={"login": "OwNeR"},
+        )
+        policy = delta.head_repository_scope(pr, frozenset({"Owner"}))
+        self.assertTrue(policy["base_repo_allowed"])
+        self.assertTrue(policy["branch_write_allowed"])
+
+    def test_cross_repo_head_owner_case_insensitive_allowlist_match(self) -> None:
+        pr = make_pr(
+            isCrossRepository=True,
+            headRepository={"nameWithOwner": "Fork/repo"},
+            headRepositoryOwner={"login": "FORK"},
+        )
+        policy = delta.head_repository_scope(pr, frozenset({"owner", "fork"}))
+        self.assertTrue(policy["branch_write_allowed"])
+
+    def test_incomplete_head_metadata_fails_closed(self) -> None:
+        pr = make_pr(headRepository=None, isCrossRepository=None)
+        policy = delta.head_repository_scope(pr, frozenset({"owner"}))
+        self.assertFalse(policy["head_metadata_complete"])
+        self.assertFalse(policy["branch_write_allowed"])
+
+
+class ClassificationStatusTests(unittest.TestCase):
+    def test_failing_check_is_active(self) -> None:
+        pr = make_pr(
+            statusCheckRollup=[
+                {"__typename": "CheckRun", "name": "ci", "conclusion": "FAILURE"}
+            ]
+        )
+        self.assertEqual(classify(pr, None)["classification"], "active")
+
+    def test_new_clean_pr_is_normal(self) -> None:
+        self.assertEqual(classify(make_pr(), None)["classification"], "normal")
+
+    def test_unchanged_clean_open_pr_is_quiet(self) -> None:
+        self.assertEqual(classify(make_pr(), make_prev())["classification"], "quiet")
+
+
+class ForeignActivityTests(unittest.TestCase):
+    def _config(self) -> delta.ClassifyConfig:
+        return delta.ClassifyConfig(
+            allowed_owners=frozenset({"owner"}),
+            self_logins=frozenset({"me"}),
+            review_trigger=review_trigger.ReviewTriggerConfig(
+                trigger_phrase="please review",
+                reviewer_logins=frozenset({"reviewbot"}),
+                gate_context="gate",
+            ),
+        )
+
+    def test_dormant_without_phrase_or_self_logins(self) -> None:
+        pr = make_pr(
+            comments=[
+                {"author": {"login": "me"}, "body": "please review", "databaseId": 100}
+            ]
+        )
+        result = delta.detect_foreign_activity(pr, None, CONFIG)
+        self.assertFalse(result["detected"])
+
+    def test_detects_self_login_trigger_absent_from_ledger(self) -> None:
+        pr = make_pr(
+            comments=[
+                {"author": {"login": "me"}, "body": "please review", "databaseId": 100}
+            ]
+        )
+        result = delta.detect_foreign_activity(pr, None, self._config())
+        self.assertTrue(result["detected"])
+        self.assertEqual(result["evidence"][0]["comment_id"], "100")
+
+    def test_ignores_trigger_recorded_in_our_own_ledger(self) -> None:
+        pr = make_pr(
+            comments=[
+                {"author": {"login": "me"}, "body": "please review", "databaseId": 100}
+            ]
+        )
+        prev = {"review_trigger": {"request_history": {HEAD: {"comment_id": "100"}}}}
+        result = delta.detect_foreign_activity(pr, prev, self._config())
+        self.assertFalse(result["detected"])
+
+
+class AttributionDriftTests(unittest.TestCase):
+    """A recorded write landing under a self-login other than the intended one."""
+
+    def _config(self, intended: str = "bot") -> delta.ClassifyConfig:
+        return delta.ClassifyConfig(
+            allowed_owners=frozenset({"owner"}),
+            self_logins=frozenset({"bot", "personal"}),
+            intended_write_identity=intended,
+        )
+
+    def _ledger_prev(self) -> dict[str, object]:
+        return {"review_trigger": {"request_history": {HEAD: {"comment_id": "100"}}}}
+
+    def _recorded_write(self, author: str) -> dict[str, object]:
+        return make_pr(
+            comments=[
+                {
+                    "author": {"login": author},
+                    "body": "please review",
+                    "databaseId": 100,
+                }
+            ]
+        )
+
+    def test_dormant_without_intended_identity(self) -> None:
+        pr = self._recorded_write("personal")
+        result = delta.detect_attribution_drift(
+            pr, self._ledger_prev(), self._config(intended="")
+        )
+        self.assertFalse(result["detected"])
+
+    def test_detects_recorded_write_landed_under_other_self_login(self) -> None:
+        pr = self._recorded_write("personal")
+        result = delta.detect_attribution_drift(pr, self._ledger_prev(), self._config())
+        self.assertTrue(result["detected"])
+        self.assertEqual(result["evidence"][0]["landed_author"], "personal")
+        self.assertEqual(result["evidence"][0]["intended_author"], "bot")
+
+    def test_no_drift_when_landed_under_intended_identity(self) -> None:
+        pr = self._recorded_write("bot")
+        result = delta.detect_attribution_drift(pr, self._ledger_prev(), self._config())
+        self.assertFalse(result["detected"])
+
+    def test_unledgered_write_is_not_drift(self) -> None:
+        pr = self._recorded_write("personal")
+        result = delta.detect_attribution_drift(pr, None, self._config())
+        self.assertFalse(result["detected"])
+
+    def test_drift_surfaces_as_material_finding_via_classify(self) -> None:
+        # Acceptance path: the finding must ride the cycle-status material
+        # channel, not merely the raw detector return -- and with no gh-bot.sh
+        # (token wrapper) in the loop at all.
+        pr = self._recorded_write("personal")
+        prev = make_prev(
+            review_trigger={"request_history": {HEAD: {"comment_id": "100"}}}
+        )
+        result = delta.classify_pr(pr, prev, None, OBS, config=self._config())
+        self.assertTrue(result["attribution_drift"]["detected"])
+        self.assertTrue(
+            any(
+                "attribution drift" in finding
+                for finding in result["material_findings"]
+            ),
+            result["material_findings"],
+        )
+
+
+STUCK_ORPHAN = {
+    "__typename": "StatusContext",
+    "context": "codex-review",
+    "state": "PENDING",
+    "targetUrl": "",
+}
+
+
+class StuckCheckSignalTests(unittest.TestCase):
+    """A stuck check reports as a material finding, never a new blocker."""
+
+    def test_stuck_check_is_material_never_a_blocker(self) -> None:
+        pr = make_pr(mergeStateStatus="UNSTABLE", statusCheckRollup=[STUCK_ORPHAN])
+        result = classify(pr, None)
+        stuck = result["checks"]["stuck"]
+        self.assertEqual(len(stuck), 1)
+        self.assertEqual(stuck[0]["class"], "orphaned_status")
+        self.assertTrue(
+            any(
+                "UNSTABLE without completing" in finding
+                for finding in result["material_findings"]
+            ),
+            result["material_findings"],
+        )
+        # The stuck signal must never introduce a blocker string: a blocker
+        # would re-pin the PR active and re-dispatch a worker every cycle.
+        self.assertFalse(
+            any(
+                "UNSTABLE without completing" in blocker or "orphan" in blocker.lower()
+                for blocker in result["blockers"]
+            ),
+            result["blockers"],
+        )
+        # The pre-existing pending-check blocker is left untouched.
+        self.assertTrue(
+            any("pending check" in blocker for blocker in result["blockers"]),
+            result["blockers"],
+        )
+
+    def test_stuck_absent_when_not_unstable(self) -> None:
+        pr = make_pr(mergeStateStatus="CLEAN", statusCheckRollup=[STUCK_ORPHAN])
+        result = classify(pr, None)
+        self.assertEqual(result["checks"]["stuck"], [])
+        self.assertFalse(
+            any(
+                "UNSTABLE without completing" in finding
+                for finding in result["material_findings"]
+            )
+        )
+
+    def test_checks_stuck_field_always_present(self) -> None:
+        result = classify(make_pr(), None)
+        self.assertIn("stuck", result["checks"])
+        self.assertEqual(result["checks"]["stuck"], [])
+
+
+HELD_RUN = {
+    "__typename": "CheckRun",
+    "name": "test",
+    "workflowName": "ci",
+    "status": "COMPLETED",
+    "conclusion": "ACTION_REQUIRED",
+}
+FAILED_RUN = {
+    "__typename": "CheckRun",
+    "name": "lint",
+    "workflowName": "ci",
+    "status": "COMPLETED",
+    "conclusion": "FAILURE",
+}
+
+
+class ApprovalHeldCheckTests(unittest.TestCase):
+    """A run held for approval escalates; it is not a failure a worker can fix."""
+
+    def test_held_run_is_material_and_not_a_failing_blocker(self) -> None:
+        pr = make_pr(mergeStateStatus="BLOCKED", statusCheckRollup=[HELD_RUN])
+        result = classify(pr, None)
+        [held] = result["checks"]["approval_held"]
+        self.assertEqual((held["name"], held["class"]), ("test", "awaiting_approval"))
+        self.assertTrue(
+            any("held for approval" in f for f in result["material_findings"]),
+            result["material_findings"],
+        )
+        self.assertFalse(
+            any("failing check" in b for b in result["blockers"]), result["blockers"]
+        )
+        # The rollup still counts it failing, so the merge gate keeps holding.
+        self.assertEqual(result["checks"]["failing"], ["test"])
+
+    def test_a_real_failure_beside_it_is_still_one_blocker(self) -> None:
+        pr = make_pr(
+            mergeStateStatus="BLOCKED", statusCheckRollup=[HELD_RUN, FAILED_RUN]
+        )
+        result = classify(pr, None)
+        self.assertIn("1 failing check(s)", result["blockers"])
+
+    def test_a_newly_held_run_dispatches_no_worker(self) -> None:
+        held = classify(
+            make_pr(mergeStateStatus="BLOCKED", statusCheckRollup=[HELD_RUN]),
+            make_prev(),
+        )
+        self.assertNotIn("checks_changed", held["needs_worker_reasons"])
+        failed = classify(
+            make_pr(mergeStateStatus="BLOCKED", statusCheckRollup=[FAILED_RUN]),
+            make_prev(),
+        )
+        self.assertIn("checks_changed", failed["needs_worker_reasons"])
+
+
+class SuppressibleDeltaArmTests(unittest.TestCase):
+    """Each suppressible arm: reason present only when NOT direct-gate-ready."""
+
+    def _assert_arm(
+        self,
+        arm: str,
+        pr_over: dict[str, object],
+        prev_over: dict[str, object],
+        *,
+        comments=None,
+    ) -> None:
+        clean_pr = make_pr(**pr_over)
+        if comments is not None:
+            clean_pr["comments"] = comments
+        clean = classify(clean_pr, make_prev(**prev_over))
+        self.assertTrue(clean["pr_clean_ready_for_direct_gate"])
+        self.assertNotIn(arm, clean["needs_worker_reasons"])
+        self.assertFalse(clean["needs_worker"])
+
+        not_ready_over = {**pr_over, "mergeStateStatus": "UNKNOWN"}
+        not_ready_prev = {**prev_over, "merge_state": "UNKNOWN"}
+        not_ready_pr = make_pr(**not_ready_over)
+        if comments is not None:
+            not_ready_pr["comments"] = comments
+        fired = classify(not_ready_pr, make_prev(**not_ready_prev))
+        self.assertFalse(fired["pr_clean_ready_for_direct_gate"])
+        self.assertIn(arm, fired["needs_worker_reasons"])
+        self.assertTrue(fired["needs_worker"])
+
+    def test_new_to_state(self) -> None:
+        clean = classify(make_pr(), None)
+        self.assertFalse(clean["needs_worker"])
+        fired = classify(make_pr(mergeStateStatus="UNKNOWN"), None)
+        self.assertIn("new_to_state", fired["needs_worker_reasons"])
+        self.assertTrue(fired["needs_worker"])
+
+    def test_head_sha_changed(self) -> None:
+        self._assert_arm(
+            "head_sha_changed",
+            {},
+            {"head_sha": OLD, "last_worker_checkin_head_sha": HEAD},
+        )
+
+    def test_resolved_human_blocking(self) -> None:
+        self._assert_arm(
+            "resolved_human_blocking", {}, {"human_stop": {"required": True}}
+        )
+
+    def test_resolved_blocking_feedback(self) -> None:
+        self._assert_arm(
+            "resolved_blocking_feedback", {}, {"blocking_feedback_ids": ["comment:x"]}
+        )
+
+    def test_checks_changed(self) -> None:
+        self._assert_arm(
+            "checks_changed",
+            {},
+            {
+                "checks_failing_identities": [
+                    {"type": "CheckRun", "name": "ci", "workflow_name": "wf"}
+                ]
+            },
+        )
+
+    def test_worker_checkin_head_unconfirmed(self) -> None:
+        self._assert_arm(
+            "worker_checkin_head_unconfirmed", {}, {"last_worker_checkin_head_sha": OLD}
+        )
+
+    def test_merge_state_became_actionable(self) -> None:
+        # This arm requires the current merge state to be actionable (CLEAN),
+        # so the not-ready side is reached with untriaged material rather than a
+        # non-actionable merge state.
+        clean = classify(make_pr(), make_prev(merge_state="UNKNOWN"))
+        self.assertTrue(clean["pr_clean_ready_for_direct_gate"])
+        self.assertNotIn("merge_state_became_actionable", clean["needs_worker_reasons"])
+        self.assertFalse(clean["needs_worker"])
+
+        fired = classify(
+            make_pr(comments=[BOT_ERROR]), make_prev(merge_state="UNKNOWN")
+        )
+        self.assertFalse(fired["pr_clean_ready_for_direct_gate"])
+        self.assertIn("merge_state_became_actionable", fired["needs_worker_reasons"])
+        self.assertTrue(fired["needs_worker"])
+
+
+class LegacyCheckIdentityMigrationTests(unittest.TestCase):
+    """The one-cycle fallback for state written before identities were persisted.
+
+    A snapshot from that generation carries only display names. The check deltas
+    must still be computed from them, or the first cycle after an upgrade reports
+    no check movement at all and silently withholds the worker it owes.
+    """
+
+    @staticmethod
+    def _legacy_prev(**over: object) -> dict[str, object]:
+        prev = make_prev(merge_state="UNKNOWN", **over)
+        del prev["checks_failing_identities"]
+        del prev["checks_pending_identities"]
+        return prev
+
+    def test_a_display_name_only_snapshot_still_reports_a_cleared_failure(self) -> None:
+        fired = classify(
+            make_pr(mergeStateStatus="UNKNOWN"),
+            self._legacy_prev(checks_failing=["ci"]),
+        )
+        self.assertIn("checks_changed", fired["needs_worker_reasons"])
+        self.assertTrue(fired["needs_worker"])
+
+    def test_a_display_name_only_snapshot_with_no_checks_reports_nothing(self) -> None:
+        quiet = classify(make_pr(mergeStateStatus="UNKNOWN"), self._legacy_prev())
+        self.assertNotIn("checks_changed", quiet["needs_worker_reasons"])
+
+    def test_one_identity_array_without_its_partner_is_refused(self) -> None:
+        # Half-migrated state is unreadable, not merely legacy: taking the
+        # display-name path with one array present would compare this cycle's
+        # identities against names and report phantom movement on every check.
+        half = self._legacy_prev()
+        half["checks_failing_identities"] = []
+        with self.assertRaises(ValueError):
+            classify(make_pr(), half)
+
+
+class UnsuppressibleDeltaArmTests(unittest.TestCase):
+    """Each unsuppressible arm fires even on an otherwise direct-gate-ready PR."""
+
+    def test_new_blocking_feedback(self) -> None:
+        result = classify(make_pr(comments=[BOT_P1]), make_prev())
+        self.assertIn("new_blocking_feedback", result["needs_worker_reasons"])
+        self.assertTrue(result["needs_worker"])
+
+    def test_new_material_feedback(self) -> None:
+        result = classify(make_pr(comments=[BOT_ERROR]), make_prev())
+        self.assertIn("new_material_feedback", result["needs_worker_reasons"])
+        self.assertTrue(result["needs_worker"])
+
+    def test_new_human_blocking_feedback(self) -> None:
+        result = classify(make_pr(comments=[HUMAN_BLOCKING]), make_prev())
+        self.assertIn("new_human_blocking_feedback", result["needs_worker_reasons"])
+        self.assertTrue(result["needs_worker"])
+
+    def test_became_ready_for_review_fires_even_when_clean(self) -> None:
+        result = classify(make_pr(), make_prev(is_draft=True))
+        self.assertTrue(result["pr_clean_ready_for_direct_gate"])
+        self.assertIn("became_ready_for_review", result["needs_worker_reasons"])
+        self.assertTrue(result["needs_worker"])
+
+
+class SelfLoginHumanFeedbackExclusionTests(unittest.TestCase):
+    """The engine must not dispatch a worker onto its own prior-round replies.
+
+    A solo maintainer whose login is the configured self-login posts every
+    worker classification reply and `Fixed in <sha>` follow-up under that login.
+    Counting those as new human feedback manufactures a self-inflicted,
+    unsuppressible `new_human_blocking_feedback` dispatch that re-fires forever
+    (issue #473). The bot arms are self-filtered structurally; the human arm
+    needs an explicit self-login filter -- but only over the *new-feedback
+    deltas*, never the classification itself.
+    """
+
+    SELF = frozenset({"solo"})
+    CONFIG = delta.ClassifyConfig(allowed_owners=frozenset({"owner"}), self_logins=SELF)
+    SELF_BLOCKING = {
+        "author": {"login": "solo", "__typename": "User"},
+        "body": "must fix this blocking issue",
+    }
+    # GitHub logins are case-insensitive: a differently-cased self login must
+    # still be recognized, matching the casefold the engine applies.
+    SELF_BLOCKING_MIXED_CASE = {
+        "author": {"login": "SoLo", "__typename": "User"},
+        "body": "must fix this blocking issue",
+    }
+    OTHER_BLOCKING = {
+        "author": {"login": "reviewer", "__typename": "User"},
+        "body": "must fix this blocking issue",
+    }
+    SELF_NONBLOCKING = {
+        "author": {"login": "solo", "__typename": "User"},
+        "body": "small stylistic note, take it or leave it",
+    }
+    OTHER_NONBLOCKING = {
+        "author": {"login": "reviewer", "__typename": "User"},
+        "body": "small stylistic note, take it or leave it",
+    }
+
+    def test_self_login_reply_does_not_manufacture_dispatch(self) -> None:
+        # A recent worker check-in suppresses the bounded `quiet_recheck_due`
+        # fallback, so the only signal that could still dispatch is the
+        # (unsuppressible) new_human_blocking_feedback delta. Filtered out for a
+        # self-authored comment, it must leave the PR needing no worker.
+        result = classify(
+            make_pr(comments=[self.SELF_BLOCKING]),
+            make_prev(last_worker_checkin_at=OBS),
+            self.CONFIG,
+        )
+        self.assertNotIn("new_human_blocking_feedback", result["needs_worker_reasons"])
+        self.assertFalse(result["needs_worker"])
+
+    def test_self_login_match_is_case_insensitive(self) -> None:
+        result = classify(
+            make_pr(comments=[self.SELF_BLOCKING_MIXED_CASE]),
+            make_prev(last_worker_checkin_at=OBS),
+            self.CONFIG,
+        )
+        self.assertNotIn("new_human_blocking_feedback", result["needs_worker_reasons"])
+        self.assertFalse(result["needs_worker"])
+
+    def test_self_login_item_is_still_classified_human_blocking(self) -> None:
+        # Deliberate scope: the comment is excluded only from the dispatch
+        # delta, not from classification -- so a genuine "do not merge" comment
+        # the maintainer posts under their own login still halts the merge gate.
+        result = classify(
+            make_pr(comments=[self.SELF_BLOCKING]),
+            make_prev(last_worker_checkin_at=OBS),
+            self.CONFIG,
+        )
+        authors = [item["author"] for item in result["feedback"]["human_blocking"]]
+        self.assertEqual(authors, ["solo"])
+        self.assertTrue(result["human_stop"]["required"])
+        self.assertFalse(result["human_stop"]["external_required"])
+        self.assertFalse(result["pr_clean_ready_for_direct_gate"])
+
+    def test_other_login_still_fires_under_same_config(self) -> None:
+        # The filter is login-specific, not a blanket human-feedback mute:
+        # genuine feedback from any other login must still dispatch a worker,
+        # even with a recent check-in that suppresses the quiet-recheck fallback.
+        result = classify(
+            make_pr(comments=[self.OTHER_BLOCKING]),
+            make_prev(last_worker_checkin_at=OBS),
+            self.CONFIG,
+        )
+        self.assertIn("new_human_blocking_feedback", result["needs_worker_reasons"])
+        self.assertTrue(result["needs_worker"])
+
+    def test_self_login_nonblocking_excluded_from_new_feedback_human(self) -> None:
+        # The self-login filter over the new-human-feedback delta also covers the
+        # non-blocking `human` arm surfaced in new_feedback["human"]: a self-authored
+        # non-blocking comment stays classified human -- so it never hollows out the
+        # maintainer's own signal -- but must not be re-surfaced to the orchestrator
+        # as new feedback every cycle.
+        result = classify(
+            make_pr(comments=[self.SELF_NONBLOCKING]),
+            make_prev(last_worker_checkin_at=OBS),
+            self.CONFIG,
+        )
+        self.assertEqual(
+            [item["author"] for item in result["feedback"]["human"]], ["solo"]
+        )
+        self.assertEqual(result["new_feedback"]["human"], [])
+
+    def test_other_login_nonblocking_still_surfaces_as_new_feedback(self) -> None:
+        # The non-blocking-arm filter is login-specific, not a blanket mute: a
+        # non-blocking comment from any other login must still surface as new
+        # human feedback for the orchestrator to relay.
+        result = classify(
+            make_pr(comments=[self.OTHER_NONBLOCKING]),
+            make_prev(last_worker_checkin_at=OBS),
+            self.CONFIG,
+        )
+        self.assertEqual(
+            [item["author"] for item in result["new_feedback"]["human"]], ["reviewer"]
+        )
+
+
+class DispatchPendingUnconfirmedTests(unittest.TestCase):
+    def test_pending_dispatch_survives_direct_gate_readiness(self) -> None:
+        prev = make_prev(
+            pending_worker_dispatch_head_sha=HEAD,
+            pending_worker_dispatch_unsuppressible=True,
+            pending_worker_dispatch_recorded_at=OBS,
+            last_worker_checkin_at="",
+        )
+        result = classify(make_pr(), prev)
+        self.assertTrue(result["pr_clean_ready_for_direct_gate"])
+        self.assertIn("dispatch_pending_unconfirmed", result["needs_worker_reasons"])
+        self.assertTrue(result["needs_worker"])
+
+    def test_pending_dispatch_clears_once_a_later_checkin_confirms(self) -> None:
+        prev = make_prev(
+            pending_worker_dispatch_head_sha=HEAD,
+            pending_worker_dispatch_unsuppressible=True,
+            pending_worker_dispatch_recorded_at=OBS,
+            last_worker_checkin_at="2026-07-10T01:00:00Z",
+        )
+        result = classify(make_pr(), prev)
+        self.assertNotIn("dispatch_pending_unconfirmed", result["needs_worker_reasons"])
+        self.assertFalse(result["needs_worker"])
+
+
+class QuietRecheckTests(unittest.TestCase):
+    def test_quiet_recheck_forces_worker_when_no_checkin_recorded(self) -> None:
+        prev = make_prev(merge_state="UNKNOWN")
+        result = classify(make_pr(mergeStateStatus="UNKNOWN"), prev)
+        self.assertIn("quiet_recheck_due", result["needs_worker_reasons"])
+        self.assertTrue(result["needs_worker"])
+
+    def test_recent_checkin_suppresses_quiet_recheck(self) -> None:
+        prev = make_prev(merge_state="UNKNOWN", last_worker_checkin_at=OBS)
+        result = classify(make_pr(mergeStateStatus="UNKNOWN"), prev)
+        self.assertNotIn("quiet_recheck_due", result["needs_worker_reasons"])
+        self.assertFalse(result["needs_worker"])
+
+
+class HeadRefGuardTests(unittest.TestCase):
+    def test_shared_head_disables_writes_for_matching_pr(self) -> None:
+        pr = classify(make_pr(), None)
+        delta.apply_head_ref_guard(
+            pr, checked=True, matching_prs=[pr["key"], "owner/repo#2"], prev_unique=None
+        )
+        self.assertFalse(pr["head_ref_uniqueness"]["unique"])
+        self.assertFalse(pr["mutation_policy"]["branch_write_allowed"])
+        self.assertEqual(pr["classification"], "active")
+        self.assertIn(
+            "head branch is shared by multiple open PRs; user decision required",
+            pr["blockers"],
+        )
+
+    def test_uniqueness_cleared_forces_worker_when_not_direct_gate_ready(self) -> None:
+        prev = make_prev(merge_state="UNKNOWN", last_worker_checkin_at=OBS)
+        pr = classify(make_pr(mergeStateStatus="UNKNOWN"), prev)
+        self.assertFalse(pr["needs_worker"])
+        delta.apply_head_ref_guard(
+            pr, checked=True, matching_prs=[pr["key"]], prev_unique=False
+        )
+        self.assertTrue(pr["needs_worker"])
+        self.assertIn("branch_uniqueness_cleared", pr["needs_worker_reasons"])
+        self.assertEqual(pr["pending_worker_dispatch_head_sha"], HEAD)
+
+    def test_uniqueness_cleared_suppressed_on_direct_gate_ready_pr(self) -> None:
+        pr = classify(make_pr(), make_prev())
+        self.assertFalse(pr["needs_worker"])
+        delta.apply_head_ref_guard(
+            pr, checked=True, matching_prs=[pr["key"]], prev_unique=False
+        )
+        self.assertFalse(pr["needs_worker"])
+        self.assertNotIn("branch_uniqueness_cleared", pr["needs_worker_reasons"])
+
+
+class QuietRecheckOverrideTests(unittest.TestCase):
+    def test_positive_override_is_accepted(self) -> None:
+        self.assertEqual(delta.validated_max_quiet_recheck_seconds(120), 120.0)
+
+    def test_non_positive_and_non_finite_overrides_are_rejected(self) -> None:
+        for value in (0, -1, float("inf"), float("nan")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                delta.validated_max_quiet_recheck_seconds(value)
+
+    def test_invalid_override_fails_on_a_clean_pr_path_too(self) -> None:
+        config = delta.ClassifyConfig(
+            allowed_owners=frozenset({"owner"}), max_quiet_recheck_seconds=0
+        )
+        with self.assertRaises(ValueError):
+            delta.classify_pr(make_pr(), None, None, OBS, config=config)
+
+
+def advisory_rounds(*rounds: tuple[str, str, object]) -> dict[str, object]:
+    return {
+        head: (
+            {"recorded_at": recorded_at}
+            if classes is None
+            else {"recorded_at": recorded_at, "finding_classes": classes}
+        )
+        for head, recorded_at, classes in rounds
+    }
+
+
+ALL_C = {"a": 0, "b": 0, "c": 2}
+MIXED = {"a": 0, "b": 1, "c": 2}
+
+
+class AdvisoryRoundCompositionTests(unittest.TestCase):
+    def test_only_c_findings_are_all_c(self) -> None:
+        self.assertEqual(
+            delta.advisory_round_composition({"finding_classes": ALL_C}), "all-c"
+        )
+
+    def test_any_non_c_finding_is_mixed(self) -> None:
+        self.assertEqual(
+            delta.advisory_round_composition({"finding_classes": MIXED}), "mixed"
+        )
+
+    def test_unclassifiable_records_are_unknown(self) -> None:
+        # Pre-adoption records carry no classes at all; the rest are records a
+        # hand edit or a partial write could produce. None of them may read as
+        # "no (c) findings" -- the tripwire fails closed on unknown.
+        for record in (
+            None,
+            "not-an-object",
+            {"recorded_at": "2026-07-10T00:00:00Z"},
+            {"finding_classes": {"a": 0, "b": 0, "c": 0}},
+            {"finding_classes": {"a": 0, "c": 1}},
+            {"finding_classes": {"a": 0, "b": 0, "c": "2"}},
+            {"finding_classes": {"a": 0, "b": 0, "c": True}},
+            {"finding_classes": {"a": 0, "b": 0, "c": -1}},
+        ):
+            with self.subTest(record=record):
+                self.assertEqual(delta.advisory_round_composition(record), "unknown")
+
+
+class AdvisoryRoundOrderingTests(unittest.TestCase):
+    def test_rounds_are_ordered_by_write_ahead_timestamp(self) -> None:
+        # Insertion order deliberately disagrees with chronology: a dict keyed
+        # by head SHA carries no ordering the tripwire could trust.
+        rounds = advisory_rounds(
+            ("b" * 40, "2026-07-10T02:00:00Z", ALL_C),
+            ("a" * 40, "2026-07-10T01:00:00Z", MIXED),
+        )
+        self.assertEqual(
+            [head for head, _ in delta.ordered_advisory_rounds(rounds)],
+            ["a" * 40, "b" * 40],
+        )
+
+    def test_tied_timestamps_fall_back_to_write_order(self) -> None:
+        # The head SHA carries no chronology, so a lexicographic tiebreak would
+        # order these arbitrarily -- here, exactly backwards. Pre-sequence
+        # records have nothing better than the mapping's current order.
+        rounds = advisory_rounds(
+            ("b" * 40, "2026-07-10T01:00:00Z", MIXED),
+            ("a" * 40, "2026-07-10T01:00:00Z", ALL_C),
+        )
+        self.assertEqual(
+            [head for head, _ in delta.ordered_advisory_rounds(rounds)],
+            ["b" * 40, "a" * 40],
+        )
+
+    def test_an_explicit_sequence_outranks_timestamps_and_key_order(self) -> None:
+        # The ledger reloads with sorted keys and timestamps can tie, so only
+        # the persisted sequence carries write order across a rollover. Both
+        # the mapping order and the timestamps here disagree with it.
+        rounds = {
+            "a" * 40: {
+                "recorded_at": "2026-07-10T01:00:00Z",
+                "sequence": 2,
+                "finding_classes": ALL_C,
+            },
+            "b" * 40: {
+                "recorded_at": "2026-07-10T01:00:00Z",
+                "sequence": 1,
+                "finding_classes": MIXED,
+            },
+        }
+        self.assertEqual(
+            [head for head, _ in delta.ordered_advisory_rounds(rounds)],
+            ["b" * 40, "a" * 40],
+        )
+
+    def test_pre_sequence_rounds_sort_before_sequenced_ones(self) -> None:
+        # A record without a sequence predates sequence persistence, so it was
+        # written before every record that has one -- whatever its timestamp
+        # says relative to theirs.
+        rounds = {
+            "a" * 40: {"recorded_at": "2026-07-10T09:00:00Z", "finding_classes": MIXED},
+            "b" * 40: {
+                "recorded_at": "2026-07-10T01:00:00Z",
+                "sequence": 1,
+                "finding_classes": ALL_C,
+            },
+        }
+        self.assertEqual(
+            [head for head, _ in delta.ordered_advisory_rounds(rounds)],
+            ["a" * 40, "b" * 40],
+        )
+
+    def test_a_timestampless_round_sorts_before_a_timestamped_one(self) -> None:
+        rounds = {
+            "a" * 40: {"finding_classes": ALL_C},
+            "b" * 40: {"recorded_at": "2026-07-10T01:00:00Z", "finding_classes": ALL_C},
+        }
+        self.assertEqual(
+            [head for head, _ in delta.ordered_advisory_rounds(rounds)],
+            ["a" * 40, "b" * 40],
+        )
+
+
+class NonConvergenceTripwireTests(unittest.TestCase):
+    def test_one_round_cannot_be_a_second_consecutive_round(self) -> None:
+        tripwire = delta.advisory_non_convergence_tripwire(
+            advisory_rounds(("a" * 40, "2026-07-10T01:00:00Z", ALL_C))
+        )
+        self.assertFalse(tripwire["armed"])
+        self.assertEqual(tripwire["previous"], {})
+
+    def test_two_consecutive_all_c_rounds_arm_it(self) -> None:
+        tripwire = delta.advisory_non_convergence_tripwire(
+            advisory_rounds(
+                ("a" * 40, "2026-07-10T01:00:00Z", ALL_C),
+                ("b" * 40, "2026-07-10T02:00:00Z", ALL_C),
+            )
+        )
+        self.assertTrue(tripwire["armed"])
+        self.assertEqual(tripwire["latest"]["head_sha"], "b" * 40)
+
+    def test_an_unclassified_predecessor_fails_closed(self) -> None:
+        # A round recorded before classes were persisted is UNKNOWN rather than
+        # (a)/(b), so a current all-(c) round still arms rather than silently
+        # resetting the count.
+        tripwire = delta.advisory_non_convergence_tripwire(
+            advisory_rounds(
+                ("a" * 40, "2026-07-10T01:00:00Z", None),
+                ("b" * 40, "2026-07-10T02:00:00Z", ALL_C),
+            )
+        )
+        self.assertTrue(tripwire["armed"])
+        self.assertEqual(tripwire["previous"]["composition"], "unknown")
+
+    def test_a_mixed_predecessor_does_not_arm_it(self) -> None:
+        tripwire = delta.advisory_non_convergence_tripwire(
+            advisory_rounds(
+                ("a" * 40, "2026-07-10T01:00:00Z", MIXED),
+                ("b" * 40, "2026-07-10T02:00:00Z", ALL_C),
+            )
+        )
+        self.assertFalse(tripwire["armed"])
+
+    def test_a_mixed_latest_round_does_not_arm_it(self) -> None:
+        tripwire = delta.advisory_non_convergence_tripwire(
+            advisory_rounds(
+                ("a" * 40, "2026-07-10T01:00:00Z", ALL_C),
+                ("b" * 40, "2026-07-10T02:00:00Z", MIXED),
+            )
+        )
+        self.assertFalse(tripwire["armed"])
+
+
+class AdvisoryTripwireSnapshotTests(unittest.TestCase):
+    """The tripwire reaches a fresh worker through the snapshot, not context."""
+
+    def _classify(self, rounds: dict[str, object]) -> dict[str, object]:
+        return classify(make_pr(), make_prev(advisory_fix_rounds={"rounds": rounds}))
+
+    def test_armed_tripwire_is_surfaced_and_reported_material(self) -> None:
+        result = self._classify(
+            advisory_rounds(
+                ("a" * 40, "2026-07-10T01:00:00Z", ALL_C),
+                ("b" * 40, "2026-07-10T02:00:00Z", ALL_C),
+            )
+        )
+        self.assertTrue(
+            result["advisory_fix_rounds"]["non_convergence_tripwire"]["armed"]
+        )
+        self.assertTrue(
+            any(
+                "non-convergence tripwire armed" in finding
+                for finding in result["material_findings"]
+            )
+        )
+
+    def test_a_converging_pr_reports_nothing(self) -> None:
+        result = self._classify(
+            advisory_rounds(
+                ("a" * 40, "2026-07-10T01:00:00Z", MIXED),
+                ("b" * 40, "2026-07-10T02:00:00Z", MIXED),
+            )
+        )
+        self.assertFalse(
+            result["advisory_fix_rounds"]["non_convergence_tripwire"]["armed"]
+        )
+        self.assertEqual(
+            [
+                finding
+                for finding in result["material_findings"]
+                if "non-convergence tripwire" in finding
+            ],
+            [],
+        )
+
+
+class GraphQLProvenanceTests(unittest.TestCase):
+    """A REST-hydrated PR is marked as such in its snapshot record: thread
+    resolution is unproven for it, and the merge gate will hold it."""
+
+    def test_a_graphql_hydrated_pr_records_availability(self) -> None:
+        self.assertTrue(
+            classify(make_pr(_graphql_available=True), None)["graphql_available"]
+        )
+
+    def test_a_rest_hydrated_pr_records_the_degrade(self) -> None:
+        self.assertFalse(
+            classify(make_pr(_graphql_available=False), None)["graphql_available"]
+        )
+
+    def test_a_record_with_no_marker_reads_as_graphql(self) -> None:
+        # The key postdates the fallback; every earlier hydration was GraphQL.
+        self.assertTrue(classify(make_pr(), None)["graphql_available"])
+
+
+class RecommendCadenceTests(unittest.TestCase):
+    def test_cadence_precedence(self) -> None:
+        self.assertEqual(delta.recommend_cadence([]), "idle")
+        self.assertEqual(delta.recommend_cadence(["quiet"]), "quiet")
+        self.assertEqual(delta.recommend_cadence(["normal", "quiet"]), "normal")
+        self.assertEqual(delta.recommend_cadence(["active", "normal"]), "active")
+
+
+if __name__ == "__main__":
+    unittest.main()

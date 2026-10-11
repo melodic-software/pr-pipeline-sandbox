@@ -1,0 +1,956 @@
+"""Worktree-pruner resolution and reporting, hermetically.
+
+`repo_path` and `remove_worktree` are exercised against a real on-disk git
+repository with a linked worktree, so the whole path is hermetic -- no `gh`, and
+notably no `ghq`: it is absent from the module's executable allowlist, so any
+lingering call would raise "not in the caller's allowlist" and fail these tests.
+This is the regression guard for #438, where a consumer without ghq hit a hard
+RuntimeError instead of resolving the checkout from the worktree's own gitdir
+pointer.
+
+Also covers #816: a worktree entry orphaned by a lock-blocked removal
+(residual empty directory, stale lease record) must self-heal on the next
+prune run instead of erroring every run.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
+from unittest import mock
+
+# FIXTURE ISOLATION (#2840). An exported ABSOLUTE GIT_DIR overrides repository
+# discovery, so `git -C <fixture> config user.email` writes the CALLER's
+# .git/config and leaves the fixture with no .git — silently re-authoring the
+# caller's next commit. Cleared once at import, mirroring the variable list in
+# scripts/test-git-helpers.sh; scripts/check-fixture-git-isolation.sh keeps it
+# true. This suite is doubly exposed: it also builds a LINKED WORKTREE, whose
+# config writes land in the main clone's SHARED config.
+# GIT_CONFIG is in the list and is a DISTINCT leak path rather than another
+# spelling of the discovery one: it replaces the file the `git config`
+# subcommand reads and writes, so an identity write follows it regardless of
+# `-C`, of GIT_DIR, and of the working directory.
+for _leaked_git_var in (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_CONFIG",
+):
+    os.environ.pop(_leaked_git_var, None)
+del _leaked_git_var
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+import babysit_lease as leases  # noqa: E402
+import prune_babysit_worktrees as prune  # noqa: E402
+
+
+@contextlib.contextmanager
+def scratch_dir() -> Iterator[pathlib.Path]:
+    """A throwaway directory as a `Path`; teardown never fails the test."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        yield pathlib.Path(td)
+
+
+def git(*args: str) -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return proc.stdout.strip()
+
+
+def make_repo(tmp: pathlib.Path) -> pathlib.Path:
+    """A one-commit repository with committer identity and signing set locally."""
+    main = tmp / "mainrepo"
+    main.mkdir()
+    git("init", "-q", str(main))
+    git("-C", str(main), "config", "user.email", "t@t")
+    git("-C", str(main), "config", "user.name", "t")
+    # Repo-local only: machines with commit.gpgsign=true globally have no key for
+    # the fixture identity and every setup commit errors out (#2358).
+    git("-C", str(main), "config", "commit.gpgsign", "false")
+    git("-C", str(main), "commit", "-q", "--allow-empty", "-m", "init")
+    return main
+
+
+def make_bare_hub(tmp: pathlib.Path) -> pathlib.Path:
+    """A bare-clone hub: no working tree, so `--git-common-dir` is the repo dir."""
+    source = make_repo(tmp)
+    bare = tmp / "hub.git"
+    git("clone", "-q", "--bare", str(source), str(bare))
+    return bare
+
+
+def add_worktree(main: pathlib.Path, root: pathlib.Path, name: str) -> pathlib.Path:
+    root.mkdir(exist_ok=True)
+    wt = root / name
+    git("-C", str(main), "worktree", "add", "-q", str(wt), "-b", f"feat/{name}")
+    return wt
+
+
+def run_main(
+    root: pathlib.Path, state_dir: pathlib.Path, *extra: str
+) -> tuple[int, dict]:
+    argv = [
+        "prune_babysit_worktrees.py",
+        "--root",
+        str(root),
+        "--state-dir",
+        str(state_dir),
+        *extra,
+    ]
+    out = io.StringIO()
+    with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
+        code = prune.main()
+    return code, json.loads(out.getvalue())
+
+
+class RepoPathResolvesFromGitMetadata(unittest.TestCase):
+    def test_linked_worktree_resolves_its_main_checkout(self) -> None:
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            wt = add_worktree(main, tmp / "root", "owner__repo__pr-1")
+
+            resolved = prune.repo_path(wt)
+
+        self.assertEqual(resolved, main.resolve())
+
+    def test_bare_hub_worktree_resolves_to_the_bare_repo_itself(self) -> None:
+        # A bare-clone hub has no working tree, so `--git-common-dir` is the bare
+        # repo directory (name != ".git"); the else-branch must return it as-is,
+        # not its parent, or `git -C <parent> worktree remove` would fail.
+        with scratch_dir() as tmp:
+            bare = make_bare_hub(tmp)
+            wt = add_worktree(bare, tmp / "root", "owner__repo__pr-1")
+
+            resolved = prune.repo_path(wt)
+
+        self.assertEqual(resolved, bare.resolve())
+
+
+class RemoveWorktreeIsHermetic(unittest.TestCase):
+    def test_removes_a_clean_worktree_under_root_without_ghq(self) -> None:
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            root = tmp / "root"
+            wt = add_worktree(main, root, "owner__repo__pr-1")
+            worktree = prune.Worktree(path=wt, owner="owner", repo="repo", number=1)
+
+            prune.remove_worktree(worktree, root)
+
+            self.assertFalse(wt.exists())
+            listed = git("-C", str(main), "worktree", "list", "--porcelain")
+        self.assertNotIn(str(wt), listed)
+
+    def test_refuses_to_remove_a_worktree_outside_the_babysit_root(self) -> None:
+        # The path-containment guard must fire for a real worktree that lives
+        # outside the caller's declared root -- resolution succeeding never
+        # licenses removal beyond the sandbox.
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            actual_root = tmp / "root"
+            wt = add_worktree(main, actual_root, "owner__repo__pr-2")
+            worktree = prune.Worktree(path=wt, owner="owner", repo="repo", number=2)
+            unrelated_root = tmp / "elsewhere"
+            unrelated_root.mkdir()
+
+            with self.assertRaises(RuntimeError) as ctx:
+                prune.remove_worktree(worktree, unrelated_root)
+
+            self.assertIn("outside babysit root", str(ctx.exception))
+            self.assertTrue(wt.exists())
+
+    def test_reports_no_residual_directory_for_a_clean_removal(self) -> None:
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            root = tmp / "root"
+            wt = add_worktree(main, root, "owner__repo__pr-3")
+            worktree = prune.Worktree(path=wt, owner="owner", repo="repo", number=3)
+
+            info = prune.remove_worktree(worktree, root)
+
+        self.assertEqual(info, {"residual_directory": False})
+
+    def test_reports_a_residual_directory_when_cleanup_stays_blocked(self) -> None:
+        # Simulates #816's Windows file-lock scenario: `git worktree remove`
+        # succeeds (its administrative record is dropped) but the directory
+        # itself refuses to delete. Real `git worktree remove` already clears
+        # the directory in this hermetic test environment, so the post-removal
+        # cleanup step is forced to report failure directly -- the same
+        # `attempt_directory_removal` retry/report contract is exercised on
+        # its own in `AttemptDirectoryRemovalTests` against a real lock
+        # simulation (a patched `shutil.rmtree` failure).
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            root = tmp / "root"
+            wt = add_worktree(main, root, "owner__repo__pr-4")
+            worktree = prune.Worktree(path=wt, owner="owner", repo="repo", number=4)
+
+            with mock.patch.object(
+                prune, "attempt_directory_removal", return_value=False
+            ):
+                info = prune.remove_worktree(worktree, root)
+
+        self.assertEqual(info, {"residual_directory": True})
+
+
+class MissingRepoErrorDetectionTests(unittest.TestCase):
+    def test_detects_gits_not_a_git_repository_failure(self) -> None:
+        with scratch_dir() as tmp:
+            not_a_repo = tmp / "not-a-repo"
+            not_a_repo.mkdir()
+
+            with self.assertRaises(RuntimeError) as ctx:
+                prune.git_status(not_a_repo)
+
+        self.assertTrue(prune.is_missing_repo_error(ctx.exception))
+
+    def test_does_not_match_an_unrelated_failure(self) -> None:
+        self.assertFalse(
+            prune.is_missing_repo_error(RuntimeError("gh: rate limit exceeded"))
+        )
+
+
+class OrphanedEntryDetectionTests(unittest.TestCase):
+    def test_a_live_linked_worktree_is_not_an_orphan(self) -> None:
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            wt = add_worktree(main, tmp / "root", "owner__repo__pr-1")
+
+            self.assertFalse(prune.is_orphaned_entry(wt))
+
+    def test_a_directory_with_no_repository_anywhere_above_it_is_an_orphan(
+        self,
+    ) -> None:
+        with scratch_dir() as tmp:
+            orphan = tmp / "owner__repo__pr-2"
+            orphan.mkdir()
+
+            self.assertTrue(prune.is_orphaned_entry(orphan))
+
+    def test_a_directory_answered_by_an_ancestor_checkout_is_an_orphan(
+        self,
+    ) -> None:
+        # `git -C <path>` runs as if git had started in that directory, so
+        # ordinary upward discovery answers from an ancestor checkout when the
+        # worktree root sits inside one -- `git status` succeeds while saying
+        # nothing about this directory. Detecting only `fatal: not a git
+        # repository` would skip the orphan: an open PR would be retained as
+        # keep_open and a closed one would error in `git worktree remove`.
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            orphan = main / "root" / "owner__repo__pr-3"
+            orphan.mkdir(parents=True)
+
+            self.assertEqual(prune.git_status(orphan)[0][:3], "## ")
+            self.assertTrue(prune.is_orphaned_entry(orphan))
+
+
+class AttemptDirectoryRemovalTests(unittest.TestCase):
+    def test_reports_true_when_the_path_is_already_gone(self) -> None:
+        with scratch_dir() as tmp:
+            missing = tmp / "already-gone"
+
+            self.assertTrue(prune.attempt_directory_removal(missing))
+
+    def test_removes_a_surviving_directory(self) -> None:
+        with scratch_dir() as tmp:
+            target = tmp / "leftover"
+            target.mkdir()
+            (target / "stray.txt").write_text("x", encoding="utf-8")
+
+            self.assertTrue(prune.attempt_directory_removal(target))
+            self.assertFalse(target.exists())
+
+    def test_reports_false_without_raising_when_removal_stays_blocked(self) -> None:
+        with scratch_dir() as tmp:
+            target = tmp / "locked"
+            target.mkdir()
+
+            with mock.patch.object(
+                prune.shutil, "rmtree", side_effect=OSError("locked")
+            ):
+                self.assertFalse(prune.attempt_directory_removal(target))
+            self.assertTrue(target.exists())
+
+
+class RemoveEmptyOrphanDirectoryTests(unittest.TestCase):
+    def test_reports_true_when_the_path_is_already_gone(self) -> None:
+        with scratch_dir() as tmp:
+            root = tmp / "root"
+            root.mkdir()
+
+            self.assertTrue(prune.remove_empty_orphan_directory(root / "gone", root))
+
+    def test_removes_an_empty_directory_under_root(self) -> None:
+        with scratch_dir() as tmp:
+            root = tmp / "root"
+            target = root / "owner__repo__pr-1"
+            target.mkdir(parents=True)
+
+            self.assertTrue(prune.remove_empty_orphan_directory(target, root))
+            self.assertFalse(target.exists())
+
+    def test_leaves_a_non_empty_directory_untouched(self) -> None:
+        with scratch_dir() as tmp:
+            root = tmp / "root"
+            target = root / "owner__repo__pr-1"
+            target.mkdir(parents=True)
+            (target / "stray.txt").write_text("x", encoding="utf-8")
+
+            self.assertFalse(prune.remove_empty_orphan_directory(target, root))
+            self.assertTrue((target / "stray.txt").exists())
+
+    def test_refuses_a_directory_outside_root(self) -> None:
+        with scratch_dir() as tmp:
+            root = tmp / "root"
+            root.mkdir()
+            outside = tmp / "elsewhere" / "owner__repo__pr-1"
+            outside.mkdir(parents=True)
+
+            self.assertFalse(prune.remove_empty_orphan_directory(outside, root))
+            self.assertTrue(outside.exists())
+
+
+class StaleWorktreeRegistrationTests(unittest.TestCase):
+    """A worktree orphaned by a corrupted `.git` pointer leaves the owning
+    repository's `$GIT_DIR/worktrees/` record behind, so removing the directory
+    alone is not a self-heal: `git worktree add` at the same deterministic path
+    then fails as "missing but already registered". The record path is readable
+    off the entry's own pointer, which is what makes the prune possible."""
+
+    def test_self_heals_a_registered_orphan_end_to_end(self) -> None:
+        """The whole recoverable path: an entry whose contents are gone but
+        whose `.git` pointer survives must lose its directory AND its record,
+        so the deterministic path is genuinely reusable afterwards."""
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            root = tmp / "root"
+            wt = add_worktree(main, root, "owner__repo__pr-7")
+            worktree = prune.Worktree(path=wt, owner="owner", repo="repo", number=7)
+            # #816's shape: the administrative record survives, the checkout's
+            # own contents do not. The pointer is left intact -- it is the only
+            # thing still naming the owning repository.
+            for child in wt.iterdir():
+                if child.name != ".git":
+                    child.unlink()
+            self.assertEqual(
+                prune.registered_repo_from_gitdir_pointer(wt), main.resolve()
+            )
+            listed = git("-C", str(main), "worktree", "list", "--porcelain")
+            self.assertIn(wt.name, listed)
+
+            state_dir = tmp / "state"
+            lease_path = leases.lease_path(state_dir, "worker", worktree.key)
+            info = prune.drop_orphaned_worktree(
+                worktree, lease_path, root, preserve_lease=False
+            )
+
+            # The lone dangling pointer must not read as user content, or the
+            # self-heal would strand exactly the orphan it can fully repair.
+            self.assertTrue(info["directory_removed"])
+            self.assertEqual(info["registration_pruned"], "pruned")
+            self.assertFalse(wt.exists())
+            self.assertNotIn(
+                wt.name, git("-C", str(main), "worktree", "list", "--porcelain")
+            )
+            # The proof that matters: the path accepts a worktree again.
+            git("-C", str(main), "worktree", "add", "-q", str(wt), "-b", "feat/redo")
+            self.assertTrue(wt.exists())
+
+    def test_recovers_a_bare_hubs_repository_from_the_pointer(self) -> None:
+        # A bare hub's record sits at `<hub>.git/worktrees/<name>`, which has no
+        # `.git`-named ancestor -- the repository has to come from the
+        # `worktrees/` segment or a bare-hub orphan is never prunable.
+        with scratch_dir() as tmp:
+            bare = make_bare_hub(tmp)
+            wt = add_worktree(bare, tmp / "root", "owner__repo__pr-6")
+
+            self.assertEqual(
+                prune.registered_repo_from_gitdir_pointer(wt), bare.resolve()
+            )
+
+    def test_restores_the_pointer_when_the_directory_will_not_go(self) -> None:
+        # Losing the gitfile to a failed rmdir would strand the registration
+        # permanently: the next run finds an empty directory and no way back to
+        # the owning repository.
+        with scratch_dir() as tmp:
+            root, wt, pointer, owner_repo = self._orphan_with_pointer(tmp)
+
+            with mock.patch.object(
+                pathlib.Path, "rmdir", side_effect=OSError("locked")
+            ):
+                removed = prune.remove_empty_orphan_directory(wt, root)
+
+            self.assertFalse(removed)
+            self.assertTrue(pointer.is_file())
+            self.assertEqual(prune.registered_repo_from_gitdir_pointer(wt), owner_repo)
+
+    def _orphan_with_pointer(
+        self, tmp: pathlib.Path
+    ) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path, pathlib.Path]:
+        root = tmp / "root"
+        root.mkdir()
+        wt = root / "owner__repo__pr-5"
+        wt.mkdir()
+        owner_repo = tmp / "somerepo"
+        pointer = wt / ".git"
+        pointer.write_text(f"gitdir: {owner_repo}/.git/worktrees/x\n", encoding="utf-8")
+        return root, wt, pointer, owner_repo
+
+    def test_restores_the_pointer_when_the_rescan_fails(self) -> None:
+        # The rescan runs AFTER the unlink, so an OSError there -- a transient
+        # access failure on the directory -- leaves the directory standing with
+        # its only ownership record already gone. Restoration cannot be keyed on
+        # the rmdir failing.
+        with scratch_dir() as tmp:
+            root, wt, pointer, owner_repo = self._orphan_with_pointer(tmp)
+
+            real_iterdir = pathlib.Path.iterdir
+            scans = []
+
+            def failing_rescan(self: pathlib.Path):
+                scans.append(self)
+                if len(scans) == 2:
+                    raise OSError("directory unreadable mid-scan")
+                return real_iterdir(self)
+
+            with mock.patch.object(pathlib.Path, "iterdir", failing_rescan):
+                removed = prune.remove_empty_orphan_directory(wt, root)
+
+            self.assertFalse(removed)
+            self.assertTrue(wt.is_dir())
+            self.assertTrue(pointer.is_file())
+            self.assertEqual(prune.registered_repo_from_gitdir_pointer(wt), owner_repo)
+
+    def test_restores_the_pointer_when_a_file_appears_before_the_rmdir(self) -> None:
+        # A file landing in the window between the unlink and the rmdir skips
+        # the removal without raising at all, so this path never reaches an
+        # exception handler -- and the directory survives holding someone's
+        # file plus no way back to the owning repository.
+        with scratch_dir() as tmp:
+            root, wt, pointer, owner_repo = self._orphan_with_pointer(tmp)
+            stray = wt / "appeared.txt"
+
+            real_iterdir = pathlib.Path.iterdir
+            scans = []
+
+            def racing_rescan(self: pathlib.Path):
+                scans.append(self)
+                if len(scans) == 2:
+                    stray.write_text("x", encoding="utf-8")
+                return real_iterdir(self)
+
+            with mock.patch.object(pathlib.Path, "iterdir", racing_rescan):
+                removed = prune.remove_empty_orphan_directory(wt, root)
+
+            self.assertFalse(removed)
+            self.assertTrue(stray.is_file())
+            self.assertTrue(pointer.is_file())
+            self.assertEqual(prune.registered_repo_from_gitdir_pointer(wt), owner_repo)
+
+    def test_a_raising_existence_probe_does_not_escape_the_restoration(self) -> None:
+        # `Path.exists()` re-raises an OSError outside the ignored not-found
+        # family, so a permission denial on the very directory the restoration
+        # exists to rescue must not escape the `finally` -- an exception thrown
+        # there replaces the original one AND leaves the pointer deleted.
+        with scratch_dir() as tmp:
+            root, wt, pointer, owner_repo = self._orphan_with_pointer(tmp)
+
+            real_iterdir = pathlib.Path.iterdir
+            real_exists = pathlib.Path.exists
+            scans = []
+            probes = []
+
+            def failing_rescan(self: pathlib.Path):
+                scans.append(self)
+                if len(scans) == 2:
+                    raise OSError("directory unreadable mid-scan")
+                return real_iterdir(self)
+
+            def denying_exists(self: pathlib.Path, **kwargs):
+                if self == pointer:
+                    probes.append(self)
+                    raise PermissionError("access denied probing the gitfile")
+                return real_exists(self, **kwargs)
+
+            with (
+                mock.patch.object(pathlib.Path, "iterdir", failing_rescan),
+                mock.patch.object(pathlib.Path, "exists", denying_exists),
+            ):
+                removed = prune.remove_empty_orphan_directory(wt, root)
+
+            self.assertTrue(probes, "the fixture never reached the pointer probe")
+            self.assertFalse(removed)
+            self.assertTrue(wt.is_dir())
+
+    def test_a_locked_record_is_not_reported_as_pruned(self) -> None:
+        # A locked record is deliberately kept: `git worktree prune` kept it
+        # while exiting 0, and `git worktree remove` refuses it with a nonzero
+        # exit. Neither exit status is the answer -- the verdict must come from
+        # re-reading `worktree list`.
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            root = tmp / "root"
+            wt = add_worktree(main, root, "owner__repo__pr-4")
+            git("-C", str(main), "worktree", "lock", str(wt))
+            shutil.rmtree(wt)
+
+            self.assertEqual(
+                prune.prune_repo_worktree_records(main.resolve(), wt), "failed"
+            )
+            git("-C", str(main), "worktree", "unlock", str(wt))
+
+    def test_clearing_one_record_leaves_an_unrelated_stale_one_alone(self) -> None:
+        # The scoping guarantee. `git worktree prune` takes no path and drops
+        # every prunable record in the repository, so a scoped `--pr` cleanup
+        # would also discard the registration of an unrelated worktree whose
+        # directory is only temporarily unavailable. Removal must name its one
+        # target; this fails against a repo-wide prune.
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            root = tmp / "root"
+            target = add_worktree(main, root, "owner__repo__pr-11")
+            bystander = add_worktree(main, root, "owner__repo__pr-12")
+            shutil.rmtree(target)
+            shutil.rmtree(bystander)
+
+            self.assertEqual(
+                prune.prune_repo_worktree_records(main.resolve(), target), "pruned"
+            )
+
+            listed = git("-C", str(main), "worktree", "list", "--porcelain")
+            self.assertNotIn(target.name, listed)
+            self.assertIn(bystander.name, listed)
+
+    def test_clearing_a_bare_hubs_record_is_targeted_too(self) -> None:
+        # `repo_path` and `registered_repo_from_gitdir_pointer` both support a
+        # bare hub, whose common directory is `hub.git` rather than a `.git`.
+        # The removal has to behave identically there or every bare-hub
+        # self-heal would silently report `failed`.
+        with scratch_dir() as tmp:
+            bare = make_bare_hub(tmp)
+            root = tmp / "root"
+            target = add_worktree(bare, root, "owner__repo__pr-13")
+            bystander = add_worktree(bare, root, "owner__repo__pr-14")
+            shutil.rmtree(target)
+            shutil.rmtree(bystander)
+
+            self.assertEqual(
+                prune.prune_repo_worktree_records(bare.resolve(), target), "pruned"
+            )
+
+            listed = git("-C", str(bare), "worktree", "list", "--porcelain")
+            self.assertNotIn(target.name, listed)
+            self.assertIn(bystander.name, listed)
+
+    def test_an_already_absent_record_reads_as_pruned(self) -> None:
+        # `git worktree remove` exits nonzero for a path it does not know, but
+        # "no record survives" is the desired end state -- the verdict comes
+        # from re-reading `worktree list`, never from that exit status.
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            never_registered = tmp / "root" / "owner__repo__pr-15"
+
+            self.assertEqual(
+                prune.prune_repo_worktree_records(main.resolve(), never_registered),
+                "pruned",
+            )
+
+    def test_a_surviving_directory_is_never_handed_to_git_to_delete(self) -> None:
+        # Unlike `prune`, `remove` deletes a worktree's contents. The caller
+        # only reaches here once the directory is gone; enforcing that here
+        # keeps a future caller from turning this into a content-deleting path.
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            root = tmp / "root"
+            wt = add_worktree(main, root, "owner__repo__pr-16")
+            keeper = wt / "uncommitted.txt"
+            keeper.write_text("work in progress\n", encoding="utf-8")
+
+            self.assertEqual(
+                prune.prune_repo_worktree_records(main.resolve(), wt), "skipped"
+            )
+            self.assertTrue(keeper.is_file())
+            self.assertIn(
+                wt.name, git("-C", str(main), "worktree", "list", "--porcelain")
+            )
+
+    def test_a_corrupted_pointer_is_an_orphan_not_an_error(self) -> None:
+        # `fatal: invalid gitfile format` is a different message from the
+        # missing-repository one, and a malformed pointer is one of the states
+        # this self-heal exists to clear -- so it must not re-raise.
+        with scratch_dir() as tmp:
+            wt = tmp / "owner__repo__pr-8"
+            wt.mkdir()
+            wt.joinpath(".git").write_text("garbage not a pointer\n", encoding="utf-8")
+
+            self.assertTrue(prune.is_orphaned_entry(wt))
+
+    def test_reports_unresolved_when_the_pointer_is_gone(self) -> None:
+        # "Never registered" and "registered, pointer gone" are
+        # indistinguishable from the path alone -- including when an ancestor
+        # checkout answers for it -- so neither is assumed.
+        self.assertEqual(
+            prune.orphan_registration_state(
+                None, pathlib.Path("x"), directory_removed=True
+            ),
+            "unresolved",
+        )
+
+    def test_skips_the_prune_while_the_directory_survives(self) -> None:
+        # The registration is only cleared once the directory is gone from disk.
+        self.assertEqual(
+            prune.orphan_registration_state(
+                None, pathlib.Path("x"), directory_removed=False
+            ),
+            "skipped",
+        )
+
+
+class DropOrphanedWorktreeTests(unittest.TestCase):
+    def _orphan(
+        self, tmp: pathlib.Path, number: int, *, parent: str = "root"
+    ) -> tuple[pathlib.Path, pathlib.Path, prune.Worktree]:
+        """A root plus a directory under `parent` that matches the naming
+        convention but isn't a git repo, with its `Worktree` identity."""
+        root = tmp / "root"
+        root.mkdir()
+        orphan_dir = tmp / parent / f"owner__repo__pr-{number}"
+        orphan_dir.mkdir(parents=True)
+        worktree = prune.Worktree(
+            path=orphan_dir, owner="owner", repo="repo", number=number
+        )
+        return root, orphan_dir, worktree
+
+    def test_drops_the_lease_record_and_removes_the_empty_directory(self) -> None:
+        with scratch_dir() as tmp:
+            root, orphan_dir, worktree = self._orphan(tmp, 9)
+            state_dir = tmp / "state"
+            lease_path = leases.lease_path(state_dir, "worker", worktree.key)
+            lease_path.parent.mkdir(parents=True)
+            lease_path.write_text("{}", encoding="utf-8")
+
+            info = prune.drop_orphaned_worktree(
+                worktree, lease_path, root, preserve_lease=False
+            )
+
+        self.assertEqual(
+            info,
+            {
+                "lease_dropped": True,
+                "directory_removed": True,
+                "registration_pruned": "unresolved",
+            },
+        )
+        self.assertFalse(lease_path.exists())
+        self.assertFalse(orphan_dir.exists())
+
+    def test_is_a_no_op_when_no_lease_record_exists(self) -> None:
+        with scratch_dir() as tmp:
+            root, _orphan_dir, worktree = self._orphan(tmp, 10)
+            lease_path = leases.lease_path(tmp / "state", "worker", worktree.key)
+
+            info = prune.drop_orphaned_worktree(
+                worktree, lease_path, root, preserve_lease=False
+            )
+
+        self.assertEqual(
+            info,
+            {
+                "lease_dropped": False,
+                "directory_removed": True,
+                "registration_pruned": "unresolved",
+            },
+        )
+
+    def test_keeps_the_caller_s_own_live_lease_while_dropping_the_orphan(
+        self,
+    ) -> None:
+        # The documented cleanup order prunes while the worker lease is still
+        # held and releases it afterwards
+        # (`reference/orchestration.md` "Cleanup"), so unlinking the record
+        # here would make that release fail and drop ownership early.
+        with scratch_dir() as tmp:
+            root, orphan_dir, worktree = self._orphan(tmp, 13)
+            lease_path = leases.lease_path(tmp / "state", "worker", worktree.key)
+            lease_path.parent.mkdir(parents=True)
+            lease_path.write_text("{}", encoding="utf-8")
+
+            info = prune.drop_orphaned_worktree(
+                worktree, lease_path, root, preserve_lease=True
+            )
+
+            self.assertEqual(
+                info,
+                {
+                    "lease_dropped": False,
+                    "directory_removed": True,
+                    "registration_pruned": "unresolved",
+                },
+            )
+            self.assertTrue(lease_path.exists())
+            self.assertFalse(orphan_dir.exists())
+
+    def test_never_deletes_content_from_a_non_empty_orphan_directory(self) -> None:
+        # An orphan's `.git` pointer could be corrupted or gone while real,
+        # uncommitted work still sits in the directory -- unlike
+        # `remove_worktree`'s post-removal cleanup, this path was never
+        # confirmed safe to discard by git, so it must never force-delete.
+        with scratch_dir() as tmp:
+            root, orphan_dir, worktree = self._orphan(tmp, 11)
+            stray_file = orphan_dir / "uncommitted-work.txt"
+            stray_file.write_text("do not delete me", encoding="utf-8")
+            lease_path = leases.lease_path(tmp / "state", "worker", worktree.key)
+
+            info = prune.drop_orphaned_worktree(
+                worktree, lease_path, root, preserve_lease=False
+            )
+
+            self.assertFalse(info["directory_removed"])
+            self.assertTrue(orphan_dir.exists())
+            self.assertEqual(stray_file.read_text(encoding="utf-8"), "do not delete me")
+
+    def test_refuses_to_remove_an_orphan_directory_outside_root(self) -> None:
+        # Defense in depth, matching `remove_worktree`'s own containment
+        # guard -- structurally unreachable through `main` (iter_worktrees
+        # only ever yields direct children of root) but a direct caller must
+        # not be able to walk this off-root regardless.
+        with scratch_dir() as tmp:
+            root, outside_dir, worktree = self._orphan(tmp, 12, parent="elsewhere")
+            lease_path = leases.lease_path(tmp / "state", "worker", worktree.key)
+
+            info = prune.drop_orphaned_worktree(
+                worktree, lease_path, root, preserve_lease=False
+            )
+
+            self.assertFalse(info["directory_removed"])
+            self.assertTrue(outside_dir.exists())
+
+
+class MainSelfHealsAnOrphanedWorktreeEntry(unittest.TestCase):
+    """End-to-end: an orphaned directory plus its stale lease record must be
+    dropped without flipping the run's exit code, so the same orphan does not
+    keep erroring every subsequent prune (#816)."""
+
+    def run_orphan_prune(
+        self, tmp: pathlib.Path, *extra_argv: str
+    ) -> tuple[int, dict[str, object], pathlib.Path, pathlib.Path]:
+        root = tmp / "root"
+        root.mkdir()
+        orphan_dir = root / "owner__repo__pr-9"
+        orphan_dir.mkdir()
+        state_dir = tmp / "state"
+        lease_path = leases.lease_path(state_dir, "worker", "owner/repo#9")
+        lease_path.parent.mkdir(parents=True)
+        lease_path.write_text("{}", encoding="utf-8")
+
+        exit_code, report = run_main(root, state_dir, *extra_argv)
+        return exit_code, report, orphan_dir, lease_path
+
+    def test_orphan_dropped_action_with_exit_code_zero(self) -> None:
+        with scratch_dir() as tmp:
+            exit_code, report, orphan_dir, lease_path = self.run_orphan_prune(
+                tmp, "--apply"
+            )
+            self.assertFalse(orphan_dir.exists())
+            self.assertFalse(lease_path.exists())
+
+        self.assertEqual(exit_code, 0)
+        [row] = report["worktrees"]
+        self.assertEqual(row["action"], "drop_orphan")
+        self.assertTrue(row["dropped"])
+        self.assertTrue(row["lease_dropped"])
+        self.assertTrue(row["directory_removed"])
+
+    def test_scoped_cleanup_leaves_the_authorizing_lease_for_its_caller(
+        self,
+    ) -> None:
+        """The documented scoped form (`--pr … --lease-token … --apply`) runs
+        while the caller still holds the lease and releases it in the next
+        step (`reference/orchestration.md` "Cleanup"). Dropping the record
+        here would make that release fail on a lease that no longer exists."""
+        with scratch_dir() as tmp:
+            root = tmp / "root"
+            root.mkdir()
+            orphan_dir = root / "owner__repo__pr-9"
+            orphan_dir.mkdir()
+            state_dir = tmp / "state"
+            lease_path = leases.lease_path(state_dir, "worker", "owner/repo#9")
+            lease_path.parent.mkdir(parents=True)
+            expires_at = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+            lease_path.write_text(
+                json.dumps(
+                    {
+                        "token": "caller-token",
+                        "run_id": "run-1",
+                        "expires_at": expires_at,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            exit_code, report = run_main(
+                root,
+                state_dir,
+                "--pr",
+                "owner/repo#9",
+                "--lease-token",
+                "caller-token",
+                "--apply",
+            )
+
+            self.assertFalse(orphan_dir.exists())
+            self.assertTrue(lease_path.exists())
+
+        self.assertEqual(exit_code, 0)
+        [row] = report["worktrees"]
+        self.assertEqual(row["action"], "drop_orphan")
+        self.assertTrue(row["dropped"])
+        self.assertFalse(row["lease_dropped"])
+        self.assertTrue(row["directory_removed"])
+
+    def test_a_non_empty_orphan_is_reported_unfinished_not_dropped(self) -> None:
+        """`remove_empty_orphan_directory` deliberately never force-deletes a
+        non-empty orphan, so the entry survives at its deterministic
+        one-per-PR path and a replacement worktree cannot be created there.
+        Reporting `dropped: true` there would claim a cleanup that did not
+        happen."""
+        with scratch_dir() as tmp:
+            root = tmp / "root"
+            root.mkdir()
+            orphan_dir = root / "owner__repo__pr-9"
+            orphan_dir.mkdir()
+            (orphan_dir / "uncommitted-work.txt").write_text("keep", encoding="utf-8")
+            state_dir = tmp / "state"
+
+            with contextlib.redirect_stderr(io.StringIO()) as warnings:
+                exit_code, report = run_main(root, state_dir, "--apply")
+
+            self.assertTrue(orphan_dir.exists())
+
+        self.assertEqual(exit_code, 0)
+        [row] = report["worktrees"]
+        self.assertEqual(row["action"], "drop_orphan")
+        self.assertFalse(row["dropped"])
+        self.assertFalse(row["directory_removed"])
+        self.assertTrue(row["residual_directory"])
+        self.assertIn("not", warnings.getvalue())
+        self.assertIn(str(orphan_dir), warnings.getvalue())
+
+    def test_dry_run_reports_the_orphan_without_mutating_it(self) -> None:
+        """Without --apply the run is a report: the documented dry-run contract
+        promises it never mutates, so the orphan directory and its stale lease
+        record must both survive."""
+        with scratch_dir() as tmp:
+            exit_code, report, orphan_dir, lease_path = self.run_orphan_prune(tmp)
+            self.assertTrue(orphan_dir.exists())
+            self.assertTrue(lease_path.exists())
+
+        self.assertEqual(exit_code, 0)
+        [row] = report["worktrees"]
+        self.assertEqual(row["action"], "drop_orphan")
+        self.assertFalse(row["dropped"])
+
+
+class NonConformingDirectoriesAreReported(unittest.TestCase):
+    """#555: a directory the tool cannot map to a PR must never vanish.
+
+    An unmappable directory reaches no git or gh call, so the whole report is
+    assertable hermetically -- which is exactly the failure: before the fix a
+    root holding only such a directory produced an empty `worktrees` list, a
+    false all-clear for a worktree the caller then had to find by hand.
+    """
+
+    def test_iter_worktrees_pairs_recognized_and_unrecognized_directories(self) -> None:
+        with scratch_dir() as tmp:
+            root = tmp / "root"
+            root.mkdir()
+            (root / "medley-1567").mkdir()
+            (root / "owner__repo__pr-1").mkdir()
+            (root / "loose-file.txt").write_text("not a worktree", encoding="utf-8")
+
+            entries = prune.iter_worktrees(root)
+
+        self.assertEqual(len(entries), 2)
+        self.assertIsInstance(entries[0], prune.UnrecognizedWorktree)
+        self.assertEqual(entries[0].path.name, "medley-1567")
+        self.assertIsInstance(entries[1], prune.Worktree)
+        self.assertEqual(entries[1].key, "owner/repo#1")
+
+    def test_main_reports_a_non_conforming_worktree_instead_of_nothing(self) -> None:
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            root = tmp / "root"
+            wt = add_worktree(main, root, "medley-1567")
+
+            code, report = run_main(root, tmp / "state")
+
+            self.assertTrue(wt.exists())
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            report["worktrees"],
+            [
+                {
+                    "path": str(wt),
+                    "action": "unrecognized",
+                    "reason": prune.UNRECOGNIZED_REASON,
+                    "removed": False,
+                }
+            ],
+        )
+
+    def test_apply_mode_reports_but_never_removes_an_unrecognized_worktree(
+        self,
+    ) -> None:
+        # The report-don't-remove invariant is what makes an unrecognized row safe
+        # to emit at all, and --apply is the only mode that can delete anything.
+        with scratch_dir() as tmp:
+            main = make_repo(tmp)
+            root = tmp / "root"
+            wt = add_worktree(main, root, "medley-1567")
+
+            code, report = run_main(root, tmp / "state", "--apply")
+
+            self.assertTrue(wt.exists())
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [row["action"] for row in report["worktrees"]], ["unrecognized"]
+        )
+        self.assertFalse(report["worktrees"][0]["removed"])
+
+    def test_scoped_pr_mode_still_reports_unrecognized_directories(self) -> None:
+        # Scoping to one PR narrows which PRs are acted on, never which
+        # directories are accounted for.
+        with scratch_dir() as tmp:
+            root = tmp / "root"
+            root.mkdir()
+            (root / "medley-1567").mkdir()
+
+            code, report = run_main(root, tmp / "state", "--pr", "owner/repo#1")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [row["action"] for row in report["worktrees"]], ["unrecognized"]
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
