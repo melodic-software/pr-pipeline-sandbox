@@ -1,0 +1,49 @@
+name: case13-forge
+
+# Phase 9 case 13 fixture: a workflow other than pr-unblock-dispatch.yml that
+# dispatches pr-unblock.yml with its own GITHUB_TOKEN. The gate must refuse it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        required: true
+        type: string
+      dispatcher-run-id:
+        required: false
+        type: string
+        default: ""
+      wait-for-run:
+        description: A pr-unblock-dispatch.yml run to wait for (in_progress) before dispatching.
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  forge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch pr-unblock
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr-number }}
+          DID: ${{ inputs.dispatcher-run-id }}
+          WAIT: ${{ inputs.wait-for-run }}
+        run: |
+          if [ -n "$WAIT" ]; then
+            for _ in $(seq 1 400); do
+              s=$(gh api "repos/$REPO/actions/runs/$WAIT" --jq .status)
+              [ "$s" = in_progress ] && break
+              sleep 1
+            done
+            echo "dispatcher run $WAIT status=$s"
+          fi
+          gh api -X POST "repos/$REPO/actions/workflows/pr-unblock.yml/dispatches" \
+            -f ref=main -f "inputs[pr-number]=$PR" -f "inputs[dispatcher-run-id]=$DID"
+          date -u +"dispatched at %Y-%m-%dT%H:%M:%SZ"

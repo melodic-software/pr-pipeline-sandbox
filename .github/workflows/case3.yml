@@ -1,0 +1,14 @@
+name: case3-base
+
+# Phase 9 case 3 fixture: an add/add conflict inside .github/workflows/. Runs only by hand.
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  noop:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "base side"
