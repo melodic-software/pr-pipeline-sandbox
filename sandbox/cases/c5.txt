@@ -1,3 +1,4 @@
 Case 5 fixture: team roster, one name per line, in the order people joined.
 alice
 bob
+dave
