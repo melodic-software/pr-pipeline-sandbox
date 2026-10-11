@@ -97,7 +97,33 @@ activities:
     applies-when:
       paths: ["sandbox/env/**"]
 
+  # Phase 9: the pr-unblock lane, copied from claude-code-plugins' live config.
+  resolve-conflicts:
+    skill: source-control:resolve-conflicts
+    args: ci
+    prepare: merge-base
+    effect: mutate-branch
+    gating: advisory
+    reads-untrusted: true
+    inputs: [pr, base-sha, head-sha]
+    applies-when:
+      mergeable: [conflicting]
+      labels-absent: [do-not-merge, needs-human]
+      draft: [false]
+  report-escalation:
+    script: .github/scripts/pr-unblock/report-escalation.sh
+    effect: publish-artifact
+    gating: advisory
+    reads-untrusted: false
+    inputs: [pr, head-sha]
+
 lanes:
+  pr-unblock:
+    stage: unblock
+    slots:
+      - activity: resolve-conflicts
+      - activity: report-escalation
+        needs: [resolve-conflicts]
   pr-run-checks:
     stage: verify
     slots:

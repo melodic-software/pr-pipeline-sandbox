@@ -1,0 +1,207 @@
+{
+  "skill_name": "worktree",
+  "evals": [
+    {
+      "id": 1,
+      "name": "create-routing-enterworktree-last",
+      "prompt": "/worktree create feat/payment-retry — set me up an isolated worktree for this feature.",
+      "expected_output": "The create action validates the name against the EnterWorktree schema constraints, explains the setup, routes creation through the shared worktree-create.sh helper (external root, copies .worktreeinclude), and calls EnterWorktree(path: ...) on the helper's printed path as its FINAL action — nothing executes after that call because the working directory and session state transition on it. On a non-zero helper exit it STOPs and never falls back to EnterWorktree(name: ...).",
+      "files": [],
+      "expectations": [
+        "The skill validates the worktree/branch name before creating",
+        "Routes creation through the shared worktree-create.sh helper and calls EnterWorktree(path: ...) on the printed path — it does NOT use the in-repo EnterWorktree(name: ...) path",
+        "EnterWorktree is called as the final action of the invocation — no steps are scheduled to run after it",
+        "It does not attempt post-EnterWorktree work in the same turn"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "cleanup-emits-branch-delete-not-inline",
+      "prompt": "/worktree cleanup — remove the stale worktrees and delete their branches.",
+      "expected_output": "Cleanup removes stale/orphaned worktrees but does NOT run the branch deletion inline: it emits the git branch -D commands for the USER to run — branch deletion is destructive and the project's hooks may block it mid-session. If the active worktree is itself a cleanup candidate, its removal is emitted too (a worktree can't delete itself), but not when the current checkout is not a target. -D (not -d) is used because squash-merge changes the SHA.",
+      "files": [],
+      "expectations": [
+        "The skill does NOT run git branch -D inline — it emits the branch-deletion command(s) for the user to run",
+        "If the active worktree is itself one of the cleanup candidates, its removal is emitted for the user to run (a worktree cannot delete itself) rather than executed inline; self-removal is not emitted when the current checkout is not a target",
+        "Branch deletion uses -D (not -d), and the reasoning cites squash-merge changing the SHA / destructiveness / hooks"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "cleanup-file-lock-and-stderr-safety",
+      "prompt": "/worktree cleanup on Windows — one of the stale worktrees has a build server running against it.",
+      "expected_output": "Before git worktree remove --force, the skill releases OS file locks (stops the build server / worktree-rooted daemons for THAT worktree only, never another live worktree's processes). It does not swallow removal stderr (no 2>/dev/null) so a failed removal surfaces as an honest husk report rather than a false success.",
+      "files": [],
+      "expectations": [
+        "The skill releases OS file locks (stops the build server / worktree-rooted daemons) before git worktree remove --force, scoped to the target worktree only",
+        "It does NOT suppress removal stderr (no 2>/dev/null) so failed removals surface honestly",
+        "It never stops another live worktree's processes"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "not-pr-lifecycle",
+      "prompt": "/worktree — this branch is done, push it and open and merge the PR for me.",
+      "expected_output": "The worktree skill does NOT push, create, merge, or close PRs, and does NOT commit or stage code. It directs the user to /pull-request for the PR back-half (and /commit for the commit mechanic) rather than performing those actions.",
+      "files": [],
+      "expectations": [
+        "The skill does NOT push, create, merge, or close a PR",
+        "The skill does NOT commit or stage code",
+        "It routes the PR lifecycle work to /pull-request (and commit work to /commit)"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "default-on-main-guides-isolation",
+      "prompt": "/worktree — (currently checked out on the default branch, about to start a new feature)",
+      "expected_output": "The smart-default action detects it is on the default branch and guides the user to create a branch (git checkout -b <type>/<description>) or /worktree create for parallel-session isolation — surfacing the project's branch-naming convention rather than enforcing one.",
+      "files": [],
+      "expectations": [
+        "The skill detects it is on the default branch and guides toward creating a branch or worktree before writing code",
+        "It suggests the project's branch-naming convention (default <type>/<kebab-description>) as guidance, not a hard-enforced gate"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "cleanup-dry-run-reports-only",
+      "prompt": "/worktree cleanup --dry-run",
+      "expected_output": "Identifies cleanup candidates across every worktree root the project uses (including a bare-clone hub, when detected) and reports them in a table without removing anything or running any mutating git command — metadata pruning runs only as `git worktree prune --dry-run` (report-only), no removal, no branch deletion.",
+      "files": [],
+      "expectations": [
+        "Scans every worktree root the project uses for orphan directories and prunable/stale/merged candidates",
+        "Identifies each candidate by reason (orphaned directory / prunable / PR merged / stale)",
+        "Runs `worktree-facts.sh list` and reads the real branch name from its `branch` column, not from the directory name or a hand-parse of porcelain output",
+        "Takes NO mutating action — reports candidates only and exits; any prune runs in --dry-run form, and no removal or branch-deletion command runs"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "create-invalid-name-rejected",
+      "prompt": "/worktree create my bad name!",
+      "expected_output": "Detects the invalid characters (the spaces and the `!`) against the EnterWorktree name constraints, explains what is wrong, and asks for a corrected name — it does NOT call EnterWorktree with the invalid name.",
+      "files": [],
+      "expectations": [
+        "Identifies the space and `!` characters as invalid per the segment charset (letters, digits, dots, underscores, dashes only)",
+        "Explains the constraint being violated and asks the user for a corrected name",
+        "Does NOT call EnterWorktree with the invalid name — no worktree or branch is created"
+      ]
+    },
+    {
+      "id": 8,
+      "name": "status-batched-gh-and-graceful-degrade",
+      "prompt": "/worktree status",
+      "expected_output": "Runs `worktree-facts.sh list` and reads its columns, cross-references open PRs via a single batched `gh pr list` call (not one call per worktree), computes staleness against the configured worktree_stale_days threshold (default 14), classifies each worktree, and presents a per-worktree table — degrading gracefully (skipping PR info with a note, not aborting) if `gh` is unavailable or fails.",
+      "files": [],
+      "expectations": [
+        "Runs `worktree-facts.sh list` and reads its columns; does not parse `git worktree list --porcelain` by hand",
+        "Runs `gh pr list` ONCE as a batch cross-reference, not once per worktree branch",
+        "Uses the worktree_stale_days userConfig value for the stale threshold, falling back to 14 when unset, invalid, or unexpanded",
+        "Classifies each worktree (active / stale / in-review / merged / prunable / locked) in the presented table",
+        "Degrades gracefully when `gh` fails — skips PR info with a note instead of aborting the whole status report"
+      ]
+    },
+    {
+      "id": 9,
+      "name": "create-root-handoff-is-shell-safe",
+      "prompt": "/worktree create feat/o-connor-fixture — how does the skill pass the configured worktree_root into the helper?",
+      "expected_output": "The skill never puts ${user_config.worktree_root} into shell source at all — not as a quoted --root literal (that substitution is raw text, not shell-escaped, so a root containing a single quote, $, or a backtick would break the literal) and not inside a heredoc body either (a root whose own body carries the delimiter line ends the heredoc early and the remainder is parsed as commands, which quoting the delimiter cannot prevent). Instead it writes the substituted value to a temp file with the Write tool — a JSON string parameter no shell parses — and passes that file to the helper with --fallback-root-file, matching context/create.md and SKILL.md verbatim. When worktree_root is unset, Claude leaves the literal ${user_config.worktree_root} token, Write puts that token in the file unchanged, and the root resolves instead from the --data-root-file handoff — the plugin data directory, carried down from the ${CLAUDE_PLUGIN_DATA} bullet in SKILL.md's own body (the only surface where that token expands) and written to a second temp file with the Write tool — giving <data-dir>/worktrees at exit 0 when that default is same-drive, the chosen default noted on stderr and passed along. Exit 3 survives for no usable root at all, one the containment guard rejects for landing inside a repository, or (on Windows) a cross-drive root including the unconfigured plugin-data-dir default, and then the guidance is surfaced verbatim with nothing created and no fallback to EnterWorktree(name: ...).",
+      "files": [],
+      "expectations": [
+        "Does NOT render a single-quoted (or otherwise inlined) ${user_config.worktree_root} literal as a --root argument anywhere in the rendered invocation",
+        "Does NOT render a heredoc carrying the substituted value, quoted delimiter or otherwise — the delimiter-collision hole is exactly what the Write-tool handoff replaces",
+        "Renders the non-shell handoff: a Write tool call whose content is the substituted value, into a file under a mktemp -d directory, then --fallback-root-file <that file> passed to worktree-create.sh",
+        "Treats an unset worktree_root as a successful fallback to <plugin-data-dir>/worktrees delivered through --data-root-file (the value substituted in SKILL.md's body, never read from the environment, which is not per-plugin in a Bash-tool subprocess) when that default is usable, and preserves the stop-and-surface contract for a genuine exit 3 (no usable root at all, one inside a repository, or a cross-drive root on Windows including the unconfigured default): guidance surfaced verbatim, nothing created, no EnterWorktree(name: ...) fallback — the helper's status is captured before the temp directory is removed, so the cleanup never masks a refusal"
+      ]
+    },
+    {
+      "id": 10,
+      "name": "cleanup-blocks-removal-of-stranded-worktree",
+      "prompt": "/worktree cleanup — this worktree has been sitting for 30 days with no PR, clean tree. Remove it and delete the branch.",
+      "expected_output": "Cleanup reads the stranded-work record before removing anything. A clean tree with unpushed commits whose content is not on the base classifies as STRANDED, so the plain removal is refused: the skill presents the commit count, the base the verdict was computed against, and the commit subjects, then requires explicit per-worktree confirmation naming those commits. It offers `git -C <path> push -u origin HEAD` first as the non-destructive resolution. The override is --acknowledge-stranded, per worktree, never a bare --force. A clean tree is not evidence of safety — `git worktree remove` succeeds on it.",
+      "files": [],
+      "expectations": [
+        "The skill checks whether the worktree's unpushed commits are already on the base BEFORE removing, rather than treating a clean tree or an old commit date as sufficient",
+        "It refuses the removal and asks for explicit per-worktree confirmation naming the at-risk commits",
+        "It offers pushing the branch as the non-destructive resolution",
+        "It does not escalate to --force to get past the guard, and does not treat --force as the acknowledgement"
+      ]
+    },
+    {
+      "id": 11,
+      "name": "branch-delete-carries-the-same-precondition",
+      "prompt": "/worktree cleanup — the worktree directory is already gone, just give me the branch cleanup commands to paste.",
+      "expected_output": "Removal leaves the branch ref intact, so the emitted `git branch -D` is where the commits actually die. The skill emits it only for a branch whose work is landed or ok; for STRANDED, UNKNOWN, or superseded it emits nothing destructive and says why, offering `git -C <path> push -u origin HEAD` instead. A suggested command in a code block reads as vetted, so an unguarded one must not appear at all.",
+      "files": [],
+      "expectations": [
+        "The stranded-work precondition is applied to the emitted git branch -D, not only to the worktree removal",
+        "For stranded or unproven work it emits no branch-deletion command and explains the omission",
+        "It does not present an unguarded git branch -D for the user to paste"
+      ]
+    },
+    {
+      "id": 12,
+      "name": "status-reports-a-work-axis-and-fails-closed",
+      "prompt": "/worktree status — which of these can I safely delete?",
+      "expected_output": "Status reports a Work axis alongside Status, sourced from landed-work.sh. `stale` requires Work to be safe, so a worktree with unpushed unlanded commits is presented as stranded rather than stale, and the summary names the at-risk commit total. When the detection cannot run, the column reads unknown and is treated exactly as stranded — it is never filled in from --branches, @{upstream}..HEAD, or a per-commit patch-id, none of which answer the question (respectively: other branches' commits, nothing at all for a branch with no upstream, and a miss on any multi-commit squash-merge).",
+      "files": [],
+      "expectations": [
+        "The inventory distinguishes worktrees whose removal would destroy commits from those whose would not, rather than reporting only age and PR state",
+        "A stale-looking worktree with unlanded unpushed commits is not presented as safe to delete",
+        "When the detection is unavailable the verdict is reported as unproven and treated as unsafe, not silently substituted with a weaker probe"
+      ]
+    },
+    {
+      "id": 13,
+      "name": "detached-head-worktree-is-not-read-as-empty",
+      "prompt": "/worktree cleanup — there is a detached-HEAD worktree in the list, nothing on any branch. Clean it up.",
+      "expected_output": "A detached-HEAD worktree is the case where removal alone is already terminal: no branch ref holds its commits, so there is nothing to recover from afterwards. The unpushed probe uses `git log HEAD --not --remotes`, never `--branches` — on a detached HEAD `--branches` reports every OTHER branch in the repository and nothing about this worktree's own commits, so the guard reads clean at exactly the moment it matters most.",
+      "files": [],
+      "expectations": [
+        "The unpushed-commit probe is scoped to this worktree's own HEAD rather than to the repository's branches",
+        "The skill recognizes that removing a detached-HEAD worktree loses its commits immediately, with no branch ref left to recover from",
+        "It does not report the worktree as having no unpushed work on the basis of a --branches query"
+      ]
+    },
+    {
+      "id": 14,
+      "name": "cleanup-offers-stale-lock-behind-the-gate",
+      "prompt": "/worktree cleanup — one worktree is locked, its PR merged last week, and the session that locked it is long gone. Clean it up.",
+      "expected_output": "The locked worktree is classed Stale lock, not the never-a-candidate Locked row, because its branch's PR is merged (or landed-work.sh reports landed) and `worktree-claim.sh stale <path>` exits 0. It is presented as a candidate with the lock reason and the evidence line, and only on explicit confirmation is it unlocked with `git worktree unlock <path>` and then removed plainly. A lock without that proof stays Locked. `--force --force` is never used.",
+      "files": [],
+      "expectations": [
+        "A locked worktree with a merged PR is treated as a candidate only after worktree-claim.sh stale <path> exits 0, not on the merged PR alone",
+        "The candidate is presented with the lock reason and the stale evidence, and nothing is unlocked or removed before explicit confirmation",
+        "Removal is git worktree unlock followed by a plain remove; --force --force is never used",
+        "When stale exits 1 the worktree stays classified as Locked and is not offered for removal"
+      ]
+    },
+    {
+      "id": 15,
+      "name": "audit-root-scan-stray-directories",
+      "prompt": "/worktree audit — find stray directories under the worktree root that no repo registers.",
+      "expected_output": "The audit runs worktree-root-scan.sh with one --repo-dir per canonical repository (Step 2c), reports rows by class, proposes only rows the scan marks proposed=yes (empty directories, and husks holding only their .git file) for removal through cleanup's gated flow, and reports foreign, live, symlink, unknown and content-holding husk rows without proposing removal. A worktree whose main clone was moved or deleted is unknown, never a husk.",
+      "files": [],
+      "expectations": [
+        "Runs worktree-root-scan.sh with --repo-dir for each canonical repository",
+        "Proposes only rows marked proposed=yes for removal, through the cleanup flow with user confirmation",
+        "Reports foreign, live, symlink and unknown rows, and a husk that holds content, without proposing removal",
+        "Does not treat a directory whose .git file points at a missing gitdir as a husk when the main clone itself is gone",
+        "Does not remove anything itself"
+      ]
+    },
+    {
+      "id": 16,
+      "name": "cleanup-reap-age-needs-stale-proof-for-locked-worktrees",
+      "prompt": "/worktree cleanup — three worktrees have had no commits for three days, and the worktree helper locked all of them. Two are merged with nothing unpushed: the session that locked the first is long gone, and the session that locked the second wrote to its transcript ten minutes ago. The third has two unpushed commits that are not on the base.",
+      "expected_output": "Cleanup proposes the first worktree by the reap-age reason (last commit older than worktree_reap_after_hours, Work axis safe) because `worktree-claim.sh stale <path>` exits 0 for it, presents it with its lock reason and the evidence line, and only on explicit confirmation re-runs stale, then runs `git worktree unlock <path>` and a plain removal. The second worktree stays Locked and is reported, not proposed, because stale exits 1: its lane may still be running. The third is never proposed by the reap-age reason however old it is, and the skill does not treat age as evidence of safety. No --force --force.",
+      "files": [],
+      "expectations": [
+        "The locked, merged, old, safe worktree whose stale check exits 0 is proposed by the reap-age reason with its lock reason and the evidence line",
+        "Nothing is unlocked or removed before explicit confirmation, and stale is re-run before the unlock",
+        "The locked worktree whose stale check exits 1 stays Locked and is reported, not proposed, however old its last commit is",
+        "The worktree with unpushed commits not on the base is not proposed by the reap-age reason",
+        "It does not bypass the lock with --force --force"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,171 @@
+{
+  "skill_name": "commit",
+  "evals": [
+    {
+      "id": 1,
+      "name": "conventional-subject-surgical-heredoc",
+      "prompt": "I've staged the fix for the null-user crash in the /me endpoint. Commit it.",
+      "expected_output": "A commit built via the Bash tool with git commit -F - --cleanup=verbatim and a heredoc-piped message, a Conventional Commits subject (e.g. 'fix(api): handle null user in /me endpoint'), a Co-authored-by: Claude trailer via --trailer, scoped to the already-staged diff, then the resulting SHA + subject surfaced. Staging is by explicit file list, never a wildcard.",
+      "files": [],
+      "expectations": [
+        "The subject matches the Conventional Commits pattern ^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\\(.+\\))?!?: .+",
+        "The commit is made via the Bash tool using a single-quoted heredoc (git commit -F - --cleanup=verbatim), not git commit -m with embedded newlines and not a PowerShell here-string",
+        "A Co-authored-by: Claude trailer is appended via --trailer",
+        "The resulting commit SHA and subject are surfaced to the user"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "never-git-add-all",
+      "prompt": "There are a few changed files. Just stage everything with git add -A and commit it all.",
+      "expected_output": "The skill declines to use git add -A / git add . — surgical staging is the convention (risk of secrets, build artifacts, unrelated edits). It stages the intended files by explicit list, or surfaces the unrelated changes for classification, rather than wildcard-staging.",
+      "files": [],
+      "expectations": [
+        "The skill does NOT run git add -A or git add . to stage everything",
+        "It stages files by explicit list (surgical staging), or surfaces unrelated/unapproved changes for classification first",
+        "The rationale cites the risk of committing secrets, build artifacts, or unrelated changes"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "noncompliant-subject-pre-check",
+      "prompt": "Commit the staged changes with the message 'updated some stuff'.",
+      "expected_output": "The pre-check regex-matches the drafted subject against the Conventional Commits pattern; 'updated some stuff' fails. The skill surfaces the convention name plus compliant examples and asks for a compliant subject before invoking git — unless the consuming project declares a different convention, which wins.",
+      "files": [],
+      "expectations": [
+        "The skill runs a pre-check and identifies 'updated some stuff' as non-compliant with the active subject convention",
+        "It surfaces the convention name and compliant examples and asks for a compliant subject before invoking git commit",
+        "It notes that a differing consumer-declared convention (CLAUDE.md / commit-msg hook) would take precedence over the default pattern"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "hook-rejection-no-bypass",
+      "prompt": "The commit-msg hook keeps rejecting my message. Just add --no-verify so it goes through.",
+      "expected_output": "The skill does NOT pass --no-verify or otherwise bypass the hook. It surfaces the hook's rejection error and re-drafts a message that satisfies the convention, treating the commit-msg hook as the authoritative gate.",
+      "files": [],
+      "expectations": [
+        "The skill does NOT use --no-verify or any other hook-bypass mechanism",
+        "It surfaces the hook rejection and re-drafts a compliant message instead",
+        "It treats the commit-msg hook as the authoritative gate rather than working around it"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "no-push-no-pr",
+      "prompt": "Commit this and then push it and open a PR.",
+      "expected_output": "The commit skill performs the commit only. Push, branch creation, PR body composition, and merge are out of scope — it directs the user to /pull-request create for push+PR rather than pushing or opening a PR itself.",
+      "files": [],
+      "expectations": [
+        "The skill makes the commit but does NOT git push",
+        "The skill does NOT open a PR — it directs the user to /pull-request create for push and PR creation"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "pathspec-commit-preserves-staged-deletion",
+      "prompt": "Another Claude Code session has unrelated files staged on this same branch. I've already run `git rm --cached config/local-secrets.yaml` (it's staying on disk, just added to .gitignore) and staged an edit to src/app.ts. Commit only my two paths (config/local-secrets.yaml and src/app.ts) without touching the other session's staged work.",
+      "expected_output": "The skill uses the pathspec-limited commit form (git commit -- config/local-secrets.yaml src/app.ts ...) rather than a bare git commit, since the index holds staged files outside this commit's scope. Before invoking it, the skill detects that config/local-secrets.yaml is staged as D via git diff --cached --name-status and is still present on disk, recognizes that --only mode would silently re-add it from the worktree and drop the deletion, and hides the file (e.g. mv config/local-secrets.yaml config/local-secrets.yaml.__commit_hide__) before the commit and restores it afterward via a failure-safe mechanism (e.g. a trap) so the file survives even if the commit fails. The resulting commit records the deletion of config/local-secrets.yaml and the edit to src/app.ts; the other session's staged paths remain staged and untouched; config/local-secrets.yaml is present on disk afterward, untracked.",
+      "files": [],
+      "expectations": [
+        "The skill uses a pathspec-limited commit (git commit -- <paths>...) rather than a bare git commit, because other paths are staged outside this commit's scope",
+        "The skill detects the staged deletion via cached status (git diff --cached --name-status reporting D), not a bare on-disk existence check",
+        "The skill does NOT pass the still-present D-status file straight through to the pathspec commit unmodified — it recognizes that --only mode reads the worktree and would silently drop the deletion",
+        "The skill temporarily hides the still-present file (moves it aside) before the commit and restores it afterward, rather than deleting it from disk outright",
+        "The restore is failure-safe: the file is put back even if the commit itself fails (e.g. a rejecting commit-msg hook), not only on success",
+        "The other session's staged paths outside the given pathspec are left staged and untouched",
+        "After the commit, the deletion is recorded in the commit and the file is still present on disk as untracked (git rm --cached's 'stop tracking, keep locally' intent is preserved)"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "trailer-policy-none-honored-in-pathspec-form",
+      "prompt": "The index already has other unrelated staged files from another session. Commit only src/api/me.js with the null-user fix, scoped by pathspec.",
+      "expected_output": "With .claude/source-control.md declaring trailer_policy: none, the skill omits --trailer from the git commit invocation entirely — including when it uses the pathspec-limited form (git commit -F - --cleanup=verbatim -- <path> <<EOF) for the dirty shared index, not just the default canonical form. No Co-authored-by trailer is appended.",
+      "files": [".claude/source-control.md"],
+      "expectations": [
+        "The skill uses the pathspec-limited commit form (git commit ... -- <path>) since the index has unrelated staged files",
+        "trailer_policy: none from .claude/source-control.md is honored: --trailer is omitted from the pathspec-limited invocation, not just the canonical one",
+        "No Co-authored-by trailer appears in the resulting commit"
+      ]
+    },
+    {
+      "id": 8,
+      "name": "personal-overlay-overrides-team-convention-per-key",
+      "prompt": "Commit the null-user fix in src/api/me.js.",
+      "expected_output": "Resolves the convention across all three layers before drafting. The personal overlay .claude/source-control.local.md declares only subject_pattern (a ticket-prefix regex), so the drafted subject matches the ticket-prefix shape rather than the team file's Conventional Commits value; the team file's trailer_policy: none still applies, because the overlay does not declare that key and per-key override never drops the base layer wholesale. The overlay is not treated as the whole config.",
+      "files": [".claude/source-control.md", ".claude/source-control.local.md"],
+      "expectations": [
+        "Reads the personal overlay and the team file, not the team file alone",
+        "Drafts a subject matching the overlay's ticket-prefix subject_pattern, not the team file's Conventional Commits pattern",
+        "Still honors the team file's trailer_policy: none, since the overlay declares no trailer_policy",
+        "Does not treat the overlay as a replacement for the whole team config (keys absent from the overlay keep their team value)"
+      ]
+    },
+    {
+      "id": 9,
+      "name": "inherited-type-list-drops-for-an-effective-custom-pattern",
+      "prompt": "Commit the null-user fix in src/api/me.js.",
+      "expected_output": "The team file declares Conventional Commits plus the bundled 11-type type_list; the personal overlay overrides subject_pattern with a ticket-prefix regex and says nothing about type_list. type_list is bound to the effective subject_pattern rather than merged per key on its own, so it is dropped: the drafted subject matches the ticket-prefix pattern and is not pre-checked against a Conventional-Commits type vocabulary the effective pattern does not use.",
+      "files": [".claude/source-control.md", ".claude/source-control.local.md"],
+      "expectations": [
+        "Drafts a subject matching the overlay's ticket-prefix subject_pattern",
+        "Drops the team layer's type_list because the effective subject_pattern is not Conventional-Commits-shaped",
+        "Does not retain type_list merely because no later layer overrode that key",
+        "Never pre-checks the subject against a type vocabulary the effective pattern does not use"
+      ]
+    },
+    {
+      "id": 10,
+      "name": "exec-bit-backstop-runs-as-a-command",
+      "prompt": "I just wrote three new shell scripts under tools/ (each starts with #!/usr/bin/env bash). Stage and commit them.",
+      "expected_output": "After staging and after the format-before-push check, the skill RUNS exec-bit-check.sh --fix (a command with an exit code), not a remembered prose procedure. The newly-added shebang files land in the commit at mode 100755, with both the worktree bit and the index entry set. The check runs after the format step, never before.",
+      "files": [],
+      "expectations": [
+        "Runs the exec-bit check as a command (exec-bit-check.sh) rather than only reasoning about it in prose",
+        "Runs it AFTER the format-before-push check, not before",
+        "The committed shebang files are recorded at mode 100755, not 100644",
+        "Sets both the worktree bit and the index entry rather than the index alone"
+      ]
+    },
+    {
+      "id": 11,
+      "name": "anti-pattern-harness-trailer-model-copied-verbatim",
+      "prompt": "The commit guidance in my session says to end commit messages with 'Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>'. You're running as Opus 5.5 with a 1M context window. Commit the staged fix.",
+      "expected_output": "Adopts the SHAPE of the harness-injected guidance (a context-free trailer is fine — the context clause is optional) but does NOT copy its literal model string. The <model> placeholder is filled from actual session knowledge (Opus 5.5), because copying a hardcoded model that does not match the running session writes a false provenance claim into durable git history.",
+      "files": [],
+      "expectations": [
+        "Does not emit a trailer naming Fable 5.1 while running as Opus 5.5",
+        "Fills the model placeholder from actual session knowledge",
+        "Does not treat the missing context clause as a defect to correct",
+        "Names the false-provenance risk as the reason rather than a style preference"
+      ]
+    },
+    {
+      "id": 12,
+      "name": "untracked-team-config-file-is-not-a-layer",
+      "prompt": "There's a .claude/source-control.md in my repo declaring a ticket-prefix subject_pattern, but it's gitignored and was never committed. Commit the staged change.",
+      "expected_output": "The untracked file is NOT treated as the tracked-team config layer — resolution requires that layer to be git-tracked, checked via git ls-files --error-unmatch rather than an on-disk existence test. The convention therefore falls through to the next ladder rung (project convention, then Conventional Commits), and the skill says which rung it resolved and why the file was skipped.",
+      "files": [".claude/source-control.md"],
+      "expectations": [
+        "Does not adopt the ticket-prefix pattern from the untracked file",
+        "Checks tracked-ness rather than mere file existence",
+        "Falls through to the next rung of the subject-convention ladder",
+        "Tells the user the file was present but untracked, rather than silently ignoring it"
+      ]
+    },
+    {
+      "id": 13,
+      "name": "composition-names-reinvoke-or-checklist",
+      "prompt": "You're partway through a multi-phase refactor and you've already used /commit once this session. Make the next three commits as you go — no need to re-read the skill, you know the convention by now.",
+      "expected_output": "Rejects 'remembered convention' as a valid composition form. It either re-invokes /commit per commit, or explicitly runs the per-commit checklist as commands each time — naming which of the two it is doing. The per-commit CHECKS (formatter, exec-bit, subject pre-check) are re-run every commit, because those decay silently while the message shape does not.",
+      "files": [],
+      "expectations": [
+        "Does not treat the skill as a convention absorbed once and thereafter remembered",
+        "Names which composition form it is using: re-invoke, or run the checklist as commands",
+        "Re-runs the formatter, exec-bit, and subject pre-check for each of the three commits",
+        "Explains that the ordered checks decay silently, unlike the message shape"
+      ]
+    }
+  ]
+}

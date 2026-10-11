@@ -1,0 +1,791 @@
+#!/usr/bin/env bash
+# Black-box contract test for pr-body-linkage-gate.sh.
+#
+# Asserts the hook's OWN behavior against expectations transcribed by hand from
+# a reading of the ci-workflows pr-issue-linkage validator, deliberately not a
+# claim that the two agree, because nothing here executes the validator. A real
+# mirroring proof needs the validator itself as an oracle, which would mean
+# vendoring a copy of upstream JavaScript into this repo. What these cases DO cover is
+# every shape a hand port gets wrong: comment stripping (terminated and
+# unterminated), a `## Related` section whose content is a deeper subsection,
+# the JavaScript word boundaries that make `#12abc` and `unclosed #5`
+# non-matches, the locale-dependence of `[[:space:]]`, and that every
+# undeterminable body ALLOWS.
+#
+# Self-contained: builds throwaway git repos with runtime-generated fixtures and
+# invokes the hook as a subprocess from an UNRELATED cwd, so any reliance on the
+# caller's working directory would surface (the hook is anchored on the payload's
+# own `cwd`).
+
+set -uo pipefail
+
+# Fixture isolation. An inherited GIT_DIR/GIT_WORK_TREE/GIT_CONFIG would
+# redirect `git init` / `git config` into the caller's repository. An inherited
+# CLAUDE_PLUGIN_DATA (another plugin's) would receive this suite's skip-notices
+# and latch hook::notice_once across cases. A case that needs a data dir sets
+# its own.
+unset GIT_DIR GIT_WORK_TREE GIT_CONFIG CLAUDE_PLUGIN_DATA
+
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK="$HOOK_DIR/pr-body-linkage-gate.sh"
+
+PASS=0
+FAIL=0
+fail() {
+  echo "FAIL: $*" >&2
+  FAIL=$((FAIL + 1))
+}
+ok() {
+  echo "ok: $*"
+  PASS=$((PASS + 1))
+}
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "SKIP: jq not on PATH -- pr-body-linkage-gate tests skipped"
+  exit 0
+fi
+
+WORK="$(mktemp -d)"
+UNRELATED="$(mktemp -d)"
+cleanup() { rm -rf "$WORK" "$UNRELATED"; }
+trap cleanup EXIT
+
+# new_repo <dir> <yml|yaml|nostep|plain> — a throwaway repo. `yml`/`yaml` carry
+# a workflow wiring in the `pr-contract` composite step, under either extension
+# the hook's glob accepts; `nostep` carries a workflow with no such step;
+# `plain` carries no workflows at all.
+new_repo() {
+  local r="$1" gated="$2"
+  mkdir -p "$r"
+  git -C "$r" init -q 2>/dev/null
+  case "$gated" in
+  yml | yaml)
+    mkdir -p "$r/.github/workflows"
+    printf 'jobs:\n  ci-status:\n    steps:\n      - uses: melodic-software/ci-workflows/.github/actions/pr-contract@5776760254f8b63cba44e896f51604cb755350d9 # v0.22.2\n' \
+      >"$r/.github/workflows/ci.$gated"
+    ;;
+  nostep)
+    mkdir -p "$r/.github/workflows"
+    printf 'jobs:\n  ci-status:\n    steps:\n      - uses: actions/checkout@v5\n' \
+      >"$r/.github/workflows/ci.yml"
+    ;;
+  *) ;;
+  esac
+}
+
+GATED="$WORK/gated"
+UNGATED="$WORK/ungated"
+NOSTEP="$WORK/nostep"
+GATED_YAML="$WORK/gated-yaml"
+OTHER="$WORK/other"
+new_repo "$GATED" yml
+new_repo "$UNGATED" plain
+new_repo "$NOSTEP" nostep
+new_repo "$GATED_YAML" yaml
+new_repo "$OTHER" yml
+
+# mk_payload <repo> <command> -> the PreToolUse payload this hook reads, on stdout.
+mk_payload() {
+  jq -n --arg cwd "$1" --arg cmd "$2" \
+    '{session_id:"test",cwd:$cwd,tool_name:"Bash",tool_input:{command:$cmd}}'
+}
+
+# run <repo> <command> -> sets RC and ERR from one hook invocation.
+RC=0
+ERR=""
+run() {
+  local repo="$1" cmd="$2" payload
+  payload=$(mk_payload "$repo" "$cmd")
+  ERR=$(cd "$UNRELATED" && printf '%s' "$payload" | bash "$HOOK" 2>&1 >/dev/null)
+  RC=$?
+}
+
+# assert_allow / assert_block <label> <repo> <command>
+assert_allow() {
+  run "$2" "$3"
+  if ((RC == 0)); then ok "$1"; else fail "$1: expected allow, got rc=$RC ($ERR)"; fi
+}
+assert_block() {
+  run "$2" "$3"
+  if ((RC == 2)); then ok "$1"; else fail "$1: expected block(2), got rc=$RC ($ERR)"; fi
+}
+
+# gh_body <body> -> a `gh pr create` command carrying <body> as a single-quoted
+# literal. Bodies in this suite never contain a single quote.
+gh_body() {
+  printf "gh pr create --title 'T' --body '%s'" "$1"
+}
+
+# Four contract sections the pinned reusable requires. Appended to every
+# allow-path fixture so a missing Summary/Fix/Verification cannot masquerade
+# as a passing closing-keyword case.
+SECTIONS=$'\n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n## Related\n\n- x'
+GOOD=$'Closes #5'"$SECTIONS"
+NO_RELATED=$'Closes #5\n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx'
+NO_KEYWORD=$'## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n## Related\n\n- refs #9'
+# #3205 reproduction: linkage + Summary + Verification + Related, no Fix.
+# CI rejects this body; the local gate must too.
+ISSUE_3205=$'No linked issue\n\n## Summary\n\nwhat\n\n## Verification\n\nevidence\n\n## Related\n\n- N/A'
+NESTED=$'Closes #5\n\n## Summary\n\n### why\n\nbody\n\n## Fix\n\n### how\n\nbody\n\n## Verification\n\n### evidence\n\nbody\n\n## Related\n\n### links\n\n- x'
+
+# --- Scope guard -------------------------------------------------------------
+
+assert_allow "ungated repo: bad body allowed" "$UNGATED" "$(gh_body "$NO_RELATED")"
+assert_allow "workflows present but none wires pr-contract: bad body allowed" "$NOSTEP" "$(gh_body "$NO_RELATED")"
+assert_allow "non-gh command allowed" "$GATED" "git commit -m 'x'"
+assert_allow "gh command that is not pr create/edit allowed" "$GATED" "gh pr view 5"
+
+# --- Closing keyword + four contract sections --------------------------------
+
+assert_allow "compliant body allowed" "$GATED" "$(gh_body "$GOOD")"
+assert_block "missing ## Related blocks" "$GATED" "$(gh_body "$NO_RELATED")"
+assert_block "missing closing keyword blocks" "$GATED" "$(gh_body "$NO_KEYWORD")"
+assert_block "empty ## Related blocks" "$GATED" \
+  "$(gh_body $'Closes #5\n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n## Related\n\n## Test plan\n\n- ran it')"
+assert_block "#3205 body (no ## Fix) is blocked" "$GATED" "$(gh_body "$ISSUE_3205")"
+assert_allow "nested ### inside each required section is content" "$GATED" "$(gh_body "$NESTED")"
+
+# CI masks fenced / indented / inline code before the heading scan. A body
+# whose only `## Fix` lives in a template sample must fail locally too.
+# These fixtures go through --body-file: a `--body '...'` literal cannot
+# carry backticks (fences, inline spans) without breaking the static reader,
+# which fail-opens and would hide a mask regression.
+printf '%s\n' $'Closes #5\n\n## Summary\n\nx\n\n```\n## Fix\nonly in the template\n```\n\n## Verification\n\nx\n\n## Related\n\n- x' >"$GATED/fenced-fix.md"
+printf '%s\n' $'Closes #5\n\n## Summary\n\nx\n\n    ## Fix\n    indented sample\n\n## Verification\n\nx\n\n## Related\n\n- x' >"$GATED/indented-fix.md"
+printf '%s\n' $'Closes #5\n\n## Summary\n\nx\n\nSee `## Fix` in the template.\n\n## Verification\n\nx\n\n## Related\n\n- x' >"$GATED/inline-fix.md"
+printf '%s\n' $'Closes #5\n\n## Summary\n\nx\n\n## Fix\n\nreal fix\n\n```\n## Fix\nsample\n```\n\n## Verification\n\nx\n\n## Related\n\n- x' >"$GATED/real-plus-fenced-fix.md"
+assert_block "a ## Fix that exists only inside a fenced sample is not the section" "$GATED" "gh pr create -t T --body-file fenced-fix.md"
+assert_block "a ## Fix that exists only as indented code is not the section" "$GATED" "gh pr create -t T --body-file indented-fix.md"
+assert_block "a ## Fix that exists only in an inline span is not the section" "$GATED" "gh pr create -t T --body-file inline-fix.md"
+assert_allow "a real ## Fix is not hidden by a later fenced sample" "$GATED" "gh pr create -t T --body-file real-plus-fenced-fix.md"
+printf '%s\n' $'Closes #5\n\n## Summary\n\nx\n\n## Fix\n\n\tonly tab-indented code\n\n## Verification\n\nx\n\n## Related\n\n- x' >"$GATED/tab-indented-fix.md"
+assert_block "a tab-indented line is code, leaving ## Fix empty" "$GATED" "gh pr create -t T --body-file tab-indented-fix.md"
+assert_allow "a line starting with a lowercase t is not code" "$GATED" \
+  "$(gh_body $'this PR closes #5\n\n## Summary\n\nx\n\n## Fix\n\nthe change\n\n## Verification\n\nx\n\n## Related\n\n- x')"
+# On a line of unmatched, strictly-increasing backtick-run lengths, the
+# pair-after-collect scan must not rescan the remainder from each opener
+# (superlinear): it must finish quickly and still fail-closed on a missing
+# section.
+{
+  printf 'Closes #5\n\n## Summary\n\nx\n\n'
+  printf 'crafted '
+  t=1
+  while ((t <= 80)); do
+    printf '%*s' "$t" '' | tr ' ' '`'
+    printf x
+    t=$((t + 1))
+  done
+  printf '\n\n## Verification\n\nx\n\n## Related\n\n- x\n'
+} >"$GATED/superlinear-ticks.md"
+start_s=$SECONDS
+assert_block "a crafted unmatched-tick line does not hide a missing ## Fix" "$GATED" "gh pr create -t T --body-file superlinear-ticks.md"
+elapsed=$((SECONDS - start_s))
+if ((elapsed < 5)); then
+  ok "crafted unmatched-tick line stays well under the 15s hook timeout (${elapsed}s)"
+else
+  fail "crafted unmatched-tick line took ${elapsed}s (must stay under 5s here)"
+fi
+# Nested differing-length runs: a double-tick span wrapping a single-tick
+# span is one CommonMark inline span. Pairing that records the inner
+# span first orphans the outer span and leaks its gap text into the
+# unanchored keyword scan.
+printf '%s\n' $'See the format: `` closes #5 `x` `` for reference.\n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n## Related\n\n- x' >"$GATED/nested-ticks.md"
+assert_block "a decoy closing keyword inside nested backticks is not linkage" "$GATED" \
+  "gh pr create -t T --body-file nested-ticks.md"
+printf '%s\n' $'Closes #5\n\nSee the format: `` closes #9 `x` `` for reference.\n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n## Related\n\n- x' >"$GATED/nested-ticks-plus-real.md"
+assert_allow "a real closing keyword is not hidden by nested backtick decoys" "$GATED" \
+  "gh pr create -t T --body-file nested-ticks-plus-real.md"
+# Escaped-tick idiom (double ticks around a lone tick) plus a later
+# same-length pair on the same line. A stale pending entry for the
+# inner tick would steal the later opener and leave its partner
+# unmatched, leaking the later span's text into the keyword scan.
+printf '%s\n' $'Use `` ` `` because `closes #5` is shown.\n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n## Related\n\n- x' >"$GATED/escaped-tick.md"
+assert_block "a decoy keyword after an escaped-backtick idiom is not linkage" "$GATED" \
+  "gh pr create -t T --body-file escaped-tick.md"
+
+run "$GATED" "$(gh_body "$ISSUE_3205")"
+if [[ "$ERR" == *'Missing a "## Fix" section.'* && "$ERR" == *"## Summary"* && "$ERR" == *"## Fix"* && "$ERR" == *"## Verification"* && "$ERR" == *"## Related"* && "$ERR" == *"Closes #N"* ]]; then
+  ok "block message names the missing Fix section and lists all four in the remedy"
+else
+  fail "block message lacks the missing Fix section or the four-section remedy: $ERR"
+fi
+
+# --- Closing-keyword shapes --------------------------------------------------
+
+for kw in Closes closes Closed Fixes fix fixed Resolves resolve resolved; do
+  assert_allow "keyword '$kw' accepted" "$GATED" \
+    "$(gh_body "$kw #5$SECTIONS")"
+done
+assert_allow "colon form accepted" "$GATED" \
+  "$(gh_body $'Closes: #5'"$SECTIONS")"
+assert_allow "owner/repo#N form accepted" "$GATED" \
+  "$(gh_body $'Closes melodic-software/standards#5'"$SECTIONS")"
+assert_allow "No linked issue marker accepted" "$GATED" \
+  "$(gh_body $'No linked issue'"$SECTIONS")"
+assert_allow "No related issue: marker accepted" "$GATED" \
+  "$(gh_body $'No related issue: drift sweep'"$SECTIONS")"
+
+# Non-closing marker (ci-workflows#544): a `Refs:` / `Relates to:` line of its
+# own is linkage; anything else on that line, or no colon, is not.
+assert_allow "Refs: #N on its own line accepted" "$GATED" \
+  "$(gh_body $'Refs: #1234'"$SECTIONS")"
+assert_allow "Relates to: #N on its own line accepted" "$GATED" \
+  "$(gh_body $'Relates to: #1234'"$SECTIONS")"
+assert_allow "Refs: owner/repo#N accepted" "$GATED" \
+  "$(gh_body $'Refs: melodic-software/standards#5'"$SECTIONS")"
+assert_allow "Refs: marker indented three spaces accepted" "$GATED" \
+  "$(gh_body $'   REFS:  #5  '"$SECTIONS")"
+assert_block "Refs: marker with trailing prose is not linkage" "$GATED" \
+  "$(gh_body $'Refs: #5 for context'"$SECTIONS")"
+assert_block "Refs #N without a colon is not linkage" "$GATED" \
+  "$(gh_body $'Refs #5'"$SECTIONS")"
+assert_block "a closing keyword split across lines is not linkage" "$GATED" \
+  "$(gh_body $'Closes\n#5'"$SECTIONS")"
+
+# Tracker link lines: `/work-items:track link` prints the bound adapter's link
+# text, which is not GitHub's `#N` grammar on every tracker (work-items
+# CONTRACT.md "Change links"). Each line below is one an adapter emits.
+assert_allow "Linear closing link line accepted" "$GATED" \
+  "$(gh_body $'Closes ENG-123'"$SECTIONS")"
+assert_allow "Linear non-closing link line (no colon) accepted" "$GATED" \
+  "$(gh_body $'Refs ENG-123'"$SECTIONS")"
+assert_allow "Jira non-closing link line accepted" "$GATED" \
+  "$(gh_body $'Refs: SW2-12345'"$SECTIONS")"
+assert_allow "Relates to: with a tracker key accepted" "$GATED" \
+  "$(gh_body $'Relates to: SW2-7'"$SECTIONS")"
+assert_allow "local-markdown non-closing link line accepted" "$GATED" \
+  "$(gh_body $'Refs: local-markdown:local/markdown#7'"$SECTIONS")"
+assert_block "a lower-case key-shaped token is not a tracker key" "$GATED" \
+  "$(gh_body $'Fixes utf-8'"$SECTIONS")"
+assert_block "a URL with a fragment is not a qualified item id" "$GATED" \
+  "$(gh_body $'Refs: https://example.com/page#1'"$SECTIONS")"
+assert_block "a tracker key with trailing prose is not a link line" "$GATED" \
+  "$(gh_body $'Refs: SW2-12 for context'"$SECTIONS")"
+assert_block "a tracker key after other text on the line is not a link line" "$GATED" \
+  "$(gh_body $'See also Closes ENG-123'"$SECTIONS")"
+
+# Negated closers: GitHub's parser ignores the negation and closes the issue
+# anyway, so CI fails them even beside valid linkage.
+assert_block "negated closer blocks" "$GATED" \
+  "$(gh_body $'This does not close #5.'"$SECTIONS")"
+assert_block "negated closer blocks even beside a Refs: marker" "$GATED" \
+  "$(gh_body $'Refs: #5\n\nThis PR deliberately never fixes #5.'"$SECTIONS")"
+assert_block "negated closer blocks even beside a real closing keyword" "$GATED" \
+  "$(gh_body $'Closes #4\n\nThis is not meant to resolve #5 here.'"$SECTIONS")"
+printf '%s\n' "Refs: #5"$'\n\n'"This doesn't close #5.$SECTIONS" >"$GATED/negated-apostrophe.md"
+assert_block "an n't contraction negates a closer" "$GATED" \
+  "gh pr create -t T --body-file negated-apostrophe.md"
+printf '%s\n' "Refs: #5"$'\n\n'$'This doesn\xe2\x80\x99t close #5.'"$SECTIONS" >"$GATED/negated-typographic.md"
+assert_block "a typographic-apostrophe contraction negates a closer" "$GATED" \
+  "gh pr create -t T --body-file negated-typographic.md"
+assert_allow "\"not only\" is affirmative" "$GATED" \
+  "$(gh_body $'This not only closes #5 but more.'"$SECTIONS")"
+assert_allow "a negation before the last comma does not reach the closer" "$GATED" \
+  "$(gh_body $'Not a draft, closes #5'"$SECTIONS")"
+assert_allow "a negation more than five words back does not reach the closer" "$GATED" \
+  "$(gh_body $'Not one two three four five closes #5'"$SECTIONS")"
+printf '%s\n' $'Closes #4\n\nThe template example `does not close #5` is shown.'"$SECTIONS" >"$GATED/negated-inline.md"
+assert_allow "a negated closer inside inline code is masked" "$GATED" \
+  "gh pr create -t T --body-file negated-inline.md"
+
+run "$GATED" "$(gh_body $'This does not close #5. We never fix #6.\nIt does not close #5 either.'"$SECTIONS")"
+if [[ "$ERR" == *'Negated closing reference ("close #5" (trigger "not"), "fix #6" (trigger "never")): GitHub still auto-closes'* &&
+  "$ERR" == *'No closing line: add Closes #N, Refs: #N (link without closing), or No linked issue.'* ]]; then
+  ok "negated-closer message lists each distinct closer once with its trigger, beside the missing-linkage message"
+else
+  fail "negated-closer or missing-linkage message wrong: $ERR"
+fi
+run "$GATED" "$(gh_body "$NO_KEYWORD")"
+if [[ "$ERR" == *'Refs: #N (link without closing)'* && "$ERR" != *'Negated'* ]]; then
+  ok "missing-linkage message and remedy name the Refs: marker"
+else
+  fail "missing-linkage message or remedy lacks the Refs: marker: $ERR"
+fi
+
+# Word boundaries: JavaScript's \b makes both of these non-matches, so a body
+# carrying only one of them must still block.
+assert_block "trailing word char after #N is not a match" "$GATED" \
+  "$(gh_body $'Closes #12abc'"$SECTIONS")"
+assert_block "keyword glued to a preceding word is not a match" "$GATED" \
+  "$(gh_body $'unclosed #5'"$SECTIONS")"
+
+# --- HTML comments -----------------------------------------------------------
+
+assert_block "markers only inside a terminated comment do not count" "$GATED" \
+  "$(gh_body $'<!-- Closes #5 and a ## Related section -->\n\nSummary.')"
+assert_block "an unterminated comment swallows the rest of the body" "$GATED" \
+  "$(gh_body $'Summary.\n<!-- oops\nCloses #5'"$SECTIONS")"
+assert_allow "content around a comment still counts" "$GATED" \
+  "$(gh_body $'Closes #5 <!-- issue --> \n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n## Related\n<!-- list below -->\n- x')"
+
+# --- Section boundaries ------------------------------------------------------
+
+assert_allow "a deeper subsection is Related's content, not its terminator" "$GATED" \
+  "$(gh_body $'Closes #5\n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n## Related\n\n### Prior art\n\n- x\n\n## Test plan\n\n- ran it')"
+assert_block "a same-level heading terminates Related, leaving it empty" "$GATED" \
+  "$(gh_body $'Closes #5\n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n## Related\n## Extra\n\n- x')"
+assert_allow "Related is matched case-insensitively" "$GATED" \
+  "$(gh_body $'Closes #5\n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n##   RELATED\n\n- x')"
+assert_block "a Related heading with trailing text is not the section" "$GATED" \
+  "$(gh_body $'Closes #5\n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n## Related work\n\n- x')"
+
+# --- Body sources ------------------------------------------------------------
+
+printf '%s\n' "$NO_RELATED" >"$GATED/body.md"
+assert_block "--body-file reads the file" "$GATED" "gh pr create -t T --body-file body.md"
+# hook::jq_fields keeps a trailing newline that `$(jq)` chomped. Unchomped, a
+# relative --body-file joins onto `$cwd\n/body.md`, the file is unreadable, and
+# the hook fail-opens. Chomp restores the per-field verdict.
+assert_block "cwd with a trailing newline still reads a relative --body-file" \
+  "$GATED"$'\n' "gh pr create -t T --body-file body.md"
+printf '%s\n' "$GOOD" >"$GATED/good.md"
+assert_allow "--body-file with a compliant file allowed" "$GATED" "gh pr create -t T -F good.md"
+assert_allow "--body-file naming a missing file allowed" "$GATED" "gh pr create -t T -F absent.md"
+
+assert_block "--body-file - reads the sole heredoc" "$GATED" \
+  "$(printf "gh pr create -t T --body-file - <<'EOF'\n%s\nEOF\n" "$NO_RELATED")"
+assert_allow "--body-file - with a compliant heredoc allowed" "$GATED" \
+  "$(printf "gh pr create -t T --body-file - <<'EOF'\n%s\nEOF\n" "$GOOD")"
+assert_block "--body \$(cat <<EOF) substitution is read" "$GATED" \
+  "$(printf "gh pr create -t T --body \"\$(cat <<'EOF'\n%s\nEOF\n)\"\n" "$NO_RELATED")"
+assert_allow "two heredocs are undeterminable" "$GATED" \
+  "$(printf "cat <<'A' >x\njunk\nA\ngh pr create -t T --body-file - <<'EOF'\n%s\nEOF\n" "$NO_RELATED")"
+assert_allow "an unterminated heredoc is undeterminable" "$GATED" \
+  "$(printf "gh pr create -t T --body-file - <<'EOF'\n%s\n" "$NO_RELATED")"
+# shellcheck disable=SC2016  # the literal, unexpanded $BODY is the fixture under test
+assert_allow "a variable body is undeterminable" "$GATED" 'gh pr create -t T --body "$BODY"'
+assert_allow "--fill carries no body flag" "$GATED" "gh pr create -t T --fill"
+assert_allow "interactive create carries no body flag" "$GATED" "gh pr create"
+assert_block "attached short-flag value is read" "$GATED" "$(printf "gh pr create -t T -b'%s'" "$NO_RELATED")"
+assert_block "--body=VALUE form is read" "$GATED" "$(printf "gh pr create -t T --body='%s'" "$NO_RELATED")"
+assert_block "an empty literal body blocks" "$GATED" "gh pr create -t T --body ''"
+assert_allow "a trailing --body with no value is malformed, not empty" "$GATED" "gh pr create -t T --body"
+assert_allow "a trailing --body-file with no value is malformed" "$GATED" "gh pr create -t T --body-file"
+assert_allow "everything after -- is positional" "$GATED" "gh pr create -t T -- --body bad"
+assert_allow "a body-file naming a directory is unreadable" "$GATED" "gh pr create -t T --body-file ."
+
+# A body-shaped string sitting in another flag's value is not the body.
+assert_allow "a label value spelled --body is not the body" "$GATED" \
+  "gh pr create -t T -l --body --fill"
+
+# --- gh pr edit --------------------------------------------------------------
+
+assert_block "gh pr edit --body is gated" "$GATED" "$(printf "gh pr edit 5 --body '%s'" "$NO_RELATED")"
+assert_block "gh pr edit --body-file is gated" "$GATED" "gh pr edit 5 --body-file body.md"
+assert_allow "gh pr edit changing no body allowed" "$GATED" "gh pr edit 5 --add-label ready"
+assert_allow "gh pr new alias with a compliant body allowed" "$GATED" \
+  "$(printf "gh pr new -t T --body '%s'" "$GOOD")"
+
+# --- Wrappers and out-of-scope targets ---------------------------------------
+
+assert_block "env-assignment wrapper is unwrapped" "$GATED" \
+  "$(printf "GH_TOKEN=x gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "env(1) wrapper is unwrapped" "$GATED" \
+  "$(printf "env GH_TOKEN=x gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "sh -c operand is re-parsed" "$GATED" \
+  "$(printf "bash -c \"gh pr create -t T --body '%s'\"" "$NO_RELATED")"
+assert_allow "--repo targets a repo whose gate is unknown" "$GATED" \
+  "$(printf "gh pr create -R other/repo -t T --body '%s'" "$NO_RELATED")"
+assert_allow "-R attached form is out of scope too" "$GATED" \
+  "$(printf "gh pr create -Rother/repo -t T --body '%s'" "$NO_RELATED")"
+assert_block "sudo wrapper is unwrapped" "$GATED" \
+  "$(printf "sudo gh pr create -t T --body '%s'" "$NO_RELATED")"
+# A wrapper option's SEPARATED value sits where the command name is expected;
+# skipping the flag alone leaves the gate looking at the value.
+assert_block "sudo -u root consumes its value" "$GATED" \
+  "$(printf "sudo -u root gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "sudo -uroot attaches its value" "$GATED" \
+  "$(printf "sudo -uroot gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "sudo --user=root attaches its value" "$GATED" \
+  "$(printf "sudo --user=root gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "sudo -- ends its own options" "$GATED" \
+  "$(printf "sudo -- gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "env -u VAR consumes its value" "$GATED" \
+  "$(printf "env -u GH_TOKEN gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "sudo -r role consumes its SELinux value" "$GATED" \
+  "$(printf "sudo -r staff_r gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "sudo -t type consumes its SELinux value" "$GATED" \
+  "$(printf "sudo -t sysadm_t gh pr create -t T --body '%s'" "$NO_RELATED")"
+
+# A wrapper that moves the working directory or the root is the `cd` case
+# wearing a flag: the gate file and a relative body path resolve elsewhere.
+assert_allow "env -C moves the directory" "$GATED" \
+  "$(printf "env -C %s gh pr create -t T --body '%s'" "$UNGATED" "$NO_RELATED")"
+assert_allow "env --chdir= moves the directory" "$GATED" \
+  "$(printf "env --chdir=%s gh pr create -t T --body '%s'" "$UNGATED" "$NO_RELATED")"
+assert_allow "sudo -D moves the directory" "$GATED" \
+  "$(printf "sudo -D %s gh pr create -t T --body '%s'" "$UNGATED" "$NO_RELATED")"
+assert_allow "sudo -R moves the filesystem root" "$GATED" \
+  "$(printf "sudo -R %s gh pr create -t T --body '%s'" "$UNGATED" "$NO_RELATED")"
+
+# `env -S` carries an entire command line in one operand; it is a command to
+# re-parse, not a value to step over.
+assert_block "env -S operand is re-parsed" "$GATED" \
+  "$(printf "env -S \"gh pr create -t T --body '%s'\"" "$NO_RELATED")"
+assert_block "env --split-string= operand is re-parsed" "$GATED" \
+  "$(printf "env --split-string=\"gh pr create -t T --body '%s'\"" "$NO_RELATED")"
+assert_allow "env -S carrying a compliant body allowed" "$GATED" \
+  "$(printf "env -S \"gh pr create -t T --body '%s'\"" "$GOOD")"
+# env appends its remaining operands to the split string, so a `-S` carrying
+# only the command prefix still reaches a body sitting after it.
+assert_block "env -S prefix splices the trailing argv" "$GATED" \
+  "$(printf "env -S 'gh pr create' -t T --body '%s'" "$NO_RELATED")"
+assert_block "env --split-string= prefix splices the trailing argv" "$GATED" \
+  "env --split-string='gh pr create' -t T --body-file body.md"
+assert_allow "a spliced compliant body is allowed" "$GATED" \
+  "$(printf "env -S 'gh pr create' -t T --body '%s'" "$GOOD")"
+
+# A short wrapper word is a CLUSTER, not one flag: `sudo -Eu root` is valid, and
+# reading it as a single unknown flag leaves `root` where the command belongs.
+# `command -p` still executes; `-v`/`-V` only print a pathname, so no PR exists
+# to gate and blocking one would be a false block.
+assert_block "command -p is an execution wrapper" "$GATED" \
+  "$(printf "command -p gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_allow "command -v runs nothing" "$GATED" \
+  "$(printf "command -v gh pr create -t T --body '%s'" "$NO_RELATED")"
+
+# Only the current shell's own builtin can relocate a later segment. `sudo cd`
+# and `env cd` FAIL (cd is a builtin, not an executable), so a wrapped cd must
+# not poison the segments after it.
+assert_block "a sudo-wrapped cd does not poison later segments" "$GATED" \
+  "$(printf "sudo cd /tmp || gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "an env-wrapped cd does not poison later segments" "$GATED" \
+  "$(printf "env cd /tmp && gh pr create -t T --body '%s'" "$NO_RELATED")"
+# `command`, `builtin`, and `eval` DO dispatch the builtin inside this shell.
+assert_allow "command cd relocates the current shell" "$GATED" \
+  "$(printf "command cd %s && gh pr create -t T --body '%s'" "$UNGATED" "$NO_RELATED")"
+assert_allow "builtin cd relocates the current shell" "$GATED" \
+  "$(printf "builtin cd %s && gh pr create -t T --body '%s'" "$UNGATED" "$NO_RELATED")"
+assert_allow "eval cd relocates the current shell" "$GATED" \
+  "$(printf "eval cd %s && gh pr create -t T --body '%s'" "$UNGATED" "$NO_RELATED")"
+# `-p` preserves execution, so the cd really happens and the call is out of
+# scope; `-v` only prints a description, so nothing moves and the gate applies.
+assert_allow "command -p cd executes the builtin" "$GATED" \
+  "$(printf "command -p cd %s && gh pr create -t T --body '%s'" "$UNGATED" "$NO_RELATED")"
+assert_block "command -v cd only prints, so nothing moves" "$GATED" \
+  "$(printf "command -v cd && gh pr create -t T --body '%s'" "$NO_RELATED")"
+
+# Options that print and exit run no command, so there is no PR to gate.
+assert_allow "env --help runs nothing" "$GATED" \
+  "$(printf "env --help gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_allow "env --version runs nothing" "$GATED" \
+  "$(printf "env --version gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_allow "sudo -V runs nothing" "$GATED" \
+  "$(printf "sudo -V gh pr create -t T --body '%s'" "$NO_RELATED")"
+
+# An option the hook does not positively recognize could eat the next word, so
+# the call goes out of scope rather than being guessed at.
+assert_allow "an unrecognized sudo option bails" "$GATED" \
+  "$(printf "sudo --future-option x gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_allow "an unrecognized sudo shorthand bails" "$GATED" \
+  "$(printf "sudo -Z gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "recognized sudo booleans are stepped over" "$GATED" \
+  "$(printf "sudo -EH gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "recognized env booleans are stepped over" "$GATED" \
+  "$(printf "env -i gh pr create -t T --body '%s'" "$NO_RELATED")"
+# env's signal options take an OPTIONAL argument, which GNU accepts only
+# attached after `=`, so they never consume the following word.
+assert_block "env --block-signal takes no separate word" "$GATED" \
+  "$(printf "env --block-signal gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "env --ignore-signal=SIG is attached" "$GATED" \
+  "$(printf "env --ignore-signal=TERM gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "sudo -B is a boolean" "$GATED" \
+  "$(printf "sudo -B gh pr create -t T --body '%s'" "$NO_RELATED")"
+
+assert_block "sudo -Eu root is a cluster ending in a value" "$GATED" \
+  "$(printf "sudo -Eu root gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "sudo -Euroot attaches the clustered value" "$GATED" \
+  "$(printf "sudo -Euroot gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "env -iu VAR is a cluster ending in a value" "$GATED" \
+  "$(printf "env -iu GH_TOKEN gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_allow "a chdir letter inside a cluster still moves the directory" "$GATED" \
+  "$(printf "env -iC %s gh pr create -t T --body '%s'" "$UNGATED" "$NO_RELATED")"
+
+# sudo login mode runs from the target user's home; shell mode does not move.
+assert_allow "sudo -i is login mode" "$GATED" \
+  "$(printf "sudo -i gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_allow "sudo --login is login mode" "$GATED" \
+  "$(printf "sudo --login gh pr create -t T --body '%s'" "$NO_RELATED")"
+assert_block "sudo -s keeps the current directory" "$GATED" \
+  "$(printf "sudo -s gh pr create -t T --body '%s'" "$NO_RELATED")"
+
+# --- How `gh` is spelled -----------------------------------------------------
+# The wrapper loop above already reads basenames; matching the binary any other
+# way lets a path-qualified or Windows-suffixed call walk straight past.
+
+for spelling in "gh.exe" "/usr/bin/gh" "./gh" "/c/Program Files/GitHub CLI/gh.exe"; do
+  assert_block "'$spelling' is the same call" "$GATED" \
+    "$(printf "'%s' pr create -t T --body '%s'" "$spelling" "$NO_RELATED")"
+done
+assert_allow "a command merely containing gh is not gh" "$GATED" \
+  "npm run lighthouse-prod --body bad"
+
+# --- Directory changes -------------------------------------------------------
+# A cd/pushd earlier in the line moves the directory gh runs in, which is the
+# directory the gate file and any relative --body-file resolved against.
+
+printf '%s\n' "$GOOD" >"$OTHER/bad.md"
+assert_allow "cd retargets a relative --body-file" "$GATED" \
+  "cd $OTHER && gh pr create -t T --body-file bad.md"
+assert_allow "cd into an ungated repo is not gated" "$GATED" \
+  "cd $UNGATED && $(gh_body "$NO_RELATED")"
+assert_allow "pushd counts as a directory change" "$GATED" \
+  "pushd $UNGATED && $(gh_body "$NO_RELATED")"
+assert_allow "a cd inside sh -c still counts" "$GATED" \
+  "bash -c \"cd $UNGATED && gh pr create -t T --body 'bad'\""
+assert_block "a cd AFTER the gh call does not excuse it" "$GATED" \
+  "$(gh_body "$NO_RELATED") && cd $UNGATED"
+
+# --- pflag grouped shorthand -------------------------------------------------
+# `-db BODY`, `-dbBODY`, `-dF file`, `-dFfile` are all valid gh and all carry a
+# body a plain `-b`/`-F` match never sees.
+
+assert_block "-db takes the next word as the body" "$GATED" \
+  "$(printf "gh pr create -db '%s'" "$NO_RELATED")"
+assert_block "-dbVALUE takes the rest of the word" "$GATED" "gh pr create -dbBAD_BODY_NO_RELATED"
+assert_block "-dF takes the next word as the body file" "$GATED" "gh pr create -dF body.md"
+assert_block "-dFVALUE takes the rest of the word" "$GATED" "gh pr create -dFbody.md"
+assert_allow "-dF with a compliant file allowed" "$GATED" "gh pr create -dF good.md"
+assert_allow "-dR retargets the repo" "$GATED" \
+  "$(printf "gh pr create -dR other/repo -t T --body '%s'" "$NO_RELATED")"
+assert_allow "a value-taking shorthand before b consumes the body word" "$GATED" \
+  "gh pr create -tb T"
+assert_allow "an unknown shorthand letter is not guessed at" "$GATED" \
+  "$(printf "gh pr create -zb '%s'" "$NO_RELATED")"
+assert_allow "a trailing value-taking cluster has nothing to take" "$GATED" "gh pr create -t T -db"
+
+# --- Attached and absolute body-file forms -----------------------------------
+
+assert_block "--body-file=X attached form" "$GATED" "gh pr create -t T --body-file=body.md"
+assert_block "-FX attached form" "$GATED" "gh pr create -t T -Fbody.md"
+assert_block "an absolute body-file path is read" "$GATED" "gh pr create -t T --body-file $GATED/body.md"
+assert_allow "an absolute path to a compliant body allowed" "$GATED" \
+  "gh pr create -t T --body-file $GATED/good.md"
+
+# --- .yaml gate spelling -----------------------------------------------------
+
+printf '%s\n' "$NO_RELATED" >"$GATED_YAML/body.md"
+assert_block "a .yaml gate workflow enforces too" "$GATED_YAML" "gh pr create -t T --body-file body.md"
+
+# --- Locale independence -----------------------------------------------------
+# `[[:space:]]` is locale-defined; JavaScript's `\s` is not. Each body below
+# uses a non-ASCII `\s` member (NBSP, em space, ideographic space) where the
+# validator accepts whitespace, so both locales must ALLOW.
+
+locale_case() {
+  local label="$1" body="$2" payload utf c
+  printf '%s' "$body" >"$GATED/u.md"
+  payload=$(mk_payload "$GATED" "gh pr create -t T --body-file u.md")
+  printf '%s' "$payload" | LC_ALL=en_US.UTF-8 bash "$HOOK" >/dev/null 2>&1
+  utf=$?
+  printf '%s' "$payload" | LC_ALL=C bash "$HOOK" >/dev/null 2>&1
+  c=$?
+  if ((utf == 0 && c == 0)); then
+    ok "$label (locale-independent)"
+  else
+    fail "$label: utf8 rc=$utf, C rc=$c (both should allow)"
+  fi
+}
+
+locale_case "NBSP between keyword and issue" $'Closes:\xc2\xa0#5'"$SECTIONS"
+locale_case "em space between keyword and issue" $'Closes\xe2\x80\x83#5'"$SECTIONS"
+locale_case "ideographic space in the heading" $'Closes #5\n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n##\xe3\x80\x80Related\n\n- x'
+locale_case "BOM ahead of the heading" $'Closes #5\n\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n\xef\xbb\xbf## Related\n\n- x'
+
+# --- CRLF --------------------------------------------------------------------
+
+printf 'Closes #5\r\n\r\n## Summary\r\n\r\nx\r\n\r\n## Fix\r\n\r\nx\r\n\r\n## Verification\r\n\r\nx\r\n\r\n## Related\r\n\r\n- x\r\n' >"$GATED/crlf-good.md"
+printf 'Closes #5\r\n\r\nno related\r\n' >"$GATED/crlf-bad.md"
+assert_allow "a CRLF body validates" "$GATED" "gh pr create -t T --body-file crlf-good.md"
+assert_block "a CRLF body still fails when it should" "$GATED" "gh pr create -t T --body-file crlf-bad.md"
+
+# --- Large bodies stay inside the declared hook timeout ----------------------
+# A cancelled hook silently stops gating, so a large body must be judged inside
+# the 15 s hooks.json timeout; the bound is loose so a slow CI runner does not flake.
+#
+# A suffix-copy line split is quadratic in the line count: 16k two-character
+# lines (well under GitHub's body-size limit) exceeded 20 s and fail-opened,
+# against 2.4 s with the parent validator. The scratch-file `readarray` split
+# must stay inside the same 8 s bound the 1000-line case uses.
+
+{
+  printf 'Closes #5\n\n'
+  dense_i=0
+  while ((dense_i < 16000)); do
+    printf 'aa\n'
+    dense_i=$((dense_i + 1))
+  done
+  printf '\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n'
+} >"$GATED/dense.md"
+dense_start=${EPOCHREALTIME:-}
+run "$GATED" "gh pr create -t T --body-file dense.md"
+dense_end=${EPOCHREALTIME:-}
+if ((RC != 2)); then
+  fail "16000 two-char-line body missing Related should block, got rc=$RC"
+elif [[ -z "$dense_start" || -z "$dense_end" ]]; then
+  echo "SKIP: EPOCHREALTIME unavailable -- dense-body timing not measured"
+else
+  dense_ms=$(awk -v s="${dense_start/,/.}" -v e="${dense_end/,/.}" 'BEGIN{printf "%d", (e-s)*1000}')
+  if ((dense_ms < 8000)); then
+    ok "16000 two-char-line body judged in ${dense_ms}ms (hooks.json timeout is 15s)"
+  else
+    fail "16000 two-char-line body took ${dense_ms}ms -- exceeds the 15s hook timeout"
+  fi
+fi
+
+# A section line ending in 20,000 blanks: the parameter-expansion trim re-scanned
+# the string at each candidate cut and took over 20 s on this body; the linear
+# trim takes well under 1 s. Same 8 s bound as the cases above.
+blank_run="$(printf '%20000s' '')"
+printf 'Closes #5\n\n## Summary\n\nx%s\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n## Related\n\n- x\n' "$blank_run" >"$GATED/blanks.md"
+blanks_start=${EPOCHREALTIME:-}
+run "$GATED" "gh pr create -t T --body-file blanks.md"
+blanks_end=${EPOCHREALTIME:-}
+if ((RC != 0)); then
+  fail "compliant body with 20000 trailing blanks should allow, got rc=$RC"
+elif [[ -z "$blanks_start" || -z "$blanks_end" ]]; then
+  echo "SKIP: EPOCHREALTIME unavailable -- trailing-blank timing not measured"
+else
+  blanks_ms=$(awk -v s="${blanks_start/,/.}" -v e="${blanks_end/,/.}" 'BEGIN{printf "%d", (e-s)*1000}')
+  if ((blanks_ms < 8000)); then
+    ok "20000 trailing blanks judged in ${blanks_ms}ms (hooks.json timeout is 15s)"
+  else
+    fail "20000 trailing blanks took ${blanks_ms}ms -- exceeds the 15s hook timeout"
+  fi
+fi
+
+# The gate leaves nothing in TMPDIR: a compliant body, a blocked body, and the
+# 16000-line body that takes the scratch-file split.
+for tmp_case in "compliant:$GOOD:0" "blocked:$NO_RELATED:2" "dense:@dense.md:2"; do
+  tmp_name="${tmp_case%%:*}"
+  tmp_rest="${tmp_case#*:}"
+  tmp_want="${tmp_rest##*:}"
+  tmp_body="${tmp_rest%:*}"
+  if [[ "$tmp_body" == @* ]]; then
+    tmp_cmd="gh pr create -t T --body-file ${tmp_body#@}"
+  else
+    tmp_cmd="$(gh_body "$tmp_body")"
+  fi
+  tmp_dir="$(mktemp -d "$WORK/tmp.XXXX")"
+  tmp_payload=$(mk_payload "$GATED" "$tmp_cmd")
+  tmp_rc=0
+  (cd "$UNRELATED" && printf '%s' "$tmp_payload" | TMPDIR="$tmp_dir" bash "$HOOK" >/dev/null 2>&1) || tmp_rc=$?
+  tmp_left="$(ls -A "$tmp_dir")"
+  if ((tmp_rc != tmp_want)); then
+    fail "$tmp_name body: expected rc=$tmp_want, got rc=$tmp_rc"
+  elif [[ -n "$tmp_left" ]]; then
+    fail "$tmp_name body left files in TMPDIR: $tmp_left"
+  else
+    ok "$tmp_name body leaves TMPDIR empty"
+  fi
+done
+
+# linkage::split_lines matches the `printf '%s\n'` + read contract: one more
+# element than the number of newlines, empty text is one empty element.
+export LC_ALL=C
+# shellcheck source=pr-linkage-validator.sh
+source "$HOOK_DIR/pr-linkage-validator.sh"
+expect_split() {
+  local name="$1" text="$2"
+  shift 2
+  linkage::split_lines "$text"
+  if ((${#LINKAGE_LINES[@]} != $#)); then
+    fail "$name: expected $# elements, got ${#LINKAGE_LINES[@]}"
+    return
+  fi
+  local i=0
+  for want in "$@"; do
+    if [[ "${LINKAGE_LINES[i]}" != "$want" ]]; then
+      fail "$name: element $i mismatch"
+      return
+    fi
+    i=$((i + 1))
+  done
+  ok "$name"
+}
+expect_split "empty text is one empty element" "" ""
+expect_split "no trailing newline still yields the last line" $'a\nb' a b
+expect_split "trailing newline yields a final empty element" $'a\nb\n' a b ""
+expect_split "only a newline is two empty elements" $'\n' "" ""
+split_pad="$(printf 'x%.0s' {1..16000})"
+expect_split "text past the here-string limit splits the same" "$split_pad"$'\nb\n' "$split_pad" b ""
+
+{
+  printf 'Closes #5\n\n'
+  perf_i=0
+  while ((perf_i < 1000)); do
+    printf 'filler line %d with several words on it\n' "$perf_i"
+    perf_i=$((perf_i + 1))
+  done
+  printf '\n## Summary\n\nx\n\n## Fix\n\nx\n\n## Verification\n\nx\n\n## Related\n\n- x\n'
+} >"$GATED/big.md"
+perf_start=${EPOCHREALTIME:-}
+run "$GATED" "gh pr create -t T --body-file big.md"
+perf_end=${EPOCHREALTIME:-}
+if [[ -z "$perf_start" || -z "$perf_end" ]]; then
+  echo "SKIP: EPOCHREALTIME unavailable -- large-body timing not measured"
+elif ((RC != 0)); then
+  fail "1000-line compliant body should allow, got rc=$RC"
+else
+  perf_ms=$(awk -v s="${perf_start/,/.}" -v e="${perf_end/,/.}" 'BEGIN{printf "%d", (e-s)*1000}')
+  if ((perf_ms < 8000)); then
+    ok "1000-line body judged in ${perf_ms}ms (hooks.json timeout is 15s)"
+  else
+    fail "1000-line body took ${perf_ms}ms -- too close to the 15s hook timeout"
+  fi
+fi
+
+# --- Missing jq fails open ---------------------------------------------------
+# The hook cannot parse its payload without jq, and a policy gate that cannot
+# read its input must not refuse the command.
+
+STUB="$WORK/stub-bin"
+mkdir -p "$STUB"
+jq_stub_ok=1
+# bash is invoked by absolute path: a PATH with no bash in it would fail the
+# invocation itself rather than exercising the hook's own missing-jq branch.
+BASH_ABS="${BASH:-$(command -v bash)}"
+for tool in dirname tr; do
+  if tool_path="$(command -v "$tool" 2>/dev/null)" && [[ -n "$tool_path" ]]; then
+    cp "$tool_path" "$STUB/" 2>/dev/null || jq_stub_ok=0
+  else
+    jq_stub_ok=0
+  fi
+done
+if ((jq_stub_ok)) && [[ -x "$BASH_ABS" ]] && ! PATH="$STUB" command -v jq >/dev/null 2>&1; then
+  payload=$(mk_payload "$GATED" "$(gh_body "$NO_RELATED")")
+  if (printf '%s' "$payload" | PATH="$STUB" "$BASH_ABS" "$HOOK" >/dev/null 2>&1); then
+    ok "a missing jq fails open"
+  else
+    fail "a missing jq did not fail open"
+  fi
+  # The plugin's hooks share one jq notice: after this gate tells the user, the
+  # MCP sibling stays quiet in the same session.
+  JQ_DATA="$WORK/jq-data"
+  mkdir -p "$JQ_DATA/skip-notices" # the stub PATH has no mkdir
+  first=$(printf '%s' "$payload" | PATH="$STUB" CLAUDE_PLUGIN_DATA="$JQ_DATA" "$BASH_ABS" "$HOOK" 2>/dev/null)
+  second=$(printf '%s' "$payload" | PATH="$STUB" CLAUDE_PLUGIN_DATA="$JQ_DATA" "$BASH_ABS" "$HOOK_DIR/pr-linkage-mcp-gate.sh" 2>/dev/null)
+  if [[ "$first" == *systemMessage* && -z "$second" ]]; then
+    ok "one jq notice per session across the plugin's hooks"
+  else
+    fail "jq notice not shared across hooks: first=$first second=$second"
+  fi
+else
+  echo "SKIP: could not build a jq-free PATH -- missing-jq fail-open not measured"
+fi
+
+# --- Kill switch -------------------------------------------------------------
+
+payload=$(mk_payload "$GATED" "$(gh_body "$NO_RELATED")")
+# A here-string, never a pipe: the kill switch exits before reading stdin, and
+# a printf still writing then fails on the closed pipe, which pipefail reports.
+if (cd "$UNRELATED" &&
+  CLAUDE_PLUGIN_OPTION_PR_BODY_LINKAGE_GATE_ENABLED=false bash "$HOOK" <<<"$payload" >/dev/null 2>&1); then
+  ok "kill switch disables the gate"
+else
+  fail "kill switch did not disable the gate"
+fi
+
+echo
+echo "passed: $PASS  failed: $FAIL"
+((FAIL == 0)) || exit 1
