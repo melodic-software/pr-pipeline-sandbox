@@ -1,0 +1,35 @@
+name: pr-run-checks
+
+# Lane caller for pr-run-checks: its file stem is the lane, so the lanes token
+# broker's check endpoint accepts its read activity (a caller whose stem
+# differs is denied lane-mismatch). No secret. Runs only on PRs that touch
+# sandbox/kill-switch/**.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: ["sandbox/kill-switch/**"]
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: The sandbox PR to run the activity on.
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  check-read-token:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      id-token: write
+    concurrency:
+      group: ${{ github.workflow }}-check-read-token-${{ github.event.pull_request.number || inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-read.yml
+    with:
+      lane: pr-run-checks
+      activity: check-read-token
+      pr-number: ${{ inputs.pr-number }}
