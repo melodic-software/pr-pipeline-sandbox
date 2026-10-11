@@ -1,0 +1,147 @@
+name: probe-midmerge
+
+# Phase 1 probe (claude-code-plugins .work/pr-pipeline-unblock/PLAN.md steps 3
+# and 4). Runs only from the probe/midmerge PR branch and is never merged.
+# Step 3: what the pinned claude-code-action does to a tree in the middle of a
+# merge. Step 4: whether resolve-version-bump-conflict.sh can write the index
+# under the lane's Bash (dontAsk, one allowed Bash command, subprocess scrub).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  midmerge:
+    if: github.event.pull_request.head.ref == 'probe/midmerge'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out the probe branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .probe
+          persist-credentials: false
+
+      - name: Stage the probe scripts
+        run: |
+          mkdir -p "$RUNNER_TEMP/bump"
+          cp .probe/scripts/probe/resolve-version-bump-conflict.sh .probe/scripts/probe/log-merge-state.sh "$RUNNER_TEMP/bump/"
+          chmod +x "$RUNNER_TEMP/bump/"*.sh
+
+      - name: Isolate the runner as the lane does
+        uses: ./.probe/.github/actions/setup-runner-isolation
+        with:
+          install-subprocess-isolation: "true"
+
+      - name: Check out the fixture PR side with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: probe/bump-pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Log the committer identity with none configured
+        run: |
+          ident=$(git var GIT_COMMITTER_IDENT 2>&1); rc=$?
+          echo "committer-ident-rc=$rc"
+          echo "committer-ident=$ident"
+
+      - name: Start the merge of the fixture main side
+        run: |
+          git merge --no-commit --no-ff origin/probe/bump-main; echo "merge-rc=$?"
+          "$RUNNER_TEMP/bump/log-merge-state.sh" before-noop
+          sha256sum plugins/bump-probe/.claude-plugin/plugin.json plugins/bump-probe/CHANGELOG.md
+
+      - name: Step 3, run the action with a prompt that edits nothing
+        id: noop
+        continue-on-error: true
+        uses: anthropics/claude-code-action@ed670b4cf9de2a5a570d130d2f6197b9e543cd64 # v1.0.240
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+          CLAUDE_BRANCH: lane/probe-midmerge
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          use_commit_signing: true
+          prompt: Do not run any tool and do not edit any file. Reply with the single word done.
+          claude_args: >-
+            --setting-sources user
+            --permission-mode dontAsk
+            --max-turns 2
+
+      - name: Log the merge state after step 3
+        if: always()
+        env:
+          NOOP_OUTCOME: ${{ steps.noop.outcome }}
+        run: |
+          echo "noop-outcome=$NOOP_OUTCOME"
+          "$RUNNER_TEMP/bump/log-merge-state.sh" after-noop
+          git log --oneline -3
+          git branch -a | head -20
+
+      - name: Restore the merge state if step 3 lost it
+        if: always()
+        run: |
+          if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            echo "step4-merge-restarted=0"
+          else
+            echo "step4-merge-restarted=1"
+            git merge --abort 2>/dev/null || true
+            git checkout -q -f -B probe/bump-pr origin/probe/bump-pr
+            git merge --no-commit --no-ff origin/probe/bump-main; echo "merge-rc=$?"
+          fi
+          "$RUNNER_TEMP/bump/log-merge-state.sh" before-bump
+          cp plugins/bump-probe/.claude-plugin/plugin.json "$RUNNER_TEMP/plugin.json.before"
+
+      - name: Step 4, run the version-bump script under the lane's Bash
+        id: bump
+        if: always()
+        continue-on-error: true
+        uses: anthropics/claude-code-action@ed670b4cf9de2a5a570d130d2f6197b9e543cd64 # v1.0.240
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+          CLAUDE_BRANCH: lane/probe-midmerge
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          use_commit_signing: true
+          prompt: >-
+            Run exactly this command once with the Bash tool, with no arguments:
+            ${{ runner.temp }}/bump/resolve-version-bump-conflict.sh
+            Then reply with its exit code and output. Run nothing else and edit no file.
+          claude_args: >-
+            --setting-sources user
+            --permission-mode dontAsk
+            --max-turns 4
+            --allowedTools "Bash(${{ runner.temp }}/bump/resolve-version-bump-conflict.sh)"
+
+      - name: Log the step 4 result
+        if: always()
+        env:
+          BUMP_OUTCOME: ${{ steps.bump.outcome }}
+          EXECUTION_FILE: ${{ steps.bump.outputs.execution_file }}
+        run: |
+          echo "bump-outcome=$BUMP_OUTCOME"
+          "$RUNNER_TEMP/bump/log-merge-state.sh" after-bump
+          unmerged=$(git ls-files -u -- plugins/bump-probe)
+          if [ -z "$unmerged" ] && ! cmp -s plugins/bump-probe/.claude-plugin/plugin.json "$RUNNER_TEMP/plugin.json.before"; then
+            echo "bump-resolved=1"
+          else
+            echo "bump-resolved=0"
+          fi
+          cat plugins/bump-probe/.claude-plugin/plugin.json
+          if [ -f "$EXECUTION_FILE" ]; then
+            jq -c '[.[] | select(.type == "result")] | last | {subtype, is_error, num_turns, permission_denials, result: ((.result // "") | .[:1500])}' "$EXECUTION_FILE"
+            jq -c '[.[] | select(.type == "user") | .message.content[]? | select(.type == "tool_result") | {is_error, content: ((.content | tostring) | .[:1500])}]' "$EXECUTION_FILE"
+          else
+            echo "no execution file"
+          fi
