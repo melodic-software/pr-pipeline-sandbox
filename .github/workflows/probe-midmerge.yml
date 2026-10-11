@@ -51,12 +51,22 @@ jobs:
 
       - name: Log the committer identity with none configured
         run: |
+          set +e
           ident=$(git var GIT_COMMITTER_IDENT 2>&1); rc=$?
           echo "committer-ident-rc=$rc"
           echo "committer-ident=$ident"
+          # A merge needs an identity even with --no-commit; set one through
+          # the environment so .git/config stays as checkout wrote it.
+          {
+            echo "GIT_AUTHOR_NAME=melodic-automation-lanes[bot]"
+            echo "GIT_COMMITTER_NAME=melodic-automation-lanes[bot]"
+            echo "GIT_AUTHOR_EMAIL=337595936+melodic-automation-lanes[bot]@users.noreply.github.com"
+            echo "GIT_COMMITTER_EMAIL=337595936+melodic-automation-lanes[bot]@users.noreply.github.com"
+          } >>"$GITHUB_ENV"
 
       - name: Start the merge of the fixture main side
         run: |
+          set +e
           git merge --no-commit --no-ff origin/probe/bump-main; echo "merge-rc=$?"
           "$RUNNER_TEMP/bump/log-merge-state.sh" before-noop
           sha256sum plugins/bump-probe/.claude-plugin/plugin.json plugins/bump-probe/CHANGELOG.md
@@ -91,6 +101,7 @@ jobs:
       - name: Restore the merge state if step 3 lost it
         if: always()
         run: |
+          set +e
           if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
             echo "step4-merge-restarted=0"
           else
