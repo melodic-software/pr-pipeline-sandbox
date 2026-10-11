@@ -1,0 +1,2 @@
+Case 10b fixture under .claude.
+value: seed
