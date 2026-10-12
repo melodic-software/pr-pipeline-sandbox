@@ -43,6 +43,9 @@ jobs:
   # melodic-software/claude-code-plugins#7334, same permissions, timeout and
   # command, with the rule checked out from that PR's head instead of the
   # queue base (this repository carries no copy of the policy script).
+  # claude-code-plugins is public, so the default token clones it.
+  # `repos/{repo}/actions/organization-variables` is the REST "list repository
+  # organization variables" endpoint the policy itself reads.
   unattended-recheck:
     if: github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
