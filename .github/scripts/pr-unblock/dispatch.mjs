@@ -106,8 +106,11 @@ export async function dispatchConflicting({
   candidates.sort((a, b) => a.number - b.number);
   const dispatched = [];
   let failed = 0;
+  // Every dispatch call counts against the cap: one that failed or returned no
+  // usable id may still have started a run.
+  let sent = 0;
   for (const node of candidates) {
-    if (dispatched.length >= maxDispatch) {
+    if (sent >= maxDispatch) {
       log(`defer #${node.number}: ${maxDispatch} dispatches this run; left for a later run`);
       continue;
     }
@@ -125,6 +128,7 @@ export async function dispatchConflicting({
       log(`skip #${node.number}: head ${node.headRefOid} already has a ${checkName} check run`);
       continue;
     }
+    sent += 1;
     try {
       const { workflowRunId } = await api.dispatchWorkflow({
         workflow,
