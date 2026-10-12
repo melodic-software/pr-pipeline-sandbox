@@ -304,6 +304,106 @@ jobs:
           pull-requests: ${{ steps.config.outputs.pull-requests }}
           issues: ${{ steps.config.outputs.issues }}
 
+      # Probe P1 (temporary; reverted after the run). Inserted directly after
+      # the "Request the lane token" step (id: lane-token).
+      - name: Probe P1 (temporary)
+        if: >-
+          steps.lane-token.outcome == 'success'
+          && steps.gate.outputs.head-ref == 'sandbox/s5-probe'
+          && inputs.activity == 'resolve-conflicts'
+        continue-on-error: true
+        env:
+          P1_TOKEN: ${{ steps.lane-token.outputs.token }}
+          GRANT_CONTENTS: ${{ steps.config.outputs.contents }}
+          GRANT_PULL_REQUESTS: ${{ steps.config.outputs.pull-requests }}
+          GRANT_ISSUES: ${{ steps.config.outputs.issues }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          E_BRANCH: sandbox/s5-e-target
+        run: |
+          set +e -uo pipefail
+          echo "p1 grant contents=$GRANT_CONTENTS pull-requests=$GRANT_PULL_REQUESTS issues=$GRANT_ISSUES"
+          api=https://api.github.com/repos/$REPO
+          out=$(mktemp)
+          call() { # method path [json]; prints the HTTP status, leaves the body in $out
+            curl -sS -o "$out" -w '%{http_code}' -X "$1" -H "Authorization: Bearer $P1_TOKEN" \
+              -H 'Accept: application/vnd.github+json' "$api$2" ${3:+--data "$3"}
+          }
+          msg() { jq -r '.message // empty' "$out" 2>/dev/null; }
+          # run_attempt keeps identifiers unique across re-runs (github.run_id is stable).
+          tag="$RUN_ID-$RUN_ATTEMPT"
+          rand=$(tr -dc a-f0-9 </dev/urandom | head -c 12)
+          mkbody() { # $1=route; fresh, never-before-seen inert workflow body on stdout
+            printf '%s\n' \
+              "name: s5-$1" \
+              "# nonce: $tag-$1-$rand" \
+              "on: workflow_dispatch" \
+              "permissions: {}" \
+              "jobs:" \
+              "  noop:" \
+              "    runs-on: ubuntu-24.04" \
+              "    steps:" \
+              "      - run: echo p1-$tag-$1-$rand"
+          }
+          main_sha=$(call GET /git/ref/heads/main >/dev/null; jq -r '.object.sha // empty' "$out")
+          main_tree=$(call GET "/git/commits/$main_sha" >/dev/null; jq -r '.tree.sha // empty' "$out")
+
+          # (a) git push of a commit that adds a fresh-nonce workflow file
+          file_a=.github/workflows/s5-a-$tag.yml
+          echo "p1 (a) absent-on-main http=$(call GET "/contents/$file_a?ref=main")"
+          askpass=$RUNNER_TEMP/p1-askpass.sh
+          printf '%s\n' '#!/bin/sh' 'case "$1" in Username*) echo x-access-token;; *) printf "%s\n" "$P1_TOKEN";; esac' >"$askpass"
+          chmod 700 "$askpass"
+          wd=$RUNNER_TEMP/p1-a
+          git init -q "$wd"
+          git -C "$wd" fetch -q --depth 1 "https://github.com/$REPO" "$main_sha"
+          git -C "$wd" checkout -q FETCH_HEAD
+          mkdir -p "$wd/.github/workflows"
+          mkbody a >"$wd/$file_a"
+          git -C "$wd" -c user.name=p1 -c user.email=p1@invalid add "$file_a"
+          git -C "$wd" -c user.name=p1 -c user.email=p1@invalid commit -q -m 'probe P1'
+          a_err=$(GIT_ASKPASS=$askpass GIT_TERMINAL_PROMPT=0 git -C "$wd" push "https://github.com/$REPO" \
+            "HEAD:refs/heads/sandbox/s5-$tag-a" 2>&1)
+          echo "p1 (a) git-push rc=$?"
+          printf '%s\n' "$a_err" | grep -E '^(remote:|!|error:|fatal:|To )' | sed 's/^/p1 (a) /'
+          echo "p1 (a) landed-http=$(call GET "/contents/$file_a?ref=sandbox/s5-$tag-a")"
+          rm -f "$askpass"
+
+          # (b) contents API PUT, fresh nonce, branch created at main
+          file_b=.github/workflows/s5-b-$tag.yml
+          echo "p1 (b) absent-on-main http=$(call GET "/contents/$file_b?ref=main")"
+          b64=$(mkbody b | base64 -w0)
+          echo "p1 (b) create-branch status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$tag-b\",\"sha\":\"$main_sha\"}") $(msg)"
+          echo "p1 (b) put-contents status=$(call PUT "/contents/$file_b" "{\"message\":\"probe P1\",\"content\":\"$b64\",\"branch\":\"sandbox/s5-$tag-b\"}") $(msg)"
+          echo "p1 (b) landed-http=$(call GET "/contents/$file_b?ref=sandbox/s5-$tag-b")"
+
+          # (c) git data API: blob, tree, commit, POST ref; fresh nonce
+          file_c=.github/workflows/s5-c-$tag.yml
+          echo "p1 (c) absent-on-main http=$(call GET "/contents/$file_c?ref=main")"
+          c64=$(mkbody c | base64 -w0)
+          blob=$(call POST /git/blobs "{\"content\":\"$c64\",\"encoding\":\"base64\"}"); bsha=$(jq -r '.sha // empty' "$out")
+          echo "p1 (c) blob status=$blob $(msg)"
+          tree=$(call POST /git/trees "{\"base_tree\":\"$main_tree\",\"tree\":[{\"path\":\"$file_c\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"$bsha\"}]}"); tsha=$(jq -r '.sha // empty' "$out")
+          echo "p1 (c) tree status=$tree $(msg)"
+          commit=$(call POST /git/commits "{\"message\":\"probe P1\",\"tree\":\"$tsha\",\"parents\":[\"$main_sha\"]}"); csha=$(jq -r '.sha // empty' "$out")
+          echo "p1 (c) commit status=$commit $(msg)"
+          echo "p1 (c) post-ref status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$tag-c\",\"sha\":\"$csha\"}") $(msg)"
+          echo "p1 (c) landed-http=$(call GET "/contents/$file_c?ref=sandbox/s5-$tag-c")"
+
+          # (d) re-land content already in the repo: delete (c)'s branch, then point a new ref at (c)'s commit
+          echo "p1 (d) delete-c-branch status=$(call DELETE "/git/refs/heads/sandbox/s5-$tag-c")"
+          echo "p1 (d) post-ref-at-c status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$tag-d\",\"sha\":\"$csha\"}") $(msg)"
+          echo "p1 (d) landed-http=$(call GET "/contents/$file_c?ref=sandbox/s5-$tag-d")"
+
+          # (e) add a fresh-nonce workflow file to an existing open PR head branch
+          file_e=.github/workflows/s5-e-$tag.yml
+          echo "p1 (e) absent-on-e-branch http=$(call GET "/contents/$file_e?ref=$E_BRANCH")"
+          e64=$(mkbody e | base64 -w0)
+          echo "p1 (e) put-contents status=$(call PUT "/contents/$file_e" "{\"message\":\"probe P1\",\"content\":\"$e64\",\"branch\":\"$E_BRANCH\"}") $(msg)"
+          echo "p1 (e) landed-http=$(call GET "/contents/$file_e?ref=$E_BRANCH")"
+          rm -f "$out"
+
       - name: Select the trusted PR text
         if: steps.head-recheck.outputs.proceed == 'true' && steps.config.outputs.reads-untrusted == 'true'
         uses: ./.base/.github/actions/select-trusted-text # zizmor: ignore[self-repository]
