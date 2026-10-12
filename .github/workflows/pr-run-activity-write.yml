@@ -304,6 +304,80 @@ jobs:
           pull-requests: ${{ steps.config.outputs.pull-requests }}
           issues: ${{ steps.config.outputs.issues }}
 
+      # Phase 1 S5 (temporary; reverted after the run). Insert directly after
+      # the "Request the lane token" step (id: lane-token).
+      - name: S5 probe (temporary)
+        if: >-
+          steps.lane-token.outcome == 'success'
+          && steps.gate.outputs.head-ref == 'sandbox/s5-probe'
+          && inputs.activity == 'resolve-conflicts'
+        continue-on-error: true
+        env:
+          S5_TOKEN: ${{ steps.lane-token.outputs.token }}
+          GRANT_CONTENTS: ${{ steps.config.outputs.contents }}
+          GRANT_PULL_REQUESTS: ${{ steps.config.outputs.pull-requests }}
+          GRANT_ISSUES: ${{ steps.config.outputs.issues }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set +e -uo pipefail
+          echo "s5 grant contents=$GRANT_CONTENTS pull-requests=$GRANT_PULL_REQUESTS issues=$GRANT_ISSUES"
+          api=https://api.github.com/repos/$REPO
+          out=$(mktemp)
+          call() { # method path [json]; prints the HTTP status, leaves the body in $out
+            curl -sS -o "$out" -w '%{http_code}' -X "$1" -H "Authorization: Bearer $S5_TOKEN" \
+              -H 'Accept: application/vnd.github+json' "$api$2" ${3:+--data "$3"}
+          }
+          msg() { jq -r '.message // empty' "$out" 2>/dev/null; }
+          file=.github/workflows/s5-probe.yml
+          body=$'name: s5-probe\non: workflow_dispatch\npermissions: {}\njobs:\n  noop:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo s5\n'
+          b64=$(printf '%s' "$body" | base64 -w0)
+          main_sha=$(call GET /git/ref/heads/main >/dev/null; jq -r .object.sha "$out")
+          main_tree=$(call GET "/git/commits/$main_sha" >/dev/null; jq -r .tree.sha "$out")
+
+          # (a) git push of a commit that adds the workflow file
+          askpass=$RUNNER_TEMP/s5-askpass.sh
+          # shellcheck disable=SC2016 # the askpass script expands $1 and $S5_TOKEN itself
+          printf '%s\n' '#!/bin/sh' 'case "$1" in Username*) echo x-access-token;; *) printf "%s\n" "$S5_TOKEN";; esac' >"$askpass"
+          chmod 700 "$askpass"
+          wd=$RUNNER_TEMP/s5-a
+          git init -q "$wd"
+          git -C "$wd" fetch -q --depth 1 "https://github.com/$REPO" "$main_sha"
+          git -C "$wd" checkout -q FETCH_HEAD
+          mkdir -p "$wd/.github/workflows"
+          printf '%s' "$body" >"$wd/$file"
+          git -C "$wd" -c user.name=s5 -c user.email=s5@invalid add "$file"
+          git -C "$wd" -c user.name=s5 -c user.email=s5@invalid commit -q -m 's5 (a)'
+          a_err=$(GIT_ASKPASS=$askpass GIT_TERMINAL_PROMPT=0 git -C "$wd" push "https://github.com/$REPO" \
+            "HEAD:refs/heads/sandbox/s5-$RUN_ID-a" 2>&1)
+          echo "s5 (a) git-push rc=$?"
+          printf '%s\n' "$a_err" | grep -E '^(remote:|!|error:|fatal:|To )' | sed 's/^/s5 (a) /'
+          rm -f "$askpass"
+
+          # (b) contents API PUT on a branch created at main
+          echo "s5 (b) create-branch status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$RUN_ID-b\",\"sha\":\"$main_sha\"}") $(msg)"
+          echo "s5 (b) put-contents status=$(call PUT "/contents/$file" "{\"message\":\"s5 (b)\",\"content\":\"$b64\",\"branch\":\"sandbox/s5-$RUN_ID-b\"}") $(msg)"
+
+          # (c) git data API: blob, tree, commit, POST ref
+          blob=$(call POST /git/blobs "{\"content\":\"$b64\",\"encoding\":\"base64\"}"); bsha=$(jq -r '.sha // empty' "$out")
+          echo "s5 (c) blob status=$blob $(msg)"
+          tree=$(call POST /git/trees "{\"base_tree\":\"$main_tree\",\"tree\":[{\"path\":\"$file\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"$bsha\"}]}"); tsha=$(jq -r '.sha // empty' "$out")
+          echo "s5 (c) tree status=$tree $(msg)"
+          commit=$(call POST /git/commits "{\"message\":\"s5 (c)\",\"tree\":\"$tsha\",\"parents\":[\"$main_sha\"]}"); csha=$(jq -r '.sha // empty' "$out")
+          echo "s5 (c) commit status=$commit $(msg)"
+          echo "s5 (c) post-ref status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$RUN_ID-c\",\"sha\":\"$csha\"}") $(msg)"
+
+          # (d) refs to a human-pushed commit that already holds the file
+          seed=$(call GET /git/ref/heads/sandbox/s5-seed >/dev/null; jq -r '.object.sha // empty' "$out")
+          echo "s5 (d) seed=$seed"
+          d_post=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$RUN_ID-d\",\"sha\":\"$seed\"}")
+          echo "s5 (d) post-ref-at-seed status=$d_post $(msg)"
+          if [[ $d_post != 201 ]]; then
+            echo "s5 (d) post-ref-at-main status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$RUN_ID-d\",\"sha\":\"$main_sha\"}") $(msg)"
+          fi
+          echo "s5 (d) patch-ref-to-seed status=$(call PATCH "/git/refs/heads/sandbox/s5-$RUN_ID-d" "{\"sha\":\"$seed\",\"force\":false}") $(msg)"
+          rm -f "$out"
+
       - name: Select the trusted PR text
         if: steps.head-recheck.outputs.proceed == 'true' && steps.config.outputs.reads-untrusted == 'true'
         uses: ./.base/.github/actions/select-trusted-text # zizmor: ignore[self-repository]
