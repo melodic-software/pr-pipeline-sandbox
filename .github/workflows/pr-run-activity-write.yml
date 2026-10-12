@@ -322,6 +322,7 @@ jobs:
           GRANT_ISSUES: ${{ steps.config.outputs.issues }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           PR_N: "117"
           WF_FILE: .github/workflows/s5-f-e55b455847c8.yml
         run: |
@@ -341,26 +342,45 @@ jobs:
           echo "p1 (f) get-pull status=$get_pr head_sha=$cf $(msg)"
           echo "p1 (f) precheck main-has-file status=$(call GET "/contents/$WF_FILE?ref=main")"
 
+          # Distinct branch names per run AND per re-run attempt: github.run_id is
+          # stable across re-runs while run_attempt increments, so without the
+          # attempt the branches would collide and route (i) would hit an
+          # already-exists ref and route (ii) would reuse an existing branch.
+          tag=$RUN_ID-$RUN_ATTEMPT
+          ref_i=sandbox/s5-$tag-f
+          ref_ii=sandbox/s5-$tag-f2
+
           # (i) POST /git/refs: point a NEW base branch at C_f (which carries the blob).
-          echo "p1 (f)(i) post-ref-at-cf status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$RUN_ID-f\",\"sha\":\"$cf\"}") $(msg)"
-          echo "p1 (f)(i) landed status=$(call GET "/contents/$WF_FILE?ref=sandbox/s5-$RUN_ID-f")"
+          echo "p1 (f)(i) post-ref-at-cf status=$(call POST /git/refs "{\"ref\":\"refs/heads/$ref_i\",\"sha\":\"$cf\"}") $(msg)"
+          i_landed=$(call GET "/contents/$WF_FILE?ref=$ref_i")
+          echo "p1 (f)(i) landed status=$i_landed"
 
           # (ii) git push of C_f (fetched from refs/pull/N/head) to a new base branch.
-          askpass=$RUNNER_TEMP/p1f-askpass.sh
-          printf '%s\n' '#!/bin/sh' 'case "$1" in Username*) echo x-access-token;; *) printf "%s\n" "$P1_TOKEN";; esac' >"$askpass"
-          chmod 700 "$askpass"
-          wd=$RUNNER_TEMP/p1f-push
-          git init -q "$wd"
-          GIT_ASKPASS=$askpass GIT_TERMINAL_PROMPT=0 git -C "$wd" fetch -q "https://github.com/$REPO" "refs/pull/$PR_N/head"
-          echo "p1 (f)(ii) fetch-pull-head rc=$?"
-          git -C "$wd" checkout -q FETCH_HEAD
-          echo "p1 (f)(ii) local-head=$(git -C "$wd" rev-parse HEAD) has-file=$(git -C "$wd" ls-tree -r --name-only HEAD | grep -c "$WF_FILE")"
-          push_err=$(GIT_ASKPASS=$askpass GIT_TERMINAL_PROMPT=0 git -C "$wd" push "https://github.com/$REPO" \
-            "HEAD:refs/heads/sandbox/s5-$RUN_ID-f2" 2>&1)
-          echo "p1 (f)(ii) git-push rc=$?"
-          printf '%s\n' "$push_err" | grep -E '^(remote:|!|error:|fatal:|To )' | sed 's/^/p1 (f)(ii) /'
-          echo "p1 (f)(ii) landed status=$(call GET "/contents/$WF_FILE?ref=sandbox/s5-$RUN_ID-f2")"
-          rm -f "$askpass" "$out"
+          # Independence guard: both routes share one fork commit (C_f). If route
+          # (i) already made the blob reachable from a base branch, a route-(ii)
+          # "landed" would only prove re-landing already-present content, not that
+          # a push of fork-PR-only content is accepted. Only run (ii) as a valid
+          # new-content push test when route (i) did NOT land the blob.
+          if [ "$i_landed" = "200" ]; then
+            echo "p1 (f)(ii) skipped=contaminated reason=route-(i)-already-landed-blob-on-base-branch"
+          else
+            askpass=$RUNNER_TEMP/p1f-askpass.sh
+            printf '%s\n' '#!/bin/sh' 'case "$1" in Username*) echo x-access-token;; *) printf "%s\n" "$P1_TOKEN";; esac' >"$askpass"
+            chmod 700 "$askpass"
+            wd=$RUNNER_TEMP/p1f-push
+            git init -q "$wd"
+            GIT_ASKPASS=$askpass GIT_TERMINAL_PROMPT=0 git -C "$wd" fetch -q "https://github.com/$REPO" "refs/pull/$PR_N/head"
+            echo "p1 (f)(ii) fetch-pull-head rc=$?"
+            git -C "$wd" checkout -q FETCH_HEAD
+            echo "p1 (f)(ii) local-head=$(git -C "$wd" rev-parse HEAD) has-file=$(git -C "$wd" ls-tree -r --name-only HEAD | grep -c "$WF_FILE")"
+            push_err=$(GIT_ASKPASS=$askpass GIT_TERMINAL_PROMPT=0 git -C "$wd" push "https://github.com/$REPO" \
+              "HEAD:refs/heads/$ref_ii" 2>&1)
+            echo "p1 (f)(ii) git-push rc=$?"
+            printf '%s\n' "$push_err" | grep -E '^(remote:|!|error:|fatal:|To )' | sed 's/^/p1 (f)(ii) /'
+            echo "p1 (f)(ii) landed status=$(call GET "/contents/$WF_FILE?ref=$ref_ii")"
+            rm -f "$askpass"
+          fi
+          rm -f "$out"
 
       - name: Select the trusted PR text
         if: steps.head-recheck.outputs.proceed == 'true' && steps.config.outputs.reads-untrusted == 'true'
