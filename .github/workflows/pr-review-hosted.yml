@@ -1,8 +1,8 @@
 name: pr-review-hosted
 
-# Sandbox caller of the org code-review reusable, pinned at the ci-workflows
-# commit that adds allowed-bot-sender-ids (Phase 9 case 14): a push by the
-# lanes App bot is reviewed, any other bot's push is skipped.
+# Sandbox caller of the org code-review reusable, pinned at ci-workflows
+# v0.41.0: a push by the lanes App bot is reviewed, any other bot's push is
+# skipped, and the lane writes its completion annotation.
 
 on:
   pull_request:
@@ -22,7 +22,7 @@ jobs:
       contents: read
       pull-requests: write
       id-token: write
-    uses: melodic-software/ci-workflows/.github/workflows/pr-review.yml@a92020292976c2e9b50f7adc922693a45a6c1226
+    uses: melodic-software/ci-workflows/.github/workflows/pr-review.yml@a621ef8112677a519b662ec5d2547475c0101f7e
     with:
       runner: ubuntu-24.04
       allowed-bot-sender-ids: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
