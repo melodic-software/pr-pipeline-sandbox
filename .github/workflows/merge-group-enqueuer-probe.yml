@@ -1,0 +1,94 @@
+name: merge-group-enqueuer-probe
+
+# Phase 11 entry probe (auto-merge-safe-prs, T22): in a merge_group run, can a
+# job holding only the read scopes below read the entry's enqueuer, the PR's
+# linked issues and timeline, and the merge-queue ruleset? Report-only: every
+# read prints its result to the job summary and the job never fails on a read.
+# Refs: melodic-software/claude-code-plugins#6202
+
+on:
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  actions: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Read enqueuer, issues, timeline, ruleset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          BASE_REF: ${{ github.event.merge_group.base_ref }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set +e
+          out="$GITHUB_STEP_SUMMARY"
+          section() { printf '\n### %s\n\n```\n' "$1" | tee -a "$out"; }
+          endsec() { printf '```\n' | tee -a "$out"; }
+          run() { "$@" 2>&1 | head -c 6000 | tee -a "$out"; printf '\nexit=%s\n' "${PIPESTATUS[0]}" | tee -a "$out"; }
+
+          name="${REPO#*/}"
+          pr="$(printf '%s' "$HEAD_REF" | sed -nE 's#^refs/heads/gh-readonly-queue/[^/]+/pr-([0-9]+)-[0-9a-f]+$#\1#p')"
+
+          section "event context"
+          printf 'head_ref=%s\nhead_sha=%s\nbase_ref=%s\nbase_sha=%s\nactor=%s\ntriggering_actor=%s\nparsed_pr=%s\nrun_id=%s attempt=%s\n' \
+            "$HEAD_REF" "$HEAD_SHA" "$BASE_REF" "$BASE_SHA" "$ACTOR" "$TRIGGERING_ACTOR" "$pr" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" | tee -a "$out"
+          endsec
+
+          section "merge_group payload keys and sender"
+          run jq '{action, merge_group: (.merge_group | {head_sha, head_ref, base_sha, base_ref, head_commit: (.head_commit | {id, message, author, committer})}), sender: (.sender | {login, type, id})}' "$GITHUB_EVENT_PATH"
+          endsec
+
+          section "(a) AddedToMergeQueueEvent actor + enqueuer (GraphQL timelineItems)"
+          run gh api graphql -F owner="$OWNER" -F name="$name" -F pr="$pr" -f query='
+            query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){
+              timelineItems(last:10,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename
+                ... on AddedToMergeQueueEvent{id createdAt actor{__typename login} enqueuer{__typename login} mergeQueue{id}}
+                ... on RemovedFromMergeQueueEvent{createdAt actor{__typename login} enqueuer{__typename login} reason}}}}}}'
+          endsec
+
+          section "(b) MergeQueueEntry.enqueuer (pullRequest.mergeQueueEntry)"
+          run gh api graphql -F owner="$OWNER" -F name="$name" -F pr="$pr" -f query='
+            query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){
+              mergeQueueEntry{id state position enqueuedAt solo jump enqueuer{__typename login} headCommit{oid} baseCommit{oid}}}}}'
+          endsec
+
+          section "(b2) repository.mergeQueue entries"
+          run gh api graphql -F owner="$OWNER" -F name="$name" -F branch="${BASE_REF#refs/heads/}" -f query='
+            query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){
+              configuration{mergingStrategy mergeMethod maximumEntriesToBuild}
+              entries(first:20){nodes{position state enqueuer{__typename login} pullRequest{number} headCommit{oid}}}}}}'
+          endsec
+
+          section "(c1) PR closingIssuesReferences, labels, body (GraphQL)"
+          run gh api graphql -F owner="$OWNER" -F name="$name" -F pr="$pr" -f query='
+            query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){
+              number author{__typename login} headRefOid labels(first:20){nodes{name}}
+              closingIssuesReferences(first:10){nodes{number state}}}}}'
+          endsec
+
+          section "(c2) REST issues timeline"
+          run gh api "repos/$REPO/issues/$pr/timeline?per_page=100" --jq '.[] | {event, actor: (.actor.login // .user.login // null), actor_type: (.actor.type // .user.type // null), created_at, label: (.label.name // null)}'
+          endsec
+
+          section "(c3) REST pull + issue events"
+          run gh api "repos/$REPO/pulls/$pr" --jq '{number, state, user: .user.login, labels: [.labels[].name], body: (.body[0:200])}'
+          run gh api "repos/$REPO/issues/$pr/events?per_page=100" --jq '.[] | {event, actor: .actor.login, created_at}'
+          endsec
+
+          section "(d) merge-queue ruleset read (grouping_strategy)"
+          run gh api "repos/$REPO/rules/branches/${BASE_REF#refs/heads/}" --jq '.[] | select(.type=="merge_queue") | .parameters'
+          run gh api "repos/$REPO/rulesets" --jq '.[] | {id, name}'
+          endsec
