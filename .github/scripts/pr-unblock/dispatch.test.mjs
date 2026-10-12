@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
-import { createGitHubApi, dispatchConflicting } from "./dispatch.mjs";
+import { createGitHubApi, dispatchConflicting, main } from "./dispatch.mjs";
 
 const CHECK_NAME = "pr-unblock / resolve-conflicts";
 const SUCCESS_RUN = { status: "completed", conclusion: "success", output: { title: "Resolved" } };
@@ -26,13 +29,16 @@ function pr(number, overrides = {}) {
 // A fake of the four GitHub calls. `pages` is the open-PR listing, one array
 // per page; `requeries` is, per re-query round, the PR nodes GitHub returns;
 // `checked` is the set of head SHAs that already carry a successful check run,
-// or a Map from head SHA to the check runs GitHub returns for it.
+// or a Map from head SHA to the check runs GitHub returns for it. `runIds`
+// maps a PR number to the workflow_run_id its dispatch returns, undefined
+// included; any other PR gets 9000 plus its number.
 function fakeApi({
   pages = [[]],
   requeries = [],
   checked = new Set(),
   failDispatch = new Set(),
   failChecks = new Set(),
+  runIds = new Map(),
 } = {}) {
   const calls = { list: [], get: [], checks: [], dispatch: [] };
   let round = 0;
@@ -66,6 +72,9 @@ function fakeApi({
       calls.dispatch.push({ workflow, ref, inputs });
       if (failDispatch.has(inputs["pr-number"])) {
         throw new Error("dispatch failed");
+      }
+      if (runIds.has(inputs["pr-number"])) {
+        return { workflowRunId: runIds.get(inputs["pr-number"]) };
       }
       return { workflowRunId: 9000 + Number(inputs["pr-number"]) };
     },
@@ -270,8 +279,141 @@ test("a failed dispatch or check-run read is reported and the other PRs still go
   assert.equal(result.failed, 2);
 });
 
+test("a 200 dispatch with no workflow_run_id counts as failed and is not reported dispatched", async () => {
+  const { api, lines, run } = harness({
+    pages: [[pr(71), pr(72)]],
+    runIds: new Map([["71", undefined]]),
+  });
+  const result = await run();
+  assert.deepEqual(dispatchedNumbers(api), ["71", "72"]);
+  assert.deepEqual(result.dispatched, [{ number: 72, workflowRunId: "9072" }]);
+  assert.equal(result.failed, 1);
+  assert.ok(lines.some((line) => line.startsWith("::error::") && line.includes("#71")));
+  assert.ok(!lines.some((line) => line.startsWith("dispatched #71")));
+});
+
+test("a dispatch with an unusable workflow_run_id still uses one of the maxDispatch slots", async () => {
+  const { api, lines, run } = harness({
+    pages: [[pr(131), pr(132), pr(133), pr(134)]],
+    runIds: new Map([["131", undefined]]),
+  });
+  const result = await run();
+  assert.deepEqual(dispatchedNumbers(api), ["131", "132", "133"]);
+  assert.deepEqual(result.dispatched, [
+    { number: 132, workflowRunId: "9132" },
+    { number: 133, workflowRunId: "9133" },
+  ]);
+  assert.equal(result.failed, 1);
+  assert.ok(lines.some((line) => line.includes("#134") && /later run/.test(line)));
+});
+
+test("a dispatch call that throws still uses one of the maxDispatch slots", async () => {
+  const { api, lines, run } = harness({
+    pages: [[pr(141), pr(142), pr(143), pr(144)]],
+    failDispatch: new Set(["141"]),
+  });
+  const result = await run();
+  assert.deepEqual(dispatchedNumbers(api), ["141", "142", "143"]);
+  assert.equal(result.failed, 1);
+  assert.ok(lines.some((line) => line.includes("#144") && /later run/.test(line)));
+});
+
+test("a workflow_run_id that is not 1 to 15 digits without a leading zero counts as failed", async () => {
+  const bad = [
+    ["81", "0123"],
+    ["82", 0],
+    ["83", "12a"],
+    ["84", 1.5],
+    ["85", "1234567890123456"],
+    ["86", ""],
+    ["87", null],
+    ["88", -5],
+  ];
+  const { lines, run } = harness(
+    { pages: [bad.map(([number]) => pr(Number(number)))], runIds: new Map(bad) },
+    { maxDispatch: 10 },
+  );
+  const result = await run();
+  assert.deepEqual(result.dispatched, []);
+  assert.equal(result.failed, bad.length);
+  for (const [number] of bad) {
+    assert.ok(
+      lines.some((line) => line.startsWith("::error::") && line.includes(`#${number}`)),
+      number,
+    );
+  }
+});
+
+test("a 15-digit workflow_run_id is accepted", async () => {
+  const { run } = harness({
+    pages: [[pr(91)]],
+    runIds: new Map([["91", 123456789012345]]),
+  });
+  const result = await run();
+  assert.deepEqual(result.dispatched, [{ number: 91, workflowRunId: "123456789012345" }]);
+  assert.equal(result.failed, 0);
+});
+
+// main against a fake API, with GITHUB_OUTPUT a real file it appends to.
+async function runMain(apiOptions) {
+  const dir = mkdtempSync(join(tmpdir(), "pr-unblock-dispatch-"));
+  const output = join(dir, "output");
+  writeFileSync(output, "");
+  try {
+    const code = await main(
+      {
+        GITHUB_TOKEN: "t0ken",
+        GITHUB_REPOSITORY: "octo/repo",
+        GITHUB_RUN_ID: "4242",
+        GITHUB_OUTPUT: output,
+      },
+      { api: fakeApi(apiOptions), sleep: async () => {}, log: () => {} },
+    );
+    return { code, output: readFileSync(output, "utf8") };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("main writes run-ids to GITHUB_OUTPUT in ascending PR order", async () => {
+  const { code, output } = await runMain({
+    pages: [[pr(103), pr(101), pr(102)]],
+    runIds: new Map([
+      ["101", 38255833396],
+      ["102", 38255833401],
+      ["103", 38255833399],
+    ]),
+  });
+  assert.equal(code, 0);
+  assert.equal(output, "run-ids=38255833396 38255833401 38255833399\n");
+});
+
+test("main writes the recorded ids and exits 1 when another dispatch failed", async () => {
+  const { code, output } = await runMain({
+    pages: [[pr(111), pr(112), pr(113)]],
+    failDispatch: new Set(["112"]),
+    runIds: new Map([
+      ["111", 500],
+      ["113", undefined],
+    ]),
+  });
+  assert.equal(code, 1);
+  assert.equal(output, "run-ids=500\n");
+});
+
+test("main writes nothing to GITHUB_OUTPUT when no run was dispatched", async () => {
+  const noPulls = await runMain({ pages: [[pr(121, { mergeable: "MERGEABLE" })]] });
+  assert.deepEqual(noPulls, { code: 0, output: "" });
+  const noRunId = await runMain({
+    pages: [[pr(122)]],
+    runIds: new Map([["122", undefined]]),
+  });
+  assert.deepEqual(noRunId, { code: 1, output: "" });
+});
+
 // The REST contract (docs.github.com rest/actions/workflows "Create a workflow
-// dispatch event": 200 with workflow_run_id; rest/checks/runs "List check runs
+// dispatch event", API version 2022-11-28: 200 with workflow_run_id only when
+// return_run_details is true, else 204; rest/checks/runs "List check runs
 // for a Git reference" with check_name) and the GraphQL listing.
 test("the GitHub adapter calls the documented endpoints", async () => {
   const requests = [];
@@ -293,6 +435,11 @@ test("the GitHub adapter calls the documented endpoints", async () => {
       body: init.body && JSON.parse(init.body),
       auth: init.headers.Authorization,
     });
+    const body = init.body && JSON.parse(init.body);
+    if (url.endsWith("/dispatches") && body.return_run_details !== true) {
+      responses.shift();
+      return { ok: true, status: 204, json: async () => assert.fail("204 has no body") };
+    }
     return { ok: true, status: 200, json: async () => responses.shift() };
   };
   const api = createGitHubApi({
@@ -330,7 +477,11 @@ test("the GitHub adapter calls the documented endpoints", async () => {
     requests[2].url,
     "https://api.example/repos/octo/repo/actions/workflows/pr-unblock.yml/dispatches",
   );
-  assert.deepEqual(requests[2].body, { ref: "refs/heads/main", inputs: { "pr-number": "1" } });
+  assert.deepEqual(requests[2].body, {
+    ref: "refs/heads/main",
+    inputs: { "pr-number": "1" },
+    return_run_details: true,
+  });
   assert.equal(requests[2].method, "POST");
   assert.equal(requests[2].auth, "Bearer t0ken");
 });
