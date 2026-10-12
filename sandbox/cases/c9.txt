@@ -1,0 +1,2 @@
+Case 9 fixture: the production replica count. Exactly one value is allowed and the capacity review owns it; do not average, combine or pick a side without that review.
+replicas: 9

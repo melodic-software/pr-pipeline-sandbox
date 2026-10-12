@@ -28,6 +28,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      id-token: write
     concurrency:
       group: ${{ github.workflow }}-check-sandbox-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
@@ -43,6 +44,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      id-token: write
     concurrency:
       group: ${{ github.workflow }}-check-disabled-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
@@ -58,6 +60,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      id-token: write
     concurrency:
       group: ${{ github.workflow }}-check-token-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
@@ -73,6 +76,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      id-token: write
     concurrency:
       group: ${{ github.workflow }}-explain-marker-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
@@ -90,6 +94,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      id-token: write
     concurrency:
       group: ${{ github.workflow }}-check-hardening-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
@@ -105,6 +110,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      id-token: write
     concurrency:
       group: ${{ github.workflow }}-check-trusted-text-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
@@ -120,6 +126,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      id-token: write
     concurrency:
       group: ${{ github.workflow }}-review-gate-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
@@ -137,6 +144,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      id-token: write
     concurrency:
       group: ${{ github.workflow }}-audit-env-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
