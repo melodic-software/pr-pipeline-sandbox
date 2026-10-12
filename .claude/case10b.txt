@@ -1,2 +1,2 @@
 Case 10b fixture under .claude.
-value: seed
+value: s5-pr-side
