@@ -56,10 +56,6 @@ jobs:
       issues: read
       pull-requests: read
     steps:
-      - name: Check out the group (for the trace script)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - name: Check out the rule
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,8 +67,6 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ github.event.merge_group.base_sha }}
-          BASE_REF: ${{ github.event.merge_group.base_ref }}
           LANES_DISABLED: ${{ vars.CLAUDE_LANES_DISABLED }}
         run: |
           set +e
@@ -83,9 +77,6 @@ jobs:
             gh api "repos/$GITHUB_REPOSITORY/$ep" 2>&1 | head -c 2000
             echo "exit=${PIPESTATUS[0]}"
           done
-          pr=$(sed -nE 's#^(refs/heads/)?gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]{40}$#\2#p' <<<"$GITHUB_REF")
-          python3 sandbox/trace_recheck.py queue-base/plugins/source-control/skills/babysit-prs/scripts \
-            "$GITHUB_REPOSITORY" "$pr" "$BASE_SHA" "${BASE_REF#refs/heads/}" "$LANES_DISABLED"
       - name: Recheck a non-human enqueue
         env:
           GH_TOKEN: ${{ github.token }}
