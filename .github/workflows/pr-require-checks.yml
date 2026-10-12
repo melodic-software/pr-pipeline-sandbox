@@ -44,8 +44,6 @@ jobs:
   # command, with the rule checked out from that PR's head instead of the
   # queue base (this repository carries no copy of the policy script).
   # claude-code-plugins is public, so the default token clones it.
-  # `repos/{repo}/actions/organization-variables` is the REST "list repository
-  # organization variables" endpoint the policy itself reads.
   unattended-recheck:
     if: github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
@@ -63,20 +61,6 @@ jobs:
           ref: 958e7cdbb35873cff57fd668388fb3699c33807d
           path: queue-base
           persist-credentials: false
-      - name: Probe the Actions variables reads (report-only)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          LANES_DISABLED: ${{ vars.CLAUDE_LANES_DISABLED }}
-        run: |
-          set +e
-          echo "vars.CLAUDE_LANES_DISABLED=[$LANES_DISABLED]"
-          for ep in "actions/variables?per_page=1" "actions/variables/CLAUDE_LANES_MERGE_RUNG_CAP" \
-                    "actions/variables/CLAUDE_LANES_REPO_DISABLED" "actions/organization-variables?per_page=100"; do
-            echo "--- gh api repos/$GITHUB_REPOSITORY/$ep"
-            gh api "repos/$GITHUB_REPOSITORY/$ep" 2>&1 | head -c 2000
-            echo "exit=${PIPESTATUS[0]}"
-          done
       - name: Recheck a non-human enqueue
         env:
           GH_TOKEN: ${{ github.token }}
