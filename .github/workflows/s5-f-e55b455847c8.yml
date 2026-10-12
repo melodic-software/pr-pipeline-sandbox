@@ -1,0 +1,8 @@
+name: s5-f-e55b455847c8
+on: workflow_dispatch
+permissions: {}
+jobs:
+  noop:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo probe-p1-f e55b455847c8
