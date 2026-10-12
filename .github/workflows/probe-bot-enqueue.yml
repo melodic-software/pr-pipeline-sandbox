@@ -1,0 +1,26 @@
+name: probe-bot-enqueue
+
+# Sandbox probe: arm auto-merge as github-actions[bot] (GITHUB_TOKEN), the shape
+# pr-automerge-dependabot.yml uses in claude-code-plugins, to record what GitHub
+# stores as the AddedToMergeQueueEvent actor and enqueuer and whether the
+# merge_group run starts at all.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  arm:
+    if: github.head_ref == 'chore/probe-bot-enqueue'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Arm auto-merge as github-actions[bot]
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr merge "$PR" -R "$GITHUB_REPOSITORY" --squash --auto
