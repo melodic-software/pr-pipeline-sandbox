@@ -319,6 +319,7 @@ jobs:
           GRANT_ISSUES: ${{ steps.config.outputs.issues }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           E_BRANCH: sandbox/s5-e-target
         run: |
           set +e -uo pipefail
@@ -330,24 +331,26 @@ jobs:
               -H 'Accept: application/vnd.github+json' "$api$2" ${3:+--data "$3"}
           }
           msg() { jq -r '.message // empty' "$out" 2>/dev/null; }
+          # run_attempt keeps identifiers unique across re-runs (github.run_id is stable).
+          tag="$RUN_ID-$RUN_ATTEMPT"
           rand=$(tr -dc a-f0-9 </dev/urandom | head -c 12)
           mkbody() { # $1=route; fresh, never-before-seen inert workflow body on stdout
             printf '%s\n' \
               "name: s5-$1" \
-              "# nonce: $RUN_ID-$1-$rand" \
+              "# nonce: $tag-$1-$rand" \
               "on: workflow_dispatch" \
               "permissions: {}" \
               "jobs:" \
               "  noop:" \
               "    runs-on: ubuntu-24.04" \
               "    steps:" \
-              "      - run: echo p1-$RUN_ID-$1-$rand"
+              "      - run: echo p1-$tag-$1-$rand"
           }
-          main_sha=$(call GET /git/ref/heads/main >/dev/null; jq -r .object.sha "$out")
-          main_tree=$(call GET "/git/commits/$main_sha" >/dev/null; jq -r .tree.sha "$out")
+          main_sha=$(call GET /git/ref/heads/main >/dev/null; jq -r '.object.sha // empty' "$out")
+          main_tree=$(call GET "/git/commits/$main_sha" >/dev/null; jq -r '.tree.sha // empty' "$out")
 
           # (a) git push of a commit that adds a fresh-nonce workflow file
-          file_a=.github/workflows/s5-a-$RUN_ID.yml
+          file_a=.github/workflows/s5-a-$tag.yml
           echo "p1 (a) absent-on-main http=$(call GET "/contents/$file_a?ref=main")"
           askpass=$RUNNER_TEMP/p1-askpass.sh
           printf '%s\n' '#!/bin/sh' 'case "$1" in Username*) echo x-access-token;; *) printf "%s\n" "$P1_TOKEN";; esac' >"$askpass"
@@ -361,22 +364,22 @@ jobs:
           git -C "$wd" -c user.name=p1 -c user.email=p1@invalid add "$file_a"
           git -C "$wd" -c user.name=p1 -c user.email=p1@invalid commit -q -m 'probe P1'
           a_err=$(GIT_ASKPASS=$askpass GIT_TERMINAL_PROMPT=0 git -C "$wd" push "https://github.com/$REPO" \
-            "HEAD:refs/heads/sandbox/s5-$RUN_ID-a" 2>&1)
+            "HEAD:refs/heads/sandbox/s5-$tag-a" 2>&1)
           echo "p1 (a) git-push rc=$?"
           printf '%s\n' "$a_err" | grep -E '^(remote:|!|error:|fatal:|To )' | sed 's/^/p1 (a) /'
-          echo "p1 (a) landed-http=$(call GET "/contents/$file_a?ref=sandbox/s5-$RUN_ID-a")"
+          echo "p1 (a) landed-http=$(call GET "/contents/$file_a?ref=sandbox/s5-$tag-a")"
           rm -f "$askpass"
 
           # (b) contents API PUT, fresh nonce, branch created at main
-          file_b=.github/workflows/s5-b-$RUN_ID.yml
+          file_b=.github/workflows/s5-b-$tag.yml
           echo "p1 (b) absent-on-main http=$(call GET "/contents/$file_b?ref=main")"
           b64=$(mkbody b | base64 -w0)
-          echo "p1 (b) create-branch status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$RUN_ID-b\",\"sha\":\"$main_sha\"}") $(msg)"
-          echo "p1 (b) put-contents status=$(call PUT "/contents/$file_b" "{\"message\":\"probe P1\",\"content\":\"$b64\",\"branch\":\"sandbox/s5-$RUN_ID-b\"}") $(msg)"
-          echo "p1 (b) landed-http=$(call GET "/contents/$file_b?ref=sandbox/s5-$RUN_ID-b")"
+          echo "p1 (b) create-branch status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$tag-b\",\"sha\":\"$main_sha\"}") $(msg)"
+          echo "p1 (b) put-contents status=$(call PUT "/contents/$file_b" "{\"message\":\"probe P1\",\"content\":\"$b64\",\"branch\":\"sandbox/s5-$tag-b\"}") $(msg)"
+          echo "p1 (b) landed-http=$(call GET "/contents/$file_b?ref=sandbox/s5-$tag-b")"
 
           # (c) git data API: blob, tree, commit, POST ref; fresh nonce
-          file_c=.github/workflows/s5-c-$RUN_ID.yml
+          file_c=.github/workflows/s5-c-$tag.yml
           echo "p1 (c) absent-on-main http=$(call GET "/contents/$file_c?ref=main")"
           c64=$(mkbody c | base64 -w0)
           blob=$(call POST /git/blobs "{\"content\":\"$c64\",\"encoding\":\"base64\"}"); bsha=$(jq -r '.sha // empty' "$out")
@@ -385,16 +388,16 @@ jobs:
           echo "p1 (c) tree status=$tree $(msg)"
           commit=$(call POST /git/commits "{\"message\":\"probe P1\",\"tree\":\"$tsha\",\"parents\":[\"$main_sha\"]}"); csha=$(jq -r '.sha // empty' "$out")
           echo "p1 (c) commit status=$commit $(msg)"
-          echo "p1 (c) post-ref status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$RUN_ID-c\",\"sha\":\"$csha\"}") $(msg)"
-          echo "p1 (c) landed-http=$(call GET "/contents/$file_c?ref=sandbox/s5-$RUN_ID-c")"
+          echo "p1 (c) post-ref status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$tag-c\",\"sha\":\"$csha\"}") $(msg)"
+          echo "p1 (c) landed-http=$(call GET "/contents/$file_c?ref=sandbox/s5-$tag-c")"
 
           # (d) re-land content already in the repo: delete (c)'s branch, then point a new ref at (c)'s commit
-          echo "p1 (d) delete-c-branch status=$(call DELETE "/git/refs/heads/sandbox/s5-$RUN_ID-c")"
-          echo "p1 (d) post-ref-at-c status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$RUN_ID-d\",\"sha\":\"$csha\"}") $(msg)"
-          echo "p1 (d) landed-http=$(call GET "/contents/$file_c?ref=sandbox/s5-$RUN_ID-d")"
+          echo "p1 (d) delete-c-branch status=$(call DELETE "/git/refs/heads/sandbox/s5-$tag-c")"
+          echo "p1 (d) post-ref-at-c status=$(call POST /git/refs "{\"ref\":\"refs/heads/sandbox/s5-$tag-d\",\"sha\":\"$csha\"}") $(msg)"
+          echo "p1 (d) landed-http=$(call GET "/contents/$file_c?ref=sandbox/s5-$tag-d")"
 
           # (e) add a fresh-nonce workflow file to an existing open PR head branch
-          file_e=.github/workflows/s5-e-$RUN_ID.yml
+          file_e=.github/workflows/s5-e-$tag.yml
           echo "p1 (e) absent-on-e-branch http=$(call GET "/contents/$file_e?ref=$E_BRANCH")"
           e64=$(mkbody e | base64 -w0)
           echo "p1 (e) put-contents status=$(call PUT "/contents/$file_e" "{\"message\":\"probe P1\",\"content\":\"$e64\",\"branch\":\"$E_BRANCH\"}") $(msg)"
