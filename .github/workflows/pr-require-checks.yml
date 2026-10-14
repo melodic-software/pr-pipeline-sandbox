@@ -19,6 +19,9 @@ on:
   # required check that never reports on it leaves the queued PR unmergeable.
   merge_group:
     types: [checks_requested]
+  # The pr-merge lane starts a full run of main after it merges a PR, and its
+  # post-merge check waits for that run.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -39,51 +42,8 @@ jobs:
           fi
           echo ".ci-force-red is absent."
 
-  # Phase 11 proof (auto-merge-safe-prs): the `unattended-recheck` job from
-  # melodic-software/claude-code-plugins#7334, same permissions, timeout and
-  # command, with the rule checked out from that PR's head instead of the
-  # queue base (this repository carries no copy of the policy script).
-  # claude-code-plugins is public, so the default token clones it.
-  unattended-recheck:
-    if: github.event_name == 'merge_group'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      actions: read
-      contents: read
-      issues: read
-      pull-requests: read
-    steps:
-      - name: Check out the rule
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: melodic-software/claude-code-plugins
-          ref: 958e7cdbb35873cff57fd668388fb3699c33807d
-          path: queue-base
-          persist-credentials: false
-      - name: Recheck a non-human enqueue
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ github.event.merge_group.base_sha }}
-          BASE_REF: ${{ github.event.merge_group.base_ref }}
-          LANES_DISABLED: ${{ vars.CLAUDE_LANES_DISABLED }}
-        run: |
-          pr=$(sed -nE 's#^(refs/heads/)?gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]{40}$#\2#p' <<<"$GITHUB_REF")
-          if [ -z "$pr" ]; then
-            echo "::error::cannot read a pull request number from the merge-group ref '$GITHUB_REF'."
-            exit 1
-          fi
-          policy=queue-base/plugins/source-control/skills/babysit-prs/scripts/babysit_merge_policy.py
-          if ! grep -qs '^def recheck(' "$policy"; then
-            echo "The queue base predates the merge-group recheck; nothing to recheck for #$pr."
-            exit 0
-          fi
-          python3 "$policy" recheck --repo "$GITHUB_REPOSITORY" --pr "$pr" \
-            --base-sha "$BASE_SHA" --base-ref "${BASE_REF#refs/heads/}" \
-            --lanes-disabled "$LANES_DISABLED"
-
   ci-status:
-    needs: [check-force-red, unattended-recheck]
+    needs: [check-force-red]
     # !cancelled(), never a success guard: a failed gate must still run this
     # job so it turns red. A skipped required check reports success.
     if: ${{ !cancelled() }}
@@ -93,12 +53,6 @@ jobs:
       - name: Aggregate gate results
         env:
           FORCE_RED: ${{ needs.check-force-red.result }}
-          RECHECK: ${{ needs.unattended-recheck.result }}
         run: |
           echo "check-force-red: $FORCE_RED"
-          echo "unattended-recheck: $RECHECK"
-          # The recheck's skip passes only off the merge queue, as in #7334.
-          if [ "$RECHECK" = skipped ] && [ "$GITHUB_EVENT_NAME" != merge_group ]; then
-            RECHECK=success
-          fi
-          [ "$FORCE_RED" = success ] && [ "$RECHECK" = success ]
+          [ "$FORCE_RED" = success ]
