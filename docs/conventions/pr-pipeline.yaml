@@ -128,7 +128,9 @@ activities:
     inputs: [issue]
     applies-when:
       events: [labeled]
-      labels: ["work-class: read-only"]
+      # Sandbox only: mechanical issues too, so the lanes App labels the PRs
+      # the pr-merge cases need.
+      labels: ["work-class: read-only", "work-class: mechanical"]
       labeled-after: "2026-10-14T18:50:34Z"
   report-outcome:
     script: .github/scripts/work-resolve-issue/report-outcome.mjs
@@ -137,7 +139,20 @@ activities:
     reads-untrusted: false
     inputs: [issue]
 
+  # The pr-merge lane, copied from claude-code-plugins' config.
+  merge-pr:
+    script: plugins/source-control/scripts/source-control-babysit-merge
+    args: --unattended --authority pr-merge --merge
+    effect: merge
+    gating: advisory
+    reads-untrusted: true
+    inputs: [pr, head-sha]
+
 lanes:
+  pr-merge:
+    stage: merge
+    slots:
+      - activity: merge-pr
   work-resolve-issue:
     stage: work
     slots:
@@ -175,3 +190,34 @@ lanes:
     slots:
       - activity: review-gate
       - activity: audit-env
+
+merge:
+  # The lane auto-merges only PRs labeled `work-class: mechanical` (C2):
+  # dependency bumps, lint and format fixes, syncs. The classes C1-C5 (read-only,
+  # mechanical, scoped, structural, untrusted-provenance) are defined in
+  # plugins/autonomy/reference/guardrails/work-classes.md.
+  rung: C2
+  authority: pr-merge
+  agent-identity: melodic-automation-lanes[bot]
+  # Sandbox only: live, so the pr-merge cases really enqueue. Main stays
+  # report-only until the owner flips it.
+  report-only: false
+  diff-check:
+    denied-paths:
+      - ".github/**"
+      - "docs/conventions/**"
+      - "plugins/source-control/skills/babysit-prs/**"
+      # The gate's wrapper, which pr-merge.yml runs under the lane token.
+      - "plugins/source-control/scripts/**"
+      - ".claude/**"
+      - "plugins/*/skills/**"
+      - "plugins/*/agents/**"
+      - "plugins/*/hooks/**"
+      - "plugins/*/.claude-plugin/**"
+      - "scripts/**"
+      # Agent instructions and the marketplace manifest the lanes load.
+      - ".claude-plugin/**"
+      - "**/AGENTS.md"
+      - "**/CLAUDE.md"
+      - "**/REVIEW.md"
+    max-changed-lines: 400
