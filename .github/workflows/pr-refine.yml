@@ -38,7 +38,7 @@ jobs:
       activity: fix-marker
       pr-number: ${{ inputs.pr-number }}
     secrets:
-      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      claude-code-oauth-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
 
   audit-env-write:
     # The lanes App's own pull_request events never start a lane, so a lane
@@ -61,4 +61,4 @@ jobs:
       activity: audit-env-write
       pr-number: ${{ inputs.pr-number }}
     secrets:
-      claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      claude-code-oauth-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
