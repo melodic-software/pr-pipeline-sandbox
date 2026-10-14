@@ -11,6 +11,11 @@
       "name": "source-control",
       "source": "./plugins/source-control",
       "description": "Copy of claude-code-plugins' source-control plugin, for the pr-unblock lane's resolve-conflicts skill."
+    },
+    {
+      "name": "work-items",
+      "source": "./plugins/work-items",
+      "description": "Copy of claude-code-plugins' work-items plugin, for the work-resolve-issue lane's work skill."
     }
   ]
 }

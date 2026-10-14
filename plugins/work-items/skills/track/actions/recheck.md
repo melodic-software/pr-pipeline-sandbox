@@ -1,0 +1,70 @@
+# Action: `recheck`
+
+Update a recurring item's `last_checked` and `next_due` dates after completing a periodic check.
+
+## Usage
+
+```
+/work-items:track recheck <text match or schedule ID>
+```
+
+## Workflow
+
+1. **Resolve the recurring-maintenance role label before any tracker read.** Read
+   `.work-item-tracker.json` at action entry and resolve
+   `config.role_labels["recurring-maintenance"]`; use `recurring` when the file or entry is
+   absent (the documented default, no warning). Stop on a malformed, empty, or non-string
+   configured value. Use the resolved string in the search below.
+
+1. **Find the item in the recurring schedule:**
+
+```bash
+SCHEDULE="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/.github/recurring-schedule.json"
+if [[ -f "$SCHEDULE" ]]; then
+  jq --arg q "<query>" '
+    .items[] | select(.id == $q or (.title | ascii_downcase | contains($q | ascii_downcase)))
+  ' "$SCHEDULE"
+fi
+```
+
+If multiple matches, present them and ask the user to clarify.
+
+1. **Evaluate any `precondition` on the matched row** before mutating dates or closing the issue ([`${CLAUDE_PLUGIN_ROOT}/reference/standing-item-preconditions.md`](${CLAUDE_PLUGIN_ROOT}/reference/standing-item-preconditions.md)):
+
+```bash
+EVAL="${CLAUDE_PLUGIN_ROOT}/scripts/evaluate-schedule-precondition.sh"
+[[ -f "$EVAL" ]] || EVAL="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/plugins/work-items/scripts/evaluate-schedule-precondition.sh"
+"$EVAL" "$SCHEDULE" "<matched-id>"   # add --operator-confirmed when the operator affirmed
+```
+
+Refuse to advance `last_checked`/`next_due` or close the associated issue when the helper exits `2` (`needs-confirmation`) or `1` (`unmet`). Surface the printed prompt inline instead.
+
+1. **Update dates.** Always set `last_checked` to today. Only advance `next_due` if it's in the past or today. If it's already in the future, the recurring-issues automation has already advanced it and re-advancing would skip a cycle.
+
+Cadence-to-days values: the Cadence Duration Table in [`add.md`](add.md#cadence-duration-table).
+
+1. **Edit `.github/recurring-schedule.json`:**
+
+Re-read the current file from disk immediately before writing (the schedule is shared; never write back a stale in-context copy), find the matched item, then edit only that row, preserving all others:
+
+- Set `last_checked` to today's date (always)
+- If `next_due <= today`: set `next_due` to today + cadence days
+- If `next_due > today`: leave `next_due` unchanged (already advanced by the recurring workflow)
+
+1. **Close the associated item** (if one exists). Search for open items with the resolved
+   recurring-maintenance label (adapter: "Search items",
+   `label:<resolved recurring-maintenance label>` + the `[Maintenance]` title, bare read). Provider
+   search is substring/prefix, not exact-title equality, so **filter the results to the item whose
+   title equals `[Maintenance] {title}` exactly** before closing. Otherwise a shorter title
+   (`Review CI`) could close a longer item's issue (`[Maintenance] Review CI workflow pins`). Close
+   only the exact match, with a recheck comment (adapter: "Close item"), reason `completed`, comment
+   "Rechecked YYYY-MM-DD. Next due: <next_due>.".
+
+1. **Confirm:** "Rechecked: **{title}**. Next due: **{next_due}**"
+
+## Notes
+
+- Cadence is a minimum interval. On-demand rechecks are always valid.
+- The recurring-issues automation will create a new item when `next_due` arrives.
+- If the schedule file was recently updated by the workflow's PR, pull latest first.
+- The schedule file edit is a working-tree change. It gets committed and pushed with the PR for the work that triggered the recheck. If rechecking without other changes, commit from your feature branch and open a PR: `git add .github/recurring-schedule.json && git commit -m "chore: advance recurring schedule for <item>"` (never commit directly to main).

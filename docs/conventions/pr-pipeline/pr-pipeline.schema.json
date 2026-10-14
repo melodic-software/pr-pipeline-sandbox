@@ -59,6 +59,7 @@
     "stage": {
       "enum": [
         "intake",
+        "work",
         "pre-ready",
         "refine",
         "verify",
@@ -112,6 +113,11 @@
           "type": "array",
           "minItems": 1,
           "items": { "$ref": "#/$defs/work-class" }
+        },
+        "labeled-after": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+          "description": "An issues lane's cutover, a UTC time such as 2026-10-20T00:00:00Z: matches only an issue labeled after it. Off an issues event it cannot be decided and fails the run."
         },
         "events": {
           "type": "array",
@@ -276,25 +282,54 @@
     "merge": {
       "type": "object",
       "additionalProperties": false,
-      "description": "How far pr-merge may merge without a human. A lane-power setting: raised only by a merged change to this file. Any rung above off requires a diff-check with denied paths.",
-      "if": {
-        "required": ["rung"],
-        "properties": { "rung": { "enum": ["C2", "C3"] } }
-      },
-      "then": {
-        "required": ["diff-check"],
-        "properties": {
-          "diff-check": {
-            "required": ["denied-paths", "max-changed-lines"],
-            "properties": { "denied-paths": { "minItems": 1 } }
+      "description": "How far the repository's merge authority may merge without a human. A lane-power setting: raised only by a merged change to this file. Any rung above off requires a diff-check with denied paths; authority local-babysit requires an agent-identity.",
+      "allOf": [
+        {
+          "if": {
+            "required": ["rung"],
+            "properties": { "rung": { "enum": ["C2", "C3"] } }
+          },
+          "then": {
+            "required": ["diff-check"],
+            "properties": {
+              "diff-check": {
+                "required": ["denied-paths", "max-changed-lines"],
+                "properties": { "denied-paths": { "minItems": 1 } }
+              }
+            }
           }
+        },
+        {
+          "if": {
+            "required": ["authority"],
+            "properties": { "authority": { "const": "local-babysit" } }
+          },
+          "then": { "required": ["agent-identity"] }
         }
-      },
+      ],
       "properties": {
         "rung": {
           "enum": ["off", "C2", "C3"],
           "default": "off",
-          "description": "Highest work class pr-merge merges. C1 produces no PR; C4 and C5 need a human (README.md, Merge authority)."
+          "description": "Highest work class the merge authority merges. C1 produces no PR; C4 and C5 need a human (README.md, Merge authority)."
+        },
+        "authority": {
+          "enum": ["local-babysit", "pr-merge"],
+          "default": "pr-merge",
+          "description": "The one lane that merges for this repository: the local babysit wrapper or the pr-merge lane. Absent means pr-merge, the meaning a rung had before this key existed; the babysit wrapper merges only when this names the authority it runs as (README.md, Merge authority)."
+        },
+        "report-only": {
+          "type": "boolean",
+          "default": false,
+          "description": "true: the merge authority reports each decision and writes nothing (no enqueue, dequeue or comment). The pr-merge lane starts true; the owner sets false to let it merge (README.md, Merge authority)."
+        },
+        "agent-identity": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9]+(-[A-Za-z0-9]+)*\\[bot\\]$",
+          "not": {
+            "pattern": "^([Gg][Ii][Tt][Hh][Uu][Bb]-[Aa][Cc][Tt][Ii][Oo][Nn][Ss]|[Dd][Ee][Pp][Ee][Nn][Dd][Aa][Bb][Oo][Tt])\\[[Bb][Oo][Tt]\\]$"
+          },
+          "description": "GitHub login the unattended merge lane acts as. It must be the [bot] login of a GitHub App dedicated to this lane: a machine user is a User and would pass every human test, and GitHub's shared built-in bots (github-actions[bot], dependabot[bot]) are rejected in any letter case. Absent: the unattended path stays inert. Required when authority is local-babysit."
         },
         "diff-check": {
           "type": "object",

@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0",
+  "provider": "github",
+  "verbs": {
+    "create-item": true,
+    "get-item": true,
+    "claim": true,
+    "renew-lease": true,
+    "release": true,
+    "reclaim": true,
+    "link-blocks": true,
+    "add-sub-item": true,
+    "list-items": true,
+    "list-sub-items": true,
+    "label-provenance": true,
+    "capabilities": true,
+    "change-link": true
+  },
+  "features": {
+    "cross_repo_edges": true,
+    "sub_items": true,
+    "leases": true,
+    "labels": true,
+    "list_items_label_filter": true
+  },
+  "limits": {
+    "sub_items_per_parent": 100,
+    "sub_item_depth": 8,
+    "dependencies_per_type": 50,
+    "list_items_max": 1000
+  },
+  "change_link": {
+    "branch_pattern": "^[a-z]+/(routine-issue-)?([0-9]+)-"
+  }
+}

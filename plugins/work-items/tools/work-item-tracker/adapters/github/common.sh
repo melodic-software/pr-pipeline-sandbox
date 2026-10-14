@@ -1,0 +1,376 @@
+# shellcheck shell=bash
+# Shared helpers for the GitHub adapter — sourced by every verb script. Identity
+# routing (CONTRACT.md "Identity routing (GitHub adapter)"): writes prefer a bot
+# wrapper (gh-bot.sh) when the consuming repo provides one, falling back to bare gh
+# for plugin-lift portability; claim assignment stays on bare gh so @me resolves to
+# the session identity.
+
+[[ -n "${_WIT_GH_COMMON_LOADED:-}" ]] && return 0
+readonly _WIT_GH_COMMON_LOADED=1
+
+WIT_GH_ADAPTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly WIT_GH_ADAPTER_DIR
+
+# A consumer may shadow this adapter with a local copy (CONTRACT.md "Adapter
+# resolution") while still running the bundled dispatcher; the shared seam libs
+# below then resolve relative to that copy and can be absent. A missing required
+# lib must hard-fail with a clear diagnostic (exit 3 — setup/config error), never
+# let sourcing fail silently and leave a verb emitting a malformed (e.g. empty-id)
+# record. Runs before the EX_* constants below exist, so it uses the literal.
+wit_gh_require_seam_lib() {
+  [[ -f "$1" ]] && return 0
+  printf 'work-item-tracker github adapter: required seam library not found: %s\n' "$1" >&2
+  printf '  a shadowed consumer-local adapter must still resolve the bundled seam lib/ directory\n' >&2
+  exit 3
+}
+
+wit_gh_require_seam_lib "$WIT_GH_ADAPTER_DIR/../../lib/id.sh"
+# shellcheck source=../../lib/id.sh
+source "$WIT_GH_ADAPTER_DIR/../../lib/id.sh"
+wit_gh_require_seam_lib "$WIT_GH_ADAPTER_DIR/../../lib/json.sh"
+# shellcheck source=../../lib/json.sh
+source "$WIT_GH_ADAPTER_DIR/../../lib/json.sh"
+wit_gh_require_seam_lib "$WIT_GH_ADAPTER_DIR/../../lib/lease.sh"
+# shellcheck source=../../lib/lease.sh
+source "$WIT_GH_ADAPTER_DIR/../../lib/lease.sh"
+# binding.sh supplies wit_project_root — the seam's single repo-root anchor; the
+# wrapper lookup below must share it, never re-derive its own copy.
+wit_gh_require_seam_lib "$WIT_GH_ADAPTER_DIR/../../lib/binding.sh"
+# shellcheck source=../../lib/binding.sh
+source "$WIT_GH_ADAPTER_DIR/../../lib/binding.sh"
+wit_gh_require_seam_lib "$WIT_GH_ADAPTER_DIR/../../lib/gh-version.sh"
+# shellcheck source=../../lib/gh-version.sh
+source "$WIT_GH_ADAPTER_DIR/../../lib/gh-version.sh"
+
+# wit_gh_resolve_bot_wrapper — echo the bot wrapper path using consumer-local-first
+# resolution (CONTRACT.md "Identity routing (GitHub adapter)"), mirroring the
+# adapter two-root resolution (CONTRACT.md "Adapter resolution"): a consuming
+# repo's own wrapper at <repo root>/tools/github-auth/gh-bot.sh wins,
+# independent of where the adapter itself resolved from (a shadowed
+# consumer-local adapter must still find the consumer's wrapper, not miss it via
+# its own directory); otherwise the plugin-bundled path beside this adapter tree.
+# The root is the seam's single anchor (wit_project_root — CLAUDE_PROJECT_DIR,
+# else the git toplevel), so a bare shell resolves the consumer wrapper too (#2941).
+wit_gh_resolve_bot_wrapper() {
+  local root
+  if root="$(wit_project_root)" && [[ -n "$root" ]]; then
+    local consumer_wrapper="$root/tools/github-auth/gh-bot.sh"
+    if [[ -f "$consumer_wrapper" ]]; then
+      printf '%s\n' "$consumer_wrapper"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$WIT_GH_ADAPTER_DIR/../../../github-auth/gh-bot.sh"
+}
+
+WIT_GH_BOT="$(wit_gh_resolve_bot_wrapper)"
+readonly WIT_GH_BOT
+
+readonly EX_INTERNAL=1
+readonly EX_USAGE=2
+readonly EX_CONFIG=3
+readonly EX_AUTH=4
+readonly EX_NOT_FOUND=5
+readonly EX_CONFLICT=7
+readonly EX_UNAVAILABLE=8
+
+# Set by wit_run_gh; declared here so a read before the first call does not trip
+# `set -u` (call-order independence).
+WIT_GH_OUT=""
+
+# wit_usage_error <message>: name the entry verb script and exit 2. The last BASH_SOURCE
+# element is the bottom of the source stack, so the verb is named whether the call sits
+# at the verb's top level or inside a helper this file defines. Indexed by length rather
+# than by -1, which needs bash 4.2 and this repo still runs on the macOS system bash 3.2.
+wit_usage_error() {
+  printf '%s: %s\n' "$(basename "${BASH_SOURCE[${#BASH_SOURCE[@]} - 1]}")" "$1" >&2
+  exit "$EX_USAGE"
+}
+
+# wit_require_github_id <id> — parse an ID and require its provider be `github`.
+# The shared grammar (lib/id.sh) accepts any provider by design; the GitHub
+# adapter must reject foreign-provider IDs so a `local-markdown:…#N` never
+# silently operates on a GitHub issue. Sets the WIT_ID_* globals on success.
+wit_require_github_id() {
+  wit_parse_id "$1" || return 1
+  [[ "$WIT_ID_PROVIDER" == "github" ]] || return 1
+}
+
+# wit_help_if_requested <usage-text> <args…> — print usage + exit 0 when the
+# first arg is --help. Adapter verbs are dispatched by the core, but each is a
+# standalone entry script (skill-script contract) and answers --help directly.
+wit_help_if_requested() {
+  local usage="$1"
+  shift
+  if [[ "${1:-}" == "--help" ]]; then
+    printf '%s\n' "$usage"
+    exit 0
+  fi
+}
+
+# gh_write <gh-args…> — write op through the bot wrapper when available.
+gh_write() {
+  if [[ -f "$WIT_GH_BOT" ]]; then
+    bash "$WIT_GH_BOT" "$@"
+  else
+    gh "$@"
+  fi
+}
+
+# wit_map_gh_error <stderr-text> — echo the contract exit code for a failed gh call.
+wit_map_gh_error() {
+  local err="$1"
+  case "$err" in
+  *"Could not resolve"* | *"Not Found"* | *"HTTP 404"*) echo "$EX_NOT_FOUND" ;;
+  *"HTTP 401"* | *"HTTP 403"* | *"not logged in"* | *authentication*) echo "$EX_AUTH" ;;
+  *"rate limit"* | *"no such host"* | *"connection refused"* | *timeout* | *"network"*) echo "$EX_UNAVAILABLE" ;;
+  *maximum* | *"limit of"*) echo "$EX_CONFLICT" ;;
+  *) echo "$EX_INTERNAL" ;;
+  esac
+}
+
+# wit_run_gh <writer:write|read> <gh-args…> — run gh (routed by writer), capture
+# stdout to WIT_GH_OUT; on failure print stderr and exit with the mapped code.
+wit_run_gh() {
+  local writer="$1" err rc errfile
+  shift
+  errfile="$(mktemp)"
+  if [[ "$writer" == "write" ]]; then
+    WIT_GH_OUT="$(gh_write "$@" 2>"$errfile")"
+  else
+    WIT_GH_OUT="$(gh "$@" 2>"$errfile")"
+  fi
+  rc=$?
+  err="$(<"$errfile")"
+  rm -f "$errfile"
+  if ((rc != 0)); then
+    printf '%s\n' "$err" >&2
+    exit "$(wit_map_gh_error "$err")"
+  fi
+  WIT_GH_OUT="$(printf '%s' "$WIT_GH_OUT" | wit_strip_cr)"
+}
+
+# wit_resolve_repo <--repo value or empty> — echo owner/repo (explicit override or
+# derived from the CWD git remote per CONTRACT.md "Setup (binding file)").
+wit_resolve_repo() {
+  local explicit="${1:-}"
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  # REST, not `gh repo view`: that is GraphQL-backed (README "View item").
+  wit_run_gh read api 'repos/{owner}/{repo}' --jq .full_name
+  printf '%s\n' "$WIT_GH_OUT"
+}
+
+# --- Assignee ops (REST) -----------------------------------------------------
+# These deliberately use `gh api` (REST) rather than `gh issue view/edit`. The
+# `gh issue` subcommands resolve assignees through GraphQL, which made the whole
+# lease protocol unrunnable in sandboxed sessions (Claude Code on the web /
+# remote execution); README "View item" records why and where to recheck.
+# The <writer> argument keeps the identity routing intact: `read` = bare gh =
+# the session identity the claim carve-out requires (README "Edit labels /
+# assignees"); `write` = the bot wrapper.
+
+# wit_read_assignees <owner> <repo> <number> — WIT_GH_OUT = JSON array of logins.
+wit_read_assignees() {
+  wit_run_gh read api "repos/$1/$2/issues/$3" --jq '[.assignees[].login]'
+}
+
+# wit_add_assignee <writer> <owner> <repo> <number> <login>
+# NOTE: unlike `gh issue edit --add-assignee`, REST POST silently IGNORES a user
+# who cannot be assigned (no push access) and still returns 201. Callers that
+# depend on the assignment having landed MUST verify with wit_read_assignees.
+wit_add_assignee() {
+  local writer="$1"
+  wit_run_gh "$writer" api --method POST "repos/$2/$3/issues/$4/assignees" \
+    -f "assignees[]=$5" --jq '[.assignees[].login]'
+}
+
+# wit_remove_assignee <writer> <owner> <repo> <number> <login>
+wit_remove_assignee() {
+  local writer="$1"
+  wit_run_gh "$writer" api --method DELETE "repos/$2/$3/issues/$4/assignees" \
+    -f "assignees[]=$5" --jq '[.assignees[].login]'
+}
+
+# wit_try_remove_assignee <owner> <repo> <number> <login> — best-effort rollback
+# on the session identity; never fails the caller.
+wit_try_remove_assignee() {
+  gh api --method DELETE "repos/$1/$2/issues/$3/assignees" \
+    -f "assignees[]=$4" >/dev/null 2>&1 || true
+}
+
+# wit_issue_url <owner> <repo> <number>
+wit_issue_url() {
+  printf 'https://github.com/%s/%s/issues/%s\n' "$1" "$2" "$3"
+}
+
+# wit_parse_edge_args <usage> <option> <args…>: parse the `<id> --<option> <id>` shape
+# the edge verbs (link-blocks, add-sub-item) share. Both ids are validated as github
+# ids and the option's value is resolved to the issue URL `gh issue edit` wants. Sets
+# WIT_EDGE_ID / WIT_EDGE_OWNER / WIT_EDGE_REPO / WIT_EDGE_NUMBER for the subject and
+# WIT_EDGE_OTHER / WIT_EDGE_OTHER_URL for the option's value. Any malformed invocation
+# exits 2 before a request is made.
+# shellcheck disable=SC2034  # the WIT_EDGE_* globals are read by the sourcing verb scripts, not within this lib
+wit_parse_edge_args() {
+  local usage="$1" option="$2"
+  shift 2
+  local id="${1:-}"
+  [[ -n "$id" ]] || wit_usage_error "$usage"
+  shift
+  local other=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    "--$option")
+      [[ $# -ge 2 ]] || wit_usage_error "--$option needs a value"
+      other="$2"
+      shift 2
+      ;;
+    *) wit_usage_error "unknown argument: $1" ;;
+    esac
+  done
+  [[ -n "$other" ]] || wit_usage_error "--$option is required"
+  wit_require_github_id "$id" || wit_usage_error "malformed or non-github id: $id"
+  WIT_EDGE_ID="$id"
+  WIT_EDGE_OWNER="$WIT_ID_OWNER"
+  WIT_EDGE_REPO="$WIT_ID_REPO"
+  WIT_EDGE_NUMBER="$WIT_ID_NUMBER"
+  wit_require_github_id "$other" || wit_usage_error "malformed or non-github --$option id: $other"
+  WIT_EDGE_OTHER="$other"
+  WIT_EDGE_OTHER_URL="$(wit_issue_url "$WIT_ID_OWNER" "$WIT_ID_REPO" "$WIT_ID_NUMBER")"
+}
+
+# shellcheck disable=SC2016  # jq program — $sv/$or are jq variables, not bash expansions
+readonly WIT_ITEM_JQ="$WIT_JQ_DEF_UTC_TS"'{
+  schema_version: $sv,
+  id: ("github:" + $or + "#" + (.number | tostring)),
+  title: .title,
+  state: (.state | ascii_downcase),
+  assignees: [(.assignees // [])[] | .login],
+  labels: [(.labels // [])[] | .name],
+  type: (.issueType.name // null),
+  blocked_by_count: ([(.blockedBy.nodes // [])[] | select(.state != "CLOSED" or .reasonRead == false
+    or .stateReason == "NOT_PLANNED" or .stateReason == "DUPLICATE" or .wontDoLabel == true)] | length),
+  blocked_by_wont_do_count: ([(.blockedBy.nodes // [])[] | select(.state == "CLOSED"
+    and (.stateReason == "NOT_PLANNED" or .stateReason == "DUPLICATE" or .wontDoLabel == true))] | length),
+  parent_id: (
+    if (.parent // null) != null and (.parent.url // null) != null
+    then (.parent.url
+          | capture("github.com/(?<o>[^/]+)/(?<r>[^/]+)/issues/(?<n>[0-9]+)")
+          | "github:" + .o + "/" + .r + "#" + .n)
+    else null
+    end),
+  url: .url,
+  created_at: (.createdAt | wit_utc_ts)
+}'
+
+# wit_gh_load_wont_do_labels — set WIT_GH_WONT_DO_LABELS (JSON array, lowercased) from
+# the binding's optional config.github.wont_do_labels; `[]` when the key or the binding
+# is absent. A present value must be an array of non-empty strings, else exit 3. Call
+# it before a pipeline into wit_gh_annotate_blocker_reasons, so the exit is not lost in
+# a pipeline stage.
+wit_gh_load_wont_do_labels() {
+  local binding ejson
+  WIT_GH_WONT_DO_LABELS='[]'
+  binding="$(wit_find_binding)" || return 0
+  ejson="$(wit_effective_binding_json "$binding")" || {
+    echo "github: invalid binding at $binding; run /work-items:setup check" >&2
+    exit "$EX_CONFIG"
+  }
+  WIT_GH_WONT_DO_LABELS="$(jq -c '(.config.github // {}) as $g
+    | if ($g | type) != "object" or ($g | has("wont_do_labels") | not) then []
+      elif ($g.wont_do_labels | type) == "array" and all($g.wont_do_labels[]; type == "string" and length > 0)
+      then $g.wont_do_labels | map(ascii_downcase)
+      else "bad" end' <<<"$ejson")"
+  if [[ "$WIT_GH_WONT_DO_LABELS" == '"bad"' ]]; then
+    echo "github: config.github.wont_do_labels must be an array of non-empty label names" >&2
+    exit "$EX_CONFIG"
+  fi
+}
+
+# wit_gh_annotate_blocker_reasons — stdin: one issue object or an array of them, as
+# `gh --json ...,blockedBy` returns it; stdout: the same JSON with `stateReason` set
+# on every CLOSED blocker node. That projection carries no stateReason or labels, so
+# both come from `gh api graphql` nodes(ids:), one query per 100 closed blockers
+# and none when there is no closed blocker. Each CLOSED node also gets `reasonRead`:
+# false when its query failed, answered with a blank or unparsable body, or returned
+# no node for it, and `wontDoLabel`: true when it was read and carries a label in
+# WIT_GH_WONT_DO_LABELS (wit_gh_load_wont_do_labels; case-insensitive). A failed query
+# is not fatal, but WIT_ITEM_JQ keeps an unread blocker blocking (fail closed). A node
+# read with a null stateReason (issues closed before GitHub recorded reasons) and no
+# listed label is resolved.
+wit_gh_annotate_blocker_reasons() {
+  local json ids n i reasons='[]' out page args id
+  json="$(cat)"
+  ids="$(printf '%s' "$json" | jq -c '[(if type == "array" then .[] else . end)
+    | (.blockedBy.nodes // [])[] | select(.state == "CLOSED") | .id] | unique')"
+  n="$(jq 'length' <<<"$ids")"
+  for ((i = 0; i < n; i += 100)); do
+    args=()
+    while IFS= read -r id; do
+      args+=(-f "ids[]=$id")
+    done <<<"$(jq -r --argjson i "$i" '.[$i:$i + 100][]' <<<"$ids")"
+    # shellcheck disable=SC2016  # GraphQL query — $ids is a GraphQL variable, not a bash expansion
+    if out="$(gh api graphql -f query='query($ids:[ID!]!){nodes(ids:$ids){... on Issue{id stateReason labels(first:100){nodes{name}}}}}' \
+      "${args[@]}" 2>/dev/null)" &&
+      page="$(jq -ce '[(.data.nodes // [])[] | select(. != null)]' <<<"$out" 2>/dev/null)"; then
+      reasons="$(jq -cn --argjson acc "$reasons" --argjson page "$page" '$acc + $page')"
+    else
+      echo "wit_gh_annotate_blocker_reasons: close-reason query failed; closed blockers keep blocking" >&2
+    fi
+  done
+  printf '%s' "$json" | jq -c --argjson r "$reasons" --argjson wl "${WIT_GH_WONT_DO_LABELS:-[]}" '
+    (reduce $r[] as $x ({}; .[$x.id] = $x)) as $by_id
+    | def ann: if (.blockedBy.nodes // null) == null then .
+        else .blockedBy.nodes |= map(if .state == "CLOSED"
+          then .id as $i | .stateReason = $by_id[$i].stateReason | .reasonRead = ($by_id | has($i))
+            | .wontDoLabel = any(($by_id[$i].labels.nodes // [])[]; (.name | ascii_downcase) as $n | any($wl[]; . == $n))
+          else . end) end;
+    if type == "array" then map(ann) else ann end'
+}
+
+# wit_emit_item <owner> <repo> <number> — fetch the issue and emit the normalized
+# item object (CONTRACT.md "JSON output contract"). blocked_by_count counts OPEN
+# blockers, blockers closed NOT_PLANNED or DUPLICATE or carrying a config.github
+# wont_do_labels label, and closed blockers whose reason could not be read;
+# blocked_by_wont_do_count counts the won't-do ones.
+# gh >= 2.94 reads through `gh issue view --json` (issueType/blockedBy/parent).
+# Older gh reads REST, the path sandboxed sessions need (README "View item"), and maps
+# the REST shape onto the same fields; type comes from .type, and parent and
+# blockers have no REST field there, so they emit as null and 0.
+wit_emit_item() {
+  local owner="$1" repo="$2" number="$3"
+  local rest_to_view='{number, title, state, assignees, labels, issueType: .type, url: .html_url, createdAt: .created_at}'
+  if wit_gh_has_native_surface; then
+    wit_run_gh read issue view "$number" -R "$owner/$repo" \
+      --json number,title,state,assignees,labels,issueType,blockedBy,parent,url,createdAt
+    wit_gh_load_wont_do_labels
+    printf '%s' "$WIT_GH_OUT" | wit_gh_annotate_blocker_reasons |
+      jq -c --arg sv "$WIT_SCHEMA_VERSION" --arg or "$owner/$repo" "$WIT_ITEM_JQ"
+  else
+    wit_run_gh read api "repos/$owner/$repo/issues/$number"
+    if jq -e 'has("pull_request")' <<<"$WIT_GH_OUT" >/dev/null; then
+      echo "wit_emit_item: $owner/$repo#$number is a pull request, not an issue" >&2
+      exit "$EX_NOT_FOUND"
+    fi
+    jq -c --arg sv "$WIT_SCHEMA_VERSION" --arg or "$owner/$repo" "$rest_to_view | $WIT_ITEM_JQ" <<<"$WIT_GH_OUT"
+  fi
+}
+
+# wit_patch_lease_comment <owner> <repo> <comment-id> <lease-json>: rewrite a
+# lease comment in place. The marker wrapper is the single lease-body format
+# this adapter writes. WIT_GH_OUT = the patched comment id.
+wit_patch_lease_comment() {
+  wit_run_gh write api --method PATCH "repos/$1/$2/issues/comments/$3" \
+    -f body="${WIT_LEASE_MARKER}$4 -->" --jq '.id'
+}
+
+# wit_list_lease_comments <owner> <repo> <number> — JSON array of
+# {id, node_id, body, created_at} for lease-marker comments, ascending id.
+wit_list_lease_comments() {
+  local owner="$1" repo="$2" number="$3"
+  wit_run_gh read api --paginate "repos/$owner/$repo/issues/$number/comments?per_page=100" \
+    --jq '[.[] | select(.body | startswith("<!-- work-item-lease v1")) | {id, node_id, body, created_at}]'
+  jq -cs 'add // []' <<<"$WIT_GH_OUT"
+}

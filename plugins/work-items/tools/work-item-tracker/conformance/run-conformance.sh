@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2154  # FAILED/CASE_NUM initialized by sourced tests/lib.sh
+# Abstract conformance suite (CONTRACT.md "Conformance"), parameterized by a binding
+# under bindings/<name>.sh. Assertions go only through the core CLI; no mocks.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TRACKER="$SCRIPT_DIR/../work-item-tracker.sh"
+source "$SCRIPT_DIR/../tests/lib.sh"
+# shellcheck source=../lib/binding.sh
+source "$SCRIPT_DIR/../lib/binding.sh"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  echo "usage: run-conformance.sh --binding <name>  (runs the abstract seam conformance suite through the core CLI against the named adapter binding under bindings/<name>.sh)"
+  exit 0
+fi
+
+# usage_error — the one spelling of the usage line every arg-parsing failure exits on.
+usage_error() {
+  echo "usage: run-conformance.sh --binding <name>" >&2
+  exit 2
+}
+
+binding_name=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --binding)
+    if [[ $# -lt 2 ]]; then
+      usage_error
+    fi
+    binding_name="$2"
+    shift 2
+    ;;
+  *)
+    usage_error
+    ;;
+  esac
+done
+if [[ -z "$binding_name" ]]; then
+  usage_error
+fi
+# The name becomes a path segment: constrain it BEFORE interpolation, so
+# `--binding ../../x` cannot escape the searched roots and source an arbitrary file.
+if ! [[ "$binding_name" =~ ^[a-z][a-z0-9-]*$ ]]; then
+  echo "run-conformance: invalid binding name '$binding_name' (expected ^[a-z][a-z0-9-]*\$)" >&2
+  exit 2
+fi
+# Bindings resolve the SAME two-root way adapters do (CONTRACT.md "Adapter resolution"),
+# with WIT_CONFORMANCE_BINDINGS_DIR as the single-root override.
+resolve_binding_file() {
+  local name="$1" root
+  if [[ -n "${WIT_CONFORMANCE_BINDINGS_DIR:-}" ]]; then
+    printf '%s\n' "$WIT_CONFORMANCE_BINDINGS_DIR/$name.sh"
+    return 0
+  fi
+  if root="$(wit_project_root)"; then
+    local local_file="$root/tools/work-item-tracker/conformance/bindings/$name.sh"
+    if [[ -f "$local_file" ]]; then
+      printf '%s\n' "$local_file"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$SCRIPT_DIR/bindings/$name.sh"
+}
+
+BINDING_FILE_SH="$(resolve_binding_file "$binding_name")"
+[[ -f "$BINDING_FILE_SH" ]] || {
+  echo "run-conformance: no binding for '$binding_name' (searched consumer-local then plugin-bundled) — last tried $BINDING_FILE_SH" >&2
+  exit 2
+}
+
+# Binding provides: cb_setup (exports WORK_ITEM_TRACKER_BINDING; sets CB_REPO to an
+# explicit target or empty for CWD derivation; clean-at-start), cb_teardown.
+CB_REPO=""
+# shellcheck source=/dev/null
+source "$BINDING_FILE_SH"
+cb_setup
+# Re-home the binding into a run-private dir: the overlay lands BESIDE it under a fixed
+# name, so two runs sharing $TMPDIR would clobber each other's overlay.
+BINDING_DIR="$(mktemp -d)"
+cp "$WORK_ITEM_TRACKER_BINDING" "$BINDING_DIR/.work-item-tracker.json"
+export WORK_ITEM_TRACKER_BINDING="$BINDING_DIR/.work-item-tracker.json"
+trap 'cb_teardown; rm -rf "$BINDING_DIR"' EXIT
+
+repo_args=()
+[[ -n "$CB_REPO" ]] && repo_args=(--repo "$CB_REPO")
+
+WIT_OUT=""
+
+# wit_case <label> <expected-rc> <args…> — run the CLI, assert exit code and
+# CR-free stdout; output lands in WIT_OUT for shape assertions.
+wit_case() {
+  local label="$1" expected_rc="$2" rc
+  shift 2
+  WIT_OUT="$(bash "$TRACKER" "$@" 2>/dev/null)"
+  rc=$?
+  assert_eq "$label (exit code)" "$expected_rc" "$rc"
+  case "$WIT_OUT" in
+  *$'\r'*) fail "$label (stdout CR-free)" "no CR" "CR present" ;;
+  *) pass "$label (stdout CR-free)" ;;
+  esac
+}
+
+assert_schema_version() {
+  assert_eq "$1 (schema_version)" "1.0" "$(jq -r '.schema_version' <<<"$WIT_OUT")"
+}
+
+# A list envelope must say whether it is complete: a reader cannot tell an absent
+# flag from an adapter that never checked. Boolean, not `false`: a live instance
+# past its ceiling legitimately reports true.
+assert_truncated_flag() {
+  assert_eq "$1 (truncated is a boolean)" "boolean" "$(jq -r '.truncated | type' <<<"$WIT_OUT")"
+}
+
+RUN_TAG="conf-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+
+# --- capabilities ---
+
+wit_case "capabilities" 0 capabilities
+assert_schema_version "capabilities"
+# Checked on JSON type, not jq -r text: `null` is a valid adapter name, and jq -r
+# prints `null` for JSON null too.
+PROVIDER="$(jq -r '.provider' <<<"$WIT_OUT")"
+if jq -e '.provider | type == "string" and length > 0' <<<"$WIT_OUT" >/dev/null; then
+  pass "capabilities names a provider"
+else
+  fail "capabilities names a provider" "JSON string of length > 0" "$(jq -c '.provider' <<<"$WIT_OUT")"
+fi
+CAPS="$WIT_OUT"
+
+# --- usage / binding errors ---
+
+wit_case "no verb → usage" 2
+wit_case "unknown verb → usage" 2 definitely-not-a-verb
+WIT_OUT="$(WORK_ITEM_TRACKER_BINDING="/nonexistent-$$.json" bash "$TRACKER" capabilities 2>/dev/null)"
+assert_eq "missing binding → exit 3" "3" "$?"
+
+# --- binding overlay (CONTRACT.md "Setup (binding file)") ---
+# Seam-level overlay behavior through the CLI; merge semantics are unit-tested in
+# lib/binding.test.sh. A non-allowlisted key exits 3; removing the overlay restores the team view.
+OVERLAY_PATH="$BINDING_DIR/.work-item-tracker.local.json"
+printf '%s\n' '{"config":{"lease_ttl_hours":1}}' >"$OVERLAY_PATH"
+wit_case "allowlisted overlay key merges; verbs still dispatch" 0 capabilities
+printf '%s\n' '{"provider":"someone-elses-provider"}' >"$OVERLAY_PATH"
+WIT_OUT="$(bash "$TRACKER" capabilities 2>/dev/null)"
+assert_eq "non-overlayable overlay key → exit 3" "3" "$?"
+rm -f "$OVERLAY_PATH"
+wit_case "overlay removal restores the team binding" 0 capabilities
+
+# --- contract-version handshake (CONTRACT.md "Contract-version handshake") ---
+# Skew is asserted against a synthetic shadow of the SAME provider via WIT_ADAPTERS_DIR:
+# major skew refuses (exit 3), a newer minor proceeds with a stderr notice.
+
+SKEW_ROOT="$(mktemp -d)"
+mkdir -p "$SKEW_ROOT/$PROVIDER"
+SKEW_MANIFEST="$SKEW_ROOT/$PROVIDER/capabilities.json"
+
+# write_skew_manifest <schema-version>: the synthetic shadow manifest for $PROVIDER.
+write_skew_manifest() {
+  printf '{"schema_version":"%s","provider":"%s","verbs":{"capabilities":true}}\n' \
+    "$1" "$PROVIDER" >"$SKEW_MANIFEST"
+}
+
+write_skew_manifest "99.0"
+SKEW_ERR="$(WIT_ADAPTERS_DIR="$SKEW_ROOT" bash "$TRACKER" capabilities 2>&1 >/dev/null)"
+assert_eq "major-skew manifest refused (exit code)" "3" "$?"
+assert_contains "major-skew stderr names both versions" "$SKEW_ERR" "99.0"
+
+cat >"$SKEW_ROOT/$PROVIDER/capabilities.sh" <<EOF
+#!/usr/bin/env bash
+jq -c . "$SKEW_MANIFEST"
+EOF
+write_skew_manifest "1.99"
+WIT_OUT="$(WIT_ADAPTERS_DIR="$SKEW_ROOT" bash "$TRACKER" capabilities 2>/dev/null)"
+assert_eq "newer-minor manifest proceeds (exit code)" "0" "$?"
+SKEW_ERR="$(WIT_ADAPTERS_DIR="$SKEW_ROOT" bash "$TRACKER" capabilities 2>&1 >/dev/null)"
+assert_contains "newer-minor proceeds with a stderr notice" "$SKEW_ERR" "newer than core"
+rm -rf "$SKEW_ROOT"
+
+verb_supported() {
+  [[ "$(jq -r --arg v "$1" '.verbs[$v] // false' <<<"$CAPS")" == "true" ]]
+}
+
+FAKE_ID="$PROVIDER:conformance/x#1"
+
+# --- unsupported verbs degrade explicitly (exit 6), never silently ---
+
+# wit_case_if_unsupported <verb> <args…>: assert the exit-6 gate for a verb declared
+# unsupported; a supported verb is exercised by its own section below.
+wit_case_if_unsupported() {
+  local verb="$1"
+  if ! verb_supported "$verb"; then
+    wit_case "unsupported $verb → exit 6" 6 "$@"
+  fi
+}
+
+wit_case_if_unsupported create-item --title x
+wit_case_if_unsupported get-item "$FAKE_ID"
+wit_case_if_unsupported claim "$FAKE_ID"
+wit_case_if_unsupported renew-lease "$FAKE_ID" --lease-comment-id 1
+wit_case_if_unsupported release "$FAKE_ID" --lease-comment-id 1
+wit_case_if_unsupported reclaim "$FAKE_ID"
+wit_case_if_unsupported link-blocks "$FAKE_ID" --blocked-by "$FAKE_ID"
+wit_case_if_unsupported add-sub-item "$FAKE_ID" --parent "$FAKE_ID"
+wit_case_if_unsupported label-provenance "$FAKE_ID" --label agent-ready
+if ! verb_supported list-items; then
+  wit_case "unsupported list-items gates list-frontier → exit 6" 6 list-frontier
+fi
+if ! verb_supported list-sub-items; then
+  wit_case "unsupported list-sub-items → exit 6" 6 list-sub-items "$FAKE_ID"
+  wit_case "unsupported list-sub-items gates list-frontier --parent → exit 6" 6 list-frontier --parent "$FAKE_ID"
+fi
+
+# --- create-item ---
+
+ITEM_A_ID="" ITEM_B_ID=""
+if verb_supported create-item; then
+  wit_case "create-item without --title → usage" 2 create-item "${repo_args[@]+"${repo_args[@]}"}"
+  wit_case "create-item A" 0 create-item --title "$RUN_TAG A" --body "conformance" "${repo_args[@]+"${repo_args[@]}"}"
+  assert_schema_version "create-item A"
+  ITEM_A_ID="$(jq -r '.id' <<<"$WIT_OUT")"
+  if [[ "$ITEM_A_ID" =~ ^[a-z0-9][a-z0-9-]*:[^#[:space:]]+#[0-9]+$ ]]; then
+    pass "create-item A id grammar"
+  else
+    fail "create-item A id grammar" "provider:owner/repo#number" "$ITEM_A_ID"
+  fi
+  assert_eq "create-item A state open" "open" "$(jq -r '.state' <<<"$WIT_OUT")"
+  wit_case "create-item B" 0 create-item --title "$RUN_TAG B" "${repo_args[@]+"${repo_args[@]}"}"
+  ITEM_B_ID="$(jq -r '.id' <<<"$WIT_OUT")"
+
+  # Edge-at-create path: --parent and --blocked-by in one create-item call, distinct
+  # from the post-create link-blocks/add-sub-item path below.
+  if [[ -n "$ITEM_A_ID" && -n "$ITEM_B_ID" ]]; then
+    wit_case "create-item C with --parent + --blocked-by" 0 \
+      create-item --title "$RUN_TAG C" --parent "$ITEM_A_ID" --blocked-by "$ITEM_B_ID" \
+      "${repo_args[@]+"${repo_args[@]}"}"
+    assert_eq "create-item C parent_id" "$ITEM_A_ID" "$(jq -r '.parent_id' <<<"$WIT_OUT")"
+    assert_eq "create-item C blocked_by_count" "1" "$(jq -r '.blocked_by_count' <<<"$WIT_OUT")"
+  fi
+fi
+
+# --- get-item ---
+
+if verb_supported get-item && [[ -n "$ITEM_A_ID" ]]; then
+  wit_case "get-item malformed id → usage" 2 get-item "not-an-id"
+  missing_id="$(sed -E 's/#[0-9]+$/#999999/' <<<"$ITEM_A_ID")"
+  wit_case "get-item nonexistent → exit 5" 5 get-item "$missing_id"
+  wit_case "get-item A" 0 get-item "$ITEM_A_ID"
+  assert_schema_version "get-item A"
+  assert_eq "get-item A unblocked" "0" "$(jq -r '.blocked_by_count' <<<"$WIT_OUT")"
+fi
+
+# --- change-link (offline: no provider call) ---
+
+if verb_supported change-link; then
+  link_id="${ITEM_A_ID:-$FAKE_ID}"
+  wit_case "change-link malformed id → usage" 2 change-link "not-an-id"
+  wit_case "change-link" 0 change-link "$link_id"
+  assert_schema_version "change-link"
+  assert_eq "change-link item_id echoes the id" "$link_id" "$(jq -r '.item_id' <<<"$WIT_OUT")"
+  assert_eq "change-link shape" "ok" "$(jq -r 'if (.refs | type) == "string" and (.refs | length) > 0
+    and ((.closes | type) == "string" or .closes == null)
+    and (.branch_ref | type) == "string" and (.branch_ref | length) > 0 then "ok" else "bad" end' <<<"$WIT_OUT")"
+  branch_ref="$(jq -r '.branch_ref' <<<"$WIT_OUT")"
+  assert_eq "manifest declares a change_link.branch_pattern" "string" \
+    "$(jq -r '.change_link.branch_pattern | type' <<<"$CAPS")"
+  # Round trip: a branch carrying the branch_ref names the same item. Needs a real item,
+  # since --branch-ref qualifies against the binding's declared scope.
+  if [[ -n "$ITEM_A_ID" ]]; then
+    item_repo="$(sed -E 's/^[^:]+:([^#]+)#.*$/\1/' <<<"$ITEM_A_ID")"
+    wit_case "change-link --branch" 0 change-link --branch "feat/${branch_ref}-conformance" --repo "$item_repo"
+    assert_eq "change-link --branch round-trips to the item" "$ITEM_A_ID" "$(jq -r '.item_id' <<<"$WIT_OUT")"
+  fi
+  wit_case "change-link --branch without an item reference → exit 5" 5 change-link --branch "conformance"
+else
+  wit_case "unsupported change-link → exit 6" 6 change-link "$FAKE_ID"
+fi
+
+# --- edges ---
+
+if verb_supported link-blocks && [[ -n "$ITEM_A_ID" && -n "$ITEM_B_ID" ]]; then
+  wit_case "link-blocks B blocked-by A" 0 link-blocks "$ITEM_B_ID" --blocked-by "$ITEM_A_ID"
+  wit_case "get-item B sees open blocker" 0 get-item "$ITEM_B_ID"
+  assert_eq "B blocked_by_count" "1" "$(jq -r '.blocked_by_count' <<<"$WIT_OUT")"
+fi
+if verb_supported add-sub-item && [[ -n "$ITEM_A_ID" && -n "$ITEM_B_ID" ]]; then
+  wit_case "add-sub-item B under A" 0 add-sub-item "$ITEM_B_ID" --parent "$ITEM_A_ID"
+  wit_case "get-item B sees parent" 0 get-item "$ITEM_B_ID"
+  assert_eq "B parent_id" "$ITEM_A_ID" "$(jq -r '.parent_id' <<<"$WIT_OUT")"
+fi
+
+# --- sub-item enumeration + container-scoped frontier ---
+# B is A's child and blocked by A, so it enumerates as a child but stays out of A's
+# scoped frontier.
+if verb_supported list-sub-items && verb_supported add-sub-item && [[ -n "$ITEM_A_ID" && -n "$ITEM_B_ID" ]]; then
+  wit_case "list-sub-items A" 0 list-sub-items "$ITEM_A_ID"
+  assert_schema_version "list-sub-items A"
+  assert_truncated_flag "list-sub-items A"
+  assert_contains "A's children hold B" "$(jq -c '[.items[].id]' <<<"$WIT_OUT")" "$ITEM_B_ID"
+  assert_eq "enumerated child B is re-parented to A" "$ITEM_A_ID" \
+    "$(jq -r '.items[0].parent_id' <<<"$WIT_OUT")"
+  wit_case "list-sub-items malformed parent id → usage" 2 list-sub-items "not-an-id"
+
+  wit_case "list-frontier --parent A" 0 list-frontier --parent "$ITEM_A_ID"
+  assert_schema_version "list-frontier --parent A"
+  assert_truncated_flag "list-frontier --parent A"
+  assert_not_contains "scoped frontier drops blocked child B" \
+    "$(jq -c '[.items[].id]' <<<"$WIT_OUT")" "$ITEM_B_ID"
+fi
+
+# --- frontier ---
+
+if verb_supported list-items && [[ -n "$ITEM_A_ID" && -n "$ITEM_B_ID" ]]; then
+  wit_case "list-frontier" 0 list-frontier "${repo_args[@]+"${repo_args[@]}"}"
+  assert_schema_version "list-frontier"
+  assert_truncated_flag "list-frontier"
+  frontier_ids="$(jq -c '[.items[].id]' <<<"$WIT_OUT")"
+  assert_contains "frontier holds unblocked A" "$frontier_ids" "$ITEM_A_ID"
+  assert_not_contains "frontier drops blocked B" "$frontier_ids" "$ITEM_B_ID"
+
+  wit_case "list-items" 0 list-items "${repo_args[@]+"${repo_args[@]}"}"
+  assert_schema_version "list-items"
+  assert_truncated_flag "list-items"
+  assert_contains "list-items holds open A" "$(jq -c '[.items[].id]' <<<"$WIT_OUT")" "$ITEM_A_ID"
+  assert_eq "list-items rows carry created_at as a UTC timestamp or null" "true" \
+    "$(jq '[.items[] | has("created_at") and (.created_at == null
+      or (.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")))] | all' <<<"$WIT_OUT")"
+  wit_case "list-items --label nobody carries" 0 list-items --label "$RUN_TAG-absent" "${repo_args[@]+"${repo_args[@]}"}"
+  assert_truncated_flag "list-items --label"
+  assert_eq "list-items --label nobody carries holds no items" "0" "$(jq '.items | length' <<<"$WIT_OUT")"
+  wit_case "list-frontier --label nobody carries" 0 list-frontier --label "$RUN_TAG-absent" "${repo_args[@]+"${repo_args[@]}"}"
+  assert_eq "list-frontier --label nobody carries holds no items" "0" "$(jq '.items | length' <<<"$WIT_OUT")"
+fi
+
+# --- lease lifecycle + claim race ---
+
+if verb_supported claim && [[ -n "$ITEM_A_ID" ]]; then
+  wit_case "claim A" 0 claim "$ITEM_A_ID" --session-id "$RUN_TAG-s1"
+  assert_schema_version "claim A"
+  HOLDER="$(jq -r '.holder' <<<"$WIT_OUT")"
+  LEASE_CID="$(jq -r '.lease_comment_id' <<<"$WIT_OUT")"
+  if [[ -n "$HOLDER" && "$HOLDER" != "null" ]]; then
+    pass "claim holder set"
+  else
+    fail "claim holder set" "non-empty holder" "$HOLDER"
+  fi
+
+  # Second session, same identity: race arbitration by lease-comment identity.
+  wit_case "second claim backs off → exit 7" 7 claim "$ITEM_A_ID" --session-id "$RUN_TAG-s2"
+
+  if verb_supported renew-lease && [[ "$LEASE_CID" =~ ^[0-9]+$ ]]; then
+    wit_case "renew-lease A" 0 renew-lease "$ITEM_A_ID" --lease-comment-id "$LEASE_CID"
+    assert_schema_version "renew-lease A"
+    # Cross-item guard: A's lease comment must not renew a different item.
+    if [[ -n "$ITEM_B_ID" ]]; then
+      wit_case "renew-lease rejects a foreign item's comment → exit 7" 7 \
+        renew-lease "$ITEM_B_ID" --lease-comment-id "$LEASE_CID"
+    fi
+  fi
+
+  if verb_supported list-items; then
+    wit_case "frontier drops claimed A" 0 list-frontier "${repo_args[@]+"${repo_args[@]}"}"
+    assert_not_contains "claimed A left frontier" "$(jq -c '[.items[].id]' <<<"$WIT_OUT")" "$ITEM_A_ID"
+  fi
+
+  if verb_supported reclaim; then
+    # A ran through a back-off, so this also asserts reclaim selects the ACTIVE
+    # lease, not A's superseded newer one.
+    wit_case "reclaim live lease is a no-op" 0 reclaim "$ITEM_A_ID"
+    assert_eq "live lease not reclaimed" "false" "$(jq -r '.reclaimed' <<<"$WIT_OUT")"
+    # `reason` is FREE TEXT with no contract vocabulary, and adapters word it differently,
+    # so assert the semantic fact, never one adapter's prose.
+    reclaim_reason="$(jq -r '.reason' <<<"$WIT_OUT")"
+    assert_contains "reclaim picked the active lease" "$reclaim_reason" "live"
+    assert_not_contains "…and not the superseded one" "$reclaim_reason" "superseded"
+
+    # Expired-lease reclaim: ttl 0 lease on B expires immediately.
+    if [[ -n "$ITEM_B_ID" ]]; then
+      wit_case "claim B with ttl 0" 0 claim "$ITEM_B_ID" --ttl-hours 0 --session-id "$RUN_TAG-s3"
+      wit_case "reclaim expired B" 0 reclaim "$ITEM_B_ID"
+      assert_eq "expired lease reclaimed" "true" "$(jq -r '.reclaimed' <<<"$WIT_OUT")"
+      wit_case "get-item B after reclaim" 0 get-item "$ITEM_B_ID"
+      assert_eq "reclaim cleared assignees" "0" "$(jq -r '.assignees | length' <<<"$WIT_OUT")"
+    fi
+  fi
+
+  # A's lease is still live here, and the s2 claim above backed off on it.
+  if verb_supported release && [[ "$LEASE_CID" =~ ^[0-9]+$ ]]; then
+    if [[ -n "$ITEM_B_ID" ]]; then
+      wit_case "release rejects a foreign item's lease → exit 7" 7 \
+        release "$ITEM_B_ID" --lease-comment-id "$LEASE_CID"
+    fi
+    wit_case "release A" 0 release "$ITEM_A_ID" --lease-comment-id "$LEASE_CID"
+    assert_schema_version "release A"
+    assert_eq "live lease released" "true" "$(jq -r '.released' <<<"$WIT_OUT")"
+    wit_case "re-release A is a no-op" 0 release "$ITEM_A_ID" --lease-comment-id "$LEASE_CID"
+    assert_eq "re-release reports released:false" "false" "$(jq -r '.released' <<<"$WIT_OUT")"
+    wit_case "same-identity claim after release holds" 0 claim "$ITEM_A_ID" --session-id "$RUN_TAG-s4"
+  fi
+fi
+
+printf '\nConformance (%s): %d cases, %d failed\n' "$binding_name" "$CASE_NUM" "$FAILED"
+[[ $FAILED -eq 0 ]] || exit 1
