@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+# lane-telemetry-upsert.sh — maintain ONE sentinel-identified telemetry comment
+# per lane instance on a lane's tracking issue, editing it in place every cycle.
+#
+# The loop-lane contract is "maintain ONE telemetry comment per writer identity,
+# EDIT it in place, never post a second". This script owns the whole mechanism:
+# lane-instance validation, marker construction, the pre-write body gate, the
+# singleton lookup, the create/update, the post-write read-back, and the
+# creation-race reconcile. The lane skills invoke it; they do not re-derive it.
+#
+# Usage:
+#   lane-telemetry-upsert.sh --lane work-loop|attend-queue --instance <id> \
+#     --repo <owner/name> --issue <n> --body-file <path> [--app-slug <slug>]
+#
+#   --lane        Lane type. Names the marker's lane half.
+#   --instance    Lane-instance id, ^[a-z0-9][a-z0-9-]{0,31}$. Names the WRITER,
+#                 so two instances of one lane never clobber each other. An empty
+#                 value, or a surviving literal ${user_config.…} placeholder,
+#                 means the key is unset and falls back to the sanitized lowercased
+#                 hostname; the fallback is validated by the same gate, so a
+#                 hostname that cannot produce a conforming id stops the lane
+#                 rather than yielding a marker nobody chose.
+#   --repo        Target repository, owner/name. Validated before it reaches any
+#                 API URL path, so a traversal value cannot redirect the write.
+#   --issue       Tracking issue number.
+#   --body-file   File whose contents become the comment body. Its FIRST line
+#                 must be exactly the sentinel this script computes from the
+#                 marker, with the cycle's telemetry below it, and at least 16
+#                 payload bytes below line 1. The lookup matches on that prefix,
+#                 so a body composed without it would never be found again and
+#                 the next cycle would post a second comment.
+#   --app-slug    The GitHub App whose installation token gh runs under; its
+#                 writes land as <slug>[bot].
+#   --help
+#
+# WRITE IDENTITY. The `gh api user` login when that call reports a User; when it
+# fails (an App installation token cannot call it) or reports a Bot, <slug>[bot]
+# from --app-slug, else the reported Bot login with its [bot] suffix. Unresolved:
+# exit 15, nothing written. A create is checked to have landed under that login:
+# a wrong --app-slug still posts one never-found comment per cycle, but every
+# such cycle exits 15 instead of reporting success, so the cause is visible.
+#
+# WRITER CHECK. The sentinel is public text anyone can paste into a comment, so
+# the lookup adopts only comments the write identity authored. A foreign sentinel
+# comment is never made canonical, written to, or tombstoned; without the check a
+# lower-id foreign comment would become canonical and its author would seed the
+# durable state the lane re-reads every cycle.
+#
+# MARKER. `work-items:<lane>@<instance>`, and the sentinel written as the body's
+# first line is `<!-- harness-ops:lane-telemetry marker=<marker> -->`. The sentinel
+# is an HTML comment: invisible when rendered, distinct per writer, so sibling
+# instances each own one comment on the SAME issue without colliding.
+#
+# THREE CHECKS, because they catch different failures. The PRE-WRITE gate runs
+# before any API call and rejects a body that is empty, opens with a literal `@`,
+# is not sentinel-prefixed, or carries under 16 payload bytes below the sentinel.
+# A body argument given an `@path` string posts the literal path text while the
+# comment's timestamp still moves, so the surface reads FRESH while carrying no
+# data. The WRITE'S OWN EXIT STATUS is checked next: a failed PATCH leaves the
+# previous cycle's body in place, which a read-back running regardless would
+# happily accept. The POST-WRITE read-back then re-reads what the write stored and
+# compares it with the body file, the only check that sees a write which reported
+# success and stored something else, an earlier cycle's body included. It is also why create and update only ever use `-F body=@`: `-f body=@FILE`
+# transmits the literal path.
+#
+# CREATION-RACE RECONCILE. Two sessions racing the first-ever upsert can both see
+# an empty lookup and both POST, forking the singleton. Every cycle duplicates are
+# visible, the LOWEST comment id is canonical (numeric sort, deterministic for
+# every session), the canonical comment receives the current cycle's full state,
+# and every other sentinel comment is edited to a one-line tombstone — only once
+# the canonical write verifies, so a cycle whose own write is unproven never
+# tombstones a racing session's comment. A crashed racer's unmerged counters are
+# an accepted loss; nothing is deleted. The reconcile converges duplicates within
+# ONE instance's own sentinel set; a sibling instance's comment carries a different
+# marker and never enters the list.
+#
+# Exit codes. Codes 2-8 are caller errors; 9 and 10 mean NOTHING was written, so
+# fix the body composition and do not re-run blind; 11-15 mean the lane is
+# UNREPORTED for this cycle and must carry that forward, because stderr does not
+# survive the session and the next cycle has to see that this one did not report.
+# A non-zero exit is never a reason to end the loop or the pass.
+#
+#   0   upserted and verified; any duplicates superseded
+#   2   usage: a missing, repeated, or unknown argument
+#   3   --lane is not one of work-loop|attend-queue
+#   4   the resolved lane instance is empty, starts with a hyphen, or carries a
+#       character outside [a-z0-9-] — rejected, never trimmed into something
+#       that looks valid
+#   5   the resolved lane instance exceeds 32 characters (the length half of
+#       ^[a-z0-9][a-z0-9-]{0,31}$, which code 4 enforces the shape half of)
+#   6   --repo is not owner/name
+#   7   --issue is not a positive integer
+#   8   prerequisite missing: gh or jq is not on PATH
+#   9   the body file is missing, empty, or opens with a literal `@` — NOTHING written
+#   10  the body is not sentinel-prefixed, or carries under 16 payload bytes
+#       below line 1 — NOTHING written
+#   11  the comment lookup failed or returned unparsable JSON; the upsert is
+#       skipped this cycle (fail closed — treating an unreadable list as empty
+#       would post a second comment)
+#   12  no comment available to write to; a create may have landed but was not
+#       re-found — lane UNREPORTED
+#   13  the PATCH of the canonical comment failed — lane UNREPORTED; the comment
+#       holds an earlier body, not this cycle's write
+#   14  the canonical comment does NOT hold this cycle's body after the write
+#       (a different body, an earlier cycle's included, or no readable body) —
+#       lane UNREPORTED; do not trust the timestamp
+#   15  the write identity is unresolved, or --app-slug is not a slug — NOTHING
+#       written; or a create landed under another login (a wrong --app-slug) —
+#       lane UNREPORTED either way
+#
+# KNOWN LIMITS. Not implemented: the 64 KiB cap, body-file containment, and read
+# retries that the `harness-ops` lanes wrapper carries. An installed plugin cannot invoke a sibling plugin's scripts, which is
+# why this mechanism lives here rather than deferring to that wrapper.
+
+set -uo pipefail
+
+MIN_PAYLOAD_BYTES=16
+
+err() { printf 'telemetry: %s\n' "$*" >&2; }
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; }
+
+require_value() {
+  (($# >= 2)) && return 0
+  err "$1 requires a value"
+  exit 2
+}
+
+LANE=""
+INSTANCE=""
+REPO=""
+ISSUE=""
+BODY_FILE=""
+APP_SLUG=""
+while (($#)); do
+  case "$1" in
+  # Normalize `--opt=value` to `--opt value` for the next pass. Known options only,
+  # so an unknown `--bogus=x` still reaches the catch-all intact.
+  --lane=* | --instance=* | --repo=* | --issue=* | --body-file=* | --app-slug=*)
+    set -- "${1%%=*}" "${1#*=}" "${@:2}"
+    ;;
+  --lane)
+    require_value "$@"
+    LANE="$2"
+    shift 2
+    ;;
+  --instance)
+    require_value "$@"
+    INSTANCE="$2"
+    shift 2
+    ;;
+  --repo)
+    require_value "$@"
+    REPO="$2"
+    shift 2
+    ;;
+  --issue)
+    require_value "$@"
+    ISSUE="$2"
+    shift 2
+    ;;
+  --body-file)
+    require_value "$@"
+    BODY_FILE="$2"
+    shift 2
+    ;;
+  --app-slug)
+    require_value "$@"
+    APP_SLUG="$2"
+    shift 2
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    err "unknown argument: $1"
+    exit 2
+    ;;
+  esac
+done
+
+[[ -n "$BODY_FILE" ]] || {
+  err "--body-file is required"
+  exit 2
+}
+
+case "$LANE" in
+work-loop | attend-queue) : ;;
+*)
+  err "--lane must be work-loop or attend-queue (got: '$LANE')"
+  exit 3
+  ;;
+esac
+
+# A surviving literal placeholder means the userConfig key is unset, so it takes
+# the same path as an absent value rather than being validated as an id.
+# shellcheck disable=SC2016  # the placeholder is matched literally, never expanded
+case "$INSTANCE" in
+'${user_config.'*) INSTANCE="" ;;
+*) : ;;
+esac
+
+# A default, not a sanitizer: the gate below validates it. Keep the transform
+# byte-for-byte; changing it orphans every comment written under the fallback.
+if [[ -z "$INSTANCE" ]]; then
+  INSTANCE="$(hostname | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')"
+  err "no lane instance supplied; assuming the sanitized hostname '$INSTANCE'"
+fi
+
+# Rejected, never sanitized: this operator text is interpolated into a marker, a
+# shell string, and a jq program, so it is checked BEFORE the marker is built.
+case "$INSTANCE" in
+"" | -* | *[!a-z0-9-]*)
+  err "lane_instance '$INSTANCE' is not ^[a-z0-9][a-z0-9-]{0,31}\$; refusing to build a marker"
+  exit 4
+  ;;
+*) : ;;
+esac
+if ((${#INSTANCE} > 32)); then
+  err "lane_instance '$INSTANCE' exceeds 32 characters; refusing to build a marker"
+  exit 5
+fi
+
+# Checked before any gh api URL path: GitHub's routing normalizes `..` segments,
+# redirecting the write to another repository the token can reach.
+if [[ ! "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ || "/$REPO/" =~ /\.+/ ]]; then
+  err "--repo must be owner/name (got: '$REPO')"
+  exit 6
+fi
+if [[ ! "$ISSUE" =~ ^[0-9]+$ ]]; then
+  err "--issue must be a positive integer (got: '$ISSUE')"
+  exit 7
+fi
+
+for bin in gh jq; do
+  command -v "$bin" >/dev/null 2>&1 || {
+    err "$bin not found (required)"
+    exit 8
+  }
+done
+
+MARKER="work-items:$LANE@$INSTANCE"
+SENT="<!-- harness-ops:lane-telemetry marker=$MARKER -->"
+
+# --- Pre-write body gate -----------------------------------------------------
+if [[ ! -s "$BODY_FILE" ]]; then
+  err "body is missing or empty - nothing written; fix the body composition, do not re-run blind"
+  exit 9
+fi
+if [[ "$(head -c 1 "$BODY_FILE")" == "@" ]]; then
+  err "body is a literal @path - nothing written; fix the body composition, do not re-run blind"
+  exit 9
+fi
+
+BODY_TEXT="$(cat "$BODY_FILE")"
+
+# A byte-prefix match, not a whole-line one, so the payload floor below line 1
+# reads the same whether that line ends in LF or CRLF.
+sentinel_ok() {
+  local text="$1" payload_bytes
+  [[ "$text" == "$SENT"* ]] || return 1
+  payload_bytes="$(printf '%s' "$text" | tail -n +2 | wc -c | tr -d ' ')"
+  ((payload_bytes >= MIN_PAYLOAD_BYTES))
+}
+
+if ! sentinel_ok "$BODY_TEXT"; then
+  err "body is not sentinel-prefixed or carries no payload - nothing written; fix the body composition, do not re-run blind"
+  exit 10
+fi
+
+# --- Write identity ----------------------------------------------------------
+# A User login is the identity; a failed call or a Bot means an App token, whose
+# writes land as <slug>[bot]. Validated before it enters a jq program.
+if [[ -n "$APP_SLUG" && ! "$APP_SLUG" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+  err "--app-slug must be a GitHub App slug (got: '$APP_SLUG') - nothing written; treat the lane as UNREPORTED"
+  exit 15
+fi
+WRITER=""
+if who="$(gh api user --jq '.login + " " + .type' 2>/dev/null)" && [[ "$who" == *" User" ]]; then
+  WRITER="${who% User}"
+elif [[ -n "$APP_SLUG" ]]; then
+  WRITER="${APP_SLUG}[bot]"
+elif [[ "${who:-}" == *" Bot" ]]; then
+  WRITER="${who% Bot}"
+  [[ "$WRITER" == *"[bot]" ]] || WRITER="${WRITER}[bot]"
+fi
+if [[ ! "$WRITER" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*(\[bot\])?$ ]]; then
+  err "cannot resolve the write identity ('$WRITER'); under an App token pass --app-slug - nothing written; treat the lane as UNREPORTED"
+  exit 15
+fi
+
+# --- Singleton lookup --------------------------------------------------------
+# Without `--paginate` a comment past page 1 is invisible and a duplicate posts every
+# cycle. `startswith` on the FULL sentinel, never `contains`: a quoted sibling is not adopted.
+# Only the writer's own comments count, because anyone can paste the sentinel.
+lookup() {
+  local pages ids
+  pages="$(gh api --paginate "repos/$REPO/issues/$ISSUE/comments?per_page=100" 2>/dev/null)" || return 1
+  ids="$(jq -r --arg s "$SENT" --arg w "$WRITER" \
+    '.[] | select(((.body // "") | startswith($s)) and (.user.login == $w)) | .id' <<<"$pages" 2>/dev/null)" || return 1
+  printf '%s\n' "$ids"
+}
+
+if ! LIST="$(lookup)"; then
+  err "comment lookup failed; skipping upsert this cycle (fail closed)"
+  exit 11
+fi
+
+if [[ -z "${LIST//[[:space:]]/}" ]]; then
+  POSTED_AS="$(gh api --method POST "repos/$REPO/issues/$ISSUE/comments" -F body=@"$BODY_FILE" --jq '.user.login' 2>/dev/null)" || POSTED_AS=""
+  # A wrong --app-slug would otherwise post a fresh, never-found comment every cycle.
+  if [[ -n "$POSTED_AS" && "$POSTED_AS" != "$WRITER" ]]; then
+    err "the comment was posted as '$POSTED_AS', not the resolved write identity '$WRITER'; fix --app-slug before the next cycle - treat the lane as UNREPORTED"
+    exit 15
+  fi
+  # A failure re-listing here is not fatal: the create may have landed, and the
+  # next cycle's ordinary upsert performs the same reconcile.
+  LIST="$(lookup)" || LIST=""
+fi
+
+SORTED="$(printf '%s\n' "$LIST" | grep -E '^[0-9]+$' | sort -n)"
+mapfile -t IDS <<<"$SORTED"
+CANON="${IDS[0]:-}"
+if [[ -z "$CANON" ]]; then
+  err "no comment available to write to (a create may have landed but was not re-found) - treat the lane as UNREPORTED and carry that forward to the next cycle"
+  exit 12
+fi
+
+if ! gh api --method PATCH "repos/$REPO/issues/comments/$CANON" -F body=@"$BODY_FILE" >/dev/null 2>&1; then
+  err "the PATCH of comment $CANON failed - treat the lane as UNREPORTED and carry that forward to the next cycle; the comment holds an earlier body, not this cycle's write"
+  exit 13
+fi
+
+# --- Post-write read-back ----------------------------------------------------
+# The stored body must equal the body file, not merely look like telemetry: a write
+# that reported success while the comment kept an earlier cycle's well-formed body
+# would otherwise verify. CR is dropped on both sides and `$( )` drops trailing
+# newlines on both, so only a line-ending or final-newline difference is tolerated.
+verify() {
+  local back want
+  back="$(gh api "repos/$REPO/issues/comments/$1" 2>/dev/null | jq -r '.body // empty' 2>/dev/null | tr -d '\r')" || return 1
+  want="$(tr -d '\r' <"$BODY_FILE")"
+  [[ "$back" == "$want" ]]
+}
+
+if ! verify "$CANON"; then
+  err "comment $CANON does NOT hold this cycle's body after the write - treat the lane as UNREPORTED and carry that forward to the next cycle; do not trust the timestamp"
+  exit 14
+fi
+
+# --- Duplicate supersede (only after a verified canonical write) -------------
+# `-f body=` here, not `-F body=@`: the tombstone is a literal string, not a file.
+for dup in "${IDS[@]:1}"; do
+  gh api --method PATCH "repos/$REPO/issues/comments/$dup" \
+    -f body="Superseded duplicate - canonical telemetry comment: $CANON" >/dev/null 2>&1 || true
+done
+
+printf 'telemetry: upserted comment %s (marker=%s) on %s#%s\n' "$CANON" "$MARKER" "$REPO" "$ISSUE"
+exit 0

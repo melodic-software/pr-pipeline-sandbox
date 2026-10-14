@@ -1,0 +1,94 @@
+{
+  "name": "work-items",
+  "version": "2.3.0",
+  "description": "Work items through a provider-neutral tracker seam (github, local-markdown, jira, gitea, linear adapters): track (dashboard, creation, race-safe claims, recurring-schedule checks, stale-lease audits), scan-todos, decompose (plans into vertical-slice items), ship (route and run one spec container), triage (raw intake and unsolicited PRs), work, work-loop (autonomous PR-only drain), attend-queue (escalations), onboard-adapter (new tracker adapter), and setup (binds the provider).",
+  "author": {
+    "name": "Melodic Software",
+    "email": "info@melodicsoftware.com"
+  },
+  "license": "MIT",
+  "keywords": [
+    "work-items",
+    "tracker",
+    "seam",
+    "provider-neutral",
+    "github",
+    "issues",
+    "triage",
+    "orchestration"
+  ],
+  "userConfig": {
+    "decompose_container_publish": {
+      "type": "boolean",
+      "title": "Decompose spec-container preselect",
+      "description": "When true, /work-items:decompose pre-selects the spec-container offer in its approval round for multi-session breakdowns; the approval gate stays mandatory. Unset or false: the plain ask, with a default answer of no. No default is declared, so unset stays distinct from false."
+    },
+    "triage_repro_count": {
+      "type": "number",
+      "title": "Triage repro count",
+      "description": "Independent reproductions /work-items:triage needs, each with evidence in its comment, before it marks a bug confirmed. Default 2. The repository's docs/conventions/work-items.yaml overrides this per repo.",
+      "default": 2,
+      "min": 1
+    },
+    "triage_objection_window_hours": {
+      "type": "number",
+      "title": "Triage objection window (hours)",
+      "description": "Hours after triage makes an item autonomous-eligible during which the work-loop lane skips it, so a person can object in a reply. 0 (the default) is off. The repository's docs/conventions/work-items.yaml overrides this per repo.",
+      "default": 0,
+      "min": 0
+    },
+    "work_dispatch_concurrency_cap": {
+      "type": "number",
+      "title": "Autonomous dispatch concurrency cap",
+      "description": "Maximum worker rows /work-items:work's autonomous execute step lets /implementation:implement-dispatch run at once in one plan phase, passed as its --wave-cap ceiling. A fractional value is floored. Unset: implement-dispatch's implement_dispatch_wave_cap option, else its internal default.",
+      "min": 1
+    },
+    "lane_instance": {
+      "type": "string",
+      "title": "Lane instance ID",
+      "description": "Writer identity for this machine's work-loop telemetry, the suffix of its telemetry marker, so concurrent lane instances never overwrite each other. Absent: the sanitized lowercased hostname. Must match ^[a-z0-9][a-z0-9-]{0,31}$. It appears verbatim in tracker comments."
+    },
+    "work_loop_item_cap_start": {
+      "type": "number",
+      "title": "Work-loop item cap start",
+      "description": "Where the work-loop lane's adaptive per-cycle item cap starts. Default 2. The cap ramps up by one after three consecutive clean items (never while a rate-limit warning is latched) and drops by one on any dirty item; enforcement is the loop body's own arithmetic.",
+      "default": 2,
+      "min": 1
+    },
+    "work_loop_item_cap_ceiling": {
+      "type": "number",
+      "title": "Work-loop item cap ceiling",
+      "description": "Upper bound the work-loop lane's adaptive item cap can ramp to for non-frontier-tier items. Default 3. Frontier-tier items are bounded separately by work_loop_frontier_item_cap_ceiling.",
+      "default": 3,
+      "min": 1
+    },
+    "work_loop_item_cap_floor": {
+      "type": "number",
+      "title": "Work-loop item cap floor",
+      "description": "Lower bound the work-loop lane's adaptive item cap can drop to on dirty items. Default 1.",
+      "default": 1,
+      "min": 1
+    },
+    "work_loop_frontier_item_cap_ceiling": {
+      "type": "number",
+      "title": "Work-loop frontier item cap ceiling",
+      "description": "Ceiling on the adaptive cap for frontier-capability-tier items in the work-loop lane, which run at concurrency 1. Default 2; keep it at or below work_loop_item_cap_ceiling. The tier is read from the provider-permissioned label only; no label means the general tier (fail-closed).",
+      "default": 2,
+      "min": 1
+    },
+    "work_loop_no_progress_threshold": {
+      "type": "number",
+      "title": "Work-loop stall threshold (cycles)",
+      "description": "Consecutive no-progress cycles (actionable work in view, no item advanced, no PR opened) before the work-loop lane raises its stall escalation. Default 3. The lane escalates and keeps looping. Idle cycles with nothing actionable neither count nor reset.",
+      "default": 3,
+      "min": 1
+    },
+    "work_loop_in_flight_stale_days": {
+      "type": "number",
+      "title": "Work-loop stale in-flight PR age (days)",
+      "description": "Age in days, from the PR's createdAt, past which a candidate's open closing PR (draft or ready) stops being silently excluded and the work-loop lane escalates it to the attended queue. Default 14. The drain report names it; the lane stores no state for it.",
+      "default": 14,
+      "min": 1
+    }
+  }
+}

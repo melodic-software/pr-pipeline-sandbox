@@ -1,0 +1,136 @@
+# Action: `add`
+
+Create a new work item with labels from the taxonomy.
+
+**Defaults applied by this action:**
+
+- **Priority.** When the `--priority` flag is absent, set no `priority:` label. Urgency is assigned at triage, not at filing. Apply the bare floor label `needs-triage` when that exact name exists in the live set ([`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md)). Do not pass it as `--priority`, and do not substitute `priority: low` or a prefixed `needs-triage` spelling. Omit the floor when the live set has no `needs-triage` label.
+- **Body template.** When `--body` is not provided, fall back to the default skeleton: a `## Context` paragraph (what observation surfaced this item, what's the cost of leaving it), a `## Proposed work` bullet list (concrete next actions), `## Acceptance criteria` (one verifiable assertion per bullet), and `## References` (cross-references to rules, files, prior PRs, or external docs). The concrete body the workflow builds is detailed in step "Build body" below.
+- **Label taxonomy.** Labels are validated against the structure documented in [`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md).
+- **Title shape.** The item title follows the convention in [`${CLAUDE_PLUGIN_ROOT}/reference/issue-conventions.md`](${CLAUDE_PLUGIN_ROOT}/reference/issue-conventions.md).
+
+## Usage
+
+```
+/work-items:track add [--category <name>] [--type <type>] [--area <area>] [--ecosystem <eco>] [--priority <p>] [--recurring --cadence <cadence>] [--context "summary"] [--label <name>]... [--body-file <path>] [--parent <id>] [--blocked-by <id>[,<id>]] "Item description"
+```
+
+## Flags
+
+- `--category <name>` -- Category label. Valid values are the consuming repo's `category:` labels (see [`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md)); default `general` only when the repo actually defines a `category:general` label, otherwise omit the category label
+- `--type <type>` -- The issue's type (default: `task`). Accepts the commit-style inputs `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `build`, `perf` and maps them to the coarse issue type: `fix` → **Bug**, `feat` → **Feature**, everything else → **Task**. On **org repos** the type is a **native GitHub Issue Type** set through the seam (not a `type:` label); on **personal / non-org repos** (no native Issue Types) it becomes a coarse `type: bug`/`type: feature`/`type: task` label instead
+- `--area <area>` -- Area label from the consuming repo's `area:` labels (see [`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md))
+- `--ecosystem <eco>` -- Ecosystem label from the consuming repo's `ecosystem:` labels (see [`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md))
+- `--priority <p>` -- Priority label; value must be one of the repo's live `priority:` members (see [`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md) "Universal axes", resolved live, never snapshotted here), e.g. `critical`, `high`, `medium`, `low` where the repo follows that convention
+- `--recurring` -- Mark as recurring. Requires `--cadence`
+- `--cadence <c>` -- One of: `weekly`, `biweekly`, `monthly`, `quarterly`, `semi-annual`, `annual`
+- `--context "summary"` -- Add research context to the item body
+- `--agent-ready` -- Apply the autonomous-eligible role label (default `agent-ready`; resolve per [`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md) "Canonical roles") and use agent-brief body template (see [`${CLAUDE_PLUGIN_ROOT}/reference/agent-brief.md`](${CLAUDE_PLUGIN_ROOT}/reference/agent-brief.md)). Brief rules (from that file): name by contract, describe the end state, yes-or-no checks, named limits. Use for items intended for AFK agent execution
+- `--force` -- Skip duplicate check
+- `--label <name>` -- Apply this label verbatim (repeatable). Each must exist in the live set ([labels.md](labels.md)); a missing one stops the action before anything is created, naming the full missing set
+- `--body-file <path>` -- Use this file, written with the Write tool, as the whole body instead of a template
+- `--parent <id>` -- File the item as a child of this container (seam `create-item --parent`). A child is filed by its container's owner, past intake: the category default, the `needs-triage` floor and the default body template do not apply
+- `--blocked-by <id>[,<id>]` -- Create the item with these blocked-by edges (seam `create-item --blocked-by`); file the blockers first
+
+## Workflow
+
+> **Authorization gate (BEFORE any step below).** Never file a work item on inferred intent. A topic the user raised, "they'd want it tracked", or approval of a related *direction* is NOT authorization to create an outward-facing artifact. Those need explicit authorization. An explicit user `/work-items:track add ...` invocation IS the authorization, as is a step of `/planning:wayfind` chart mode filing the map, or its decision items, that the user asked it to chart (chart mode refuses unattended runs); model-initiated filing is not, and no other skill's steps count. If you only *infer* an item should exist: draft the title + body, ASK first, OR write a local note in the topic's memory slice (`<memory_dir>/<slug>/`, default `.work/`) instead.
+
+1. Parse the item text and flags from arguments.
+
+1. **Duplicate check** (skip if `--force`): the search-before-create pre-flight (adapter: "Search items", `--state all`, bare read). When the GraphQL search returns HTTP 403, use the REST form of "Search items" instead. If a potential duplicate is found (similar title), present it: "Similar item found: **#N {title}** ({state}). Add anyway, merge, or skip?"
+
+1. **Rejected-concept check.** When the consuming repo keeps a rejected-concept ledger (`docs/out-of-scope/`, one file per concept), scan its concept files for a match with the incoming request. Match by **concept similarity, not keyword** ("night theme" matches `dark-mode.md`). On a match, answer from the ledger instead of re-litigating: present the recorded rationale ("Rejected before in `docs/out-of-scope/<concept>.md`: <reason>. Still stand?"). If the user confirms the rejection stands, append the request to that file's "Prior requests" log (re-read the file from disk first; append a line, never rewrite the file) and stop without filing. If the user reconsiders, or the directory is absent, continue normally: no ledger, no check.
+
+1. **Resolve the issue type** `{type}` from `--type` (default `task`), mapping the input to the coarse type: `fix` → `Bug`, `feat` → `Feature`, everything else → `Task`. **Org repos** (native Issue Types available): the type is applied through the seam as a native Issue Type, **not** a label, so it is not part of `{labels}`. **Personal / non-org repos** (native-type mechanism unavailable): the type rides as a coarse long-form label instead. Append `type: bug` / `type: feature` / `type: task` (colon-space, matching the reconciled naming) to `{labels}`. Determine which path applies from the bound adapter's capabilities (for the GitHub adapter, native Issue Types are an org-only feature).
+
+1. **Build labels list** `{labels}` (comma-separated for the seam) from the remaining flags. With no `--priority` and no `--agent-ready`, include no `priority:` label and include the bare `needs-triage` floor when the live set has it. A supplied `--priority`, or `--agent-ready`, does not leave the floor on: a known tier or a complete brief is already past intake. Also start from `category:general` and replace it with a supplied `--category`. Append `--area`/`--ecosystem` labels when provided. When `--agent-ready` is set, also append the autonomous-eligible role label (default `agent-ready`) so the item is eligible for autonomous pickup. A default that the consuming repo doesn't define is omitted rather than passed. With `--parent`, or a `--label` that is the binding's container label (`config.container_label`, default `work-map`), skip the `category:general` default and the `needs-triage` floor: a container or its child is not intake. Append each `--label` verbatim, after checking them as the flag says.
+
+1. **Build body.** With `--body-file`, the file is the body. With `--parent` or the container label and no `--body-file`, the description is the body. Otherwise, if `--agent-ready`, use the agent-brief template from [`${CLAUDE_PLUGIN_ROOT}/reference/agent-brief.md`](${CLAUDE_PLUGIN_ROOT}/reference/agent-brief.md) (Type, Summary, Current behavior, Desired behavior, Key interfaces, Acceptance criteria, Out of scope). Otherwise use the default template:
+
+```markdown
+## Context
+
+{what observation surfaced this item; the cost of leaving it, from the description and --context}
+
+## Proposed work
+
+- {concrete next action derived from the description}
+
+## Acceptance criteria
+
+- [ ] {one verifiable assertion per bullet}
+
+## References
+
+- {cross-references to rules, files, prior PRs, or external docs, or "none"}
+
+## Metadata
+
+| Field | Value |
+|-------|-------|
+| Category | {category} |
+| Area | {area or "unspecified"} |
+| Ecosystem | {ecosystem or "unspecified"} |
+
+{if --recurring: ## Recurring\n\nCadence: {cadence}\nTriggers: {triggers or "none configured"}}
+```
+
+Shape the composed body for the person who reads the item, bottom line first and no filler: invoke `/writing:be-concise` via the Skill tool when the `writing` plugin is installed; otherwise apply that discipline inline. The template's sections stay as they are, and no acceptance criterion, number, or reference is dropped to shorten it.
+
+1. **Create the item** via the seam (`create-item` routes the write through the adapter's identity policy). On org repos pass the resolved native Issue Type via the seam's `--type` passthrough (the adapter maps `Bug`/`Feature`/`Task` to the native GitHub Issue Type); on personal / non-org repos the type instead rode into `{labels}` in the resolve step, so omit `--type`. **When `--recurring` targets a repo with no `.github/recurring-schedule.json` yet, resolve the schedule bootstrap FIRST** (the ask-first path in the next step). If the user declines the new schedule or it cannot be written, create the item **non-recurring** (drop the `[Maintenance]` prefix and the `recurring`/`cadence:` labels) or abort; never create a `[Maintenance]` item that `due`/`recheck` can never reconcile because no schedule row backs it. If `--recurring` and the schedule is in place, prefix the title with `[Maintenance]` to match the convention used by the recurring-issues automation (enables dedup and `recheck` matching). Write the composed body to a temp file with the Write tool and pass it argv-safe. **Never** inline the generated body, which can contain quotes, backticks, or `$()` the shell would interpret before the seam sees it:
+
+```bash
+# Call 1: print a fresh temp path. Write the composed body to that path with the Write tool
+# before call 2, never through the shell. --body-file hands the file to the seam as one
+# literal body the shell never re-parses.
+mktemp
+# Call 2: every value spelled out, the temp path from call 1 included.
+"${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/work-item-tracker.sh" create-item \
+  --title "[Maintenance] {title}" \
+  --body-file "<temp path from call 1>" \
+  --type "{type}" \
+  --labels "{labels}"   # --type: org repos only (native Issue Type); on personal/non-org repos drop it, the type is already a type: label in {labels}
+# Call 3: run it whether call 2 succeeded or failed, so no temp file is left behind.
+rm -f "<temp path from call 1>"
+```
+
+Run each call as its own plain Bash command: no `$(...)`, no `git`, and no `&&` chain around `create-item`, so a worktree-isolated session can run it as written. When call 2 fails, still run call 3, then report the failure; a retry starts again from call 1 with a fresh temp path. If the `${CLAUDE_PLUGIN_ROOT}` tracker path does not exist, run `git rev-parse --show-toplevel` as a separate call and spell out `<that path>/tools/work-item-tracker/work-item-tracker.sh` in call 2.
+
+- **Pointer**: [Worktrees, "How Claude Code enforces isolation"](https://code.claude.com/docs/en/worktrees#how-claude-code-enforces-isolation); probe [#6929](https://github.com/melodic-software/claude-code-plugins/issues/6929).
+- **As of**: 2026-10-11
+- **Recheck trigger**: a Claude Code release in which the pre-#6929 snippet (tracker path fallback through `$(git rev-parse --show-toplevel)`, body through `"$(cat "$BODY_FILE")"`) runs from a worktree-isolated session.
+
+For non-recurring items, omit the `[Maintenance]` prefix. Pass `--parent '<id>'` and `--blocked-by '<id>[,<id>]'` through to `create-item` when given; a `--parent` the provider cannot honor exits `6`, which is reported, never dropped. The emitted item object carries the new `id` (fully-qualified) and `number`.
+
+1. **If `--recurring`:** Also add the item to the consuming repo's `.github/recurring-schedule.json`. When the file does not exist yet, create it with an `{"items": []}` skeleton before appending (ask first if the repo has no recurring setup at all, since without the schedule `due`/`recheck` will never see the item):
+
+```json
+{
+  "id": "kebab-case-id",
+  "title": "Title text",
+  "cadence": "quarterly",
+  "area": ["<your-area>"],
+  "category": "<your-category>",
+  "triggers": [],
+  "last_checked": "2026-04-08",
+  "next_due": "2026-07-07",
+  "notes": "Description text.",
+  "close_previous": true
+}
+```
+
+Re-read the current file from disk immediately before the write, because the schedule is shared and another session may have appended since it was last in context. Then append the new item to the `items` array and write it back, preserving every existing row. Compute `next_due` from today + cadence duration. Also add the recurring-maintenance role label (default `recurring`) and the `cadence:{cadence}` label to the item.
+
+1. Confirm: "Created **#{number}**: {title} (type: {type}, labels: {labels})"
+
+## Cadence Duration Table
+
+| Cadence | Days |
+|---------|------|
+| `weekly` | 7 |
+| `biweekly` | 14 |
+| `monthly` | 30 |
+| `quarterly` | 90 |
+| `semi-annual` | 180 |
+| `annual` | 365 |

@@ -1,0 +1,31 @@
+# shellcheck shell=bash
+# Shared assertions for adapter verb *.test.sh files. Sourced, never run
+# directly (runner ignores non-*.test.sh).
+set -uo pipefail
+
+# tests/lib.sh provides the FAILED/CASE_NUM defensive defaults.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../tests/lib.sh"
+
+# assert_help <script> — --help exits 0 with non-empty stdout.
+assert_help() {
+  local script="$1" name out rc
+  name="$(basename "$script")"
+  out="$(bash "$script" --help 2>/dev/null)"
+  rc=$?
+  assert_eq "$name --help exit 0" "0" "$rc"
+  if [[ -n "$out" ]]; then
+    pass "$name --help non-empty stdout"
+  else
+    fail "$name --help non-empty stdout" "non-empty" "empty"
+  fi
+}
+
+# assert_usage_error <script> <args…> — the invocation exits 2 (usage).
+assert_usage_error() {
+  local script="$1" name rc
+  shift
+  name="$(basename "$script")"
+  bash "$script" "$@" >/dev/null 2>&1
+  rc=$?
+  assert_eq "$name usage error → exit 2" "2" "$rc"
+}

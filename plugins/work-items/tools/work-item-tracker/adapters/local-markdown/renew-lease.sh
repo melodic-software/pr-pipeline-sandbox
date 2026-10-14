@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# renew-lease <id> --lease-comment-id <n> — CONTRACT.md "Lease protocol". Bumps
+# renewed_at in place on the addressed lease. The handle is store-global, so a
+# stale or cross-item handle would otherwise renew a DIFFERENT item's lease and
+# report success for <id>; the handle's owning item is verified against <id> first.
+set -uo pipefail
+# shellcheck source=common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
+usage='usage: renew-lease <id> --lease-comment-id <n>'
+wit_help_if_requested "$usage" "$@"
+
+id="${1:-}"
+[[ -n "$id" ]] || wit_usage_error "$usage"
+shift
+lease_comment_id=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --lease-comment-id)
+    [[ $# -ge 2 ]] || wit_usage_error "--lease-comment-id needs a value"
+    lease_comment_id="$2"
+    shift 2
+    ;;
+  *) wit_usage_error "unknown argument: $1" ;;
+  esac
+done
+wit_require_local_id "$id" || wit_usage_error "malformed or non-local-markdown id: $id"
+[[ "$lease_comment_id" =~ ^[0-9]+$ ]] || wit_usage_error "--lease-comment-id must be numeric"
+
+wit_need_storage
+number="$WIT_ID_NUMBER"
+
+found="$(wit_find_lease_file "$lease_comment_id")" || {
+  printf 'renew-lease: no lease with handle %s\n' "$lease_comment_id" >&2
+  exit "$EX_CONFLICT"
+}
+lease_number="${found%%$'\t'*}"
+old_line="${found#*$'\t'}"
+
+if [[ "$lease_number" != "$number" ]]; then
+  printf 'renew-lease: lease %s belongs to item #%s, not #%s\n' \
+    "$lease_comment_id" "$lease_number" "$number" >&2
+  exit "$EX_CONFLICT"
+fi
+
+file="$(wit_item_file "$number")"
+lease_json="$(wit_lease_json "$old_line")"
+
+# The addressed lease must BE the active lease (newest non-superseded). A
+# superseded/older handle renewing would resurrect a lease its owner no longer holds.
+active_id="$(jq -r '.lease_comment_id // empty' <<<"$(wit_active_lease_json "$file")")"
+if [[ "$active_id" != "$lease_comment_id" ]]; then
+  printf 'renew-lease: lease %s is not the active lease (active: %s)\n' \
+    "$lease_comment_id" "${active_id:-none}" >&2
+  exit "$EX_CONFLICT"
+fi
+
+# Being the active (non-superseded) lease is still not enough: an active lease can
+# be EXPIRED — `renewed_at + ttl_hours` already elapsed — without a superseding
+# marker yet, including ttl-0 born-expired claims. Renewing that would revive a
+# lease another worker has reasonably treated as expired, defeating TTL-based
+# handoff. Refuse the renewal (conflict) for an expired lease; recovery is a
+# fresh claim, not a revive of the dead handle.
+if ! wit_lease_is_live "$lease_json" "$(date -u +%s)"; then
+  printf 'renew-lease: lease %s is expired (renewed_at + ttl_hours elapsed); not renewing\n' \
+    "$lease_comment_id" >&2
+  exit "$EX_CONFLICT"
+fi
+
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+renewed="$(jq -c --arg ts "$now" '. + {renewed_at: $ts}' <<<"$lease_json")"
+new_line="${WIT_LEASE_MARKER}${renewed} -->"
+
+# The renewal is only real once it lands in the store. A rewrite that cannot run
+# (no temp file, a full or unwritable store) must fail the verb: reporting a
+# renewed_at no reader will ever see hands the holder a lease the next reader
+# still expires on the old timestamp. Exit 1 is internal/unexpected store I/O
+# failure (CONTRACT.md "Exit codes"), distinct from the exit-7 conflicts above.
+if ! { tmp="$(mktemp)" &&
+  awk -v old="$old_line" -v new="$new_line" '$0 == old { print new; next } { print }' "$file" >"$tmp" &&
+  mv "$tmp" "$file"; }; then
+  rm -f "${tmp:-}"
+  printf 'renew-lease: writing the renewed lease for %s failed\n' "$id" >&2
+  exit 1
+fi
+
+jq -c --arg sv "$WIT_SCHEMA_VERSION" --arg id "$id" --arg cid "$lease_comment_id" \
+  '{schema_version: $sv, id: $id, holder: .holder, acquired_at: .acquired_at,
+    renewed_at: .renewed_at, ttl_hours: .ttl_hours,
+    lease_comment_id: ($cid | tonumber), session_id: (.session_id // null)}' <<<"$renewed"

@@ -117,7 +117,33 @@ activities:
     reads-untrusted: false
     inputs: [pr, head-sha]
 
+  # Phase 3 of the issue-work lane: copied from claude-code-plugins' config,
+  # with the go-live time set to when this sandbox case was staged.
+  resolve-issue:
+    skill: work-items:work
+    args: --ci
+    effect: mutate-branch
+    gating: advisory
+    reads-untrusted: true
+    inputs: [issue]
+    applies-when:
+      events: [labeled]
+      labels: ["work-class: read-only"]
+      labeled-after: "2026-10-14T18:50:34Z"
+  report-outcome:
+    script: .github/scripts/work-resolve-issue/report-outcome.mjs
+    effect: publish-artifact
+    gating: advisory
+    reads-untrusted: false
+    inputs: [issue]
+
 lanes:
+  work-resolve-issue:
+    stage: work
+    slots:
+      - activity: resolve-issue
+      - activity: report-outcome
+        needs: [resolve-issue]
   pr-unblock:
     stage: unblock
     slots:
