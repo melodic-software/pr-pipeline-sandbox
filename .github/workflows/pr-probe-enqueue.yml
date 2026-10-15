@@ -1,0 +1,49 @@
+name: pr-probe-enqueue
+
+# PROBE, remove after: lane caller for the enqueue/auto-merge permission probe.
+# Runs probe-enqueue-pr (pull-requests write, contents read) and
+# probe-enqueue-branch (contents write, pull-requests read) on one PR.
+# workflow_dispatch only, by a listed human.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: The throwaway sandbox PR to probe.
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  probe-enqueue-pr:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      id-token: write
+    concurrency:
+      group: pr-pipeline-write-${{ inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-write.yml # zizmor: ignore[self-repository]
+    with:
+      lane: pr-probe-enqueue
+      activity: probe-enqueue-pr
+      pr-number: ${{ inputs.pr-number }}
+
+  probe-enqueue-branch:
+    needs: probe-enqueue-pr
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      id-token: write
+    concurrency:
+      group: pr-pipeline-write-${{ inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-write.yml # zizmor: ignore[self-repository]
+    with:
+      lane: pr-probe-enqueue
+      activity: probe-enqueue-branch
+      pr-number: ${{ inputs.pr-number }}

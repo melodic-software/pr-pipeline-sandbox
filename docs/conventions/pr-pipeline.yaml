@@ -148,7 +148,28 @@ activities:
     reads-untrusted: true
     inputs: [pr, head-sha]
 
+  # PROBE, remove after: which lane token lets the lanes App enqueue a PR and
+  # enable auto-merge. Run by pr-probe-enqueue.yml on a throwaway PR.
+  probe-enqueue-pr:
+    script: scripts/lanes/probe-enqueue.sh
+    effect: publish-artifact
+    gating: advisory
+    reads-untrusted: false
+    inputs: [pr, head-sha]
+  probe-enqueue-branch:
+    script: scripts/lanes/probe-enqueue.sh
+    effect: mutate-branch
+    gating: advisory
+    reads-untrusted: false
+    inputs: [pr, head-sha]
+
 lanes:
+  # PROBE, remove after.
+  pr-probe-enqueue:
+    stage: maintenance
+    slots:
+      - activity: probe-enqueue-pr
+      - activity: probe-enqueue-branch
   pr-merge:
     stage: merge
     slots:
