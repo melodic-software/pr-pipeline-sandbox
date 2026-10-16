@@ -1,1 +1,2 @@
 Restack probe for melodic-software/claude-code-plugins#7664, layer 1.
+Second line, pushed to layer 1 after the stack was submitted.
