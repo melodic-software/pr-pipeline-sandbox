@@ -110,6 +110,25 @@ activities:
       mergeable: [conflicting]
       labels-absent: [do-not-merge, needs-human]
       draft: [false]
+  # Phase 3 of the address-feedback plan (claude-code-plugins#7032): the model
+  # job pushes fixes and records replies; the script job posts them.
+  address-feedback:
+    skill: source-control:pull-request
+    args: comments --ci
+    prepare: review-threads
+    effect: mutate-branch
+    gating: advisory
+    reads-untrusted: true
+    inputs: [pr, head-sha]
+    applies-when:
+      labels-absent: [do-not-merge, needs-human]
+      draft: [false]
+  publish-feedback:
+    script: .github/scripts/pr-unblock/publish-feedback.mjs
+    effect: publish-artifact
+    gating: advisory
+    reads-untrusted: true
+    inputs: [pr, head-sha]
   report-escalation:
     script: .github/scripts/pr-unblock/report-escalation.sh
     effect: publish-artifact
@@ -163,8 +182,11 @@ lanes:
     stage: unblock
     slots:
       - activity: resolve-conflicts
+      - activity: address-feedback
+      - activity: publish-feedback
+        needs: [address-feedback]
       - activity: report-escalation
-        needs: [resolve-conflicts]
+        needs: [resolve-conflicts, address-feedback, publish-feedback]
   pr-run-checks:
     stage: verify
     slots:
