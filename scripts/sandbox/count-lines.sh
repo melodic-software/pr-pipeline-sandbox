@@ -10,4 +10,4 @@ for f in $@; do
   echo "$f: $n"
 done
 echo "total: $total"
-exit 1
+exit 0
