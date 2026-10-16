@@ -10,10 +10,11 @@ mode=${2:-bytes}
 
 if [ -z "$dir" ]; then
   echo "usage: sum-sizes.sh DIR [bytes|kb]" >&2
+  exit 2
 fi
 if [ ! -d "$dir" ]; then
   echo "not a directory: $dir" >&2
-  exit 1
+  exit 2
 fi
 
 total=0
