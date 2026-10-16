@@ -2,10 +2,10 @@ name: pr-merge
 
 # What this does, in plain words:
 #
-# Some pull requests are low-risk chores (labeled `work-class: mechanical`,
-# also called C2). Instead of the owner merging each one by hand, this
-# workflow asks the existing merge gate (the babysit merge script) about each
-# such PR and, when the gate says yes, adds the PR to GitHub's merge queue at
+# Some pull requests are low-risk chores (the lanes App opened them for an
+# issue labeled `work-class: mechanical`, also called C2). Instead of the
+# owner merging each one by hand, this workflow asks the existing merge gate
+# (the babysit merge script) about each such PR and, when the gate says yes, adds the PR to GitHub's merge queue at
 # the exact commit the gate checked. The merge queue then runs CI one last
 # time and merges.
 #
@@ -74,12 +74,14 @@ jobs:
       && (github.event_name != 'workflow_run'
       || github.event.workflow_run.head_repository.full_name == github.repository)
     # One run at a time, and a running one is never cancelled: a cancelled run
-    # could stop between the gate's check and its merge-queue write. While one
-    # runs, GitHub keeps at most one more waiting, which is enough because
-    # every run re-reads every PR.
+    # could stop between the gate's check and its merge-queue write. Extra runs
+    # wait in line (`queue: max`) instead of being dropped. Without it GitHub
+    # keeps only one waiting run and cancels the rest, which leaves CANCELLED
+    # `merge` checks on PRs and makes the merge hook refuse them. Waiting is
+    # harmless because every run re-reads every PR from the API.
     concurrency:
       group: pr-merge
-      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -126,17 +128,22 @@ jobs:
       # behind the run is a listed human (trusted-actors.json on main). Runs
       # started by a bot, such as the lanes App pushing or labeling, or by an
       # unlisted account, stop here quietly instead of failing; the hourly
-      # run picks up whatever they changed.
+      # run picks up whatever they changed. The hourly run itself always
+      # proceeds: nobody starts it, and GitHub names as its actor whoever last
+      # changed the schedule or the default branch, often a bot.
       - name: Check who started the run
         id: who
         if: steps.kill.outputs.proceed == 'true'
         env:
+          EVENT: ${{ github.event_name }}
           ACTOR_ID: ${{ github.actor_id }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           LIST: .base/.github/standards/trusted-actors/trusted-actors.json
         run: |
           set -euo pipefail
-          if [[ $ACTOR_ID =~ ^[1-9][0-9]*$ ]] &&
+          if [ "$EVENT" = schedule ]; then
+            echo "proceed=true" >>"$GITHUB_OUTPUT"
+          elif [[ $ACTOR_ID =~ ^[1-9][0-9]*$ ]] &&
             jq -e --argjson id "$ACTOR_ID" --arg login "$TRIGGERING_ACTOR" '
               [.actors[] | select(.kind == "human")] as $humans
               | ($humans | any(.id == $id))
@@ -144,7 +151,7 @@ jobs:
             ' "$LIST" >/dev/null; then
             echo "proceed=true" >>"$GITHUB_OUTPUT"
           else
-            echo "::notice::started by ${TRIGGERING_ACTOR:-an unknown account}, who is not a listed human; nothing checked, the hourly run will look"
+            echo "::notice::started by ${TRIGGERING_ACTOR:-an unknown account}, who is not a listed human; nothing checked here, the next hourly run checks every candidate"
             echo "proceed=false" >>"$GITHUB_OUTPUT"
           fi
 
@@ -192,9 +199,11 @@ jobs:
           pull-requests: ${{ steps.config.outputs.pull-requests }}
           issues: ${{ steps.config.outputs.issues }}
 
-      # Candidates: open, non-draft PRs into main that carry the C2 label.
-      # This is only a shortlist; the gate checks the label's origin and every
-      # other rule again. Read with the job's own read-only token.
+      # Candidates: open, non-draft PRs into main that the lanes App
+      # (merge.agent-identity on main) opened. The work class lives on the
+      # closing issue, never on the PR, so no PR label is read here. This is
+      # only a shortlist; the gate checks the author, the closing issue's class
+      # and every other rule again. Read with the job's own read-only token.
       - name: List the candidate PRs
         id: candidates
         if: steps.lane-token.outputs.token != ''
@@ -203,10 +212,15 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          identity=$(yq '.merge."agent-identity" // ""' .base/docs/conventions/pr-pipeline.yaml)
+          slug=${identity%\[bot\]}
+          if ! [[ $slug =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "::error::merge.agent-identity is not an App bot login: $identity"
+            exit 1
+          fi
           gh pr list --repo "$REPO" --base main --state open --limit 500 \
-            --json number,headRefOid,isDraft,updatedAt,labels |
-            jq -c '[.[] | select((.isDraft | not)
-              and any(.labels[]; (.name | ascii_downcase) == "work-class: mechanical"))
+            --author "app/$slug" --json number,headRefOid,isDraft,updatedAt |
+            jq -c '[.[] | select(.isDraft | not)
               | {number, head: .headRefOid, updatedAt}]' >"$RUNNER_TEMP/candidates.json"
           echo "count=$(jq length "$RUNNER_TEMP/candidates.json")" >>"$GITHUB_OUTPUT"
 

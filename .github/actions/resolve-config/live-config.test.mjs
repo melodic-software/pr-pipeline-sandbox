@@ -6,6 +6,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
+import { parse } from "yaml";
+
 import { resolve, resolveGrant } from "./resolve.mjs";
 
 const read = (relative) =>
@@ -98,21 +100,48 @@ test("live config: report-escalation applies and is granted publish-artifact onl
   );
 });
 
-// An agent-ready label event on a read-only issue. The shipped cutover is the
-// far future, so the lane stays off until the owner sets the go-live time.
+// An agent-ready label event on a read-only issue. The
+// lane went live at 2026-10-14T19:21:59Z, the labeled-after time in the live config.
 const ISSUE = { event: "labeled", labels: ["agent-ready", "work-class: read-only"], labeledAt: "2026-10-20T00:00:00Z" };
 
-test("live config: resolve-issue starts nothing before the owner sets the go-live time", () => {
-  assert.equal(skipReason("work-resolve-issue", "resolve-issue", ISSUE), "not-applicable");
+test("live config: resolve-issue starts for a read-only issue labeled after the go-live time", () => {
+  assert.equal(selected("work-resolve-issue", "resolve-issue", ISSUE).applies, true);
 });
 
-test("live config: after the go-live time resolve-issue admits read-only issues only", () => {
-  const after = { ...ISSUE, labeledAt: "2099-01-01T00:00:01Z" };
-  assert.equal(selected("work-resolve-issue", "resolve-issue", after).applies, true);
+test("live config: resolve-issue starts nothing for an issue labeled before the go-live time", () => {
   assert.equal(
-    skipReason("work-resolve-issue", "resolve-issue", { ...after, labels: ["agent-ready", "work-class: scoped"] }),
+    skipReason("work-resolve-issue", "resolve-issue", { ...ISSUE, labeledAt: "2026-10-14T19:21:58Z" }),
     "not-applicable",
   );
+});
+
+test("live config: resolve-issue starts for a mechanical issue", () => {
+  assert.equal(
+    selected("work-resolve-issue", "resolve-issue", { ...ISSUE, labels: ["agent-ready", "work-class: mechanical"] }).applies,
+    true,
+  );
+});
+
+test("live config: resolve-issue admits read-only and mechanical issues only", () => {
+  assert.equal(
+    skipReason("work-resolve-issue", "resolve-issue", { ...ISSUE, labels: ["agent-ready", "work-class: scoped"] }),
+    "not-applicable",
+  );
+});
+
+// The run must pass the fragment format check before it reports done.
+test("live config: resolve-issue may run the changelog fragment check", () => {
+  assert.deepEqual(selected("work-resolve-issue", "resolve-issue", ISSUE).checks, [
+    "scripts/check-changelog-fragments.sh --check",
+  ]);
+});
+
+// Owner decision 2026-10-14: the run may read any web page.
+test("live config: resolve-issue may read any domain; no other activity reads the web", () => {
+  assert.deepEqual(selected("work-resolve-issue", "resolve-issue", ISSUE)["web-access"], { enabled: true, domains: "any" });
+  const doc = parse(FILES.config);
+  const others = Object.entries(doc.activities).filter(([name, a]) => name !== "resolve-issue" && a["web-access"]?.enabled);
+  assert.deepEqual(others, []);
 });
 
 test("live config: resolve-issue may only write its branch; report-outcome may only write PRs and issues", () => {
