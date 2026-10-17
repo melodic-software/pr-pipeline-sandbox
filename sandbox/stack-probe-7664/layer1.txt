@@ -1,0 +1,1 @@
+Limit-restart probe for melodic-software/claude-code-plugins: conflicts with main on purpose. Do not merge.
