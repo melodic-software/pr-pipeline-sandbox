@@ -50,7 +50,10 @@ jobs:
 
       - name: Call claude -p until the first error
         env:
-          ANTHROPIC_API_KEY: ${{ secrets[inputs.key-secret] }}
+          # Each allowed secret named literally, so no dispatch value can select any other secret.
+          ANTHROPIC_API_KEY: >-
+            ${{ inputs.key-secret == 'LANE_FUNDING_EXHAUSTED_KEY' && secrets.LANE_FUNDING_EXHAUSTED_KEY
+            || inputs.key-secret == 'LANE_FUNDING_PROBE_API_KEY' && secrets.LANE_FUNDING_PROBE_API_KEY || '' }}
           KEY_SECRET: ${{ inputs.key-secret }}
           MODEL: ${{ inputs.model }}
           MAX_CALLS: ${{ inputs.max-calls }}
