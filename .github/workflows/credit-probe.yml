@@ -24,7 +24,13 @@ jobs:
       - name: Install Claude Code
         env:
           CLI_VERSION: ${{ inputs.cli-version }}
-        run: npm install -g "@anthropic-ai/claude-code@${CLI_VERSION}"
+        # An npm spec can also be a tarball URL or a git source; accept a version only.
+        run: |
+          if ! [[ "$CLI_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::cli-version must be an exact version such as 2.1.302"
+            exit 1
+          fi
+          npm install -g "@anthropic-ai/claude-code@${CLI_VERSION}"
 
       - name: Run one claude -p with the org key only
         env:
