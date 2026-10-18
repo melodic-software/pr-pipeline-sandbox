@@ -9,11 +9,21 @@ name: claude-lane-probe
 
 on:
   workflow_dispatch:
+    inputs:
+      scenario:
+        description: >-
+          pins: control plus each credential leg behind hostile settings.
+          fallback: a key past its spend limit plus a subscription token, to
+          show the key leg's credit stop hands the same prompt to the subscription.
+        type: choice
+        options: [pins, fallback]
+        default: pins
 
 permissions: {}
 
 jobs:
   control:
+    if: inputs.scenario == 'pins'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions: {}
@@ -50,6 +60,7 @@ jobs:
           fi
 
   lane:
+    if: inputs.scenario == 'pins'
     # key: only the API key is set. subscription: only an OAuth token is set, the
     # case where a user apiKeyHelper would outrank the credential if the managed
     # empty helper did not cancel it.
@@ -106,3 +117,64 @@ jobs:
         run: |
           echo "lane-class=${LANE_CLASS} credential=${CREDENTIAL} cli-version=${CLI_VERSION} turns=${LANE_TURNS}"
           if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then cat "$LOG_FILE"; fi
+
+  fallback:
+    if: inputs.scenario == 'fallback'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pin managed settings
+        uses: melodic-software/ci-workflows/.github/actions/claude-lane/managed-settings@edddd34054ad82a371235fa10b8a7e2f93886be1
+
+      - name: Isolate the runner
+        uses: ./.github/actions/setup-runner-isolation
+        with:
+          install-subprocess-isolation: "true"
+
+      - name: Write the prompt
+        run: printf '%s\n' 'Reply with the single word OK.' > "$RUNNER_TEMP/prompt.md"
+
+      - name: Run claude-lane, limited key then subscription
+        id: lane
+        uses: melodic-software/ci-workflows/.github/actions/claude-lane@edddd34054ad82a371235fa10b8a7e2f93886be1
+        with:
+          role: probe
+          prompt-file: ${{ runner.temp }}/prompt.md
+          api-key: ${{ secrets.LANE_FUNDING_EXHAUSTED_KEY }}
+          api-key-name: LANE_FUNDING_EXHAUSTED_KEY
+          subscription-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
+          subscription-token-name: AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN
+          model: claude-haiku-5-5
+          effort: low
+          max-turns: "1"
+          permission-mode: dontAsk
+
+      - name: Report
+        if: always()
+        env:
+          LANE_CLASS: ${{ steps.lane.outputs.lane-class }}
+          CREDENTIAL: ${{ steps.lane.outputs.credential }}
+          LOG_FILE: ${{ steps.lane.outputs.log-file }}
+        run: |
+          echo "lane-class=${LANE_CLASS} credential=${CREDENTIAL}"
+          if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then cat "$LOG_FILE"; fi
+          # The switch held only if the log shows exactly two legs: the key stopping on
+          # credits, then the subscription succeeding.
+          if [ "$CREDENTIAL" != AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN ] || [ -n "$LANE_CLASS" ]; then
+            echo "::error::fallback did not complete on the subscription"
+            exit 1
+          fi
+          if ! { [ -n "$LOG_FILE" ] && jq -se '
+              length == 2
+              and .[0].secret == "LANE_FUNDING_EXHAUSTED_KEY" and .[0].class == "credit-stop"
+              and .[1].secret == "AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN" and .[1].class == ""
+            ' "$LOG_FILE" >/dev/null; }; then
+            echo "::error::the log does not show a key credit stop followed by a subscription success"
+            exit 1
+          fi
