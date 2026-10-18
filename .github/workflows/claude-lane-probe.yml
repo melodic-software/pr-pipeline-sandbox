@@ -164,8 +164,17 @@ jobs:
         run: |
           echo "lane-class=${LANE_CLASS} credential=${CREDENTIAL}"
           if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then cat "$LOG_FILE"; fi
-          # The switch held only if leg 1 was a credit stop on the key and leg 2 succeeded on the subscription.
+          # The switch held only if the log shows exactly two legs: the key stopping on
+          # credits, then the subscription succeeding.
           if [ "$CREDENTIAL" != AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN ] || [ -n "$LANE_CLASS" ]; then
             echo "::error::fallback did not complete on the subscription"
+            exit 1
+          fi
+          if ! { [ -n "$LOG_FILE" ] && jq -se '
+              length == 2
+              and .[0].secret == "LANE_FUNDING_EXHAUSTED_KEY" and .[0].class == "credit-stop"
+              and .[1].secret == "AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN" and .[1].class == ""
+            ' "$LOG_FILE" >/dev/null; }; then
+            echo "::error::the log does not show a key credit stop followed by a subscription success"
             exit 1
           fi
