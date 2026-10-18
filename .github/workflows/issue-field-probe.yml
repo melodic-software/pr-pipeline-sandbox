@@ -1,0 +1,54 @@
+name: issue-field-probe
+
+# Issue-field access probe (claude-code-plugins issue-dimensions plan, step 1).
+# Reads one sandbox issue's org issue-field values, field timeline events and
+# field search with this job's GITHUB_TOKEN (issues: read), and the same REST
+# read with no token as a control. Runs no repository code: no checkout.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/issue-field-probe.yml
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: "167"
+    steps:
+      - name: Read issue field values
+        run: |
+          api() {
+            curl -sS -w '\nHTTP %{http_code}\n' -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' "$@"
+          }
+          base="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues/$ISSUE"
+          echo "--- REST issue-field-values, GITHUB_TOKEN ---"
+          api -H "Authorization: Bearer $GH_TOKEN" "$base/issue-field-values"
+          echo "--- REST issue-field-values, no token ---"
+          api "$base/issue-field-values"
+          echo "--- REST timeline issue_field events, GITHUB_TOKEN ---"
+          api -H "Authorization: Bearer $GH_TOKEN" "$base/timeline" -o "$RUNNER_TEMP/timeline.json"
+          jq -c '[.[] | select(.event | startswith("issue_field")) | {event, actor: .actor.login}]' "$RUNNER_TEMP/timeline.json" || cat "$RUNNER_TEMP/timeline.json"
+          echo "--- REST advanced search has:field.effort / no:field.effort, GITHUB_TOKEN ---"
+          for q in "has:field.effort" "no:field.effort"; do
+            echo "$q: $(gh api -X GET search/issues -f q="repo:$GITHUB_REPOSITORY is:issue $q" -f advanced_search=true \
+              --jq '"\(.total_count) \([.items[].number])"' 2>&1)"
+          done
+          echo "--- GraphQL issueFieldValues and field timeline, GITHUB_TOKEN ---"
+          # shellcheck disable=SC2016  # $o, $r, $n are GraphQL variables
+          gh api graphql -F n="$ISSUE" -f o="${GITHUB_REPOSITORY%/*}" -f r="${GITHUB_REPOSITORY#*/}" -f query='
+            query($o: String!, $r: String!, $n: Int!) {
+              repository(owner: $o, name: $r) { issue(number: $n) {
+                issueFieldValues(first: 10) { nodes { __typename
+                  ... on IssueFieldSingleSelectValue { name optionId field { ... on IssueFieldSingleSelect { name } } } } }
+                timelineItems(first: 10, itemTypes: [ISSUE_FIELD_ADDED_EVENT, ISSUE_FIELD_CHANGED_EVENT]) { nodes { __typename
+                  ... on IssueFieldChangedEvent { actor { login } previousValue newValue } } }
+              } } }' 2>&1 || true
