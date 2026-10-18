@@ -1,24 +1,37 @@
 name: credit-probe
 
-# claude-code-plugins#6962: does a self-written `claude -p` on a hosted runner,
-# with a linked Console org's API key, draw that org's API credits? The owner
-# reads the org's credit balance before dispatch and after the run; the log's
-# total_cost_usd is the amount the balance should move by. Runs no repository
-# code: no checkout.
+# API-key funding probes for the claude-lane launcher (claude-code-plugins#6962,
+# ci-workflows#781). Runs `claude -p` with one chosen key secret only, repeating
+# up to max-calls times until a call errors, and prints the stream-json of
+# the last call, so a credit or spend-limit stop's exact result shape is on
+# record. Runs no repository code: no checkout.
 
 on:
   workflow_dispatch:
     inputs:
+      key-secret:
+        description: Which API key secret to use
+        type: choice
+        options:
+          - LANE_FUNDING_PROBE_API_KEY
+          - LANE_FUNDING_EXHAUSTED_KEY
+        default: LANE_FUNDING_PROBE_API_KEY
+      model:
+        description: Model for each call
+        default: claude-haiku-5-5
+      max-calls:
+        description: Calls to make, stopping at the first error (1-50)
+        default: "1"
       cli-version:
-        description: Exact Claude Code CLI version to install
-        required: true
+        description: Exact Claude Code version, or `latest`
+        default: latest
 
 permissions: {}
 
 jobs:
   probe:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions: {}
     steps:
       - name: Install Claude Code
@@ -26,22 +39,54 @@ jobs:
           CLI_VERSION: ${{ inputs.cli-version }}
         # An npm spec can also be a tarball URL or a git source; accept a version only.
         run: |
+          if [ "$CLI_VERSION" = latest ]; then
+            CLI_VERSION=$(npm view @anthropic-ai/claude-code version)
+          fi
           if ! [[ "$CLI_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::cli-version must be an exact version such as 2.1.302"
+            echo "::error::cli-version must be an exact version such as 2.1.302, or latest"
             exit 1
           fi
           npm install -g "@anthropic-ai/claude-code@${CLI_VERSION}"
 
-      - name: Run one claude -p with the org key only
+      - name: Call claude -p until the first error
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.LANE_FUNDING_PROBE_API_KEY }}
+          # Each allowed secret named literally, so no dispatch value can select any other secret.
+          ANTHROPIC_API_KEY: >-
+            ${{ inputs.key-secret == 'LANE_FUNDING_EXHAUSTED_KEY' && secrets.LANE_FUNDING_EXHAUSTED_KEY
+            || inputs.key-secret == 'LANE_FUNDING_PROBE_API_KEY' && secrets.LANE_FUNDING_PROBE_API_KEY || '' }}
+          KEY_SECRET: ${{ inputs.key-secret }}
+          MODEL: ${{ inputs.model }}
+          MAX_CALLS: ${{ inputs.max-calls }}
         run: |
           if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "::error::LANE_FUNDING_PROBE_API_KEY is empty"
+            echo "::error::$KEY_SECRET is empty"
+            exit 1
+          fi
+          if ! [[ "$MAX_CALLS" =~ ^[0-9]+$ ]] || [ "$MAX_CALLS" -lt 1 ] || [ "$MAX_CALLS" -gt 50 ]; then
+            echo "::error::max-calls must be a whole number from 1 to 50"
+            exit 1
+          fi
+          if ! [[ "$MODEL" =~ ^[a-z0-9.-]+$ ]]; then
+            echo "::error::model must be a plain model id"
             exit 1
           fi
           claude --version
           set +e
-          claude -p "Reply with the single word OK." --max-turns 1 --output-format json > "$RUNNER_TEMP/result.json"
-          echo "exit-code=$?"
-          jq '{is_error, subtype, num_turns, total_cost_usd, usage, modelUsage, result}' "$RUNNER_TEMP/result.json"
+          stopped=max-calls
+          for i in $(seq 1 "$MAX_CALLS"); do
+            claude -p "Reply with the single word OK." --model "$MODEL" --max-turns 1 \
+              --output-format stream-json --verbose > "$RUNNER_TEMP/stream.jsonl" 2> "$RUNNER_TEMP/stderr.txt"
+            code=$?
+            result=$(tail -n 1 "$RUNNER_TEMP/stream.jsonl")
+            echo "call=$i exit=$code $(jq -c '{is_error, subtype, num_turns, total_cost_usd}' <<<"$result" 2>/dev/null)"
+            if [ "$code" -ne 0 ] || [ "$(jq -r '.is_error' <<<"$result" 2>/dev/null)" != false ]; then
+              stopped=error
+              break
+            fi
+          done
+          echo "stopped=$stopped"
+          # Only the init event is dropped: retry and status events are part of the record.
+          echo "--- last call: stream-json (init event dropped; unparsable lines kept raw) ---"
+          jq -cR 'fromjson? // . | select(type != "object" or .type != "system" or .subtype != "init")' "$RUNNER_TEMP/stream.jsonl"
+          echo "--- last call: stderr ---"
+          cat "$RUNNER_TEMP/stderr.txt"
