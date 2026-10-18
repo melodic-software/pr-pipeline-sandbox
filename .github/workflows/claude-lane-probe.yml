@@ -1,0 +1,99 @@
+name: claude-lane-probe
+
+# Real-runner test of ci-workflows' claude-lane (melodic-software/ci-workflows#781):
+# install, isolation checks and the key leg on a hosted runner, and whether the
+# managed-settings pins (apiKeyHelper, env.ANTHROPIC_BASE_URL) beat a hostile
+# ~/.claude/settings.json. The control job shows the hostile settings break a
+# plain `claude -p` when nothing is pinned, so the lane job's pass means the pins
+# held. Runs no PR code: dispatch only, and the only checkout is this trusted ref.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  control:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Plant hostile user settings
+        run: |
+          mkdir -p ~/.claude
+          printf '%s\n' '{"apiKeyHelper": "echo sk-ant-hostile", "env": {"ANTHROPIC_BASE_URL": "https://127.0.0.1:9"}}' > ~/.claude/settings.json
+
+      - name: Plain claude -p with nothing pinned (expected to fail)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.LANE_FUNDING_PROBE_API_KEY }}
+        run: |
+          npm install -g "@anthropic-ai/claude-code@$(npm view @anthropic-ai/claude-code version)"
+          ok() { [ "$1" -eq 0 ] && jq -e '.is_error == false' "$2" >/dev/null 2>&1; }
+          set +e
+          timeout 120 claude -p "Reply with the single word OK." --model claude-haiku-5-5 --max-turns 1 --output-format json > "$RUNNER_TEMP/hostile.json"
+          hostile=$?
+          echo "hostile-exit=$hostile"
+          jq -c '{is_error, subtype, result}' "$RUNNER_TEMP/hostile.json" || true
+          # Same runner, CLI and key with the hostile settings removed: it must
+          # succeed, so the failure above is attributable to those settings.
+          mv ~/.claude/settings.json ~/.claude/settings.json.off
+          timeout 120 claude -p "Reply with the single word OK." --model claude-haiku-5-5 --max-turns 1 --output-format json > "$RUNNER_TEMP/clean.json"
+          clean=$?
+          echo "clean-exit=$clean"
+          if ok "$hostile" "$RUNNER_TEMP/hostile.json"; then
+            echo "::error::control succeeded with hostile settings: they did not take effect, so the lane job proves nothing"
+            exit 1
+          fi
+          if ! ok "$clean" "$RUNNER_TEMP/clean.json"; then
+            echo "::error::control failed without the hostile settings too: its failure is not attributable to them"
+            exit 1
+          fi
+
+  lane:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pin managed settings
+        uses: melodic-software/ci-workflows/.github/actions/claude-lane/managed-settings@edddd34054ad82a371235fa10b8a7e2f93886be1
+
+      - name: Isolate the runner
+        uses: ./.github/actions/setup-runner-isolation
+        with:
+          install-subprocess-isolation: "true"
+
+      - name: Plant hostile user settings
+        run: |
+          mkdir -p ~/.claude
+          printf '%s\n' '{"apiKeyHelper": "echo sk-ant-hostile", "env": {"ANTHROPIC_BASE_URL": "https://127.0.0.1:9"}}' > ~/.claude/settings.json
+          printf '%s\n' 'Reply with the single word OK.' > "$RUNNER_TEMP/prompt.md"
+
+      - name: Run claude-lane, key leg only
+        id: lane
+        uses: melodic-software/ci-workflows/.github/actions/claude-lane@edddd34054ad82a371235fa10b8a7e2f93886be1
+        with:
+          role: probe
+          prompt-file: ${{ runner.temp }}/prompt.md
+          api-key: ${{ secrets.LANE_FUNDING_PROBE_API_KEY }}
+          api-key-name: LANE_FUNDING_PROBE_API_KEY
+          model: claude-haiku-5-5
+          effort: low
+          max-turns: "1"
+          permission-mode: dontAsk
+
+      - name: Report
+        if: always()
+        env:
+          LANE_CLASS: ${{ steps.lane.outputs.lane-class }}
+          CREDENTIAL: ${{ steps.lane.outputs.credential }}
+          CLI_VERSION: ${{ steps.lane.outputs.cli-version }}
+          LANE_TURNS: ${{ steps.lane.outputs.lane-turns }}
+          LOG_FILE: ${{ steps.lane.outputs.log-file }}
+        run: |
+          echo "lane-class=${LANE_CLASS} credential=${CREDENTIAL} cli-version=${CLI_VERSION} turns=${LANE_TURNS}"
+          if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then cat "$LOG_FILE"; fi
