@@ -1,0 +1,41 @@
+name: credit-probe
+
+# claude-code-plugins#6962: does a self-written `claude -p` on a hosted runner,
+# with a linked Console org's API key, draw that org's API credits? The owner
+# reads the org's credit balance before dispatch and after the run; the log's
+# total_cost_usd is the amount the balance should move by. Runs no repository
+# code: no checkout.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cli-version:
+        description: Exact Claude Code CLI version to install
+        required: true
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Install Claude Code
+        env:
+          CLI_VERSION: ${{ inputs.cli-version }}
+        run: npm install -g "@anthropic-ai/claude-code@${CLI_VERSION}"
+
+      - name: Run one claude -p with the org key only
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.LANE_FUNDING_PROBE_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::LANE_FUNDING_PROBE_API_KEY is empty"
+            exit 1
+          fi
+          claude --version
+          set +e
+          claude -p "Reply with the single word OK." --max-turns 1 --output-format json > "$RUNNER_TEMP/result.json"
+          echo "exit-code=$?"
+          jq '{is_error, subtype, num_turns, total_cost_usd, usage, modelUsage, result}' "$RUNNER_TEMP/result.json"
