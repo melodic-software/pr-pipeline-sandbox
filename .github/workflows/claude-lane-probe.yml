@@ -28,13 +28,24 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.LANE_FUNDING_PROBE_API_KEY }}
         run: |
           npm install -g "@anthropic-ai/claude-code@$(npm view @anthropic-ai/claude-code version)"
+          ok() { [ "$1" -eq 0 ] && jq -e '.is_error == false' "$2" >/dev/null 2>&1; }
           set +e
-          timeout 120 claude -p "Reply with the single word OK." --max-turns 1 --output-format json > "$RUNNER_TEMP/result.json"
-          code=$?
-          echo "control-exit=$code"
-          jq -c '{is_error, subtype, result}' "$RUNNER_TEMP/result.json" || true
-          if [ "$code" -eq 0 ] && jq -e '.is_error == false' "$RUNNER_TEMP/result.json" >/dev/null; then
-            echo "::error::control succeeded: the hostile settings did not take effect, so the lane job proves nothing"
+          timeout 120 claude -p "Reply with the single word OK." --model claude-haiku-5-5 --max-turns 1 --output-format json > "$RUNNER_TEMP/hostile.json"
+          hostile=$?
+          echo "hostile-exit=$hostile"
+          jq -c '{is_error, subtype, result}' "$RUNNER_TEMP/hostile.json" || true
+          # Same runner, CLI and key with the hostile settings removed: it must
+          # succeed, so the failure above is attributable to those settings.
+          mv ~/.claude/settings.json ~/.claude/settings.json.off
+          timeout 120 claude -p "Reply with the single word OK." --model claude-haiku-5-5 --max-turns 1 --output-format json > "$RUNNER_TEMP/clean.json"
+          clean=$?
+          echo "clean-exit=$clean"
+          if ok "$hostile" "$RUNNER_TEMP/hostile.json"; then
+            echo "::error::control succeeded with hostile settings: they did not take effect, so the lane job proves nothing"
+            exit 1
+          fi
+          if ! ok "$clean" "$RUNNER_TEMP/clean.json"; then
+            echo "::error::control failed without the hostile settings too: its failure is not attributable to them"
             exit 1
           fi
 
