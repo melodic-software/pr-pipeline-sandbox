@@ -1,11 +1,11 @@
 name: claude-lane-probe
 
 # Real-runner test of ci-workflows' claude-lane (melodic-software/ci-workflows#781):
-# install, isolation checks and the key leg on a hosted runner, and whether the
-# managed-settings pins (apiKeyHelper, env.ANTHROPIC_BASE_URL) beat a hostile
-# ~/.claude/settings.json. The control job shows the hostile settings break a
-# plain `claude -p` when nothing is pinned, so the lane job's pass means the pins
-# held. Runs no PR code: dispatch only, and the only checkout is this trusted ref.
+# install, isolation checks and each credential leg on a hosted runner, and
+# whether the managed-settings pins (apiKeyHelper, env.ANTHROPIC_BASE_URL) beat a
+# hostile ~/.claude/settings.json on both legs. The control job shows the hostile
+# settings break a plain `claude -p` when nothing is pinned, so a lane leg's pass
+# means the pins held. Runs no PR code: dispatch only, and the only checkout is this trusted ref.
 
 on:
   workflow_dispatch:
@@ -50,6 +50,13 @@ jobs:
           fi
 
   lane:
+    # key: only the API key is set. subscription: only an OAuth token is set, the
+    # case where a user apiKeyHelper would outrank the credential if the managed
+    # empty helper did not cancel it.
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [key, subscription]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -73,14 +80,16 @@ jobs:
           printf '%s\n' '{"apiKeyHelper": "echo sk-ant-hostile", "env": {"ANTHROPIC_BASE_URL": "https://127.0.0.1:9"}}' > ~/.claude/settings.json
           printf '%s\n' 'Reply with the single word OK.' > "$RUNNER_TEMP/prompt.md"
 
-      - name: Run claude-lane, key leg only
+      - name: Run claude-lane, ${{ matrix.leg }} credential only
         id: lane
         uses: melodic-software/ci-workflows/.github/actions/claude-lane@edddd34054ad82a371235fa10b8a7e2f93886be1
         with:
           role: probe
           prompt-file: ${{ runner.temp }}/prompt.md
-          api-key: ${{ secrets.LANE_FUNDING_PROBE_API_KEY }}
-          api-key-name: LANE_FUNDING_PROBE_API_KEY
+          api-key: ${{ matrix.leg == 'key' && secrets.LANE_FUNDING_PROBE_API_KEY || '' }}
+          api-key-name: ${{ matrix.leg == 'key' && 'LANE_FUNDING_PROBE_API_KEY' || '' }}
+          subscription-token: ${{ matrix.leg == 'subscription' && secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          subscription-token-name: ${{ matrix.leg == 'subscription' && 'AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN' || '' }}
           model: claude-haiku-5-5
           effort: low
           max-turns: "1"
