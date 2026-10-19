@@ -1,0 +1,26 @@
+name: probe-0e-job
+
+# Phase 0e probe: one producer or apply job. It holds the runner for a fixed
+# time so overlapping jobs in one concurrency group would show.
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  work:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Hold the runner
+        env:
+          NAME: ${{ inputs.name }}
+        run: |
+          echo "probe=e-job name=$NAME started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          sleep 45
+          echo "probe=e-job name=$NAME ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

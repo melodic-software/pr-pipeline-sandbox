@@ -1,0 +1,31 @@
+name: probe-0e-a
+
+# Phase 0e probe, first of two lanes finishing on one PR: a producer and an
+# apply job, each in the per-PR write group with queue: max, as pr-unblock.yml
+# does. probe-0e-b.yml starts on the same push.
+
+on:
+  push:
+    branches: [probe/write-lane-phase0]
+    paths: [probe/0e/**]
+
+permissions: {}
+
+jobs:
+  produce:
+    concurrency:
+      group: pr-pipeline-write-172
+      queue: max
+    uses: ./.github/workflows/probe-0e-job.yml
+    with:
+      name: a-produce
+
+  apply:
+    needs: produce
+    if: ${{ !cancelled() }}
+    concurrency:
+      group: pr-pipeline-write-172
+      queue: max
+    uses: ./.github/workflows/probe-0e-job.yml
+    with:
+      name: a-apply

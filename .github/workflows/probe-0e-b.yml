@@ -1,0 +1,29 @@
+name: probe-0e-b
+
+# Phase 0e probe, second of two lanes finishing on one PR; see probe-0e-a.yml.
+
+on:
+  push:
+    branches: [probe/write-lane-phase0]
+    paths: [probe/0e/**]
+
+permissions: {}
+
+jobs:
+  produce:
+    concurrency:
+      group: pr-pipeline-write-172
+      queue: max
+    uses: ./.github/workflows/probe-0e-job.yml
+    with:
+      name: b-produce
+
+  apply:
+    needs: produce
+    if: ${{ !cancelled() }}
+    concurrency:
+      group: pr-pipeline-write-172
+      queue: max
+    uses: ./.github/workflows/probe-0e-job.yml
+    with:
+      name: b-apply
