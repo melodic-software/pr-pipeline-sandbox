@@ -1,0 +1,16 @@
+name: probe-0c
+
+# Phase 0c probe entry: calls probe-0c-lane.yml for the middle producer.
+
+on:
+  push:
+    branches: [probe/write-lane-phase0]
+    paths: [probe/0c/**]
+
+permissions: {}
+
+jobs:
+  lane:
+    uses: ./.github/workflows/probe-0c-lane.yml
+    with:
+      activity: fix-docs

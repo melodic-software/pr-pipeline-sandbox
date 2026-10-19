@@ -1,0 +1,28 @@
+name: probe-0c-producer
+
+# Phase 0c probe: a producer that outputs a patch-state naming itself.
+
+on:
+  workflow_call:
+    inputs:
+      activity:
+        required: true
+        type: string
+    outputs:
+      patch-state:
+        value: ${{ jobs.produce.outputs.patch-state }}
+
+permissions: {}
+
+jobs:
+  produce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      patch-state: ${{ steps.state.outputs.patch-state }}
+    steps:
+      - name: Write the patch state
+        id: state
+        env:
+          ACTIVITY: ${{ inputs.activity }}
+        run: echo "patch-state=state-$ACTIVITY" >>"$GITHUB_OUTPUT"

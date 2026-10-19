@@ -1,0 +1,76 @@
+name: probe-0c-lane
+
+# Phase 0c probe: a reusable caller with three producer jobs, only the one
+# named by inputs.activity running, and an apply job that reads
+# needs[inputs.activity].outputs.patch-state under !cancelled(). The control
+# job has the same read without !cancelled() and is expected to be skipped.
+
+on:
+  workflow_call:
+    inputs:
+      activity:
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  fix-ci:
+    if: inputs.activity == 'fix-ci'
+    uses: ./.github/workflows/probe-0c-producer.yml
+    with:
+      activity: fix-ci
+
+  fix-docs:
+    if: inputs.activity == 'fix-docs'
+    uses: ./.github/workflows/probe-0c-producer.yml
+    with:
+      activity: fix-docs
+
+  resolve-issue:
+    if: inputs.activity == 'resolve-issue'
+    uses: ./.github/workflows/probe-0c-producer.yml
+    with:
+      activity: resolve-issue
+
+  apply:
+    needs: [fix-ci, fix-docs, resolve-issue]
+    if: ${{ !cancelled() && needs[inputs.activity].result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      read-state: ${{ steps.read.outputs.read-state }}
+    steps:
+      - name: Read the named producer's patch state
+        id: read
+        env:
+          STATE: ${{ needs[inputs.activity].outputs.patch-state }}
+        run: echo "read-state=$STATE" >>"$GITHUB_OUTPUT"
+
+  control:
+    needs: [fix-ci, fix-docs, resolve-issue]
+    if: needs[inputs.activity].result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo "control ran"
+
+  report:
+    needs: [fix-ci, fix-docs, resolve-issue, apply, control]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report the probe line
+        env:
+          ACTIVITY: ${{ inputs.activity }}
+          READ_STATE: ${{ needs.apply.outputs.read-state }}
+          APPLY: ${{ needs.apply.result }}
+          CONTROL: ${{ needs.control.result }}
+          RESULTS: fix-ci=${{ needs.fix-ci.result }},fix-docs=${{ needs.fix-docs.result }},resolve-issue=${{ needs.resolve-issue.result }}
+        run: |
+          result=fail
+          if [ "$APPLY" = success ] && [ "$READ_STATE" = "state-$ACTIVITY" ]; then
+            result=pass
+          fi
+          echo "probe=c result=$result activity=$ACTIVITY read-state=$READ_STATE apply=$APPLY control-without-guard=$CONTROL producers=$RESULTS"
