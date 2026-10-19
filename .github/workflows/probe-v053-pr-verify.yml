@@ -1,0 +1,94 @@
+name: probe-v053-pr-verify
+
+# Probe: claude-code-plugins pr-verify.yml's judgment step, with its tools and
+# inputs, on run-claude-cli v0.53.0 (each leg under bwrap with the CLI tree
+# and _actions read-only). Fixture data stands in for the PR files.
+
+on:
+  push:
+    branches: [probe/run-claude-cli-v053]
+    paths: [probe/v053/pr-verify/**, .github/workflows/probe-v053-pr-verify.yml]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  judge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Write the prompt, schema and data
+        id: prompt
+        env:
+          DATA: ${{ github.workspace }}/pr-verify-data
+          PROMPT_FILE: ${{ runner.temp }}/pr-verify-prompt.md
+          SCHEMA_FILE: ${{ runner.temp }}/pr-verify-schema.json
+        run: |
+          mkdir -p "$DATA"
+          cp probe/v053/pr-verify/data/* "$DATA/"
+          prompt=$(<probe/v053/pr-verify/prompt.md)
+          prompt=${prompt//DIFF_FILE/$DATA/diff.patch}
+          prompt=${prompt//CONTEXT_FILE/$DATA/context.json}
+          prompt=${prompt//PR_FILE/$DATA/pr.json}
+          prompt=${prompt//SPEC_TEXT_FILE/$DATA/spec-text.json}
+          prompt=${prompt//SPEC_FILE/$DATA/spec.json}
+          printf '%s\n' "$prompt" >"$PROMPT_FILE"
+          printf '%s\n' '{"type":"object","properties":{"verdict":{"enum":["pass","pass-notes","fail"]},"summary":{"type":"string"},"notes":{"type":"array","items":{"type":"string"}}},"required":["verdict","summary","notes"],"additionalProperties":false}' >"$SCHEMA_FILE"
+      - uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@34c8358f2d6c2551d7d462064ea46d403df0b7ac # v0.52.0
+      - uses: ./.github/actions/setup-runner-isolation
+        with:
+          install-subprocess-isolation: true
+      - name: Judge the pull request
+        id: judge
+        continue-on-error: true
+        timeout-minutes: 22
+        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@d0fc3b14564383022ccc0559a5f96f3698dac39b # v0.53.0
+        env:
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+        with:
+          lane: pr-verify
+          role: automations
+          prompt-file: ${{ runner.temp }}/pr-verify-prompt.md
+          preamble: >-
+            You run unattended; return only the verdict the schema asks for;
+            nothing you write is posted.
+          api-key: ${{ secrets.AUTOMATIONS_CLAUDE_API_KEY }}
+          subscription-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
+          model: opus
+          max-turns: "60"
+          permission-mode: dontAsk
+          tools: Read
+          allowed-tools: Read(./pr-verify-data/**)
+          disallowed-tools: |
+            Read(./.base/**)
+            Glob
+            Grep
+            Bash
+            Edit
+            Write
+            NotebookEdit
+            WebFetch
+            WebSearch
+            Agent
+            mcp__*
+          json-schema-file: ${{ runner.temp }}/pr-verify-schema.json
+          leg-timeout-minutes: "10"
+      - name: Report
+        if: always()
+        env:
+          OUTCOME: ${{ steps.judge.outcome }}
+          EXECUTION_FILE: ${{ steps.judge.outputs.execution-file }}
+          LOG_FILE: ${{ steps.judge.outputs.log-file }}
+          LANE_CLASS: ${{ steps.judge.outputs.lane-class }}
+          CREDENTIAL: ${{ steps.judge.outputs.credential }}
+          CLI_VERSION: ${{ steps.judge.outputs.cli-version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node probe/v053/pr-verify/report.mjs

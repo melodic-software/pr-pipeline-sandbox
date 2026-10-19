@@ -1,0 +1,64 @@
+name: probe-v053-0b
+
+# Probe 0b re-run on run-claude-cli v0.53.0: a plugin passed through the
+# plugin-dirs input (each entry goes to --plugin-dir and --add-dir) under
+# --restricted, and the model invokes its skill, which reads reference/x.md
+# from its own directory.
+
+on:
+  push:
+    branches: [probe/run-claude-cli-v053]
+    paths: [probe/v053/0b/**, probe/v053/plugins/**, .github/workflows/probe-v053-0b.yml]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  skill:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@34c8358f2d6c2551d7d462064ea46d403df0b7ac # v0.52.0
+      - uses: ./.github/actions/setup-runner-isolation
+        with:
+          install-subprocess-isolation: true
+      - name: Write the prompt
+        run: |
+          printf '%s\n' 'Use the Skill tool to invoke the probe-plugin:probe-skill skill, then do exactly what it says.' >"$RUNNER_TEMP/probe-0b-prompt.md"
+      - name: Run the skill
+        id: lane
+        continue-on-error: true
+        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@d0fc3b14564383022ccc0559a5f96f3698dac39b # v0.53.0
+        env:
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+        with:
+          lane: probe-0b
+          role: automations
+          prompt-file: ${{ runner.temp }}/probe-0b-prompt.md
+          api-key: ${{ secrets.AUTOMATIONS_CLAUDE_API_KEY }}
+          model: sonnet
+          max-turns: "4"
+          permission-mode: dontAsk
+          tools: |
+            Skill
+            Read
+          allowed-tools: |
+            Skill
+            Read
+          plugin-dirs: probe/v053/plugins/probe-plugin
+          leg-timeout-minutes: "5"
+      - name: Report
+        if: always()
+        env:
+          EXECUTION_FILE: ${{ steps.lane.outputs.execution-file }}
+          LANE_CLASS: ${{ steps.lane.outputs.lane-class }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node probe/v053/0b/report.mjs "$EXECUTION_FILE" "$LANE_CLASS" "$RUN_URL"
