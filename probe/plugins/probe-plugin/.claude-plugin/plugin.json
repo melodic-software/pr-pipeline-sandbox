@@ -1,0 +1,5 @@
+{
+  "name": "probe-plugin",
+  "version": "0.0.1",
+  "description": "Phase 0b probe plugin: one skill with a reference file, one hook, one MCP server."
+}

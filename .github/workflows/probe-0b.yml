@@ -1,0 +1,64 @@
+name: probe-0b
+
+# Phase 0b probe: the probe copy of run-claude-cli (v0.52.0 plus a
+# plugin-dirs input) loads a plugin staged outside the checkout, under
+# --restricted, and the model invokes its skill, which reads a file under its
+# reference/. The report also records whether the plugin's hook and MCP
+# server started under the default managed settings (allowManagedHooksOnly).
+
+on:
+  push:
+    branches: [probe/write-lane-phase0]
+    paths: [probe/0b/**]
+
+permissions: {}
+
+jobs:
+  skill:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@34c8358f2d6c2551d7d462064ea46d403df0b7ac # v0.52.0
+      - uses: ./.github/actions/setup-runner-isolation
+        with:
+          install-subprocess-isolation: true
+      - name: Stage the plugin and write the prompt
+        id: stage
+        run: |
+          mkdir -p "$RUNNER_TEMP/staged-plugins"
+          cp -R probe/plugins/probe-plugin "$RUNNER_TEMP/staged-plugins/"
+          echo "plugin-dir=$RUNNER_TEMP/staged-plugins/probe-plugin" >>"$GITHUB_OUTPUT"
+          printf '%s\n' 'Use the Skill tool to invoke the probe-plugin:probe-skill skill, then do exactly what it says.' >"$RUNNER_TEMP/probe-0b-prompt.md"
+      - name: Run the skill
+        id: lane
+        continue-on-error: true
+        uses: ./.github/actions/run-claude-cli-probe
+        env:
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+        with:
+          lane: probe-0b
+          role: automations
+          prompt-file: ${{ runner.temp }}/probe-0b-prompt.md
+          api-key: ${{ secrets.AUTOMATIONS_CLAUDE_API_KEY }}
+          model: sonnet
+          max-turns: "4"
+          permission-mode: dontAsk
+          tools: |
+            Skill
+            Read
+          allowed-tools: |
+            Skill
+            Read
+          plugin-dirs: ${{ steps.stage.outputs.plugin-dir }}
+          leg-timeout-minutes: "5"
+      - name: Report
+        env:
+          EXECUTION_FILE: ${{ steps.lane.outputs.execution-file }}
+          LANE_CLASS: ${{ steps.lane.outputs.lane-class }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node probe/0b/report.mjs "$EXECUTION_FILE" "$LANE_CLASS" "$RUNNER_TEMP" "$RUN_URL"

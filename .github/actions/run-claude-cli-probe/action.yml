@@ -1,0 +1,128 @@
+name: run-claude-cli-probe
+description: >-
+  Probe-only copy of melodic-software/ci-workflows run-claude-cli at v0.52.0
+  (34c8358f2d6c2551d7d462064ea46d403df0b7ac) with one added input,
+  `plugin-dirs` (one `--plugin-dir` per line). `--restricted` and every other
+  flag are unchanged. Do not use outside the write-lane Phase 0 probes.
+
+inputs:
+  lane:
+    required: true
+  role:
+    required: true
+  prompt-file:
+    required: true
+  preamble:
+    required: false
+    default: ""
+  api-key:
+    required: false
+    default: ""
+  subscription-token:
+    required: false
+    default: ""
+  model:
+    required: true
+  effort:
+    required: false
+    default: ""
+  max-turns:
+    required: true
+  permission-mode:
+    required: true
+  allowed-tools:
+    required: false
+    default: ""
+  disallowed-tools:
+    required: false
+    default: ""
+  tools:
+    required: false
+    default: ""
+  plugin-dirs:
+    description: Absolute plugin directories, one per line, each passed as `--plugin-dir`.
+    required: false
+    default: ""
+  json-schema-file:
+    required: false
+    default: ""
+  cli-version:
+    required: false
+    default: latest
+  watchdog-max-wait-ms:
+    required: false
+    default: "1800000"
+  leg-timeout-minutes:
+    required: false
+    default: "30"
+
+outputs:
+  lane-class:
+    value: >-
+      ${{ steps.run.outputs.lane-class
+      || (steps.isolation.outcome == 'success' && steps.install.outcome == 'failure' && 'install-failed')
+      || (steps.run.outcome != 'success' && 'other')
+      || '' }}
+  lane-turns:
+    value: ${{ steps.run.outputs.lane-turns }}
+  lane-models:
+    value: ${{ steps.run.outputs.lane-models }}
+  credential:
+    value: ${{ steps.run.outputs.credential }}
+  execution-file:
+    value: ${{ steps.run.outputs.execution-file }}
+  log-file:
+    value: ${{ steps.run.outputs.log-file }}
+  cli-version:
+    value: ${{ steps.install.outputs.cli-version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verify the isolation contract
+      id: isolation
+      shell: bash
+      env:
+        LANE_MANAGED_SETTINGS: /etc/claude-code/managed-settings.json
+      run: node "$GITHUB_ACTION_PATH/lane.cjs" verify-isolation
+
+    - name: Prepare the work directory
+      id: workdir
+      shell: bash
+      run: |
+        dir="$(mktemp -d "$RUNNER_TEMP/run-claude-cli-XXXXXX")"
+        echo "path=$dir" >>"$GITHUB_OUTPUT"
+
+    - name: Install the Claude Code CLI
+      id: install
+      shell: bash
+      env:
+        LANE_CLI_VERSION_INPUT: ${{ inputs.cli-version }}
+        LANE_WORK_DIR: ${{ steps.workdir.outputs.path }}
+      run: node "$GITHUB_ACTION_PATH/lane.cjs" install
+
+    - name: Run the lane
+      id: run
+      shell: bash
+      env:
+        LANE_NAME: ${{ inputs.lane }}
+        LANE_ROLE: ${{ inputs.role }}
+        LANE_PROMPT_FILE: ${{ inputs.prompt-file }}
+        LANE_PREAMBLE: ${{ inputs.preamble }}
+        LANE_API_KEY: ${{ inputs.api-key }}
+        LANE_SUBSCRIPTION_TOKEN: ${{ inputs.subscription-token }}
+        LANE_MODEL: ${{ inputs.model }}
+        LANE_EFFORT: ${{ inputs.effort }}
+        LANE_MAX_TURNS: ${{ inputs.max-turns }}
+        LANE_PERMISSION_MODE: ${{ inputs.permission-mode }}
+        LANE_ALLOWED_TOOLS: ${{ inputs.allowed-tools }}
+        LANE_DISALLOWED_TOOLS: ${{ inputs.disallowed-tools }}
+        LANE_TOOLS: ${{ inputs.tools }}
+        LANE_PLUGIN_DIRS: ${{ inputs.plugin-dirs }}
+        LANE_JSON_SCHEMA_FILE: ${{ inputs.json-schema-file }}
+        LANE_WATCHDOG_MAX_WAIT_MS: ${{ inputs.watchdog-max-wait-ms }}
+        LANE_LEG_TIMEOUT_MINUTES: ${{ inputs.leg-timeout-minutes }}
+        LANE_CLI_VERSION: ${{ steps.install.outputs.cli-version }}
+        LANE_CLI_PATH: ${{ steps.install.outputs.cli-path }}
+        LANE_WORK_DIR: ${{ steps.workdir.outputs.path }}
+      run: node "$GITHUB_ACTION_PATH/lane.cjs" run
