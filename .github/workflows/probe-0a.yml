@@ -1,0 +1,95 @@
+name: probe-0a
+
+# Phase 0a probe: run-claude-cli v0.52.0 with model `default`, once on the API
+# key leg alone and once on the subscription leg alone (the other secret
+# empty, which the action skips), and report the models each leg used.
+
+on:
+  push:
+    branches: [probe/write-lane-phase0]
+    paths: [probe/0a/**]
+
+permissions: {}
+
+jobs:
+  api-key:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@34c8358f2d6c2551d7d462064ea46d403df0b7ac # v0.52.0
+      - uses: ./.github/actions/setup-runner-isolation
+        with:
+          install-subprocess-isolation: true
+      - name: Write the prompt
+        run: printf '%s\n' 'Reply with the single word OK.' >"$RUNNER_TEMP/probe-0a-prompt.md"
+      - name: Run the API key leg
+        id: lane
+        continue-on-error: true
+        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@34c8358f2d6c2551d7d462064ea46d403df0b7ac # v0.52.0
+        env:
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+        with:
+          lane: probe-0a
+          role: automations
+          prompt-file: ${{ runner.temp }}/probe-0a-prompt.md
+          preamble: ""
+          api-key: ${{ secrets.AUTOMATIONS_CLAUDE_API_KEY }}
+          model: default
+          max-turns: "1"
+          permission-mode: dontAsk
+          tools: Read
+          leg-timeout-minutes: "5"
+      - name: Report
+        env:
+          LOG_FILE: ${{ steps.lane.outputs.log-file }}
+          LANE_CLASS: ${{ steps.lane.outputs.lane-class }}
+          LANE_MODELS: ${{ steps.lane.outputs.lane-models }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node probe/0a/report.mjs api-key "$LOG_FILE" "$LANE_CLASS" "$LANE_MODELS" "$RUN_URL"
+
+  subscription:
+    needs: api-key
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@34c8358f2d6c2551d7d462064ea46d403df0b7ac # v0.52.0
+      - uses: ./.github/actions/setup-runner-isolation
+        with:
+          install-subprocess-isolation: true
+      - name: Write the prompt
+        run: printf '%s\n' 'Reply with the single word OK.' >"$RUNNER_TEMP/probe-0a-prompt.md"
+      - name: Run the subscription leg
+        id: lane
+        continue-on-error: true
+        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@34c8358f2d6c2551d7d462064ea46d403df0b7ac # v0.52.0
+        env:
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+        with:
+          lane: probe-0a
+          role: automations
+          prompt-file: ${{ runner.temp }}/probe-0a-prompt.md
+          preamble: ""
+          subscription-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
+          model: default
+          max-turns: "1"
+          permission-mode: dontAsk
+          tools: Read
+          leg-timeout-minutes: "5"
+      - name: Report
+        env:
+          LOG_FILE: ${{ steps.lane.outputs.log-file }}
+          LANE_CLASS: ${{ steps.lane.outputs.lane-class }}
+          LANE_MODELS: ${{ steps.lane.outputs.lane-models }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node probe/0a/report.mjs subscription "$LOG_FILE" "$LANE_CLASS" "$LANE_MODELS" "$RUN_URL"
