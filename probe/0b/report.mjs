@@ -45,6 +45,14 @@ const fired = (kind) =>
   [runnerTemp, "/tmp"].some((d) => d && fs.existsSync(`${d}/probe-0b-${kind}-fired`));
 const mcpEntry = mcp.find((s) => String(s?.name ?? "").includes("probe-mcp"));
 const readDenied = readResult?.is_error === true;
+// The denial text for the marker file read only, cut short and reduced to a
+// plain character set.
+const denial = readDenied
+  ? text(readResult).replace(/[^\w ./:'()-]/gu, " ").replace(/\s+/gu, "_").slice(0, 160)
+  : "none";
+const readPath = String(readUse?.input?.file_path ?? "");
+const readUnderStaged = readPath.startsWith(`${runnerTemp}/staged-plugins/`);
+const denials = Array.isArray(final?.permission_denials) ? final.permission_denials.length : 0;
 
 const pass = skillOk && readOk;
 const fields = [
@@ -56,6 +64,9 @@ const fields = [
   `skill-invoked=${skillOk}`,
   `read-reference=${readOk}`,
   `read-denied=${readDenied}`,
+  `read-under-staged-dir=${readUnderStaged}`,
+  `permission-denials=${denials}`,
+  `denial=${denial}`,
   `replied-marker=${replied}`,
   `hook-fired=${fired("hook")}`,
   `mcp-fired=${fired("mcp")}`,

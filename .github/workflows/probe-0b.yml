@@ -54,6 +54,7 @@ jobs:
           allowed-tools: |
             Skill
             Read
+            Read(//home/runner/work/_temp/staged-plugins/**)
           plugin-dirs: ${{ steps.stage.outputs.plugin-dir }}
           leg-timeout-minutes: "5"
       - name: Report
