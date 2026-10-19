@@ -54,8 +54,8 @@ jobs:
         run: |
           mkdir -p "$DATA"
           printf '%s\n' 'diff --git a/README.md b/README.md' '--- a/README.md' '+++ b/README.md' '@@ -1 +1,2 @@' ' # sandbox' '+A line added by the probe.' >"$DATA/diff.patch"
-          jq -n '{pr: {number: 1, title: "docs: add a line", body: "Probe PR.", head_sha: "a", base_sha: "b"}, items: []}' >"$DATA/context.json"
-          jq -n '{pr: 1, head_sha: "a", base_sha: "b"}' >"$DATA/pr.json"
+          jq -n '{pr: {number: 1, title: "docs: add a line", body: "Probe PR.", head_sha: "1111111111111111111111111111111111111111", base_sha: "2222222222222222222222222222222222222222"}, items: []}' >"$DATA/context.json"
+          jq -n '{pr: 1, head_sha: "1111111111111111111111111111111111111111", base_sha: "2222222222222222222222222222222222222222"}' >"$DATA/pr.json"
           echo '[]' >"$DATA/spec.json"
           echo '[]' >"$DATA/spec-text.json"
           echo "CANARY-$(openssl rand -hex 8)" >.base/CANARY.md
@@ -158,8 +158,8 @@ jobs:
         env:
           EXECUTION_FILE: ${{ steps.judge.outputs.execution-file }}
           PR_NUMBER: "1"
-          HEAD_SHA: a
-          BASE_SHA: b
+          HEAD_SHA: "1111111111111111111111111111111111111111"
+          BASE_SHA: "2222222222222222222222222222222222222222"
           HEAD_REF: probe
           SPEC_FILE: ${{ github.workspace }}/pr-verify-data/spec.json
           VERDICT_DIR: ${{ runner.temp }}/pr-verify-verdict
