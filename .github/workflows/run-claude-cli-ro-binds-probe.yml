@@ -1,0 +1,124 @@
+name: run-claude-cli-ro-binds-probe
+
+# Hosted-runner probe for ci-workflows run-claude-cli at a pinned commit: one
+# leg on a trivial prompt, with the CLI install tree and _work/_actions bound
+# read-only. The model runs one fixed script that tries to restore write bits
+# and write under both trees; a later step checks the script's own record.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/run-claude-cli-ro-binds-probe.yml
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Apply the Claude managed settings
+        uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@162c9e16669eab4fc3f27ecb7a78b50d33f03cea
+
+      - name: Isolate the runner
+        timeout-minutes: 2
+        env:
+          RUNNER_HOSTING: ${{ runner.environment }}
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -qq &&
+              sudo apt-get install -y --no-install-recommends bubblewrap socat && break
+            echo "apt-get attempt $i failed, retrying..."
+            sleep 5
+          done
+          if [ "$RUNNER_HOSTING" = github-hosted ] &&
+            [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          command -v bwrap
+          bwrap --version
+          sock=/var/run/docker.sock
+          if [ -e "$sock" ]; then
+            sudo chmod 600 "$sock"
+          fi
+          sudo rm -f /etc/sudoers.d/runner
+          if sudo -n true 2>/dev/null; then
+            echo "::error::sudo still works for the runner user"
+            exit 1
+          fi
+
+      - name: Write the prompt and the probe script
+        run: |
+          cat >"$RUNNER_TEMP/probe-write.sh" <<'EOF'
+          #!/usr/bin/env bash
+          out=/home/runner/work/_temp/probe-result.txt
+          {
+            echo "credential-in-subprocess=${ANTHROPIC_API_KEY:+key}${CLAUDE_CODE_OAUTH_TOKEN:+token}"
+            for d in /home/runner/work/_temp/run-claude-cli-*/cli /home/runner/work/_actions; do
+              echo "dir=$d"
+              chmod u+w "$d" 2>&1
+              echo "chmod-exit=$?"
+              touch "$d/probe-write" 2>&1
+              echo "touch-exit=$?"
+              grep -F " $d " /proc/self/mountinfo | head -n 1
+            done
+          } >>"$out" 2>&1
+          cat "$out"
+          EOF
+          chmod +x "$RUNNER_TEMP/probe-write.sh"
+          printf '%s\n' 'Use the Bash tool to run exactly this command once: bash /home/runner/work/_temp/probe-write.sh' \
+            'Then reply with the single word OK, followed by the command output verbatim.' >"$RUNNER_TEMP/prompt.md"
+
+      - name: Run run-claude-cli
+        id: lane
+        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@162c9e16669eab4fc3f27ecb7a78b50d33f03cea
+        with:
+          lane: probe
+          role: automations
+          prompt-file: ${{ runner.temp }}/prompt.md
+          api-key: ${{ secrets.AUTOMATIONS_CLAUDE_API_KEY }}
+          subscription-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-haiku-5-5
+          effort: low
+          max-turns: "4"
+          permission-mode: dontAsk
+          tools: |
+            Bash
+          allowed-tools: |
+            Bash(bash /home/runner/work/_temp/probe-write.sh)
+          leg-timeout-minutes: "8"
+
+      - name: Check the probe record
+        if: always()
+        env:
+          LANE_CLASS: ${{ steps.lane.outputs.lane-class }}
+          CREDENTIAL: ${{ steps.lane.outputs.credential }}
+          CLI_VERSION: ${{ steps.lane.outputs.cli-version }}
+          LOG_FILE: ${{ steps.lane.outputs.log-file }}
+          EXECUTION_FILE: ${{ steps.lane.outputs.execution-file }}
+        run: |
+          echo "lane-class=${LANE_CLASS} credential=${CREDENTIAL} cli-version=${CLI_VERSION}"
+          if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then cat "$LOG_FILE"; fi
+          if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
+            echo "--- final result"
+            jq -r '.[] | select(.type == "result") | .result' "$EXECUTION_FILE"
+          fi
+          result="$RUNNER_TEMP/probe-result.txt"
+          echo "--- probe record"
+          if [ ! -f "$result" ]; then
+            echo "::error::the leg never ran the probe script"
+            exit 1
+          fi
+          cat "$result"
+          fail=0
+          if [ -n "$LANE_CLASS" ]; then echo "::error::lane-class=${LANE_CLASS}"; fail=1; fi
+          if grep -q '^credential-in-subprocess=.\+' "$result"; then echo "::error::a credential reached the Bash subprocess"; fail=1; fi
+          if grep -q '^chmod-exit=0$' "$result"; then echo "::error::a chmod under a protected tree succeeded"; fail=1; fi
+          if grep -q '^touch-exit=0$' "$result"; then echo "::error::a write under a protected tree succeeded"; fail=1; fi
+          [ "$(grep -c '^dir=' "$result")" -eq 2 ] || { echo "::error::expected two protected trees"; fail=1; }
+          for f in "$RUNNER_TEMP"/run-claude-cli-*/cli/probe-write /home/runner/work/_actions/probe-write; do
+            if [ -e "$f" ]; then echo "::error::$f exists"; fail=1; fi
+          done
+          exit "$fail"
