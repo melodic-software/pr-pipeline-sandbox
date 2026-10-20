@@ -53,7 +53,20 @@ ADAPTED=(
 )
 
 # "<path> <commit>": compared against that commit instead of the ref.
-PINNED=()
+PINNED=(
+  # Phase 6a (claude-code-plugins#8691): the issue lane's agent job loses its
+  # push token; apply-issue-patch commits its patch.
+  ".github/actions/resolve-config/activity-rules.json f51c6e311bc81862cc1915c9c238b84d4c0cf4bd"
+  ".github/actions/resolve-config/callers.test.mjs f51c6e311bc81862cc1915c9c238b84d4c0cf4bd"
+  ".github/actions/resolve-config/live-config.test.mjs f51c6e311bc81862cc1915c9c238b84d4c0cf4bd"
+  ".github/actions/resolve-config/models.test.mjs f51c6e311bc81862cc1915c9c238b84d4c0cf4bd"
+  ".github/actions/resolve-config/patch-rules.json f51c6e311bc81862cc1915c9c238b84d4c0cf4bd"
+  ".github/scripts/apply-patch/apply-patch.mjs f51c6e311bc81862cc1915c9c238b84d4c0cf4bd"
+  ".github/scripts/apply-patch/apply-patch.test.mjs f51c6e311bc81862cc1915c9c238b84d4c0cf4bd"
+  ".github/workflows/pr-run-activity-read.yml f51c6e311bc81862cc1915c9c238b84d4c0cf4bd"
+  ".github/workflows/pr-run-activity-write.yml f51c6e311bc81862cc1915c9c238b84d4c0cf4bd"
+  ".github/workflows/work-resolve-issue.yml f51c6e311bc81862cc1915c9c238b84d4c0cf4bd"
+)
 
 usage() {
   echo "usage: $0 <claude-code-plugins ref> [--repo <clone>]" >&2
