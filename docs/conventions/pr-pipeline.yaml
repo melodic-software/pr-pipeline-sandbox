@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=pr-pipeline/pr-pipeline.schema.json
-version: 1
+version: 2
 
 activities:
   check-sandbox:
@@ -21,7 +21,6 @@ activities:
   # their fixtures.
   fix-marker:
     skill: sandbox-marker:fix-marker
-    max-turns: 10
     effect: mutate-branch
     gating: advisory
     reads-untrusted: false
@@ -29,7 +28,6 @@ activities:
       paths: ["sandbox/refine/**"]
   explain-marker:
     skill: sandbox-marker:explain-marker
-    max-turns: 5
     effect: read
     gating: advisory
     reads-untrusted: false
@@ -44,7 +42,6 @@ activities:
   # Case 12: a gate skill whose verdict is sandbox/gate/verdict.txt on the head.
   review-gate:
     skill: sandbox-marker:review-gate
-    max-turns: 5
     effect: read
     gating: gate
     reads-untrusted: false
@@ -53,7 +50,6 @@ activities:
   # Case 14: what a skill's Bash subprocess and its ancestors can see.
   audit-env:
     skill: sandbox-marker:audit-env
-    max-turns: 6
     effect: read
     gating: advisory
     reads-untrusted: false
@@ -90,7 +86,6 @@ activities:
   # pr-run-activity-write.yml, whose job holds id-token: write.
   audit-env-write:
     skill: sandbox-marker:audit-env
-    max-turns: 6
     effect: mutate-tracker
     gating: advisory
     reads-untrusted: false
@@ -129,6 +124,94 @@ activities:
     gating: advisory
     reads-untrusted: true
     inputs: [pr, head-sha]
+  # Copied from claude-code-plugins 9329c4cd64, for the synced pr-unblock-dispatch.yml.
+  review-dependency:
+    # Reviews one Dependabot pull request the classifier sorts `review` (a
+    # major bump, an action publisher outside the allowlist, a group holding
+    # a major, a red ci-status, or a file outside the content rule) and
+    # returns a verdict: merge, fix, close or escalate. It posts nothing
+    # itself. pr-unblock-dispatch.yml starts it; a trusted person may also
+    # dispatch it by hand.
+    skill: source-control:pull-request
+    # The skill's CI mode for dependency bumps: reads the runner's context
+    # file, the checkout and upstream release notes, runs no head code, and
+    # pushes a fix only outside .github/ with [dependabot skip].
+    args: dependency --ci
+    # Before any model turn the runner skips a pull request Dependabot did
+    # not open or one sorted `auto`, and hands it to a person once
+    # `loop.dependency-review-rounds` rounds already ran.
+    prepare: dependency-review
+    # Reads the upstream changelog and release notes for the bumped versions.
+    web-access:
+      enabled: true
+      domains: [github.com, raw.githubusercontent.com, www.npmjs.com, registry.npmjs.org, pypi.org]
+    # Pushes a fix to the pull request's branch, nothing else.
+    effect: mutate-branch
+    # ci-status judges the pushed fix; the verdict job acts on the verdict.
+    gating: advisory
+    # Reads the PR body's release notes, the upstream changelog and head files.
+    reads-untrusted: true
+    inputs: [pr, head-sha]
+    applies-when:
+      labels-absent: [do-not-merge, needs-human]
+      draft: [false]
+  apply-dependency-verdict:
+    # Acts on the verdict review-dependency recorded: posts the round marker
+    # (for merge, the record the pr-merge lane merges on), closes the pull request
+    # and files an ignore-entry issue (never for a security update), or hands
+    # the pull request to a person. Never merges. A script, no model.
+    script: .github/scripts/pr-unblock/apply-dependency-verdict.mjs
+    effect: publish-artifact
+    gating: advisory
+    # Reads the verdict the model wrote, and the PR body for an advisory.
+    reads-untrusted: true
+    inputs: [pr, head-sha]
+  fix-ci:
+    # Fixes the failing CI checks on a lanes App pull request: reproduces each
+    # with the repository's own command, fixes the cause and reruns it. It
+    # holds no write token: the runner turns its uncommitted edits into a
+    # patch that apply-ci-fix pushes. pr-unblock-dispatch.yml starts it; a
+    # trusted person may also dispatch it by hand.
+    skill: source-control:pull-request
+    # The skill's CI mode for failing checks: never weakens a check, never
+    # edits .github/, and reports each check fixed or escalated.
+    args: ci --ci
+    # Before the run a base job writes the failing checks' names, workflow,
+    # annotations and log ends to a context file, or hands the pull request
+    # to a person once `loop.fix-ci-rounds` fixes were already pushed. The
+    # read runner gives the skill that file, Bash, Edit and Write.
+    prepare: ci-context
+    # Runs head code, so no write token: the change leaves as a patch.
+    effect: read
+    # ci-status judges the pushed fix.
+    gating: advisory
+    # Reads check annotations and logs, which print head text.
+    reads-untrusted: true
+    inputs: [pr, head-sha]
+    applies-when:
+      labels-absent: [do-not-merge, needs-human]
+      draft: [false]
+  apply-ci-fix:
+    # Applies fix-ci's patch to the head fix-ci worked on and pushes it as one
+    # commit, without force. A script, no model, and it runs no head code.
+    script: .github/scripts/pr-unblock/apply-ci-fix.mjs
+    # Before the mint the runner checks the patch artifact and the head;
+    # the script refuses the whole patch when any change is under .github/,
+    # an agent instruction path (CLAUDE.md, AGENTS.md, .claude/ or
+    # .claude-plugin/, a plugin's hooks/, monitors/ or bin/, .mcp.json,
+    # .lsp.json, .gitmodules, CODEOWNERS), a
+    # symbolic link or a gitlink, and hands an empty, invalid or unappliable
+    # patch to a person.
+    prepare: apply-patch
+    # Pushes the fix to the pull request's branch, nothing else.
+    effect: mutate-branch
+    gating: advisory
+    # Reads the patch and the report the model wrote.
+    reads-untrusted: true
+    inputs: [pr, head-sha]
+    applies-when:
+      labels-absent: [do-not-merge, needs-human]
+      draft: [false]
   report-escalation:
     script: .github/scripts/pr-unblock/report-escalation.sh
     effect: publish-artifact
@@ -145,11 +228,14 @@ activities:
     gating: advisory
     reads-untrusted: true
     inputs: [issue]
+    # Sandbox only: no checks, since none of claude-code-plugins' scripts/
+    # checks exist here.
     applies-when:
       events: [labeled]
-      # Sandbox only: mechanical issues too, so the lanes App labels the PRs
-      # the pr-merge cases need.
-      labels: ["work-class: read-only", "work-class: mechanical"]
+      # As on claude-code-plugins: the agent-ready label alone admits the
+      # issue, and a hold label starts nothing.
+      labels-absent: [needs-human, needs-owner-decision, "status: needs-decision"]
+      labels: [agent-ready]
       labeled-after: "2026-10-14T18:50:34Z"
   report-outcome:
     script: .github/scripts/work-resolve-issue/report-outcome.mjs
@@ -185,8 +271,19 @@ lanes:
       - activity: address-feedback
       - activity: publish-feedback
         needs: [address-feedback]
+      # Started by pr-unblock-dispatch.yml for review-tier Dependabot PRs.
+      - activity: review-dependency
+      # Runs after review-dependency, in its own job with its own token.
+      - activity: apply-dependency-verdict
+        needs: [review-dependency]
+      # Started by pr-unblock-dispatch.yml for lanes App PRs whose ci-status
+      # failed.
+      - activity: fix-ci
+      # Runs after fix-ci, in its own job with its own token.
+      - activity: apply-ci-fix
+        needs: [fix-ci]
       - activity: report-escalation
-        needs: [resolve-conflicts, address-feedback, publish-feedback]
+        needs: [resolve-conflicts, address-feedback, publish-feedback, review-dependency, apply-dependency-verdict, fix-ci, apply-ci-fix]
   pr-run-checks:
     stage: verify
     slots:
@@ -213,6 +310,21 @@ lanes:
       - activity: review-gate
       - activity: audit-env
 
+# The version 1 activities' max-turns, as profiles (schema version 2).
+models:
+  profiles:
+    standard: { model: default, max-turns: 75 }
+    turns-10: { model: default, max-turns: 10 }
+    turns-6: { model: default, max-turns: 6 }
+    turns-5: { model: default, max-turns: 5 }
+  default-profile: standard
+  routes:
+    fix-marker: turns-10
+    explain-marker: turns-5
+    review-gate: turns-5
+    audit-env: turns-6
+    audit-env-write: turns-6
+
 merge:
   # The lane auto-merges only PRs labeled `work-class: mechanical` (C2):
   # dependency bumps, lint and format fixes, syncs. The classes C1-C5 (read-only,
@@ -224,6 +336,9 @@ merge:
   # Sandbox only: live, so the pr-merge cases really enqueue. Main stays
   # report-only until the owner flips it.
   report-only: false
+  # Schema version 2 requires it at a rung above off. The sandbox's pr-merge
+  # gate predates the verifier verdict and does not read it.
+  require-verifier-verdict: true
   diff-check:
     denied-paths:
       - ".github/**"

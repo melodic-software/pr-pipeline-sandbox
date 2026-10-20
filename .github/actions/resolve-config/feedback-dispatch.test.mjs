@@ -20,7 +20,7 @@ const APP_ID = 337595936;
 const CLAUDE = { databaseId: 209825114 };
 const ACTIONS_BOT = { id: 41898282 };
 
-const config = (addressFeedbackSlot) => `version: 1
+const config = (addressFeedbackSlot) => `version: 2
 activities:
   resolve-conflicts:
     skill: source-control:resolve-conflicts
@@ -66,6 +66,7 @@ function baseWith(text) {
   for (const file of [
     "docs/conventions/pr-pipeline/pr-pipeline.schema.json",
     ".github/standards/github-actions-conventions/vocabulary.json",
+    ".github/standards/trusted-actors/trusted-actors.json",
   ]) {
     mkdirSync(dirname(join(base, file)), { recursive: true });
     cpSync(join(ROOT, file), join(base, file));
@@ -89,15 +90,6 @@ function fakes() {
   const dispatched = [];
   const reads = [];
   const api = {
-    getRun: async (id) => ({
-      id: Number(id),
-      path: ".github/workflows/pr-review-hosted.yml",
-      event: "pull_request",
-      status: "completed",
-      head_sha: HEAD,
-      repository: { full_name: REPOSITORY },
-      head_repository: { full_name: REPOSITORY },
-    }),
     pullsForCommit: async () => [pull],
     listIssueComments: async () =>
       ["claude-review", "claude-security-review"].map((lane) => ({
@@ -126,6 +118,21 @@ async function run(slot, text = config(slot)) {
   const base = baseWith(text);
   const { api, github, dispatched, reads } = fakes();
   const lines = [];
+  const event = join(base, "event.json");
+  writeFileSync(
+    event,
+    JSON.stringify({
+      workflow_run: {
+        id: 38779135732,
+        path: ".github/workflows/pr-review-hosted.yml",
+        event: "pull_request",
+        status: "completed",
+        head_sha: HEAD,
+        repository: { full_name: REPOSITORY },
+        head_repository: { full_name: REPOSITORY },
+      },
+    }),
+  );
   try {
     await main(
       {
@@ -135,7 +142,7 @@ async function run(slot, text = config(slot)) {
         GITHUB_OUTPUT: join(base, "output"),
         RUNNER_TEMP: base,
         BASE_PATH: base,
-        UPSTREAM_RUN_ID: "38779135732",
+        GITHUB_EVENT_PATH: event,
         APP_SENDER_ID: String(APP_ID),
       },
       { api, github, log: (line) => lines.push(line) },
@@ -168,10 +175,13 @@ test("a config the resolver refuses fails the run even when the lane has no addr
   await assert.rejects(run(null, text), (error) => error.name === "Rejection" && error.code === "undefined-activity");
 });
 
-test("this repository's own config resolves without failing the run", async () => {
+// The round is enabled in this repository (#7032 Phase 4), so a lanes App PR
+// with an open reviewer-bot thread on a reviewed head is dispatched.
+test("this repository's own config dispatches address-feedback", async () => {
   const { dispatched, lines } = await run(null, readFileSync(join(ROOT, "docs/conventions/pr-pipeline.yaml"), "utf8"));
-  assert.ok(dispatched.length <= 1);
-  assert.match(lines.at(-1), /^(dispatched #42|skip: )/);
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].inputs.activity, "address-feedback");
+  assert.match(lines.at(-1), /^dispatched #42 /);
 });
 
 test("a disabled address-feedback slot dispatches nothing", async () => {

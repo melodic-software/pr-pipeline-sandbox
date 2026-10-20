@@ -4,10 +4,40 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
+import { LIMIT_DEFAULTS } from "../work-resolve-issue/limits.mjs";
+import { emptyRecord, markHandled, parseRecord, serializeRecord } from "./dispatch-record.mjs";
 import { createGitHubApi, dispatchConflicting, main } from "./dispatch.mjs";
 
 const CHECK_NAME = "pr-unblock / resolve-conflicts";
+// The lanes App bot's user id (.github/standards/trusted-actors/trusted-actors.json).
+const LANES_APP = 337595936;
+// The title GitHub gives a pr-unblock.yml run, read from the workflow file:
+// its top-level run-name scalar as YAML reads it (a double-quoted string, or a
+// plain one cut at " #", which starts a comment), with the inputs filled in.
+function pr_unblockTitle(activity, number) {
+  const workflow = readFileSync(new URL("../../workflows/pr-unblock.yml", import.meta.url), "utf8");
+  const raw = /^run-name:[ \t]*(.*)$/m.exec(workflow)?.[1] ?? "";
+  const value = raw.startsWith('"') ? JSON.parse(raw.slice(0, raw.lastIndexOf('"') + 1)) : raw.split(/[ \t]#/)[0].trim();
+  return value
+    .replaceAll("${{ inputs.activity }}", activity)
+    .replaceAll("${{ inputs.pr-number }}", String(number));
+}
 const SUCCESS_RUN = { status: "completed", conclusion: "success", output: { title: "Resolved" } };
+// A failed run whose summary opens with the lane record report-check-run
+// writes; `tokens` follow class=rate-limit, and null leaves no record.
+const failedRun = (completed, tokens = "") => ({
+  name: CHECK_NAME,
+  status: "completed",
+  conclusion: "failure",
+  completed_at: completed,
+  output: {
+    title: "Failed",
+    summary:
+      tokens === null
+        ? "The activity step failed."
+        : `lane=pr-unblock activity=resolve-conflicts class=rate-limit${tokens}\n\nThe activity step failed.`,
+  },
+});
 const UNTRUSTED_SKIP = {
   status: "completed",
   conclusion: "neutral",
@@ -31,7 +61,8 @@ function pr(number, overrides = {}) {
 // `checked` is the set of head SHAs that already carry a successful check run,
 // or a Map from head SHA to the check runs GitHub returns for it. `runIds`
 // maps a PR number to the workflow_run_id its dispatch returns, undefined
-// included; any other PR gets 9000 plus its number.
+// included; any other PR gets 9000 plus its number. `workflowRuns` is the
+// pr-unblock.yml run listing.
 function fakeApi({
   pages = [[]],
   requeries = [],
@@ -39,11 +70,16 @@ function fakeApi({
   failDispatch = new Set(),
   failChecks = new Set(),
   runIds = new Map(),
+  workflowRuns = [],
+  ciFixPulls = [],
 } = {}) {
-  const calls = { list: [], get: [], checks: [], dispatch: [] };
+  const calls = { list: [], get: [], checks: [], dispatch: [], runs: [] };
   let round = 0;
   return {
     calls,
+    async listCiFixCandidates() {
+      return { rateLimit: { cost: 1, remaining: 4999 }, pullRequests: { nodes: ciFixPulls, pageInfo: { hasNextPage: false, endCursor: null } } };
+    },
     async listOpenPulls({ base, after }) {
       calls.list.push({ base, after });
       const index = after === undefined ? 0 : Number(after);
@@ -51,6 +87,15 @@ function fakeApi({
         nodes: pages[index],
         pageInfo: { hasNextPage: index + 1 < pages.length, endCursor: String(index + 1) },
       };
+    },
+    async listPullCommits() {
+      return [];
+    },
+    async getCommit(sha) {
+      return { sha, files: [] };
+    },
+    async listPullFiles() {
+      return [];
     },
     async getPulls(numbers) {
       calls.get.push([...numbers]);
@@ -67,6 +112,13 @@ function fakeApi({
         return checked.get(sha) ?? [];
       }
       return checked.has(sha) ? [SUCCESS_RUN] : [];
+    },
+    async listWorkflowRuns(workflow) {
+      calls.runs.push(workflow);
+      if (workflowRuns instanceof Error) {
+        throw workflowRuns;
+      }
+      return workflowRuns;
     },
     async dispatchWorkflow({ workflow, ref, inputs }) {
       calls.dispatch.push({ workflow, ref, inputs });
@@ -224,6 +276,78 @@ test("an in-progress run or any other completed conclusion counts as handled", a
   assert.deepEqual(api.calls.dispatch, []);
 });
 
+// A run the usage limit stopped (FINAL-DESIGN C5) stops counting as handled
+// once its limit resets: at its `resets=` time, else five hours after it
+// ended. Until then, and for any failure with no lane record, it still counts.
+test("a limit-stopped run counts as handled only until its limit resets", async () => {
+  const now = Date.parse("2026-10-17T12:00:00Z");
+  const [statedPast, statedFuture, fallbackPast, fallbackFuture, noRecord] = [pr(21), pr(22), pr(23), pr(24), pr(25)];
+  const { api, run } = harness(
+    {
+      pages: [[statedPast, statedFuture, fallbackPast, fallbackFuture, noRecord]],
+      checked: new Map([
+        [statedPast.headRefOid, [failedRun("2026-10-17T10:00:00Z", " resets=2026-10-17T11:00:00Z turns=3")]],
+        [statedFuture.headRefOid, [failedRun("2026-10-17T10:00:00Z", " resets=2026-10-17T13:00:00Z")]],
+        [fallbackPast.headRefOid, [failedRun("2026-10-17T06:00:00Z")]],
+        [fallbackFuture.headRefOid, [failedRun("2026-10-17T08:00:00Z", " turns=2")]],
+        [noRecord.headRefOid, [failedRun("2026-10-01T00:00:00Z", null)]],
+      ]),
+    },
+    { now, maxDispatch: 10 },
+  );
+  await run();
+  assert.deepEqual(dispatchedNumbers(api), ["21", "23"]);
+});
+
+test("the resolved limits set how many reset limit stops hold a head", async () => {
+  const now = Date.parse("2026-10-17T12:00:00Z");
+  const stopped = pr(28);
+  const apiOptions = { pages: [[stopped]], checked: new Map([[stopped.headRefOid, [failedRun("2026-10-17T06:00:00Z")]]]) };
+  const defaults = harness(apiOptions, { now });
+  await defaults.run();
+  assert.deepEqual(dispatchedNumbers(defaults.api), ["28"]);
+  const one = harness(apiOptions, { now, limits: { ...LIMIT_DEFAULTS, "limit-stops-per-head": 1 } });
+  await one.run();
+  assert.deepEqual(dispatchedNumbers(one.api), []);
+});
+
+test("skips a PR while a resolve-conflicts run for it is queued or going", async () => {
+  for (const status of ["queued", "in_progress", "waiting", "pending"]) {
+    const { api, lines, run } = harness({
+      pages: [[pr(26), pr(27)]],
+      workflowRuns: [{ id: 1, status, display_title: pr_unblockTitle("resolve-conflicts", 26) }],
+    });
+    await run();
+    assert.deepEqual(api.calls.runs, ["pr-unblock.yml"], status);
+    assert.deepEqual(dispatchedNumbers(api), ["27"], status);
+    assert.ok(lines.some((line) => line.includes("#26") && line.includes("run 1")), status);
+  }
+});
+
+test("a finished run, another PR's run or another activity's run does not hold the dispatch", async () => {
+  const { api, run } = harness({
+    pages: [[pr(28)]],
+    workflowRuns: [
+      { id: 1, status: "completed", display_title: pr_unblockTitle("resolve-conflicts", 28) },
+      { id: 2, status: "in_progress", display_title: pr_unblockTitle("resolve-conflicts", 280) },
+      { id: 3, status: "queued", display_title: pr_unblockTitle("address-feedback", 28) },
+    ],
+  });
+  await run();
+  assert.deepEqual(dispatchedNumbers(api), ["28"]);
+});
+
+test("an unreadable run listing dispatches nothing and counts as a failure", async () => {
+  const { api, lines, run } = harness({
+    pages: [[pr(29)]],
+    workflowRuns: new Error("runs read failed"),
+  });
+  const result = await run();
+  assert.deepEqual(api.calls.dispatch, []);
+  assert.equal(result.failed, 1);
+  assert.ok(lines.some((line) => line.startsWith("::error::") && line.includes("runs read failed")));
+});
+
 test("maxDispatch defaults to 3, in ascending PR number, logging the PRs left for a later run", async () => {
   const { api, lines, run } = harness({ pages: [[pr(25), pr(23), pr(21), pr(24), pr(22)]] });
   await run();
@@ -355,7 +479,7 @@ test("a 15-digit workflow_run_id is accepted", async () => {
 });
 
 // main against a fake API, with GITHUB_OUTPUT a real file it appends to.
-async function runMain(apiOptions) {
+async function runMain(apiOptions, limits = LIMIT_DEFAULTS) {
   const dir = mkdtempSync(join(tmpdir(), "pr-unblock-dispatch-"));
   const output = join(dir, "output");
   writeFileSync(output, "");
@@ -366,8 +490,9 @@ async function runMain(apiOptions) {
         GITHUB_REPOSITORY: "octo/repo",
         GITHUB_RUN_ID: "4242",
         GITHUB_OUTPUT: output,
+        APP_SENDER_ID: String(LANES_APP),
       },
-      { api: fakeApi(apiOptions), sleep: async () => {}, log: () => {} },
+      { api: fakeApi(apiOptions), sleep: async () => {}, log: () => {}, loadLimits: async () => limits },
     );
     return { code, output: readFileSync(output, "utf8") };
   } finally {
@@ -401,6 +526,95 @@ test("main writes the recorded ids and exits 1 when another dispatch failed", as
   assert.equal(output, "run-ids=500\n");
 });
 
+test("main records a review-dependency dispatch beside the conflict dispatches", async () => {
+  const dependabot = pr(131, {
+    mergeable: "MERGEABLE",
+    author: { login: "dependabot[bot]" },
+    headRefName: "dependabot/npm_and_yarn/x-2.0.0",
+    title: "build(deps): bump x from 1.0.0 to 2.0.0",
+    body: "",
+    labels: { nodes: [] },
+    changedFiles: 0,
+  });
+  const { code, output } = await runMain({ pages: [[pr(130), dependabot]] });
+  assert.equal(code, 0);
+  assert.equal(output, "run-ids=9130 9131\n");
+});
+
+// A lanes App PR whose head's ci-status failed, as fix-ci-dispatch.mjs lists it.
+const ciFixPull = (number) => {
+  const head = String(number).padStart(40, "c");
+  return {
+    number,
+    isDraft: false,
+    isCrossRepository: false,
+    baseRefName: "main",
+    headRefOid: head,
+    author: { login: "melodic-automation-lanes", databaseId: LANES_APP },
+    labels: { nodes: [] },
+    commits: {
+      nodes: [
+        {
+          commit: {
+            oid: head,
+            statusCheckRollup: {
+              contexts: {
+                nodes: [{ __typename: "CheckRun", name: "ci-status", status: "COMPLETED", conclusion: "FAILURE", checkSuite: { app: { databaseId: 15368 } } }],
+              },
+            },
+          },
+        },
+      ],
+    },
+  };
+};
+
+test("main records fix-ci dispatches beside the others, capped by limits.fix-ci-per-run", async () => {
+  const pulls = [ciFixPull(141), ciFixPull(142), ciFixPull(143)];
+  const capped = await runMain({ pages: [[pr(140)]], ciFixPulls: pulls }, { ...LIMIT_DEFAULTS, "fix-ci-per-run": 1, "fix-ci-restarts": 1 });
+  assert.deepEqual(capped, { code: 0, output: "run-ids=9140 9141\n" });
+  const fallback = await runMain({ pages: [[]], ciFixPulls: pulls });
+  assert.deepEqual(fallback, { code: 0, output: "run-ids=9141 9142\n" }, "with no fix-ci limit the default of 2 holds");
+});
+
+test("without the lanes App sender id main still dispatches conflicts, dispatches no fix-ci, and exits 1", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pr-unblock-dispatch-"));
+  try {
+    const output = join(dir, "output");
+    writeFileSync(output, "");
+    const code = await main(
+      { GITHUB_TOKEN: "t", GITHUB_REPOSITORY: "o/r", GITHUB_RUN_ID: "1", GITHUB_OUTPUT: output },
+      { api: fakeApi({ pages: [[pr(150)]], ciFixPulls: [ciFixPull(151)] }), log: () => {}, loadLimits: async () => LIMIT_DEFAULTS },
+    );
+    assert.equal(code, 1);
+    assert.equal(readFileSync(output, "utf8"), "run-ids=9150\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("main appends each run id to RUN_IDS_FILE as soon as its dispatch returns", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pr-unblock-dispatch-"));
+  try {
+    const file = join(dir, "ids");
+    const api = fakeApi({ pages: [[pr(160), pr(161)]], runIds: new Map([["161", undefined]]) });
+    const seen = [];
+    const dispatch = api.dispatchWorkflow;
+    api.dispatchWorkflow = async (request) => {
+      seen.push(readFileSync(file, { encoding: "utf8", flag: "a+" }));
+      return dispatch(request);
+    };
+    await main(
+      { GITHUB_TOKEN: "t", GITHUB_REPOSITORY: "o/r", GITHUB_RUN_ID: "1", GITHUB_OUTPUT: join(dir, "out"), APP_SENDER_ID: String(LANES_APP), RUN_IDS_FILE: file },
+      { api, log: () => {}, loadLimits: async () => LIMIT_DEFAULTS },
+    );
+    assert.deepEqual(seen, ["", "9160\n"], "the first id is on disk before the second dispatch");
+    assert.equal(readFileSync(file, "utf8"), "9160\n", "an id that is not a run id is not recorded");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("main writes nothing to GITHUB_OUTPUT when no run was dispatched", async () => {
   const noPulls = await runMain({ pages: [[pr(121, { mergeable: "MERGEABLE" })]] });
   assert.deepEqual(noPulls, { code: 0, output: "" });
@@ -427,6 +641,7 @@ test("the GitHub adapter calls the documented endpoints", async () => {
     },
     { total_count: 1, check_runs: [SUCCESS_RUN] },
     { workflow_run_id: 77, run_url: "u", html_url: "h" },
+    { total_count: 1, workflow_runs: [{ id: 5, status: "queued" }] },
   ];
   const fetchStub = async (url, init) => {
     requests.push({
@@ -484,4 +699,91 @@ test("the GitHub adapter calls the documented endpoints", async () => {
   });
   assert.equal(requests[2].method, "POST");
   assert.equal(requests[2].auth, "Bearer t0ken");
+  assert.deepEqual(await api.listWorkflowRuns("pr-unblock.yml"), [{ id: 5, status: "queued" }]);
+  assert.equal(
+    requests[3].url,
+    "https://api.example/repos/octo/repo/actions/workflows/pr-unblock.yml/runs?event=workflow_dispatch&per_page=100",
+  );
+});
+
+// The record a run leaves: the next run, against the same GitHub state,
+// dispatches the same PRs and skips the reads the record makes redundant.
+// #1 conflicts at a head a successful run handled; #2 conflicts and is new;
+// #3 reads UNKNOWN, then CONFLICTING at a head a successful run handled.
+const recordState = () => ({
+  pages: [[pr(1), pr(2), pr(3, { mergeable: "UNKNOWN" })]],
+  requeries: [[pr(3)]],
+  checked: new Set([pr(1).headRefOid, pr(3).headRefOid]),
+});
+
+test("a run records heads a finished run handled, and the next run skips their reads and re-queries", async () => {
+  const record = emptyRecord();
+  const first = harness(recordState(), { record });
+  await first.run();
+  // Without a record: a check-run read per conflicting head (#1, #2, #3) and
+  // one re-query round after one 10 s wait.
+  assert.deepEqual(dispatchedNumbers(first.api), ["2"]);
+  assert.equal(first.api.calls.checks.length, 3);
+  assert.equal(first.api.calls.get.length, 1);
+  assert.deepEqual(first.sleeps, [10_000]);
+  assert.deepEqual([...record.handled.get(CHECK_NAME)].sort(), [pr(1).headRefOid, pr(3).headRefOid]);
+
+  const second = harness(recordState(), { record: parseRecord(serializeRecord(record)) });
+  await second.run();
+  assert.deepEqual(dispatchedNumbers(second.api), ["2"]);
+  assert.deepEqual(second.api.calls.checks.map((call) => call.sha), [pr(2).headRefOid]);
+  assert.equal(second.api.calls.get.length, 0);
+  assert.deepEqual(second.sleeps, []);
+  assert.ok(second.lines.includes(`skip #1: head ${pr(1).headRefOid} already has a ${CHECK_NAME} check run (recorded)`));
+});
+
+test("a run whose every candidate is recorded lists no workflow runs", async () => {
+  const record = emptyRecord();
+  markHandled(record, CHECK_NAME, pr(1).headRefOid);
+  const { api, run } = harness({ pages: [[pr(1)]] }, { record });
+  await run();
+  assert.deepEqual(api.calls.runs, []);
+  assert.deepEqual(api.calls.checks, []);
+});
+
+test("only a finished run that handles the head for good is recorded", async () => {
+  const runs = new Map([
+    [pr(1).headRefOid, [UNTRUSTED_SKIP]],
+    [pr(2).headRefOid, [{ status: "in_progress", conclusion: null }]],
+    [pr(3).headRefOid, [failedRun("2026-10-17T10:00:00Z", " resets=2026-10-17T12:00:00Z")]],
+    [pr(4).headRefOid, [failedRun("2026-10-17T10:00:00Z", null)]],
+  ]);
+  const record = emptyRecord();
+  const { run } = harness({ pages: [[pr(1), pr(2), pr(3), pr(4)]], checked: runs }, { record, maxDispatch: 9 });
+  await run();
+  // #4 failed for a reason other than the usage limit: handled for good.
+  assert.deepEqual([...(record.handled.get(CHECK_NAME) ?? [])], [pr(4).headRefOid]);
+});
+
+test("main carries the record in DISPATCH_RECORD and writes it only when it changed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pr-unblock-record-"));
+  const output = join(dir, "output");
+  const path = join(dir, "record.json");
+  const env = {
+    GITHUB_TOKEN: "t0ken",
+    GITHUB_REPOSITORY: "octo/repo",
+    GITHUB_RUN_ID: "4242",
+    GITHUB_OUTPUT: output,
+    APP_SENDER_ID: String(LANES_APP),
+    DISPATCH_RECORD: path,
+  };
+  // A recorded head no open PR carries any more is dropped.
+  writeFileSync(path, JSON.stringify({ version: 1, handled: { [CHECK_NAME]: ["f".repeat(40)] }, dispatched: {} }));
+  const options = () => ({ api: fakeApi({ pages: [[pr(1)]], checked: new Set([pr(1).headRefOid]) }), sleep: async () => {}, log: () => {}, loadLimits: async () => LIMIT_DEFAULTS });
+  try {
+    writeFileSync(output, "");
+    assert.equal(await main(env, options()), 0);
+    assert.equal(readFileSync(output, "utf8"), "record-changed=true\n");
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { version: 1, handled: { [CHECK_NAME]: [pr(1).headRefOid] }, dispatched: {} });
+    writeFileSync(output, "");
+    assert.equal(await main(env, options()), 0);
+    assert.equal(readFileSync(output, "utf8"), "");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

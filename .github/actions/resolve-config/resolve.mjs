@@ -7,6 +7,7 @@ import { posix } from "node:path";
 import Ajv2020 from "ajv/dist/2020.js";
 import { parseDocument } from "yaml";
 
+import { checkDimensions, dimensionBudget, issueDimensions, parsePin } from "./dimensions.mjs";
 import { MissingFact, appliesAll, factsFor } from "./predicate.mjs";
 import { checkActivityName, checkLaneName } from "./vocabulary.mjs";
 
@@ -15,6 +16,14 @@ const CONFIG_BASENAME = "pr-pipeline.yaml";
 const RESERVED_ACTIVITIES = new Set(["run", "report"]);
 const TRUSTED_ACTORS_PATH =
   ".github/standards/trusted-actors/trusted-actors.json";
+// Model routes that are no activity: pr-verify.yml's judgment, the code and
+// security review lanes, and intake triage.
+const RUN_ROUTES = new Set(["verify-pr", "review-code", "review-security", "triage-issue", "summarize-reuse"]);
+// The profile every run takes in a config with no `models` block.
+const BUILTIN_MODELS = Object.freeze({
+  profiles: { standard: { model: "default", "max-turns": 75 } },
+  "default-profile": "standard",
+});
 
 export class Rejection extends Error {
   constructor(code, message) {
@@ -200,10 +209,18 @@ function checkLeaves(activities, activityRules) {
     if (isComposite(activity)) {
       continue;
     }
-    if (activity.prepare !== undefined && activity.effect === "read") {
+    // ci-context is the read runner's one mode, apply-patch a branch-writing
+    // script's; every other mode needs a skill that can write.
+    const needs = { "ci-context": "read", "apply-patch": "mutate-branch" }[activity.prepare];
+    if (
+      activity.prepare !== undefined &&
+      (needs ? activity.effect !== needs : activity.effect === "read")
+    ) {
       throw new Rejection(
         "invalid-prepare",
-        `activity \`${name}\` sets prepare with effect read; prepare needs a skill that can write`,
+        needs
+          ? `activity \`${name}\` sets prepare: ${activity.prepare}, which needs effect ${needs}`
+          : `activity \`${name}\` sets prepare with effect read; prepare needs a skill that can write`,
       );
     }
     const rule = Object.hasOwn(activityRules, name)
@@ -217,6 +234,146 @@ function checkLeaves(activities, activityRules) {
     }
   }
 }
+
+// The prepare mode an applied-by target must set, per key.
+const APPLIER_PREPARE = Object.freeze({ patch: "apply-patch" });
+
+// What the schema cannot check about `applied-by`: each target is a script
+// activity (a patch target one with prepare: apply-patch), and every lane that
+// holds the producer holds the target in a slot that needs the producer.
+function checkAppliedBy(doc) {
+  const reject = (message) => {
+    throw new Rejection("invalid-applied-by", message);
+  };
+  const handsOn = (activity) => !isComposite(activity) && isObject(activity["applied-by"]);
+  for (const [name, activity] of Object.entries(doc.activities)) {
+    for (const [key, target] of Object.entries(handsOn(activity) ? activity["applied-by"] : {})) {
+      const applier = Object.hasOwn(doc.activities, target) ? doc.activities[target] : undefined;
+      if (typeof applier?.script !== "string") {
+        reject(`activity \`${name}\` applied-by.${key} names \`${target}\`, which is not a script activity`);
+      }
+      const prepare = APPLIER_PREPARE[key];
+      if (prepare !== undefined && applier.prepare !== prepare) {
+        reject(`activity \`${name}\` applied-by.${key} names \`${target}\`, which does not set prepare: ${prepare}`);
+      }
+    }
+  }
+  for (const lane of Object.keys(doc.lanes)) {
+    const leaves = laneSlots(doc, lane);
+    for (const producer of leaves.filter((entry) => handsOn(entry.activity))) {
+      for (const [key, target] of Object.entries(producer.activity["applied-by"])) {
+        const applier = leaves.find((entry) => entry.name === target);
+        if (applier === undefined) {
+          reject(`lane \`${lane}\` holds \`${producer.name}\`, whose applied-by.${key} \`${target}\` is not in the lane`);
+        }
+        if (!applier.needs.includes(producer.name)) {
+          reject(`lane \`${lane}\` slot \`${target}\` applies \`${producer.name}\`'s ${key} and does not need it`);
+        }
+      }
+    }
+  }
+}
+
+// Every patch-rules.json row refuses these, so no row can admit them.
+const UNIVERSAL_REFUSE = Object.freeze([
+  "github",
+  "claude",
+  "mcp-config",
+  "gitmodules",
+  "settings",
+  "symlink",
+  "gitlink",
+  "new-executable",
+  "rename-into-refused",
+]);
+
+// patch-rules.json against its schema, which names every refusal and allow
+// rule apply-patch knows; then what the schema cannot check: each row refuses
+// the universal set, a two-parent commit allows exactly merge-result, and
+// each prepare mode a patch-producing activity uses has a row.
+export function checkPatchRules(patchRules, schema, activities = {}) {
+  const fail = (message) => {
+    throw new Rejection("patch-rules", message);
+  };
+  if (!isObject(patchRules) || !isObject(schema)) {
+    fail("patch-rules.json and patch-rules.schema.json must be present");
+  }
+  const validate = new Ajv2020({ allErrors: true, strict: false, validateFormats: false }).compile(schema);
+  if (!validate(patchRules)) {
+    fail(
+      `patch-rules.json fails its schema: ${validate.errors.map((error) => `${error.instancePath || "/"} ${error.message}`).join("; ")}`,
+    );
+  }
+  for (const [row, rules] of Object.entries(patchRules)) {
+    const missing = UNIVERSAL_REFUSE.filter((name) => !rules.refuse.includes(name));
+    if (missing.length > 0) {
+      fail(`patch-rules.json row \`${row}\` does not refuse ${missing.join(", ")}`);
+    }
+    if (rules.commit.parents.includes("base") && (rules.allow.length !== 1 || rules.allow[0] !== "merge-result")) {
+      fail(`patch-rules.json row \`${row}\` commits with the base as a parent, so its allow must be exactly [merge-result]`);
+    }
+  }
+  for (const [name, activity] of Object.entries(activities)) {
+    const row = activity?.prepare ?? "default";
+    if (activity?.["applied-by"]?.patch !== undefined && !Object.hasOwn(patchRules, row)) {
+      fail(`activity \`${name}\` hands on a patch with prepare: ${row}, and patch-rules.json has no \`${row}\` row`);
+    }
+  }
+  return patchRules;
+}
+
+// A runner names the applied-by keys it hands on (applied-by-supported, a
+// comma- or space-separated list); an applying leaf with any other key would
+// hand nothing on, so it fails before the head checkout.
+export function checkAppliedBySupported(selected, supported = "") {
+  const kinds = new Set(String(supported).split(/[\s,]+/).filter(Boolean));
+  const missing = Object.keys(selected?.["applied-by"] ?? {}).filter((key) => !kinds.has(key));
+  if (selected?.applies && missing.length > 0) {
+    throw new Rejection(
+      "applied-by-unsupported",
+      `activity \`${selected.name}\` sets applied-by ${missing.join(", ")}, and this runner does not pass applied-by-supported: ${missing.join(", ")}`,
+    );
+  }
+}
+
+// What the schema cannot check about `models`: every profile a route or
+// default-profile names exists, and every route names a skill activity or a
+// run route, so a mistyped route cannot silently take the default.
+function checkModels(models, activities) {
+  if (models === undefined) {
+    return;
+  }
+  const { profiles } = models;
+  for (const [route, profile] of [
+    ["default-profile", models["default-profile"]],
+    ...Object.entries(models.routes ?? {}),
+  ]) {
+    if (!Object.hasOwn(profiles, profile)) {
+      throw new Rejection(
+        "undefined-profile",
+        `models: \`${route}\` names profile \`${profile}\`, which is not defined`,
+      );
+    }
+  }
+  for (const route of Object.keys(models.routes ?? {})) {
+    const activity = Object.hasOwn(activities, route) ? activities[route] : undefined;
+    if (!RUN_ROUTES.has(route) && typeof activity?.skill !== "string") {
+      throw new Rejection(
+        "undefined-route",
+        `models.routes names \`${route}\`, which is neither a skill activity nor ${[...RUN_ROUTES].join(", ")}`,
+      );
+    }
+  }
+  if (models["issue-dimensions"] !== undefined) {
+    checkDimensions(models["issue-dimensions"]);
+  }
+}
+
+// Whether a skill activity takes its budget from its issue's dimensions.
+const dimensionedBy = (activity, models) =>
+  models?.["issue-dimensions"] !== undefined &&
+  typeof activity.skill === "string" &&
+  (activity.inputs ?? []).includes("issue");
 
 // Rejections 1, 2, 4-9 and 3 over the whole file, whichever lane the run asked for.
 export function loadConfig(files, { configPath }) {
@@ -252,6 +409,7 @@ export function loadConfig(files, { configPath }) {
     }
   }
   checkComposites(doc.activities);
+  checkModels(doc.models, doc.activities);
   checkLeaves(
     doc.activities,
     checkActivityRules(files.activityRules, files.effectGrants),
@@ -322,6 +480,7 @@ export function loadConfig(files, { configPath }) {
       }
     }
   }
+  checkAppliedBy(doc);
   return doc;
 }
 
@@ -405,7 +564,7 @@ const decides = (index, selected) => selected < 0 || index === selected;
 
 // The facts the decided enabled slots read. Rejects the same files and request
 // resolve() would, before any fact is fetched.
-export function neededFacts(files, { lane, activity, configPath }) {
+export function neededFacts(files, { lane, activity, configPath, pinnedDimensions }) {
   const doc = loadConfig(files, { configPath });
   const entries = laneSlots(doc, lane);
   const selected = selectedIndex(entries, lane, activity);
@@ -417,6 +576,11 @@ export function neededFacts(files, { lane, activity, configPath }) {
       }
       if ((definition.inputs ?? []).includes("changed-paths")) {
         needed.add("changedPaths");
+      }
+      // The fields are read now, unless an earlier resolve pinned them.
+      if (dimensionedBy(definition, doc.models) && !pinnedDimensions) {
+        needed.add("fieldValues");
+        needed.add("fieldSetters");
       }
     }
   });
@@ -466,18 +630,18 @@ function codeownersGlobs(text) {
 
 // The changed-paths input: the PR's changed files that still exist, that match
 // the slot's `paths` predicate when it has one, and that have a safe name. For
-// any effect but `read`, instruction surfaces and every path CODEOWNERS lists
-// are left out of what the activity is asked to fix. Sorted, without
-// duplicates.
+// an activity that edits (an effect other than `read`, or a patch it hands
+// on), instruction surfaces and every path CODEOWNERS lists are left out of
+// what it is asked to fix. Sorted, without duplicates.
 export function changedPathTargets({
   paths,
   predicatePaths,
-  effect,
+  edits,
   codeowners,
 }) {
   const owned = codeownersGlobs(codeowners);
   const notTargeted = (path) =>
-    effect !== "read" &&
+    edits &&
     (INSTRUCTION_SURFACES.some((glob) =>
       posix.matchesGlob(path.toLowerCase(), glob),
     ) ||
@@ -518,11 +682,60 @@ function grantFor(effectGrants, effect) {
   return Object.freeze({ ...row });
 }
 
+// The profile a route takes, with every default applied: its route's profile,
+// else default-profile; the built-in one when the config has no `models`.
+function routeModels(models = BUILTIN_MODELS, route) {
+  const routes = models.routes ?? {};
+  const profile = Object.hasOwn(routes, route) ? routes[route] : models["default-profile"];
+  const values = models.profiles[profile];
+  return {
+    profile,
+    model: values.model,
+    effort: values.effort ?? null,
+    "subagent-model": values["subagent-model"] ?? "inherit",
+    "max-turns": values["max-turns"],
+  };
+}
+
+// The Claude Code arguments a resolved profile sets: `--model` unless the
+// model is `default`, `--max-turns`, and `--effort` only when the profile sets
+// one. Every value is a schema enum or integer, never free text.
+export function modelArgs(models) {
+  return [
+    ...(models.model === "default" ? [] : ["--model", models.model]),
+    "--max-turns",
+    String(models["max-turns"]),
+    ...(models.effort === null ? [] : ["--effort", models.effort]),
+  ].join(" ");
+}
+
+// The settings JSON a resolved profile sets: the subagent model as settings
+// env, or empty for `inherit`.
+export function modelSettings(models) {
+  return models["subagent-model"] === "inherit"
+    ? ""
+    : JSON.stringify({ env: { CLAUDE_CODE_SUBAGENT_MODEL: models["subagent-model"] } });
+}
+
+// The resolved profile of a run that is no lane activity (RUN_ROUTES), after
+// the same file checks as resolve().
+export function resolveRoute(files, { route, configPath }) {
+  if (!RUN_ROUTES.has(route)) {
+    throw new Rejection(
+      "undefined-route",
+      `\`${route}\` is not a run route; one of ${[...RUN_ROUTES].join(", ")} is required`,
+    );
+  }
+  return routeModels(loadConfig(files, { configPath }).models, route);
+}
+
 function resolveSlot(
   { name, activity, predicate, predicates, enabled, needs },
-  { effectGrants, codeowners },
+  { effectGrants, codeowners, trustedActors },
   facts,
   decided,
+  models,
+  pinnedDimensions,
 ) {
   const grant = grantFor(effectGrants, activity.effect);
   let outcome = { applies: null, skipReason: null };
@@ -548,7 +761,7 @@ function resolveSlot(
         ),
       ),
       predicatePaths: predicate?.paths,
-      effect: activity.effect,
+      edits: activity.effect !== "read" || activity["applied-by"]?.patch !== undefined,
       codeowners,
     });
     if (targets.length === 0) {
@@ -556,6 +769,34 @@ function resolveSlot(
     }
   }
   const kind = activity.skill === undefined ? "script" : "skill";
+  let runModels = kind === "skill" ? routeModels(models, name) : null;
+  let sizing = {};
+  if (dimensionedBy(activity, models)) {
+    const config = models["issue-dimensions"];
+    let dims;
+    if (pinnedDimensions) {
+      // What an earlier resolve read for this run, whose job timeout is
+      // already fixed: the fields are not read again.
+      dims = parsePin(pinnedDimensions, config);
+    } else if (decided) {
+      for (const fact of ["fieldValues", "fieldSetters"]) {
+        if (facts[fact] === undefined) {
+          throw new MissingFact(fact);
+        }
+      }
+      dims = issueDimensions(facts, config, trustedActors);
+    } else {
+      dims = parsePin("not-assessed", config);
+    }
+    const budget = dimensionBudget(dims, config);
+    if (budget.skip !== null && outcome.applies) {
+      outcome = { applies: false, skipReason: budget.skip };
+    }
+    if (budget.skip === null) {
+      runModels = { ...runModels, "max-turns": budget["max-turns"] };
+    }
+    sizing = { "issue-dimensions": budget.pin, "timeout-minutes": budget["timeout-minutes"] };
+  }
   return {
     name,
     kind,
@@ -563,7 +804,10 @@ function resolveSlot(
     ...(activity.args === undefined ? {} : { args: activity.args }),
     ...(activity.prepare === undefined ? {} : { prepare: activity.prepare }),
     ...(activity.checks === undefined ? {} : { checks: activity.checks }),
+    ...(activity["self-checks"] === undefined ? {} : { "self-checks": activity["self-checks"] }),
+    ...(activity["verify-scripts"] === undefined ? {} : { "verify-scripts": activity["verify-scripts"] }),
     ...(activity["web-access"] === undefined ? {} : { "web-access": activity["web-access"] }),
+    ...(activity["applied-by"] === undefined ? {} : { "applied-by": activity["applied-by"] }),
     effect: activity.effect,
     gating: activity.gating,
     "reads-untrusted": activity["reads-untrusted"],
@@ -572,8 +816,8 @@ function resolveSlot(
     needs,
     ...(predicate === undefined ? {} : { "applies-when": predicate }),
     enabled,
-    model: activity.model ?? null,
-    "max-turns": activity["max-turns"] ?? null,
+    models: runModels,
+    ...sizing,
     grant,
     applies: outcome.applies,
     "skip-reason": outcome.skipReason,
@@ -622,16 +866,61 @@ function resolveMerge(merge = {}, configPath) {
   };
 }
 
+// The `limits` leaf with every default applied, in hours and counts; the lane
+// scripts' copy of these defaults is
+// .github/scripts/work-resolve-issue/limits.mjs.
+const limitsOf = (limits = {}) => ({
+  "fallback-reset": limits["fallback-reset"] ?? 5,
+  "reset-clamp-min": limits["reset-clamp-min"] ?? 1,
+  "reset-clamp-max": limits["reset-clamp-max"] ?? 168,
+  "restarts-per-run": limits["restarts-per-run"] ?? 5,
+  "limit-stops-per-head": limits["limit-stops-per-head"] ?? 3,
+  "limit-stops-per-issue": limits["limit-stops-per-issue"] ?? 3,
+  "wip-cap": limits["wip-cap"] ?? 60,
+  "turn-cap-restarts": limits["turn-cap-restarts"] ?? 0,
+  "fix-ci-per-run": limits["fix-ci-per-run"] ?? 2,
+  "fix-ci-restarts": limits["fix-ci-restarts"] ?? 1,
+  "admission-window-hours": limits["admission-window-hours"] ?? 24,
+  "admission-factor": limits["admission-factor"] ?? 0.8,
+});
+
+const loopOf = (loop = {}) => ({
+  "review-rounds": loop["review-rounds"] ?? 2,
+  "no-progress": loop["no-progress"] ?? 3,
+  "dependency-review-rounds": loop["dependency-review-rounds"] ?? 2,
+  "fix-ci-rounds": loop["fix-ci-rounds"] ?? 3,
+});
+
+// The resolved loop caps alone, after the same file checks as resolve(), for
+// a job that resolves no lane slot (pr-unblock.yml's fix-ci-context).
+export function resolveLoop(files, { configPath }) {
+  return loopOf(loadConfig(files, { configPath }).loop);
+}
+
+// The resolved limits alone, after the same file checks as resolve(), for a
+// run that resolves no lane slot (pr-unblock-dispatch.yml).
+export function resolveLimits(files, { configPath }) {
+  return limitsOf(loadConfig(files, { configPath }).limits);
+}
+
+// The wip leaf as set, after the same file checks as resolve(), for the WIP
+// cap check. Its defaults have one copy, WIP_DEFAULTS in
+// .github/scripts/work-resolve-issue/limits.mjs, which its readers apply;
+// this module imports nothing outside this action's sparse checkout.
+export function resolveWipLeaf(files, { configPath }) {
+  return loadConfig(files, { configPath }).wip ?? {};
+}
+
 export function resolve(
   files,
-  { lane, activity, configPath, basePath, facts },
+  { lane, activity, configPath, basePath, facts, pinnedDimensions },
 ) {
   const doc = loadConfig(files, { configPath });
   const section = laneSection(doc, lane);
   const entries = laneSlots(doc, lane);
   const index = selectedIndex(entries, lane, activity);
   const slots = entries.map((entry, i) =>
-    resolveSlot(entry, files, facts, decides(i, index)),
+    resolveSlot(entry, files, facts, decides(i, index), doc.models, pinnedDimensions),
   );
   return {
     version: 1,
@@ -643,10 +932,9 @@ export function resolve(
       slots,
     },
     selected: index < 0 ? null : slots[index],
-    loop: {
-      "review-rounds": doc.loop?.["review-rounds"] ?? 2,
-      "no-progress": doc.loop?.["no-progress"] ?? 3,
-    },
+    loop: loopOf(doc.loop),
+    limits: limitsOf(doc.limits),
+    wip: doc.wip ?? {},
     merge: resolveMerge(doc.merge, configPath),
   };
 }
