@@ -33,6 +33,32 @@ test("a run that pushed back or stopped is a failed resolve-issue", () => {
   }
 });
 
+// The plan's fixed text for a run that reached its turn cap: the cause, never
+// the run's words, and only when the run left no outcome of its own.
+test("a run stopped at its turn cap says so in the resolve-issue description", () => {
+  const unread = { exit: "stopped", steps: [], unread: true };
+  const status = (outcome, turnCap) =>
+    plan({ outcome, branch: BRANCH, resolveResult: "failure", reportResult: "success", turnCap }).find(
+      (s) => s.context === "pipeline/resolve-issue",
+    );
+  assert.deepEqual(status(unread, { cap: 75 }), {
+    context: "pipeline/resolve-issue",
+    state: "failure",
+    description: "Stopped at the turn cap.",
+  });
+  assert.equal(status(unread, null).description, "Failed in the work lane run.");
+  assert.equal(status({ exit: "stopped", steps: [] }, { cap: 75 }).description, "Failed in the work lane run.");
+});
+
+// A funding stop names its cause instead of a failure or the turn cap.
+test("a run stopped on the lane's funding says so in the resolve-issue description", () => {
+  const unread = { exit: "stopped", steps: [], unread: true };
+  const status = plan({ outcome: unread, branch: BRANCH, resolveResult: "failure", reportResult: "success", turnCap: { cap: 75 }, funding: { regain: null } }).find(
+    (s) => s.context === "pipeline/resolve-issue",
+  );
+  assert.equal(status.description, "Stopped on the lane's funding.");
+});
+
 test("a cancelled or skipped job posts error", () => {
   const statuses = plan({ outcome: done, branch: BRANCH, resolveResult: "cancelled", reportResult: "skipped" });
   assert.deepEqual(byContext(statuses), {
@@ -175,6 +201,69 @@ test("main posts nothing when lane.json names no lane branch of this issue", asy
   );
 });
 
+// A branch resolve-issue reused from an earlier run whose report this run never
+// read: the earlier run may already have posted its statuses on this head
+// (its report-statuses ran, its report-outcome failed), and a later status
+// with the same context replaces an earlier one, so this run posts only its
+// own report-outcome. Its PR carries the hold line, so a human merges it.
+const REUSED = "work-resolve-issue/issue-77-400-1";
+const UNREPORTED = { "pipeline/report-outcome": "success" };
+
+test("a reused branch with no report of its own posts only report-outcome, leaving the earlier run's statuses", () => {
+  for (const reportResult of ["success", "failure"]) {
+    const statuses = plan({ outcome: null, branch: REUSED, resolveResult: "success", reportResult });
+    assert.deepEqual(byContext(statuses), { "pipeline/report-outcome": reportResult }, reportResult);
+  }
+});
+
+test("main posts on the reused branch when lane.json names no branch, or another one", async () => {
+  for (const files of [{}, { "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: BRANCH }) }]) {
+    await withOutcome(files, async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        ["GET", /\/git\/ref\/heads\/work-resolve-issue\/issue-77-400-1$/, 200, { object: { sha: SHA } }],
+        ["POST", new RegExp(`/statuses/${SHA}$`), 201, {}],
+      ]);
+      assert.equal(await main({ env: { ...env(dir), REUSE_BRANCH: REUSED }, fetch }), 0);
+      assert.deepEqual(byContext(calls.filter((c) => c.method === "POST").map((c) => c.body)), UNREPORTED);
+    });
+  }
+});
+
+test("main reads the run's own outcome for a reused branch lane.json names", async () => {
+  await withOutcome({ "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: REUSED }) }, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/git\/ref\/heads\/work-resolve-issue\/issue-77-400-1$/, 200, { object: { sha: SHA } }],
+      ["POST", new RegExp(`/statuses/${SHA}$`), 201, {}],
+    ]);
+    assert.equal(await main({ env: { ...env(dir), REUSE_BRANCH: REUSED }, fetch }), 0);
+    assert.deepEqual(byContext(calls.filter((c) => c.method === "POST").map((c) => c.body)), {
+      "pipeline/resolve-issue": "success",
+      "pipeline/report-outcome": "success",
+    });
+  });
+});
+
+test("main posts only report-outcome on a reused branch lane.json names whose outcome cannot be read", async () => {
+  for (const files of [{}, { "work-outcome.json": "{" }, { "work-outcome.json": JSON.stringify({ exit: "finished" }) }]) {
+    await withOutcome({ ...files, "lane.json": JSON.stringify({ branch: REUSED }) }, async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        ["GET", /\/git\/ref\/heads\/work-resolve-issue\/issue-77-400-1$/, 200, { object: { sha: SHA } }],
+        ["POST", new RegExp(`/statuses/${SHA}$`), 201, {}],
+      ]);
+      assert.equal(await main({ env: { ...env(dir), REUSE_BRANCH: REUSED }, fetch }), 0);
+      assert.deepEqual(byContext(calls.filter((c) => c.method === "POST").map((c) => c.body)), UNREPORTED, JSON.stringify(files));
+    });
+  }
+});
+
+test("main refuses a reuse branch that is not this issue's lane branch", async () => {
+  await withOutcome({}, async (dir) => {
+    const { fetch, calls } = fakeFetch([]);
+    assert.equal(await main({ env: { ...env(dir), REUSE_BRANCH: "main" }, fetch }), 1);
+    assert.deepEqual(calls, []);
+  });
+});
+
 test("main fails when the branch head cannot be read", async () => {
   await withOutcome(
     { "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: BRANCH }) },
@@ -184,4 +273,82 @@ test("main fails when the branch head cannot be read", async () => {
       assert.ok(!calls.some((c) => c.method === "POST"));
     },
   );
+});
+
+// A resumed run that committed nothing kept no branch, and report-outcome
+// opens its PR from the branch it resumed at the tip run-checks checked, so
+// this run's statuses go on that tip, replacing the earlier run's.
+const RESUMED = "work-resolve-issue/issue-77-100-1";
+const TIP = "e".repeat(40);
+const resumedChecks = (branch = RESUMED, results = [{ check: "scripts/check-changelog-fragments.sh --check", exit: 0 }]) =>
+  JSON.stringify({ version: 1, branch, tip: TIP, results });
+const APP_COMMIT = {
+  author: { login: "melodic-automation-lanes[bot]" },
+  committer: { login: "web-flow" },
+  commit: { verification: { verified: true } },
+};
+const resumedRoutes = (commits = [APP_COMMIT], refTip = TIP) => [
+  ["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }],
+  ...(refTip ? [["GET", new RegExp(`/git/ref/heads/${RESUMED}$`), 200, { object: { sha: refTip } }]] : []),
+  ["GET", new RegExp(`/compare/main\\.\\.\\.${TIP}$`), 200, { commits, total_commits: commits.length }],
+  ["POST", new RegExp(`/statuses/${TIP}$`), 201, {}],
+];
+
+test("main posts a resumed run's statuses on the resumed branch's checked tip", async () => {
+  await withOutcome(
+    { "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: "", resume: RESUMED }) },
+    async (dir) => {
+      const { fetch, calls } = fakeFetch(resumedRoutes());
+      const run = { ...env(dir), RESUME_BRANCH: RESUMED, RUNNER_CHECKS: resumedChecks() };
+      assert.equal(await main({ env: run, fetch }), 0);
+      const posted = calls.filter((c) => c.method === "POST");
+      assert.ok(posted.length > 0, "no status was posted");
+      assert.ok(posted.every((c) => c.path === `/repos/o/r/statuses/${TIP}`), JSON.stringify(posted.map((c) => c.path)));
+      assert.equal(byContext(posted.map((c) => c.body))["pipeline/resolve-issue"], "success");
+    },
+  );
+});
+
+// lane.json can be rewritten by code the model started, so its resume counts
+// only when it equals the runner's resume branch and the branch passed the
+// gate report-outcome opens its PR on: a check ran, none failed, and every
+// commit ahead of the default branch is the lanes App's.
+test("main posts nothing for a resumed run whose resume or check results do not match the runner's", async () => {
+  for (const [label, resume, runner, checks, commits] of [
+    ["a failing check", RESUMED, RESUMED, resumedChecks(RESUMED, [{ check: "x", exit: 1 }])],
+    ["no check ran", RESUMED, RESUMED, resumedChecks(RESUMED, [])],
+    ["a commit not the App's", RESUMED, RESUMED, resumedChecks(), [APP_COMMIT, { ...APP_COMMIT, author: { login: "stranger" } }]],
+    ["no runner resume branch", RESUMED, "", resumedChecks()],
+    ["a lane.json resume that is not the runner's", "work-resolve-issue/issue-77-99-1", RESUMED, resumedChecks()],
+    ["no check results", RESUMED, RESUMED, ""],
+    ["check results for another branch", RESUMED, RESUMED, resumedChecks("work-resolve-issue/issue-77-99-1")],
+  ]) {
+    await withOutcome(
+      { "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: "", resume }) },
+      async (dir) => {
+        const { fetch, calls } = fakeFetch(resumedRoutes(commits));
+        assert.equal(await main({ env: { ...env(dir), RESUME_BRANCH: runner, RUNNER_CHECKS: checks }, fetch }), 0, label);
+        assert.deepEqual(calls.filter((c) => c.method === "POST"), [], label);
+      },
+    );
+  }
+});
+
+// The statuses belong on the tip the PR opens from, so a resumed branch that
+// moved past the checked tip, or whose ref cannot be read, gets none.
+test("main posts nothing for a resumed branch no longer at the checked tip", async () => {
+  for (const [label, refTip] of [
+    ["a moved branch", "f".repeat(40)],
+    ["an unreadable ref", null],
+  ]) {
+    await withOutcome(
+      { "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: "", resume: RESUMED }) },
+      async (dir) => {
+        const { fetch, calls } = fakeFetch(resumedRoutes([APP_COMMIT], refTip));
+        const run = { ...env(dir), RESUME_BRANCH: RESUMED, RUNNER_CHECKS: resumedChecks() };
+        assert.equal(await main({ env: run, fetch }), 0, label);
+        assert.deepEqual(calls.filter((c) => c.method === "POST"), [], label);
+      },
+    );
+  }
 });

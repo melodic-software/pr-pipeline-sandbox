@@ -34,6 +34,7 @@ jobs:
       queue: max
     uses: ./.github/workflows/pr-run-activity-write.yml
     with:
+      role: automations
       lane: pr-refine
       activity: fix-marker
       pr-number: ${{ inputs.pr-number }}
@@ -57,6 +58,7 @@ jobs:
       queue: max
     uses: ./.github/workflows/pr-run-activity-write.yml
     with:
+      role: automations
       lane: pr-refine
       activity: audit-env-write
       pr-number: ${{ inputs.pr-number }}

@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=pr-pipeline/pr-pipeline.schema.json
-version: 1
+version: 2
 
 activities:
   check-sandbox:
@@ -21,7 +21,6 @@ activities:
   # their fixtures.
   fix-marker:
     skill: sandbox-marker:fix-marker
-    max-turns: 10
     effect: mutate-branch
     gating: advisory
     reads-untrusted: false
@@ -29,7 +28,6 @@ activities:
       paths: ["sandbox/refine/**"]
   explain-marker:
     skill: sandbox-marker:explain-marker
-    max-turns: 5
     effect: read
     gating: advisory
     reads-untrusted: false
@@ -44,7 +42,6 @@ activities:
   # Case 12: a gate skill whose verdict is sandbox/gate/verdict.txt on the head.
   review-gate:
     skill: sandbox-marker:review-gate
-    max-turns: 5
     effect: read
     gating: gate
     reads-untrusted: false
@@ -53,7 +50,6 @@ activities:
   # Case 14: what a skill's Bash subprocess and its ancestors can see.
   audit-env:
     skill: sandbox-marker:audit-env
-    max-turns: 6
     effect: read
     gating: advisory
     reads-untrusted: false
@@ -90,7 +86,6 @@ activities:
   # pr-run-activity-write.yml, whose job holds id-token: write.
   audit-env-write:
     skill: sandbox-marker:audit-env
-    max-turns: 6
     effect: mutate-tracker
     gating: advisory
     reads-untrusted: false
@@ -145,6 +140,8 @@ activities:
     gating: advisory
     reads-untrusted: true
     inputs: [issue]
+    # Sandbox only: no checks, since none of claude-code-plugins' scripts/
+    # checks exist here.
     applies-when:
       events: [labeled]
       # Sandbox only: mechanical issues too, so the lanes App labels the PRs
@@ -213,6 +210,21 @@ lanes:
       - activity: review-gate
       - activity: audit-env
 
+# The version 1 activities' max-turns, as profiles (schema version 2).
+models:
+  profiles:
+    standard: { model: default, max-turns: 75 }
+    turns-10: { model: default, max-turns: 10 }
+    turns-6: { model: default, max-turns: 6 }
+    turns-5: { model: default, max-turns: 5 }
+  default-profile: standard
+  routes:
+    fix-marker: turns-10
+    explain-marker: turns-5
+    review-gate: turns-5
+    audit-env: turns-6
+    audit-env-write: turns-6
+
 merge:
   # The lane auto-merges only PRs labeled `work-class: mechanical` (C2):
   # dependency bumps, lint and format fixes, syncs. The classes C1-C5 (read-only,
@@ -224,6 +236,9 @@ merge:
   # Sandbox only: live, so the pr-merge cases really enqueue. Main stays
   # report-only until the owner flips it.
   report-only: false
+  # Schema version 2 requires it at a rung above off. The sandbox's pr-merge
+  # gate predates the verifier verdict and does not read it.
+  require-verifier-verdict: true
   diff-check:
     denied-paths:
       - ".github/**"

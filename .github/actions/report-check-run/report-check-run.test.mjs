@@ -12,6 +12,7 @@ import path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { anyHandles, limitResetsAt } from "../../scripts/pr-unblock/limit-stop.mjs";
 import { main } from "./report-check-run.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -43,7 +44,7 @@ function fakeFetch(status = 201) {
       init,
       body: init.body === undefined ? undefined : JSON.parse(init.body),
     });
-    return { ok: status < 300, status, json: async () => ({ id: 1 }) };
+    return new Response(JSON.stringify({ id: 1 }), { status });
   };
   fetchImpl.calls = calls;
   return fetchImpl;
@@ -70,6 +71,7 @@ async function run(env = {}, status) {
       GITHUB_API_URL: "https://api.example.test",
       GITHUB_SERVER_URL: "https://github.com",
       GITHUB_RUN_ID: "123",
+      GITHUB_RUN_ATTEMPT: "1",
       ...env,
     },
     fetchImpl,
@@ -107,6 +109,69 @@ test("a valid verdict POSTs one completed check run with the contract body", asy
     call.body.details_url,
     `https://github.com/${REPOSITORY}/actions/runs/123`,
   );
+});
+
+const LIMIT = {
+  ACT_OUTCOME: "failure",
+  LANE_CLASS: "rate-limit",
+  LANE_RESETS: "2026-10-17T15:30:00Z",
+  LANE_TURNS: "3",
+  LANE_MAX_TURNS: "30",
+};
+
+test("a lane record from env opens the summary and fills output.text and external_id, with no annotation", async () => {
+  const { calls } = await run({ ...LIMIT, GITHUB_RUN_ATTEMPT: "2" });
+  const { body } = calls[0];
+  assert.equal(body.conclusion, "failure");
+  const [line, blank, ...rest] = body.output.summary.split("\n");
+  assert.equal(line, "lane=pr-refine activity=simplify class=rate-limit resets=2026-10-17T15:30:00Z turns=3 max-turns=30");
+  assert.equal(blank, "");
+  assert.equal(rest.join("\n"), "The activity step failed.");
+  const json = /^```json\n(.*)\n```$/.exec(body.output.text);
+  assert.deepEqual(JSON.parse(json[1]), {
+    lane: "pr-refine",
+    activity: "simplify",
+    class: "rate-limit",
+    resets: "2026-10-17T15:30:00Z",
+    turns: 3,
+    "max-turns": 30,
+  });
+  assert.equal(body.external_id, "pr-refine:simplify:123:2");
+  assert.equal(body.output.annotations, undefined);
+});
+
+test("the posted limit stop is the one limit-stop.mjs reads from the summary", async () => {
+  const { calls } = await run({ ...LIMIT, LANE_MODELS: "claude-opus-5-5", LANE_PROFILE: "standard" });
+  assert.match(calls[0].body.output.summary, / max-turns=30 models=claude-opus-5-5 profile=standard\n/);
+  const posted = { ...calls[0].body, id: 1, completed_at: "2026-10-17T12:00:00Z" };
+  assert.equal(limitResetsAt(posted), Date.parse("2026-10-17T15:30:00Z"));
+  const ids = [1, 2, 3].map((id) => ({ ...posted, id }));
+  const now = Date.parse("2026-10-17T16:00:00Z");
+  assert.equal(anyHandles(ids.slice(0, 2), { now }), false);
+  assert.equal(anyHandles(ids, { now }), true);
+  assert.equal(anyHandles(ids.slice(0, 1), { now: Date.parse("2026-10-17T15:00:00Z") }), true);
+});
+
+test("another posted failure class is a record limit-stop.mjs reads as no limit stop", async () => {
+  const { calls } = await run({ ACT_OUTCOME: "failure", LANE_CLASS: "max-turns", LANE_TURNS: "31", LANE_MAX_TURNS: "30" });
+  const posted = { ...calls[0].body, id: 1, completed_at: "2026-10-17T12:00:00Z" };
+  assert.equal(limitResetsAt(posted), null);
+  assert.equal(anyHandles([posted], { now: Date.parse("2026-10-20T00:00:00Z") }), true);
+});
+
+test("a malformed run attempt posts the record without an external_id", async () => {
+  const { calls } = await run({ ...LIMIT, GITHUB_RUN_ATTEMPT: "1:x" });
+  assert.equal("external_id" in calls[0].body, false);
+  assert.match(calls[0].body.output.summary, /^lane=pr-refine activity=simplify class=rate-limit /);
+});
+
+test("no lane record POSTs no annotations, text, external_id or record line", async () => {
+  const { calls } = await run();
+  const { output } = calls[0].body;
+  assert.equal(output.annotations, undefined);
+  assert.equal(output.text, undefined);
+  assert.equal("external_id" in calls[0].body, false);
+  assert.doesNotMatch(output.summary, /lane=/);
 });
 
 test("an absent verdict file POSTs failure on the env head", async () => {
@@ -158,6 +223,19 @@ test("a verdict claiming a no-pr gate while the env reason is empty POSTs failur
   assert.equal(calls.length, 1);
   assert.equal(calls[0].body.conclusion, "failure");
   assert.equal(calls[0].body.head_sha, FALLBACK);
+});
+
+test("a run job that failed before the act step POSTs failure carrying RUN_FAILURE", async () => {
+  const { calls } = await run({
+    RUN_RESULT: "failure",
+    ACT_OUTCOME: "skipped",
+    RUN_FAILURE: "lane-token-denied: the broker answered 403 with reason workflow-modified",
+  });
+  assert.equal(calls[0].body.conclusion, "failure");
+  assert.equal(
+    calls[0].body.output.summary,
+    "The run job did not succeed: lane-token-denied: the broker answered 403 with reason workflow-modified",
+  );
 });
 
 test("a malformed env head SHA exits non-zero with no API call", async () => {
@@ -234,6 +312,17 @@ test("a skip reason in the base schema's enum POSTs neutral", async () => {
   });
   assert.equal(calls[0].body.conclusion, "neutral");
   assert.match(calls[0].body.output.summary, /not-applicable-paths/);
+});
+
+// #7732: request-lane-token's skip for a workflow file the PR changes ends the
+// run job green with the act step skipped and this skip reason.
+test("a workflow-modified skip from a run job that succeeded POSTs neutral", async () => {
+  const verdict = { ...JSON.parse(readFileSync(fixture("verdict-skipped.json"), "utf8")), "skip-reason": "workflow-modified", outcome: "skipped" };
+  const verdictPath = path.join(dir, "verdict.json");
+  writeFileSync(verdictPath, JSON.stringify(verdict));
+  const { calls } = await run({ VERDICT_PATH: verdictPath, ACT_OUTCOME: "skipped" });
+  assert.equal(calls[0].body.conclusion, "neutral");
+  assert.equal(calls[0].body.output.summary, "Skip reason: workflow-modified");
 });
 
 test("the enum is read from base-path: a base schema without the reason POSTs failure", async () => {

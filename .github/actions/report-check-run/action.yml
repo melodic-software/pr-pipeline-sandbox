@@ -29,6 +29,20 @@ inputs:
     description: The run job's act-outcome output (`steps.act.outcome`).
     required: false
     default: ""
+  run-failure:
+    description: >
+      The run job's run-failure output: the reason a step before the act step
+      failed with, such as request-lane-token's. Appended to a failed run
+      job's summary; empty when no such step failed.
+    required: false
+    default: ""
+  not-run-reason:
+    description: >
+      A skip reason from the caller's own workflow for an activity job that
+      did not run, with run-result `skipped`. Posts neutral with it and needs
+      no verdict. Empty for every run job's report.
+    required: false
+    default: ""
   gate-reason:
     description: >
       The run job's gate stop reason output, from its gate steps; empty when
@@ -49,6 +63,34 @@ inputs:
     default: ""
   all-verified:
     description: The check-signed-commits all-verified output; empty when it did not run.
+    required: false
+    default: ""
+  lane-class:
+    description: >
+      The run job's lane-class output: report-lane-outcome's failure class,
+      empty on a success. With the five below it becomes the first line of
+      the posted check run's output.summary, its output.text and external_id
+      (lane-record.mjs).
+    required: false
+    default: ""
+  lane-resets:
+    description: The run job's lane-resets output, the ISO time a usage limit resets.
+    required: false
+    default: ""
+  lane-turns:
+    description: The run job's lane-turns output, the turns the skill took.
+    required: false
+    default: ""
+  lane-max-turns:
+    description: The run job's lane-max-turns output, the skill's --max-turns cap.
+    required: false
+    default: ""
+  lane-models:
+    description: The run job's lane-models output, the comma list of models the run's modelUsage names.
+    required: false
+    default: ""
+  lane-profile:
+    description: The run job's lane-profile output, the models profile resolve-config gave the skill.
     required: false
     default: ""
   verdict-path:
@@ -77,11 +119,19 @@ runs:
         ACTIVITY: ${{ inputs.activity }}
         RUN_RESULT: ${{ inputs.run-result }}
         ACT_OUTCOME: ${{ inputs.act-outcome }}
+        RUN_FAILURE: ${{ inputs.run-failure }}
+        NOT_RUN_REASON: ${{ inputs.not-run-reason }}
         GATE_REASON: ${{ inputs.gate-reason }}
         HEAD_SHA: ${{ inputs.head-sha }}
         PR_HEAD_SHA: ${{ inputs.pr-head-sha }}
         CAN_COMMIT: ${{ inputs.can-commit }}
         ALL_VERIFIED: ${{ inputs.all-verified }}
+        LANE_CLASS: ${{ inputs.lane-class }}
+        LANE_RESETS: ${{ inputs.lane-resets }}
+        LANE_TURNS: ${{ inputs.lane-turns }}
+        LANE_MAX_TURNS: ${{ inputs.lane-max-turns }}
+        LANE_MODELS: ${{ inputs.lane-models }}
+        LANE_PROFILE: ${{ inputs.lane-profile }}
         VERDICT_PATH: ${{ inputs.verdict-path }}
         BASE_PATH: ${{ inputs.base-path }}
         HEAD_SHA_FALLBACK: ${{ inputs.head-sha-fallback }}

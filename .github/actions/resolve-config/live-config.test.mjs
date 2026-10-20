@@ -8,7 +8,7 @@ import { test } from "node:test";
 
 import { parse } from "yaml";
 
-import { resolve, resolveGrant } from "./resolve.mjs";
+import { checkPatchRules, resolve, resolveGrant } from "./resolve.mjs";
 
 const read = (relative) =>
   readFileSync(new URL(relative, import.meta.url), "utf8");
@@ -23,8 +23,10 @@ const FILES = {
   laneRules: json("./lane-rules.json"),
   effectGrants: json("./effect-grants.json"),
   activityRules: json("./activity-rules.json"),
+  trustedActors: json("../../standards/trusted-actors/trusted-actors.json"),
 };
-// A conflicting, ready, unlabeled PR that changed one Markdown file.
+// A conflicting, ready, unlabeled PR that changed one Markdown file; as an
+// issue, a listed human set it Small, Low and Known (the org's option ids).
 const FACTS = {
   event: "dispatch",
   changedPaths: ["docs/guide.md"],
@@ -33,6 +35,12 @@ const FACTS = {
   workClasses: [],
   mergeable: "conflicting",
   draft: false,
+  fieldValues: [
+    { field: 15462270, option: 27053568 },
+    { field: 48625720, option: 85127651 },
+    { field: 48625721, option: 85127654 },
+  ],
+  fieldSetters: { 15462270: 153232337, 48625720: 153232337, 48625721: 153232337 },
 };
 const selected = (lane, activity, facts = {}) =>
   resolve(FILES, {
@@ -100,31 +108,168 @@ test("live config: report-escalation applies and is granted publish-artifact onl
   );
 });
 
-// An agent-ready label event on a read-only issue. The
-// lane went live at 2026-10-14T19:21:59Z, the labeled-after time in the live config.
-const ISSUE = { event: "labeled", labels: ["agent-ready", "work-class: read-only"], labeledAt: "2026-10-20T00:00:00Z" };
-
-test("live config: resolve-issue starts for a read-only issue labeled after the go-live time", () => {
-  assert.equal(selected("work-resolve-issue", "resolve-issue", ISSUE).applies, true);
-});
-
-test("live config: resolve-issue starts nothing for an issue labeled before the go-live time", () => {
-  assert.equal(
-    skipReason("work-resolve-issue", "resolve-issue", { ...ISSUE, labeledAt: "2026-10-14T19:21:58Z" }),
-    "not-applicable",
+// Expected values from #7032's acceptance criteria and effect-grants.json.
+test("live config: pr-unblock runs its slots in order", () => {
+  const { lane } = resolve(FILES, {
+    lane: "pr-unblock",
+    activity: "resolve-conflicts",
+    configPath: CONFIG_PATH,
+    basePath: ".base",
+    facts: FACTS,
+  });
+  assert.deepEqual(
+    lane.slots.map((slot) => slot.activity ?? slot.name),
+    [
+      "resolve-conflicts",
+      "address-feedback",
+      "publish-feedback",
+      "review-dependency",
+      "apply-dependency-verdict",
+      "fix-ci",
+      "apply-ci-fix",
+      "report-escalation",
+    ],
   );
 });
 
-test("live config: resolve-issue starts for a mechanical issue", () => {
+test("live config: address-feedback applies to a ready PR with comments --ci and prepare review-threads", () => {
+  const slot = selected("pr-unblock", "address-feedback", { mergeable: "clean" });
+  assert.equal(slot.applies, true);
+  assert.equal(slot["reads-untrusted"], true);
+  assert.equal(slot.skill, "source-control:pull-request");
+  assert.equal(slot.args, "comments --ci");
+  assert.equal(slot.prepare, "review-threads");
+  assert.deepEqual(
+    resolveGrant(FILES, { lane: "pr-unblock", activity: "address-feedback", configPath: CONFIG_PATH }),
+    { effect: "mutate-branch", grant: { contents: "write", "pull-requests": "read", issues: "read" } },
+  );
+});
+
+test("live config: address-feedback waits for a human on do-not-merge and skips a draft", () => {
+  for (const labels of [["do-not-merge"], ["do-not-merge", "needs-human"]]) {
+    assert.equal(skipReason("pr-unblock", "address-feedback", { labels }), "awaiting-human");
+  }
+  assert.equal(skipReason("pr-unblock", "address-feedback", { draft: true }), "not-applicable");
+});
+
+// needs-human does not skip the slot: the review-threads select step holds a
+// needs-human PR unless a write-access trusted person asked for the fix
+// (address-feedback.mjs isFixRequest).
+test("live config: address-feedback applies to a needs-human PR", () => {
   assert.equal(
-    selected("work-resolve-issue", "resolve-issue", { ...ISSUE, labels: ["agent-ready", "work-class: mechanical"] }).applies,
+    selected("pr-unblock", "address-feedback", { mergeable: "clean", labels: ["needs-human"] }).applies,
     true,
   );
 });
 
-test("live config: resolve-issue admits read-only and mechanical issues only", () => {
+test("live config: every other PR activity still waits on needs-human", () => {
+  for (const [lane, activity, facts] of [
+    ["pr-unblock", "resolve-conflicts", {}],
+    ["pr-unblock", "review-dependency", { mergeable: "clean" }],
+    ["pr-refine", "fix-docs", {}],
+  ]) {
+    assert.equal(skipReason(lane, activity, { ...facts, labels: ["needs-human"] }), "awaiting-human", activity);
+  }
+});
+
+test("live config: publish-feedback runs the reply script after address-feedback, granted publish-artifact only", () => {
+  const slot = selected("pr-unblock", "publish-feedback");
+  assert.equal(slot.applies, true);
+  // It reads the replies the model wrote.
+  assert.equal(slot["reads-untrusted"], true);
+  assert.equal(slot.script, ".github/scripts/pr-unblock/publish-feedback.mjs");
+  assert.deepEqual(slot.needs, ["address-feedback"]);
+  assert.deepEqual(
+    resolveGrant(FILES, { lane: "pr-unblock", activity: "publish-feedback", configPath: CONFIG_PATH }),
+    { effect: "publish-artifact", grant: { contents: "read", "pull-requests": "write", issues: "write" } },
+  );
+});
+
+test("live config: report-escalation follows every other pr-unblock activity", () => {
+  assert.deepEqual(selected("pr-unblock", "report-escalation").needs, [
+    "resolve-conflicts",
+    "address-feedback",
+    "publish-feedback",
+    "review-dependency",
+    "apply-dependency-verdict",
+    "fix-ci",
+    "apply-ci-fix",
+  ]);
+});
+
+test("live config: fix-ci holds no write token and its push job may only write its branch", () => {
+  const grant = (activity) => resolveGrant(FILES, { lane: "pr-unblock", activity, configPath: CONFIG_PATH });
+  assert.deepEqual(grant("fix-ci"), { effect: "read", grant: { contents: "read", "pull-requests": "read", issues: "read" } });
+  assert.deepEqual(grant("apply-ci-fix"), {
+    effect: "mutate-branch",
+    grant: { contents: "write", "pull-requests": "read", issues: "read" },
+  });
+  const fix = selected("pr-unblock", "fix-ci");
+  assert.equal(fix.prepare, "ci-context");
+  assert.equal(fix.args, "ci --ci");
+  assert.equal(selected("pr-unblock", "apply-ci-fix").prepare, "apply-patch");
+  assert.equal(selected("pr-unblock", "apply-ci-fix").applies, true);
+  assert.equal(selected("pr-unblock", "fix-ci", { labels: ["needs-human"] }).applies, false);
+});
+
+test("live config: review-dependency may only write its branch; its verdict job may only write PRs and issues", () => {
+  const grant = (activity) => resolveGrant(FILES, { lane: "pr-unblock", activity, configPath: CONFIG_PATH });
+  assert.deepEqual(grant("review-dependency"), {
+    effect: "mutate-branch",
+    grant: { contents: "write", "pull-requests": "read", issues: "read" },
+  });
+  assert.deepEqual(grant("apply-dependency-verdict"), {
+    effect: "publish-artifact",
+    grant: { contents: "read", "pull-requests": "write", issues: "write" },
+  });
+  const review = selected("pr-unblock", "review-dependency");
+  assert.equal(review.prepare, "dependency-review");
+  assert.equal(review.args, "dependency --ci");
+  assert.equal(selected("pr-unblock", "apply-dependency-verdict").script, ".github/scripts/pr-unblock/apply-dependency-verdict.mjs");
+});
+
+// An agent-ready label event on an issue. The lane went live at
+// 2026-10-14T19:21:59Z, the labeled-after time in the live config.
+const ISSUE = {
+  event: "labeled",
+  labels: ["agent-ready"],
+  labeledAt: "2026-10-20T00:00:00Z",
+};
+
+// Owner decision 2026-10-17: the agent-ready label alone admits the issue;
+// no marker comment and no work-class label admits or refuses it.
+test("live config: resolve-issue starts on the agent-ready label alone, whatever its work-class label", () => {
+  for (const labels of [
+    ["agent-ready"],
+    ["agent-ready", "work-class: read-only"],
+    ["agent-ready", "work-class: scoped"],
+    ["agent-ready", "work-class: structural"],
+  ]) {
+    assert.equal(selected("work-resolve-issue", "resolve-issue", { ...ISSUE, labels }).applies, true, labels.join());
+  }
+});
+
+// The holds stay: a person decides these, so the issue waits for them.
+test("live config: resolve-issue starts nothing for an issue carrying a hold label", () => {
+  for (const hold of ["needs-human", "needs-owner-decision", "status: needs-decision"]) {
+    assert.equal(skipReason("work-resolve-issue", "resolve-issue", { ...ISSUE, labels: ["agent-ready", hold] }), "awaiting-human", hold);
+  }
+});
+
+// Codex P1 on #7780: the label alone admits, so its removal while a run waits
+// stops the run; the labels are read when the run starts.
+test("live config: resolve-issue starts nothing once agent-ready is gone from the issue", () => {
+  assert.equal(skipReason("work-resolve-issue", "resolve-issue", { ...ISSUE, labels: [] }), "not-applicable");
+  assert.equal(skipReason("work-resolve-issue", "resolve-issue", { ...ISSUE, labels: ["bug"] }), "not-applicable");
+});
+
+test("live config: resolve-issue still needs the agent-ready label event after the go-live time", () => {
   assert.equal(
-    skipReason("work-resolve-issue", "resolve-issue", { ...ISSUE, labels: ["agent-ready", "work-class: scoped"] }),
+    skipReason("work-resolve-issue", "resolve-issue", { ...ISSUE, labeledAt: "2026-10-14T19:21:58Z" }),
+    "not-applicable",
+  );
+  assert.equal(
+    skipReason("work-resolve-issue", "resolve-issue", { ...ISSUE, event: "dispatch" }),
     "not-applicable",
   );
 });
@@ -136,11 +281,48 @@ test("live config: resolve-issue may run the changelog fragment check", () => {
   ]);
 });
 
-// Owner decision 2026-10-14: the run may read any web page.
-test("live config: resolve-issue may read any domain; no other activity reads the web", () => {
-  assert.deepEqual(selected("work-resolve-issue", "resolve-issue", ISSUE)["web-access"], { enabled: true, domains: "any" });
+// #8310 (owner decision: option a): the run's own advisory check-affected over
+// its uncommitted work, which the runner's run-checks job never reruns.
+test("live config: resolve-issue self-checks its uncommitted work with check-affected", () => {
+  const leaf = selected("work-resolve-issue", "resolve-issue", ISSUE);
+  assert.deepEqual(leaf["self-checks"], ["scripts/check-affected.sh --uncommitted"]);
+  assert.ok(!leaf.checks.includes("scripts/check-affected.sh --uncommitted"), leaf.checks.join(" | "));
+});
+
+// Code a verify-script runs can read the lane's token from any same-user
+// process's /proc/<pid>/environ, so no listed script runs checkout code.
+const RUNS_CHECKOUT_CODE = ["scripts/run-test-file.sh", "plugins/skill-quality/scripts/check-skill.sh"];
+test("live config: resolve-issue may run the can't-fail scan, git mv or rm, the evals check, the shared-copy sync and the fragment writer, and no script that runs checkout code; no other activity lists verify-scripts", () => {
+  const scripts = selected("work-resolve-issue", "resolve-issue", ISSUE)["verify-scripts"];
+  assert.deepEqual(scripts, [
+    "plugins/testing/skills/audit/scripts/cant-fail-scan.sh",
+    "scripts/git-mv-rm.sh",
+    "plugins/skill-quality/scripts/check-evals-quality.sh",
+    "scripts/sync-shared-copies.sh",
+    "scripts/new-changelog-fragment.sh",
+  ]);
+  for (const script of RUNS_CHECKOUT_CODE) assert.ok(!scripts.includes(script), script);
   const doc = parse(FILES.config);
-  const others = Object.entries(doc.activities).filter(([name, a]) => name !== "resolve-issue" && a["web-access"]?.enabled);
+  const others = Object.entries(doc.activities).filter(([name, a]) => name !== "resolve-issue" && a["verify-scripts"]);
+  assert.deepEqual(others, []);
+});
+
+// A domain list, not `any`: `any` also grants the curl-based docs scripts.
+test("live config: resolve-issue reads official docs hosts only; review-dependency reads release-note hosts; no other activity reads the web", () => {
+  const web = selected("work-resolve-issue", "resolve-issue", ISSUE)["web-access"];
+  assert.notEqual(web.domains, "any");
+  assert.deepEqual(web, {
+    enabled: true,
+    domains: ["code.claude.com", "platform.claude.com", "docs.anthropic.com", "docs.github.com", "nodejs.org", "docs.python.org"],
+  });
+  const doc = parse(FILES.config);
+  assert.deepEqual(doc.activities["review-dependency"]["web-access"], {
+    enabled: true,
+    domains: ["github.com", "raw.githubusercontent.com", "www.npmjs.com", "registry.npmjs.org", "pypi.org"],
+  });
+  const others = Object.entries(doc.activities).filter(
+    ([name, a]) => !["resolve-issue", "review-dependency"].includes(name) && a["web-access"]?.enabled,
+  );
   assert.deepEqual(others, []);
 });
 
@@ -157,10 +339,37 @@ test("live config: resolve-issue may only write its branch; report-outcome may o
   });
 });
 
+test("live config: label-unblocked may only write issues", () => {
+  assert.deepEqual(resolveGrant(FILES, { lane: "work-unblock", activity: "label-unblocked", configPath: CONFIG_PATH }), {
+    effect: "mutate-tracker",
+    grant: { contents: "read", "pull-requests": "read", issues: "write" },
+  });
+});
+
 test("live config: fix-docs applies to a Markdown change and waits on needs-human", () => {
   assert.equal(selected("pr-refine", "fix-docs").applies, true);
   assert.equal(
     skipReason("pr-refine", "fix-docs", { labels: ["needs-human"] }),
     "awaiting-human",
   );
+});
+
+test("live config: fix-docs does not apply to a draft PR", () => {
+  assert.equal(skipReason("pr-refine", "fix-docs", { draft: true }), "not-applicable");
+});
+
+// Each activity's applied-by lands with the phase that moves it to the read
+// runner, after the broker serves a reader that knows the field; until then
+// no live activity sets it.
+test("live config: no activity sets applied-by yet", () => {
+  const { activities } = parse(FILES.config);
+  assert.deepEqual(
+    Object.keys(activities).filter((name) => Object.hasOwn(activities[name], "applied-by")),
+    [],
+  );
+});
+
+test("live config: the shipped patch rules pass against the live activities", () => {
+  const rules = json("./patch-rules.json");
+  assert.equal(checkPatchRules(rules, json("./patch-rules.schema.json"), parse(FILES.config).activities), rules);
 });
