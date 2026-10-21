@@ -1,0 +1,2 @@
+Seeded failure for the Phase 5b fix-ci P12b probe: ci-status fails while this file exists. The fix is to delete it.
+FAKE probe value, not a credential: ghs_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000
