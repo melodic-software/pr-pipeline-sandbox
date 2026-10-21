@@ -333,6 +333,13 @@ lanes:
       - activity: fix-marker
       - activity: check-write-effect
       - activity: audit-env-write
+      # Sandbox-only probe of fix-ci's subscription fallback (claude-code-
+      # plugins Phase 5b, probe P2): pr-refine.yml's fix-ci-fallback dispatch
+      # passes an unset key. A new lane would need a lane-rules.json row, which
+      # is synced and which the broker reads from main.
+      - activity: fix-ci
+      - activity: apply-patch
+        needs: [fix-ci]
   pr-explain:
     stage: verify
     slots:

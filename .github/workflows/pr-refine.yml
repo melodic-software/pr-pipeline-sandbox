@@ -13,6 +13,14 @@ on:
         description: The sandbox PR to run the activity on.
         required: true
         type: string
+      activity:
+        description: >-
+          refine runs fix-marker and audit-env-write; fix-ci-fallback runs only
+          the Phase 5b fallback probe below.
+        required: false
+        type: choice
+        options: [refine, fix-ci-fallback]
+        default: refine
 
 permissions: {}
 
@@ -23,6 +31,7 @@ jobs:
     if: >-
       !(github.event_name == 'pull_request'
       && format('{0}', github.event.sender.id) == vars.AUTOMATION_LANES_APP_SENDER_ID)
+      && inputs.activity != 'fix-ci-fallback'
     permissions:
       contents: read
       pull-requests: read
@@ -47,6 +56,7 @@ jobs:
     if: >-
       !(github.event_name == 'pull_request'
       && format('{0}', github.event.sender.id) == vars.AUTOMATION_LANES_APP_SENDER_ID)
+      && inputs.activity != 'fix-ci-fallback'
     permissions:
       contents: read
       pull-requests: read
@@ -64,3 +74,154 @@ jobs:
       pr-number: ${{ inputs.pr-number }}
     secrets:
       claude-code-oauth-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
+
+  # Sandbox-only probe of fix-ci's subscription fallback (claude-code-plugins
+  # Phase 5b, probe P2): pr-unblock.yml's fix-ci jobs on lane pr-refine,
+  # except that the first call passes a key secret that is never set, so it
+  # reports credential-present=false and hands off, and fix-ci-subscription
+  # runs the activity on AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN. A credit stop
+  # cannot be forced. On main because a dispatch runs there and the broker
+  # refuses a caller that differs from main's tip. Remove after the probe.
+  fix-ci-context:
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.activity == 'fix-ci-fallback'
+      && format('{0}', github.event.sender.id) != vars.AUTOMATION_LANES_APP_SENDER_ID
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # check out main
+      pull-requests: read # the PR's head and commits
+      checks: read # the head's check runs and their annotations
+      actions: read # each failing job's workflow file and log
+    outputs:
+      proceed: ${{ steps.context.outputs.proceed }}
+      context-sha256: ${{ steps.context.outputs.context-sha256 }}
+      context-attempt: ${{ steps.upload.outcome == 'success' && github.run_attempt || '' }}
+    steps:
+      - name: Check out the default branch tip
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .base
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Check the kill switch
+        id: kill
+        uses: ./.base/.github/actions/check-kill-switch # zizmor: ignore[self-repository]
+        with:
+          value: ${{ vars.CLAUDE_LANES_DISABLED }}
+          repo-value: ${{ vars.CLAUDE_LANES_REPO_DISABLED }}
+
+      - name: Install resolve-config's dependencies
+        if: steps.kill.outputs.proceed == 'true'
+        run: npm ci --ignore-scripts --omit=dev --prefix .base/.github/actions/resolve-config
+
+      - name: Write the failing checks' context
+        id: context
+        if: steps.kill.outputs.proceed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          APP_SENDER_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
+          CONTEXT_FILE: ${{ runner.temp }}/ci-context/context.json
+          BASE_PATH: .base
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-context"
+          node .base/.github/scripts/pr-unblock/fix-ci-context.mjs
+
+      - name: Upload the context
+        id: upload
+        if: steps.context.outputs.proceed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-context-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-context/context.json
+          retention-days: 1
+          if-no-files-found: error
+
+  fix-ci:
+    needs: fix-ci-context
+    if: ${{ !cancelled() && needs.fix-ci-context.outputs.proceed == 'true' }}
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      id-token: write
+    concurrency:
+      group: pr-pipeline-write-${{ inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-read.yml
+    with:
+      role: automations
+      lane: pr-refine
+      activity: fix-ci
+      pr-number: ${{ inputs.pr-number }}
+      trusted-base: default-tip
+      ci-context-attempt: ${{ needs.fix-ci-context.outputs.context-attempt }}
+      ci-context-sha256: ${{ needs.fix-ci-context.outputs.context-sha256 }}
+      timeout-minutes: 60
+    secrets:
+      # Never set, in the sandbox or the org.
+      claude-api-key: ${{ secrets.AUTOMATIONS_CLAUDE_API_KEY_PROBE_UNSET }}
+
+  fix-ci-subscription:
+    needs: [fix-ci-context, fix-ci]
+    if: >-
+      ${{ !cancelled() && needs.fix-ci-context.outputs.proceed == 'true'
+      && (needs.fix-ci.outputs.lane-class == 'credit-stop'
+      || needs.fix-ci.outputs.credential-present == 'false') }}
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      id-token: write
+    concurrency:
+      group: pr-pipeline-write-${{ inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-read.yml
+    with:
+      role: automations
+      lane: pr-refine
+      activity: fix-ci
+      fallback: ${{ needs.fix-ci.outputs.lane-class == 'credit-stop' && 'credit-stop' || 'no-key' }}
+      pr-number: ${{ inputs.pr-number }}
+      trusted-base: default-tip
+      ci-context-attempt: ${{ needs.fix-ci-context.outputs.context-attempt }}
+      ci-context-sha256: ${{ needs.fix-ci-context.outputs.context-sha256 }}
+      timeout-minutes: 60
+    secrets:
+      claude-code-oauth-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
+
+  apply-patch:
+    needs: [fix-ci, fix-ci-subscription]
+    if: >-
+      ${{ !cancelled() && ((needs.fix-ci-subscription.outputs.patch-state || needs.fix-ci.outputs.patch-state) == 'written'
+      || (needs.fix-ci-subscription.outputs.patch-state || needs.fix-ci.outputs.patch-state) == 'empty') }}
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      id-token: write
+    concurrency:
+      group: pr-pipeline-write-${{ inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-write.yml
+    with:
+      role: automations
+      lane: pr-refine
+      activity: apply-patch
+      pr-number: ${{ inputs.pr-number }}
+      trusted-base: default-tip
+      patch-state: ${{ needs.fix-ci-subscription.outputs.patch-state || needs.fix-ci.outputs.patch-state }}
+      patch-sha256: ${{ needs.fix-ci-subscription.outputs.patch-sha256 || needs.fix-ci.outputs.patch-sha256 }}
+      patch-attempt: ${{ needs.fix-ci-subscription.outputs.patch-attempt || needs.fix-ci.outputs.patch-attempt }}
+      patch-activity: fix-ci
+      patch-prepare: ci-context
+      patch-head-sha: ${{ needs.fix-ci-subscription.outputs.head-sha || needs.fix-ci.outputs.head-sha }}
+      reply-attempt: ${{ needs.fix-ci-subscription.outputs.reply-attempt || needs.fix-ci.outputs.reply-attempt }}
