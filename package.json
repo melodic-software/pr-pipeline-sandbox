@@ -1,0 +1,25 @@
+{
+  "name": "@melodic-software/claude-code-plugins-ci",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Locked CI-only toolchain for the Claude Code plugin marketplace (claude CLI, Biome, and markdownlint-cli2 for the markdown-format hook's repo-local node_modules/.bin probe).",
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@anthropic-ai/claude-code": "2.1.304",
+    "@biomejs/biome": "2.5.15",
+    "@playwright/cli": "0.1.22",
+    "htmlhint": "1.9.2",
+    "markdownlint-cli2": "0.23.3"
+  },
+  "overrides": {
+    "smol-toml": "^1.9.0",
+    "katex": "~0.18.2",
+    "markdown-it": "15.0.2"
+  },
+  "allowScripts": {
+    "@anthropic-ai/claude-code@2.1.246": true
+  }
+}

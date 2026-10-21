@@ -22,7 +22,8 @@ const CHMOD_SENTENCE =
 // Every write lane denies the shell commands that can print a file or the
 // environment, read-only ones that need no allow rule
 // (https://code.claude.com/docs/en/permissions#read-only-commands) among
-// them, and Read of process files.
+// them, and Read of process files and of the checkout's git directory.
+const WORKSPACE = "/home/runner/work/repo/repo";
 const SHELL_DENIED = [
   "Bash(echo *)",
   "Bash(printf *)",
@@ -54,6 +55,7 @@ const SHELL_DENIED = [
   "Bash(more *)",
   "Bash(less *)",
   "Read(//proc/**)",
+  `Read(/${WORKSPACE}/.git/**)`,
 ];
 // The deny rules other than the write lanes' shell set.
 const ownDenied = (denied) => denied.filter((rule) => !SHELL_DENIED.includes(rule));
@@ -118,6 +120,7 @@ function stage(overrides) {
     CAN_COMMIT: "true",
     PREPARE: "",
     SCRATCH: path.join(runTemp, "lane-scratch"),
+    WORKSPACE,
     GITHUB_OUTPUT: output,
     GITHUB_ENV: envFile,
     ...overrides,
@@ -158,6 +161,23 @@ test("a writing skill that can commit gets the commit tool and the instruction t
   assert.ok(args.includes(CHMOD_SENTENCE), args);
 });
 
+test("a writing skill gets the Grep and Glob tools, since its shell cannot grep or find", () => {
+  for (const overrides of [{}, { PREPARE: "merge-base" }]) {
+    const { status, args, allowed } = stage(overrides);
+    assert.equal(status, 0);
+    assert.ok(allowed.includes("Grep") && allowed.includes("Glob"), allowed.join(" | "));
+    assert.ok(args.includes("Bash(grep *)") && args.includes("Bash(find *)"), args);
+  }
+});
+
+test("a writing skill with no workspace path fails red before any output", () => {
+  for (const WORKSPACE of ["", "relative/path", "/has space"]) {
+    const { status, args } = stage({ WORKSPACE });
+    assert.notEqual(status, 0, WORKSPACE);
+    assert.equal(args, "", WORKSPACE);
+  }
+});
+
 test("a writing skill that cannot commit gets no chmod rule and no chmod instruction", () => {
   const { status, args, allowed } = stage({ CAN_COMMIT: "false" });
   assert.equal(status, 0);
@@ -175,7 +195,7 @@ test("prepare: merge-base leaves out the commit tool and the instruction to comm
   assert.ok(!allowed.includes(CHMOD_RULE), allowed.join(" | "));
   assert.ok(!args.includes("chmod"), args);
   // Still a writing skill: it edits and stages its resolution.
-  assert.match(args, /--allowedTools "Skill\(source-control:resolve-conflicts\),Read\([^)]*\),Edit,Write,Agent,Edit\(/);
+  assert.match(args, /--allowedTools "Skill\(source-control:resolve-conflicts\),Read\([^)]*\),Edit,Write,Agent,Grep,Glob,Edit\(/);
   assert.ok(args.includes(`--disallowedTools "WebFetch,WebSearch,${SHELL_DENIED.join(",")}"`), args);
 });
 
@@ -1206,9 +1226,102 @@ for (const [name, run] of [
   ["web-access with a domain list", () => withWebAccess({ enabled: true, domains: ["code.claude.com"] })],
   ["a read skill that hands on a patch", () => withAppliedBy({ patch: "apply-patch" })],
 ]) {
-  test(`a write lane denies every shell read command and Read of /proc: ${name}`, () => {
-    const { status, denied } = run();
+  test(`a write lane denies every shell read command and Read of /proc and .git: ${name}`, () => {
+    const { status, denied, workspace = WORKSPACE } = run();
     assert.equal(status, 0);
-    for (const rule of SHELL_DENIED) assert.ok(denied.includes(rule), `${rule} in ${denied.join(" | ")}`);
+    for (const rule of SHELL_DENIED) {
+      const expected = rule.replace(WORKSPACE, workspace);
+      assert.ok(denied.includes(expected), `${expected} in ${denied.join(" | ")}`);
+    }
   });
 }
+
+// --- launcher: run-claude-cli, which reads only inside the checkout ---
+
+const outputOf = (text, name) => (new RegExp(`^${name}<<(\\S+)\\n([\\s\\S]*?)\\n\\1$`, "m").exec(text)?.[2] ?? "").split("\n").filter(Boolean);
+
+// Runs the skill step for run-claude-cli and reads its launcher outputs and
+// the stage it left.
+function launch(overrides = {}) {
+  const stageDir = path.join(mkdtempSync(path.join(root, "stage-")), "lane-stage");
+  const run = stage({ LAUNCHER: "run-claude-cli", STAGE: stageDir, WORKSPACE, EFFECT: "read", CAN_COMMIT: "false", ...overrides });
+  const text = readFileSync(run.env.GITHUB_OUTPUT, "utf8");
+  return {
+    ...run,
+    stageDir,
+    tools: outputOf(text, "tools"),
+    allowedTools: outputOf(text, "allowed-tools"),
+    deniedTools: outputOf(text, "disallowed-tools"),
+    pluginDirs: /^plugin-dirs=(.*)$/m.exec(text)?.[1] ?? "",
+    preamble: /^preamble=(.*)$/m.exec(text)?.[1] ?? "",
+    promptFile: (() => {
+      try {
+        return readFileSync(path.join(stageDir, "prompt.md"), "utf8");
+      } catch {
+        return "";
+      }
+    })(),
+  };
+}
+
+test("run-claude-cli: a ci-context skill gets Bash, Edit and Write, the staged context and plugin under .lane/, and no claude_args", () => {
+  const ciDir = mkdtempSync(path.join(root, "ci-launch-"));
+  writeFileSync(path.join(ciDir, "context.json"), '{"head_sha":"x"}');
+  const run = launch({ PREPARE: "ci-context", CI_DIR: ciDir, SKILL: "source-control:pull-request" });
+  assert.equal(run.status, 0, run.stdout);
+  assert.deepEqual(run.tools.toSorted(), ["Agent", "Bash", "Edit", "Glob", "Grep", "Read", "Skill", "Write"]);
+  for (const rule of ["Skill(source-control:pull-request)", "Bash", "Edit", "Write", "Agent", "Grep", "Glob"]) {
+    assert.ok(run.allowedTools.includes(rule), `${rule} in ${run.allowedTools.join(" | ")}`);
+  }
+  for (const rule of ["WebFetch", "WebSearch", "Edit(./.lane/ci/**)", "Write(./.lane/ci/**)", "Edit(./.lane/plugins/**)", "Write(./.lane/plugins/**)", "Edit(./.lane/trusted-context.json)", "Write(./.lane/trusted-context.json)", "Read(//proc/**)"]) {
+    assert.ok(run.deniedTools.includes(rule), `${rule} in ${run.deniedTools.join(" | ")}`);
+  }
+  assert.equal(run.pluginDirs, ".lane/plugins/source-control");
+  assert.equal(readFileSync(path.join(run.stageDir, "ci", "context.json"), "utf8"), '{"head_sha":"x"}');
+  assert.ok(statSync(path.join(run.stageDir, "plugins", "source-control")).isDirectory());
+  assert.ok(statSync(path.join(run.stageDir, "scratch")).isDirectory());
+  assert.equal(run.promptFile, "Call the Skill tool with skill source-control:pull-request and args ci, then follow the skill instructions to the end.\n");
+  assert.ok(run.preamble.includes(`The context file is ${WORKSPACE}/.lane/ci/context.json.`), run.preamble);
+  assert.ok(run.preamble.includes(`Your scratchpad directory is ${WORKSPACE}/.lane/scratch:`), run.preamble);
+  assert.match(run.preamble, /Leave every fix uncommitted in the working tree/);
+  assert.equal(run.args, "", "no claude_args for the launcher");
+  assert.deepEqual(run.plugins, []);
+});
+
+test("run-claude-cli: a read skill without ci-context gets no Bash, Edit or Write", () => {
+  const run = launch({ SKILL: "source-control:pull-request" });
+  assert.equal(run.status, 0, run.stdout);
+  assert.deepEqual(run.tools.toSorted(), ["Glob", "Grep", "Read", "Skill"]);
+  assert.ok(!run.allowedTools.some((rule) => /^(Bash|Edit|Write)/.test(rule)), run.allowedTools.join(" | "));
+  assert.ok(run.deniedTools.includes("Read(//proc/**)"), run.deniedTools.join(" | "));
+  assert.doesNotMatch(run.preamble, /context file/);
+});
+
+test("run-claude-cli refuses an issue lane, a writing skill, a patch-producing read skill and a gate before any output", () => {
+  const appliedBy = path.join(mkdtempSync(path.join(root, "launch-ab-")), "resolved.json");
+  writeFileSync(appliedBy, JSON.stringify({ selected: { args: "--ci", "applied-by": { patch: "apply-patch" } } }));
+  for (const [overrides, message] of [
+    [{ ISSUE_NUMBER: "7" }, /an issue lane runs on claude-code-action/],
+    [{ EFFECT: "mutate-branch", CAN_COMMIT: "true" }, /only a read skill/],
+    [{ RESOLVED: appliedBy }, /only a read skill/],
+    [{ GATING: "gate" }, /a gate skill's verdict is not read from the launcher/],
+  ]) {
+    const run = launch(overrides);
+    assert.notEqual(run.status, 0, JSON.stringify(overrides));
+    assert.match(run.stdout, message);
+    assert.deepEqual(run.tools, []);
+    assert.equal(run.promptFile, "");
+  }
+});
+
+test("run-claude-cli: a skill plugin holding a symbolic link fails red", () => {
+  const linked = mkdtempSync(path.join(root, "base-link-"));
+  mkdirSync(path.join(linked, "plugins", "source-control"), { recursive: true });
+  mkdirSync(path.join(linked, ".claude-plugin"));
+  writeFileSync(path.join(linked, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "melodic-software" }));
+  spawnSync("ln", ["-s", "/etc/passwd", path.join(linked, "plugins", "source-control", "link")]);
+  const run = launch({ BASE_PATH: linked, SKILL: "source-control:pull-request" });
+  assert.notEqual(run.status, 0);
+  assert.match(run.stdout, /the skill's plugin holds a symbolic link/);
+  assert.deepEqual(run.tools, []);
+});
