@@ -337,6 +337,9 @@ lanes:
       # plugins Phase 5b, probe P2): pr-refine.yml's fix-ci-fallback dispatch
       # passes an unset key. A new lane would need a lane-rules.json row, which
       # is synced and which the broker reads from main.
+      # Caveat: these two slots temporarily let pr-refine push a fix, which
+      # breaks lane-rules.json's pr-refine `never: "Changes behavior"`. Remove
+      # them once P2 is recorded in probes.md.
       - activity: fix-ci
       - activity: apply-patch
         needs: [fix-ci]
