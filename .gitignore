@@ -1,0 +1,3 @@
+# The read runner copies the base-built node_modules into the checkout
+# (pr-run-activity-read.yml), and a lane patch must leave them out.
+node_modules/
