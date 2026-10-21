@@ -20,11 +20,14 @@ SYNCED=(
   .github/actions/check-wip-cap
   .github/actions/collect-base-activity
   .github/actions/log-api-budget
+  .github/actions/open-lane-output
   .github/actions/report-check-run
   .github/actions/request-lane-token
   .github/actions/resolve-config
+  .github/actions/seal-lane-output
   .github/actions/select-trusted-text
   .github/actions/setup-runner-isolation
+  .github/lane-keys
   .github/scripts/apply-patch
   .github/scripts/merge-base
   .github/scripts/pr-unblock
@@ -51,6 +54,11 @@ SYNCED=(
   package.json
   plugins/multi-agent/reference/defaults.yaml
   scripts/setup-env.sh
+  # The read runner's caller-secret gate, and the shadow check the owner runs
+  # after the scan-carrier keygen.
+  scripts/check-read-caller-keys.mjs
+  scripts/check-read-caller-keys.sh
+  scripts/check-scan-carrier-secret-shadow.sh
 )
 
 # The sandbox's own versions of files claude-code-plugins also has.
@@ -60,16 +68,17 @@ ADAPTED=(
   # main's, unchanged; resolve-issue takes main's labels and holds but keeps
   # the sandbox's go-live time and no checks.
   docs/conventions/pr-pipeline.yaml
-  # Sandbox activities fix-marker and audit-env-write, with the role input.
+  # Sandbox activities fix-marker and audit-env-write, with the role input,
+  # and the fix-ci fallback probe (pr-unblock.yml's fix-ci jobs on this lane).
   .github/workflows/pr-refine.yml
+  # The sandbox's own scan-carrier key pair: one per repository, never shared.
+  # Until the owner runs keygen here it is the placeholder line, so seal fails
+  # closed.
+  .github/lane-keys/scan-carrier.pub
 )
 
 # "<path> <commit>": compared against that commit instead of the ref.
-PINNED=(
-  # A sync-manifest-managed file: check-managed-files refuses a hand edit, and
-  # nothing in the lane runtime reads it.
-  ".github/standards/runner-policy/policy.json 9329c4cd64765267e43aef0ceef58c40961cd676"
-)
+PINNED=()
 
 usage() {
   echo "usage: $0 <claude-code-plugins ref> [--repo <clone>]" >&2

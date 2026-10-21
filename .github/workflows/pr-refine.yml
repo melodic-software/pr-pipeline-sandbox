@@ -36,6 +36,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      issues: write
       id-token: write
     concurrency:
       # One per-PR queue shared by every write lane: it queues, never cancels.
@@ -61,6 +62,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      issues: write
       id-token: write
     concurrency:
       # One per-PR queue shared by every write lane: it queues, never cancels.
@@ -95,6 +97,8 @@ jobs:
       actions: read # each failing job's workflow file and log
     outputs:
       proceed: ${{ steps.context.outputs.proceed }}
+      head-sha: ${{ steps.context.outputs.head-sha }}
+      escalation-reason: ${{ steps.context.outputs.escalation-reason }}
       context-sha256: ${{ steps.context.outputs.context-sha256 }}
       context-attempt: ${{ steps.upload.outcome == 'success' && github.run_attempt || '' }}
     steps:
@@ -152,6 +156,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      issues: write
       id-token: write
     concurrency:
       group: pr-pipeline-write-${{ inputs.pr-number }}
@@ -165,10 +170,12 @@ jobs:
       trusted-base: default-tip
       ci-context-attempt: ${{ needs.fix-ci-context.outputs.context-attempt }}
       ci-context-sha256: ${{ needs.fix-ci-context.outputs.context-sha256 }}
+      head-sha: ${{ needs.fix-ci-context.outputs.head-sha }}
       timeout-minutes: 60
     secrets:
       # Never set, in the sandbox or the org.
       claude-api-key: ${{ secrets.AUTOMATIONS_CLAUDE_API_KEY_PROBE_UNSET }}
+      scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
 
   fix-ci-subscription:
     needs: [fix-ci-context, fix-ci]
@@ -180,6 +187,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      issues: write
       id-token: write
     concurrency:
       group: pr-pipeline-write-${{ inputs.pr-number }}
@@ -194,12 +202,14 @@ jobs:
       trusted-base: default-tip
       ci-context-attempt: ${{ needs.fix-ci-context.outputs.context-attempt }}
       ci-context-sha256: ${{ needs.fix-ci-context.outputs.context-sha256 }}
+      head-sha: ${{ needs.fix-ci-context.outputs.head-sha }}
       timeout-minutes: 60
     secrets:
       claude-code-oauth-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
+      scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
 
   apply-patch:
-    needs: [fix-ci, fix-ci-subscription]
+    needs: [fix-ci-context, fix-ci, fix-ci-subscription]
     if: >-
       ${{ !cancelled() && ((needs.fix-ci-subscription.outputs.patch-state || needs.fix-ci.outputs.patch-state) == 'written'
       || (needs.fix-ci-subscription.outputs.patch-state || needs.fix-ci.outputs.patch-state) == 'empty') }}
@@ -207,6 +217,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      issues: write
       id-token: write
     concurrency:
       group: pr-pipeline-write-${{ inputs.pr-number }}
@@ -223,5 +234,7 @@ jobs:
       patch-attempt: ${{ needs.fix-ci-subscription.outputs.patch-attempt || needs.fix-ci.outputs.patch-attempt }}
       patch-activity: fix-ci
       patch-prepare: ci-context
-      patch-head-sha: ${{ needs.fix-ci-subscription.outputs.head-sha || needs.fix-ci.outputs.head-sha }}
+      # The head fix-ci-context gated, from a job that ran no head code, as in
+      # pr-unblock.yml.
+      patch-head-sha: ${{ needs.fix-ci-context.outputs.head-sha }}
       reply-attempt: ${{ needs.fix-ci-subscription.outputs.reply-attempt || needs.fix-ci.outputs.reply-attempt }}
