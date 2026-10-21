@@ -65,7 +65,11 @@ ADAPTED=(
 )
 
 # "<path> <commit>": compared against that commit instead of the ref.
-PINNED=()
+PINNED=(
+  # A sync-manifest-managed file: check-managed-files refuses a hand edit, and
+  # nothing in the lane runtime reads it.
+  ".github/standards/runner-policy/policy.json 9329c4cd64765267e43aef0ceef58c40961cd676"
+)
 
 usage() {
   echo "usage: $0 <claude-code-plugins ref> [--repo <clone>]" >&2
