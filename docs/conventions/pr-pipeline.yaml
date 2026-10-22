@@ -2,6 +2,32 @@
 version: 2
 
 activities:
+  # main's fix-docs at 7.1 (claude-code-plugins Phase 7.1), unchanged.
+  fix-docs:
+    skill: ai-slop:audit
+    args: fix
+    # Runs the skill's detect script on head files, so no write token: the
+    # read runner turns its uncommitted fixes into a patch that apply-patch
+    # pushes under patch-rules.json's default row.
+    effect: read
+    applied-by:
+      patch: apply-patch
+    # No web access: under the default row apply-patch can push more than
+    # markdown, so a page the run read could steer a push or carry a key out.
+    gating: advisory
+    # Head markdown can quote issue, PR or web text.
+    reads-untrusted: true
+    inputs: [changed-paths]
+    # The auto-mode classifier approves tool calls no rule allows, so the
+    # skill's own scripts run without a Bash rule per command; the run fails
+    # red unless the CLI reports the mode (ADR 0049).
+    permission-mode: auto
+    applies-when:
+      paths: ["**/*.md"]
+      labels-absent: [do-not-merge, needs-human]
+      # Skips a draft PR before any model turn: pipeline lanes leave drafts
+      # alone.
+      draft: [false]
   check-sandbox:
     script: scripts/lanes/check-sandbox.sh
     effect: read
@@ -341,8 +367,10 @@ lanes:
       # breaks lane-rules.json's pr-refine `never: "Changes behavior"`. Remove
       # them once P2 is recorded in probes.md.
       - activity: fix-ci
+      # main's fix-docs (Phase 7.1 probes P1-P3), on pr-refine as on main.
+      - activity: fix-docs
       - activity: apply-patch
-        needs: [fix-ci]
+        needs: [fix-ci, fix-docs]
   pr-explain:
     stage: verify
     slots:
@@ -367,9 +395,16 @@ models:
       workload: code
       effort-role: verifier
       max-turns: 75
+    # main's fix-docs profile: a mechanical worker, from the multi-agent role
+    # map.
+    docs-fix:
+      role: worker
+      workload: mechanical
+      max-turns: 75
   default-profile: standard
   routes:
     fix-ci: code-fix
+    fix-docs: docs-fix
     fix-marker: turns-10
     explain-marker: turns-5
     review-gate: turns-5

@@ -938,12 +938,32 @@ jobs:
           model: ${{ steps.config.outputs.model }}
           effort: ${{ steps.config.outputs.effort }}
           max-turns: ${{ steps.config.outputs.max-turns }}
-          permission-mode: dontAsk
+          # dontAsk unless the activity sets permission-mode: auto.
+          permission-mode: ${{ steps.config.outputs.permission-mode }}
           tools: ${{ steps.stage.outputs.tools }}
           allowed-tools: ${{ steps.stage.outputs.allowed-tools }}
           disallowed-tools: ${{ steps.stage.outputs.disallowed-tools }}
           plugin-dirs: ${{ steps.stage.outputs.plugin-dirs }}
           leg-timeout-minutes: "45"
+
+      # The CLI's init message reports the permission mode the leg ran in. A
+      # leg in another mode, or with no init message, fails the job, so no
+      # patch is collected; a credit stop hands off unchecked. It reads only
+      # that field and writes no summary.
+      - name: Check the API key leg's permission mode
+        id: mode-key
+        if: >-
+          always() && (steps.act-key.outcome == 'success' || steps.act-key.outcome == 'failure')
+          && steps.act-key.outputs.lane-class != 'credit-stop'
+        env:
+          EXECUTION_FILE: ${{ steps.act-key.outputs.execution-file }}
+          MODE: ${{ steps.config.outputs.permission-mode }}
+        run: |
+          mode=$(jq -r 'if type == "array" then ([.[] | select(.type? == "system" and .subtype? == "init")] | first | .permissionMode // "") else "" end' "$EXECUTION_FILE" 2>/dev/null) || mode=""
+          if [ -z "$MODE" ] || [ "$mode" != "$MODE" ]; then
+            echo "::error::permission-mode: the leg's init message does not report the mode asked for ($MODE)"
+            exit 1
+          fi
 
       - name: Run the skill on the OAuth token
         id: act-token
@@ -966,12 +986,25 @@ jobs:
           model: ${{ steps.config.outputs.model }}
           effort: ${{ steps.config.outputs.effort }}
           max-turns: ${{ steps.config.outputs.max-turns }}
-          permission-mode: dontAsk
+          permission-mode: ${{ steps.config.outputs.permission-mode }}
           tools: ${{ steps.stage.outputs.tools }}
           allowed-tools: ${{ steps.stage.outputs.allowed-tools }}
           disallowed-tools: ${{ steps.stage.outputs.disallowed-tools }}
           plugin-dirs: ${{ steps.stage.outputs.plugin-dirs }}
           leg-timeout-minutes: "45"
+
+      - name: Check the OAuth token leg's permission mode
+        id: mode-token
+        if: always() && (steps.act-token.outcome == 'success' || steps.act-token.outcome == 'failure')
+        env:
+          EXECUTION_FILE: ${{ steps.act-token.outputs.execution-file }}
+          MODE: ${{ steps.config.outputs.permission-mode }}
+        run: |
+          mode=$(jq -r 'if type == "array" then ([.[] | select(.type? == "system" and .subtype? == "init")] | first | .permissionMode // "") else "" end' "$EXECUTION_FILE" 2>/dev/null) || mode=""
+          if [ -z "$MODE" ] || [ "$mode" != "$MODE" ]; then
+            echo "::error::permission-mode: the leg's init message does not report the mode asked for ($MODE)"
+            exit 1
+          fi
 
       # Issue mode, on claude-code-action until the issue lane moves to the
       # launcher. A failure does not stop the job here: the next step fails
@@ -1929,17 +1962,19 @@ jobs:
               //   a pattern neither line matches alone, so a token cut across
               //   two lines is caught and nothing a single line holds is
               //   judged twice. The OpenAI key pattern (any sk- and 20 token
-              //   characters) is left out of this pass: joining a line that
-              //   ends in an sk- word to the next line's first word matches
-              //   it, and a false block fails fix-ci closed and asks for a
-              //   rotation. In the patch the pair is hunk
+              //   characters) and the R2 key pair pattern (a 32-hex and a
+              //   64-hex token on one line) are left out of this pass: joining
+              //   a line that ends in an sk- word to the next line's first
+              //   word matches the first, adjacent md5 and sha256 lines match
+              //   the second, and a false block fails fix-ci closed and asks
+              //   for a rotation. In the patch the pair is hunk
               //   lines with their +, - or space prefix removed and the file
               //   headers dropped, or a token split inside an added hunk
               //   would join as "...ab+cd..." and never match.
               const straddles = (left, right) => {
                 const joined = left + right;
                 for (const [label, re] of blocking) {
-                  if (label === 'OpenAI key' || re.test(left) || re.test(right)) continue;
+                  if (label === 'OpenAI key' || label === 'R2 key pair' || re.test(left) || re.test(right)) continue;
                   for (const match of joined.matchAll(new RegExp(re.source, `${re.flags.replace('g', '')}g`))) {
                     if (match.index < left.length && match.index + match[0].length > left.length) return label;
                   }
@@ -2539,6 +2574,7 @@ jobs:
           pr-head-sha: ${{ steps.pr-head.outputs.sha }}
           can-commit: ${{ needs.run.outputs.can-commit }}
           all-verified: ${{ steps.signed.outputs.all-verified }}
+          unverified: ${{ steps.signed.outputs.unverified }}
           verdict-path: ${{ runner.temp }}/verdict/verdict.json
           base-path: .base
           head-sha-fallback: ${{ github.event.pull_request.head.sha || github.sha }}

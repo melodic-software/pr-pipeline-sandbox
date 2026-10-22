@@ -16,10 +16,11 @@ on:
       activity:
         description: >-
           refine runs fix-marker and audit-env-write; fix-ci-fallback runs only
-          the Phase 5b fallback probe below.
+          the Phase 5b fallback probe below; fix-docs runs main's fix-docs, and
+          fix-docs-no-key runs it with an empty key (Phase 7.1 probes).
         required: false
         type: choice
-        options: [refine, fix-ci-fallback]
+        options: [refine, fix-ci-fallback, fix-docs, fix-docs-no-key]
         default: refine
 
 permissions: {}
@@ -31,7 +32,7 @@ jobs:
     if: >-
       !(github.event_name == 'pull_request'
       && format('{0}', github.event.sender.id) == vars.AUTOMATION_LANES_APP_SENDER_ID)
-      && inputs.activity != 'fix-ci-fallback'
+      && (inputs.activity == '' || inputs.activity == 'refine')
     permissions:
       contents: read
       pull-requests: read
@@ -57,7 +58,7 @@ jobs:
     if: >-
       !(github.event_name == 'pull_request'
       && format('{0}', github.event.sender.id) == vars.AUTOMATION_LANES_APP_SENDER_ID)
-      && inputs.activity != 'fix-ci-fallback'
+      && (inputs.activity == '' || inputs.activity == 'refine')
     permissions:
       contents: read
       pull-requests: read
@@ -238,3 +239,86 @@ jobs:
       # pr-unblock.yml.
       patch-head-sha: ${{ needs.fix-ci-context.outputs.head-sha }}
       reply-attempt: ${{ needs.fix-ci-subscription.outputs.reply-attempt || needs.fix-ci.outputs.reply-attempt }}
+
+  # main's fix-docs jobs (claude-code-plugins Phase 7.1, probes P1-P3), run on
+  # dispatch only, so other sandbox PRs spend nothing. fix-docs-no-key passes
+  # an empty key, so the first call hands off and fix-docs-subscription runs
+  # on the OAuth token (P2).
+  fix-docs:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && (inputs.activity == 'fix-docs' || inputs.activity == 'fix-docs-no-key')
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      issues: write
+      id-token: write
+    concurrency:
+      group: pr-pipeline-write-${{ inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-read.yml
+    with:
+      role: automations
+      lane: pr-refine
+      activity: fix-docs
+      pr-number: ${{ inputs.pr-number }}
+      trusted-base: default-tip
+      timeout-minutes: 60
+    secrets:
+      claude-api-key: ${{ inputs.activity == 'fix-docs' && secrets.AUTOMATIONS_CLAUDE_API_KEY || '' }}
+      scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
+
+  fix-docs-subscription:
+    needs: fix-docs
+    if: >-
+      ${{ !cancelled() && (needs.fix-docs.outputs.lane-class == 'credit-stop'
+      || needs.fix-docs.outputs.credential-present == 'false') }}
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      issues: write
+      id-token: write
+    concurrency:
+      group: pr-pipeline-write-${{ inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-read.yml
+    with:
+      role: automations
+      lane: pr-refine
+      activity: fix-docs
+      fallback: ${{ needs.fix-docs.outputs.lane-class == 'credit-stop' && 'credit-stop' || 'no-key' }}
+      pr-number: ${{ inputs.pr-number }}
+      trusted-base: default-tip
+      timeout-minutes: 60
+    secrets:
+      claude-code-oauth-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
+      scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
+
+  apply-docs-patch:
+    needs: [fix-docs, fix-docs-subscription]
+    if: >-
+      ${{ !cancelled() && (needs.fix-docs-subscription.outputs.patch-state || needs.fix-docs.outputs.patch-state) == 'written' }}
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      issues: write
+      id-token: write
+    concurrency:
+      group: pr-pipeline-write-${{ inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-write.yml
+    with:
+      role: automations
+      lane: pr-refine
+      activity: apply-patch
+      pr-number: ${{ inputs.pr-number }}
+      trusted-base: default-tip
+      patch-state: ${{ needs.fix-docs-subscription.outputs.patch-state || needs.fix-docs.outputs.patch-state }}
+      patch-sha256: ${{ needs.fix-docs-subscription.outputs.patch-sha256 || needs.fix-docs.outputs.patch-sha256 }}
+      patch-attempt: ${{ needs.fix-docs-subscription.outputs.patch-attempt || needs.fix-docs.outputs.patch-attempt }}
+      patch-activity: fix-docs
+      patch-head-sha: ${{ needs.fix-docs-subscription.outputs.head-sha || needs.fix-docs.outputs.head-sha }}
+      reply-attempt: ${{ needs.fix-docs-subscription.outputs.reply-attempt || needs.fix-docs.outputs.reply-attempt }}

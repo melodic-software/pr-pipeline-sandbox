@@ -309,8 +309,10 @@ test("live config: resolve-issue may run the can't-fail scan, git mv or rm, the 
   assert.deepEqual(others, []);
 });
 
-// A domain list, not `any`: `any` also grants the curl-based docs scripts.
-test("live config: resolve-issue reads official docs hosts only; review-dependency reads release-note hosts; no other activity reads the web", () => {
+// A domain list, not `any`, for resolve-issue: on the write path `any` also
+// grants the curl-based docs scripts. fix-docs reads any host from a job with
+// no write token, and the launcher stages no docs script.
+test("live config: resolve-issue reads official docs hosts only; review-dependency reads release-note hosts; no other activity, fix-docs included, reads the web", () => {
   const web = selected("work-resolve-issue", "resolve-issue", ISSUE)["web-access"];
   assert.notEqual(web.domains, "any");
   assert.deepEqual(web, {
@@ -322,6 +324,7 @@ test("live config: resolve-issue reads official docs hosts only; review-dependen
     enabled: true,
     domains: ["github.com", "raw.githubusercontent.com", "www.npmjs.com", "registry.npmjs.org", "pypi.org"],
   });
+  assert.notEqual(selected("pr-refine", "fix-docs")["web-access"]?.enabled, true);
   const others = Object.entries(doc.activities).filter(
     ([name, a]) => !["resolve-issue", "review-dependency"].includes(name) && a["web-access"]?.enabled,
   );
@@ -418,16 +421,63 @@ test("live config: fix-docs does not apply to a draft PR", () => {
   assert.equal(skipReason("pr-refine", "fix-docs", { draft: true }), "not-applicable");
 });
 
+// The model run holds no write token; only the script that pushes its patch
+// may write the branch, from its own job in pr-refine.
+test("live config: fix-docs holds no write token and its push job in pr-refine may only write its branch", () => {
+  const grant = (activity) => resolveGrant(FILES, { lane: "pr-refine", activity, configPath: CONFIG_PATH });
+  assert.deepEqual(grant("fix-docs"), { effect: "read", grant: { contents: "read", "pull-requests": "read", issues: "read" } });
+  assert.deepEqual(grant("apply-patch"), {
+    effect: "mutate-branch",
+    grant: { contents: "write", "pull-requests": "read", issues: "read" },
+  });
+  const fix = selected("pr-refine", "fix-docs");
+  assert.equal(fix.prepare, undefined, "no prepare mode: apply-patch takes the default row");
+  assert.deepEqual(fix["applied-by"], { patch: "apply-patch" });
+  const apply = selected("pr-refine", "apply-patch");
+  assert.deepEqual(apply.needs, ["fix-docs"]);
+  assert.equal(apply.script, ".github/scripts/apply-patch/apply-patch.mjs");
+  assert.equal(apply.prepare, "apply-patch");
+});
+
+// Auto mode is decided per activity: fix-docs alone runs in it.
+test("live config: only fix-docs sets permission-mode, to auto", () => {
+  assert.equal(selected("pr-refine", "fix-docs")["permission-mode"], "auto");
+  const { activities } = parse(FILES.config);
+  assert.deepEqual(
+    Object.entries(activities).filter(([, a]) => Object.hasOwn(a, "permission-mode")).map(([name, a]) => [name, a["permission-mode"]]),
+    [["fix-docs", "auto"]],
+  );
+});
+
+// fix-docs hands on a patch, so its targets leave out instruction surfaces
+// and CODEOWNERS paths, as a write activity's do.
+test("live config: fix-docs is not asked to fix an instruction surface", () => {
+  const slot = selected("pr-refine", "fix-docs", { changedTargets: ["docs/guide.md", "CLAUDE.md", "plugins/p/skills/s/SKILL.md"] });
+  assert.deepEqual(slot["changed-paths"], ["docs/guide.md"]);
+});
+
+// activity-rules.json is trust-root data: a config that gives fix-docs a
+// write effect again is refused.
+test("live config: fix-docs with a write effect is refused", () => {
+  const writes = FILES.config.replace("effect: read\n    applied-by:\n      patch: apply-patch\n", "effect: mutate-branch\n");
+  assert.notEqual(writes, FILES.config);
+  assert.throws(
+    () => resolve({ ...FILES, config: writes }, { lane: "pr-refine", activity: "fix-docs", configPath: CONFIG_PATH, basePath: ".base", facts: FACTS }),
+    (error) => error.code === "forbidden-by-activity",
+  );
+});
+
 // Each activity's applied-by lands with the phase that moves it to the read
-// runner, after the broker serves a reader that knows the field; fix-ci and
-// resolve-issue so far.
-test("live config: only fix-ci and resolve-issue set applied-by: fix-ci's patch to apply-patch, resolve-issue's to apply-issue-patch and its outcome to report-outcome", () => {
+// runner, after the broker serves a reader that knows the field; fix-docs,
+// fix-ci and resolve-issue so far.
+test("live config: only fix-docs, fix-ci and resolve-issue set applied-by: fix-docs's and fix-ci's patch to apply-patch, resolve-issue's to apply-issue-patch and its outcome to report-outcome", () => {
   const { activities } = parse(FILES.config);
   assert.deepEqual(
     Object.entries(activities)
       .filter(([, activity]) => Object.hasOwn(activity, "applied-by"))
       .map(([name, activity]) => [name, activity["applied-by"]]),
     [
+      ["fix-docs", { patch: "apply-patch" }],
       ["fix-ci", { patch: "apply-patch" }],
       ["resolve-issue", { patch: "apply-issue-patch", "work-outcome": "report-outcome" }],
     ],
