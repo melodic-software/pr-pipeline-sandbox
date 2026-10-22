@@ -1,6 +1,8 @@
 {
   "name": "pr-pipeline-sandbox",
-  "owner": { "name": "melodic-software" },
+  "owner": {
+    "name": "melodic-software"
+  },
   "plugins": [
     {
       "name": "sandbox-marker",
@@ -16,6 +18,11 @@
       "name": "work-items",
       "source": "./plugins/work-items",
       "description": "Copy of claude-code-plugins' work-items plugin, for the work-resolve-issue lane's work skill."
+    },
+    {
+      "name": "ai-slop",
+      "source": "./plugins/ai-slop",
+      "description": "Copy of claude-code-plugins' ai-slop plugin, for the pr-refine lane's fix-docs skill."
     }
   ]
 }
