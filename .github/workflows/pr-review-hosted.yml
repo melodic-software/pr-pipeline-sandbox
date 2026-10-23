@@ -1,8 +1,11 @@
 name: pr-review-hosted
 
-# Sandbox caller of the org code-review reusable, pinned at ci-workflows
-# v0.41.0: a push by the lanes App bot is reviewed, any other bot's push is
-# skipped, and the lane writes its completion annotation.
+# Sandbox caller of the org pr-review-cli reusable, lane `code`, at the pin
+# and hold inputs claude-code-plugins#9361 uses. A push by the lanes App bot is
+# reviewed, any other bot's push is skipped. The job id `pr-review` keeps the
+# check `pr-review / claude-review-status`, which ci-status's `Require both
+# review lanes on this head` step reads. No resolve-model job: the review runs
+# on the reusable's default model.
 
 on:
   pull_request:
@@ -11,20 +14,77 @@ on:
 permissions:
   contents: read
 
+# A newer event waits for the running review: a cancelled run reads as red.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  pr-review:
+  # The reusable reads no kill switch, so this caller does. ci-status passes a
+  # lane this job stopped by its `Report the kill switch` step.
+  kill-switch:
     if: github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read # check out the default branch for the kill-switch action
+    outputs:
+      proceed: ${{ steps.kill.outputs.proceed == 'true' && vars.CLAUDE_REVIEW_DISABLED != 'true' && 'true' || 'false' }}
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          path: .base
+          persist-credentials: false
+          sparse-checkout: |
+            /.github/actions/check-kill-switch/
+            /.node-version
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .base/.node-version
+          package-manager-cache: false
+
+      - name: Check the kill switch
+        id: kill
+        uses: ./.base/.github/actions/check-kill-switch # zizmor: ignore[self-repository]
+        with:
+          value: ${{ vars.CLAUDE_LANES_DISABLED }}
+          repo-value: ${{ vars.CLAUDE_LANES_REPO_DISABLED }}
+
+      - name: Report the kill switch
+        if: steps.kill.outputs.proceed != 'true' || vars.CLAUDE_REVIEW_DISABLED == 'true'
+        env:
+          REASON: ${{ steps.kill.outputs.reason }}
+          LANE_SWITCH: ${{ vars.CLAUDE_REVIEW_DISABLED }}
+        run: |
+          echo "::notice::a kill switch stops this review (lanes: ${REASON:-unreadable}, CLAUDE_REVIEW_DISABLED: ${LANE_SWITCH:-unset})"
+
+  pr-review:
+    needs: [kill-switch]
+    if: ${{ !cancelled() && github.event.pull_request.draft == false && needs.kill-switch.outputs.proceed == 'true' }}
     permissions:
       contents: read
-      pull-requests: write
-      id-token: write
-    uses: melodic-software/ci-workflows/.github/workflows/pr-review.yml@a621ef8112677a519b662ec5d2547475c0101f7e
+      pull-requests: write # the review, its comments, the marker and the hold label
+    uses: melodic-software/ci-workflows/.github/workflows/pr-review-cli.yml@9aca743c4ed9aaf7870288a36586c3994e9321e4 # v0.64.1
     with:
-      runner: ubuntu-24.04
+      lane: code
+      publish: comments
       allowed-bot-sender-ids: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
+      # The `human` entries of .github/standards/trusted-actors/trusted-actors.json.
+      allowed-author-ids: '153232337'
+      docs-only-paths: ''
+      # A hold adds this label and a `claude-lane-hold` marker comment; ci-status
+      # fails while the label is on. Keep both lists equal in the two callers.
+      hold-label: needs-human
+      hold-paths: |
+        .github/standards/trusted-actors/**
+        .github/actions/check-trusted-trigger/**
+        **/CODEOWNERS
+        **/.gitmodules
     secrets:
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      CLAUDE_API_KEY: ${{ secrets.REVIEWS_CLAUDE_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.REVIEWS_CLAUDE_CODE_OAUTH_TOKEN }}
