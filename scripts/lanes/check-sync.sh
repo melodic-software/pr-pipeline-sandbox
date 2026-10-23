@@ -71,6 +71,9 @@ ADAPTED=(
   # Sandbox activities fix-marker and audit-env-write, with the role input,
   # and the fix-ci fallback probe (pr-unblock.yml's fix-ci jobs on this lane).
   .github/workflows/pr-refine.yml
+  # The synced dispatch job plus claude-code-plugins#9361's rerun-ci-status
+  # job, ahead of the next full resync.
+  .github/workflows/pr-feedback-dispatch.yml
   # The sandbox's own scan-carrier key pair: one per repository, never shared.
   # Until the owner runs keygen here it is the placeholder line, so seal fails
   # closed.
