@@ -1,0 +1,1 @@
+Canary a: a clean change with no hold path.
