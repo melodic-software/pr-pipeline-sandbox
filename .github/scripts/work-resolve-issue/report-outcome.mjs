@@ -3,10 +3,11 @@
 // what the resolve-issue run left and acts on the issue, with no model:
 //
 //   done      opens a ready PR from the run's branch: the body starts
-//             `Closes #<issue>`, or `Refs: #<issue>` when the run reports
-//             `"link": "refs"` (a recorded decision keeps the issue open),
-//             which also gives the issue the human-gated label and a
-//             refs-hold comment. The title is the run's Conventional
+//             `Closes #<issue>`, or `Refs: #<issue>` and a Remaining work
+//             section when the run's `remaining` names the parts of the
+//             issue it leaves for later work (a malformed list counts as
+//             none); the merge lane reads a plain `Refs:` issue as it reads
+//             a closing one. The title is the run's Conventional
 //             Commits title, with any `#` or `/` a space
 //             (else one built from the issue title), and the body carries
 //             the hold line when a human must merge it. The PR gets no label:
@@ -43,6 +44,10 @@
 //             issue, the branch and its current tip; else fixed text only.
 //             The runner's check results are listed and never stop it: the
 //             PR always carries the hold line, so a human reads them.
+//   refused  a done run whose patch apply-issue-patch refused
+//             (ESCALATION_REASON patch-protected-path, patch-invalid or
+//             patch-not-applied) hands back like stopped, naming the reason;
+//             patch-empty changes nothing, as the run committed nothing.
 //   dimension the issue's dimensions skipped the run before any model turn
 //             (DIMENSION_SKIP): comments the next step with an
 //             outcome=<reason> marker, adds the human-gated label, removes
@@ -72,9 +77,11 @@
 //                       copy against the lane branch. Empty when that job did
 //                       not succeed.
 //   REUSE_BRANCH        the lane branch --find-prior chose, or empty
-//   DIMENSION_SKIP      split-required, research-first, probe-first or
-//                       not-assessed when the issue dimensions skipped the
-//                       run (work-resolve-issue.yml report-skip), else empty
+//   ESCALATION_REASON   apply-issue-patch's escalation reason (a PATCH_REASONS
+//                       key), or empty
+//   DIMENSION_SKIP      split-required, research-first or probe-first when
+//                       the issue dimensions skipped the run
+//                       (work-resolve-issue.yml report-skip), else empty
 //   REUSE_SUMMARY_DIR   on a reuse, holds the summary pass's reuse-summary.json
 //                       (runner-written issue, branch and tip; model output)
 //   TRACKER_CONFIG      base .work-item-tracker.json, for the human-gated label
@@ -139,10 +146,10 @@ function prTitle(runTitle, issueTitle, issueNumber) {
   }
   return (match && conventionalFrom(runTitle)) || conventionalFrom(issueTitle) || `fix: resolve issue ${issueNumber}`;
 }
-// Work a human merges: structural and untrusted-provenance work, and any diff
+// Work a human merges: untrusted-provenance work, and any diff
 // that touches a path the merge lane refuses (merge.diff-check.denied-paths in the base
 // pr-pipeline.yaml), so the two lists cannot drift apart.
-const HOLD_CLASSES = new Set(["work-class: structural", "work-class: untrusted-provenance"]);
+const HOLD_CLASSES = new Set(["work-class: untrusted-provenance"]);
 // An owner decision that a person merges the issue's PR. It holds only when the
 // lane's labeler check passes: the newest `labeled` event is a listed human's
 // (by id) or the lanes App's, so no one else can add the hold or stand in for it.
@@ -164,7 +171,13 @@ const COMPARE_FILES_CAP = 300;
 // clampReset from here.
 export { clampReset };
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z$/;
-const MARKER = /^<!-- work-resolve-issue outcome=([a-z]+(?:-[a-z]+)*)(?: resets=(\S+))?(?: cap=(\d+))?(?: run=(\d+))?(?: branch=(resumed))? -->/;
+// The attended queue's escalation marker (work-items reference
+// escalation-marker.md): the first line of every comment that hands the issue
+// to a person, so /work-items:attend-queue lists it as escalated. The outcome
+// marker follows on the next line.
+export const ESCALATION_MARKER = "<!-- work-items:escalation lane=work-resolve-issue kind=escalated -->";
+const escalated = (lines) => [ESCALATION_MARKER, ...lines];
+const MARKER = /^(?:<!-- work-items:escalation lane=work-resolve-issue kind=escalated -->\r?\n)?<!-- work-resolve-issue outcome=([a-z]+(?:-[a-z]+)*)(?: resets=(\S+))?(?: cap=(\d+))?(?: run=(\d+))?(?: branch=(resumed))? -->/;
 
 // `branch=resumed` marks a resumed run that kept no branch of its own, so its
 // work is still on the branch it resumed (see findPrior).
@@ -178,15 +191,13 @@ export const limitedMarker = ({ resets, runId, onResumed = false }) =>
 export const turnCapMarker = ({ cap, runId, onResumed = false }) =>
   `<!-- work-resolve-issue outcome=turn-cap${cap ? ` cap=${cap}` : ""}${runId ? ` run=${runId}` : ""}${resumedTag(onResumed)} -->`;
 
-// A Refs PR has no closing issue, so the merge lane never merges it: the issue
-// gets `label` and this comment, whose marker tells work-unblock which hold it
-// may lift once that PR merges.
+// The marker of a refs-hold comment: the App's needs-human hold on the issue
+// of a Refs PR, which work-unblock lifts once that PR merges. report-outcome
+// sets none, since the merge lane merges a plain `Refs:` PR as a closing one.
 export const refsHoldMarker = (pr) => `<!-- work-resolve-issue refs-hold #${pr} -->`;
-export const refsHoldComment = (pr, label) =>
-  `${refsHoldMarker(pr)}\nThe lanes App's pull request #${pr} links this issue with \`Refs:\`, not \`Closes\`, so the merge lane never merges it. report-outcome added \`${label}\` so a person merges or closes it. When it merges, work-unblock removes this \`${label}\` and \`agent-ready\` and adds \`needs-triage\`, so triage decides what work is left. To keep the issue held after the merge, add \`needs-owner-decision\`.`;
 
 // {outcome, resets, run, onResumed} from a comment body that opens with the lane's
-// marker, or null. resets is epoch milliseconds, or null when absent or
+// marker, alone or after ESCALATION_MARKER, or null. resets is epoch milliseconds, or null when absent or
 // unreadable; onResumed is true for `branch=resumed`.
 export function parseOutcomeMarker(body) {
   const match = MARKER.exec(String(body ?? ""));
@@ -258,8 +269,16 @@ export function readOutcome(path) {
     verification: list(parsed.verification),
     notDone: notDoneList(parsed.not_done),
     steps: stepList(parsed.steps),
-    link: parsed.link === "refs" ? "refs" : "closes",
+    remaining: remainingList(parsed.remaining),
   };
+}
+
+// The parts of the issue the PR leaves for later work: 1 to MAX_ITEMS strings,
+// each with text left in the bullet it renders as. Anything else is empty, so
+// the PR closes the issue.
+function remainingList(value) {
+  const items = Array.isArray(value) && value.length <= MAX_ITEMS && value.every((item) => typeof item === "string") ? value.map((item) => item.slice(0, MAX_ITEM)) : [];
+  return items.every((item) => bullets([item]).slice(2)) ? items : [];
 }
 
 // Model text is data. HTML comments go; `&` is escaped first, so no entity
@@ -277,7 +296,7 @@ const neutral = (value, cap, { path = false } = {}) =>
   (path ? value : value.replaceAll(/<!--[\s\S]*?(-->|$)/g, ""))
     .replaceAll(/\p{Cf}/gu, "")
     .replaceAll("\r\n", "\n")
-    .replaceAll(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ")
+    .replaceAll(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g, " ")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -312,7 +331,7 @@ const bullets = (items) =>
 // this report already handed on.
 function handBack({ outcome, issueNumber, branch, humanLabel, runUrl, runId, onResumed = false }) {
   const pushback = outcome.exit === "pushback";
-  const lines = [
+  const lines = escalated([
     `<!-- work-resolve-issue outcome=${outcome.exit}${runId ? ` run=${runId}` : ""}${resumedTag(onResumed)} -->`,
     pushback
       ? "The work-resolve-issue lane did not start this issue: it needs a person to make it clearer first."
@@ -321,7 +340,7 @@ function handBack({ outcome, issueNumber, branch, humanLabel, runUrl, runId, onR
     "Why, in the run's own words:",
     "",
     quoted(outcome.reason || outcome.summary),
-  ];
+  ]);
   if (outcome.notDone.length) {
     lines.push("", "What the run says it did not do:", "", bullets(outcome.notDone.map(({ what }) => what)));
   }
@@ -330,7 +349,7 @@ function handBack({ outcome, issueNumber, branch, humanLabel, runUrl, runId, onR
       "",
       pushback
         ? `Partial work is on the branch \`${branch}\`.`
-        : `Partial work is on the branch \`${branch}\`. A retry continues from it; delete the branch first to start again from the default branch.`,
+        : `Partial work is on the branch \`${branch}\`. A retry continues from it while it is not behind the default branch, and otherwise starts fresh from the default branch; delete the branch first to always start fresh.`,
     );
   }
   if (runUrl) {
@@ -352,23 +371,33 @@ function handBack({ outcome, issueNumber, branch, humanLabel, runUrl, runId, onR
   };
 }
 
+// apply-issue-patch's escalation reasons, each with why the patch did not land.
+export const PATCH_REASONS = {
+  "patch-empty": "the run wrote no change",
+  "patch-protected-path": "the patch changes a path the issue lane may not push: a workflow, a CODEOWNERS file, submodule config or a settings file",
+  "patch-invalid": "the run's output was not a valid patch to push: missing, too large, made on another commit, or carrying a credential shape",
+  "patch-not-applied": "the patch did not apply to the commit the run started from",
+};
+
 // The step that must come before the lane can run an issue its dimensions
 // skipped, as triage's apply-outcome rule names it.
 export const DIMENSION_STEPS = {
   "split-required": "Its Size is too large for one run: split it into smaller issues with `/work-items:decompose`.",
   "research-first": "Its Uncertainty says research comes first: plan or research the approach, then set Uncertainty to Known.",
   "probe-first": "Its Uncertainty says only an experiment answers it: run a probe or spike first, then set Uncertainty to Known.",
-  "not-assessed":
-    "Its Size, Complexity and Uncertainty fields are not all set by a listed human or the lanes App: triage it, or set them yourself.",
 };
+
+// Outcomes no run produces now that issue comments may still carry from runs
+// that ran nothing, so prior() passes them over like a dimension skip.
+const RETIRED_SKIPS = new Set(["not-assessed"]);
 
 // A run its issue dimensions skipped before any model turn: the issue goes to
 // a person with the next step, and agent-ready comes off.
 function dimensionSkipPlan({ reason, issueNumber, humanLabel, runUrl, runId }) {
-  const lines = [
+  const lines = escalated([
     `<!-- work-resolve-issue outcome=${reason}${runId ? ` run=${runId}` : ""} -->`,
     `The work-resolve-issue lane did not start this issue (\`${reason}\`). ${DIMENSION_STEPS[reason]}`,
-  ];
+  ]);
   if (runUrl) {
     lines.push("", `Run: ${runUrl}`);
   }
@@ -411,7 +440,7 @@ function fundingPlan({ issueNumber, branch, regain, runId, runUrl, onResumed }) 
       : "The work-resolve-issue lane stopped on its funding (`funding`: no credit or a disabled key), not on this issue. It keeps `agent-ready`; once the lane is funded again, a person removes and adds `agent-ready` to restart it.",
   ];
   if (branch) {
-    lines.push("", `Partial work is on the branch \`${branch}\`; the restart continues from it.`);
+    lines.push("", `Partial work is on the branch \`${branch}\`; the restart continues from it while it is not behind the default branch, and otherwise starts fresh.`);
   }
   if (runUrl) {
     lines.push("", `Run: ${runUrl}`);
@@ -427,27 +456,27 @@ function turnCapPlan({ issueNumber, branch, cap, restart, humanLabel, runId, run
   const lines = [
     turnCapMarker({ cap, runId, onResumed }),
     restart
-      ? `The work-resolve-issue lane stopped on this issue: ${reached}. It keeps \`agent-ready\`, and work-unblock starts it again from the branch.`
+      ? `The work-resolve-issue lane stopped on this issue: ${reached}. It keeps \`agent-ready\`, and work-unblock starts it again from the branch, or fresh from the default branch once the branch is behind it.`
       : `The work-resolve-issue lane stopped on this issue: ${reached}. It has used its restarts, so it needs a person.`,
   ];
   lines.push(
     "",
     branch
-      ? `Partial work is on the branch \`${branch}\`; a restart or retry continues from it. Delete the branch first to start again from the default branch.`
+      ? `Partial work is on the branch \`${branch}\`; a restart or retry continues from it while it is not behind the default branch, and otherwise starts fresh. Delete the branch first to always start fresh.`
       : "The run committed nothing.",
   );
   if (runUrl) {
     lines.push("", `Run: ${runUrl}`);
   }
   if (!restart) {
-    lines.push("", `To retry from the branch, remove \`${humanLabel}\` and add \`agent-ready\` again; a smaller issue, or a larger Size or Complexity field, may fit the cap.`);
+    lines.push("", `To retry (from the branch while it is not behind the default branch, else fresh), remove \`${humanLabel}\` and add \`agent-ready\` again; a smaller issue, or a larger Size or Complexity field, may fit the cap.`);
   }
   return {
     action: restart ? "turn-cap" : "hand-back",
     exit: "turn-cap",
     issueNumber,
     runId,
-    comment: lines.join("\n"),
+    comment: (restart ? lines : escalated(lines)).join("\n"),
     addLabels: restart ? [] : [humanLabel],
     removeLabels: restart ? [] : ["agent-ready"],
   };
@@ -634,8 +663,9 @@ export function decide({
   runId = "",
   checks = null,
   resumed = "",
+  escalation = "",
 }) {
-  outcome = { changes: [], verification: [], notDone: [], ...outcome };
+  outcome = { changes: [], verification: [], notDone: [], remaining: [], ...outcome };
   const onResumed = !branch && resumed !== "";
   // A funding, limit or turn-cap record counts only for a run that left no
   // outcome of its own: any code the run executed can forge the record, so it
@@ -651,6 +681,21 @@ export function decide({
   if (turnCap && outcome.unread) {
     const restart = turnCapRestarts < limits["turn-cap-restarts"];
     return turnCapPlan({ issueNumber, branch, cap: turnCap.cap, restart, humanLabel, runId, runUrl, onResumed });
+  }
+  // apply-issue-patch refused the run's patch: its work never landed, so no
+  // PR opens, from a resumed branch either.
+  if (outcome.exit === "done" && escalation && escalation !== "patch-empty") {
+    return handBack({
+      outcome: stopped(
+        `The run reported done, but apply-issue-patch did not commit its patch (\`${escalation}\`): ${PATCH_REASONS[escalation]}. The run's log names the path or check.`,
+      ),
+      issueNumber,
+      branch: branch || resumed,
+      humanLabel,
+      runUrl,
+      runId,
+      onResumed,
+    });
   }
   // A resumed run that committed nothing of its own: its work is the
   // resumed branch's. main passes checks for that branch only once run-checks
@@ -741,7 +786,8 @@ export function decide({
       runId,
     });
   }
-  const refs = outcome.link === "refs";
+  // A PR that names work it leaves for later links without closing.
+  const refs = outcome.remaining.length > 0;
   // A listing cut at the cap may hide a denied path, so it holds only while
   // some path is denied.
   const hold =
@@ -762,6 +808,7 @@ export function decide({
     "Opened by the work-resolve-issue lane. The run's own summary:",
     "",
     quoted(outcome.summary),
+    ...(refs ? ["", "## Remaining work", "", bullets(outcome.remaining)] : []),
     ...(gaps.length ? ["", "## Not verified", "", bullets(gaps)] : []),
     "",
     "## Fix",
@@ -787,7 +834,6 @@ export function decide({
     title: prTitle(outcome.title, issueTitle, issueNumber),
     body,
     branch,
-    refsHold: refs ? humanLabel : null,
   };
 }
 
@@ -823,6 +869,11 @@ export const RESUMABLE = new Set(["turn-cap", "stopped", "limited", "funding"]);
 // The issue's lane branch name, capturing its run id and attempt.
 const laneBranch = (issueNumber) => new RegExp(`^work-resolve-issue/issue-${issueNumber}-([1-9][0-9]*)-([1-9][0-9]*)$`);
 export const isLaneBranch = (name, issueNumber) => laneBranch(issueNumber).test(name ?? "");
+// The issue a lane branch name is for, or null for any other name.
+export const laneBranchIssue = (name) => {
+  const issue = /^work-resolve-issue\/issue-([1-9][0-9]*)-/.exec(name ?? "")?.[1];
+  return issue && isLaneBranch(name, issue) ? Number(issue) : null;
+};
 
 // A commit the lanes App made through the API: verified, authored by the App
 // and committed by web-flow (a branch name proves nothing about who pushed to
@@ -865,11 +916,15 @@ export function readBranch(dir, issueNumber, key = "branch") {
 //          runs that kept no branch, is turn-cap, stopped, limited or funding
 //          and names a run whose newest lane branch passes the same
 //          tip, commit and PR checks, with every commit ahead of the default
-//          branch verified, by the lanes App, committed by web-flow: the model runs on a new lane branch
-//          made at that branch's tip (`tip`, the sha read), so it continues
-//          the work instead of starting from the default branch;
+//          branch verified, by the lanes App, committed by web-flow, and no
+//          commit behind the default branch: the model runs on a new lane
+//          branch made at that branch's tip (`tip`, the sha read), so it
+//          continues the work instead of starting from the default branch.
+//          A branch behind the default branch would carry its stale base into
+//          the runner's whole-branch checks, so it starts fresh instead
+//          (`stale` names it) and is left as it is;
 //   run    otherwise.
-// `branches` are {name, sha, aheadBy, tip, tipAt, pulls, commits} (commits
+// `branches` are {name, sha, aheadBy, behindBy, tip, tipAt, pulls, commits} (commits
 // from GET /compare, null when the listing is cut short; tip from GET
 // /commits/{sha}, tipAt epoch ms, pulls from
 // GET /pulls?state=all&head=); `closing` the issue's open closing PRs as
@@ -914,11 +969,19 @@ export function findPrior({ issueNumber, repo, bot, humans, branches, closing, m
   // fresh, so deleting a resumed run's branch never falls back to an older one.
   const decisive = [...markers]
     .reverse()
-    .find((marker) => !(marker.onResumed && RESUMABLE.has(marker.outcome)) && !Object.hasOwn(DIMENSION_STEPS, marker.outcome));
+    .find(
+      (marker) =>
+        !(marker.onResumed && RESUMABLE.has(marker.outcome)) &&
+        !Object.hasOwn(DIMENSION_STEPS, marker.outcome) &&
+        !RETIRED_SKIPS.has(marker.outcome),
+    );
   const resume =
     RESUMABLE.has(decisive?.outcome) && decisive.run !== ""
       ? lane.find((branch) => branch.match[1] === decisive.run && usable(branch) && allLane(branch))
       : null;
+  if (resume && resume.behindBy !== 0) {
+    return { action: "run", stale: { branch: resume.name, behindBy: resume.behindBy } };
+  }
   return resume ? { action: "resume", branch: resume.name, tip: resume.sha, cause: decisive.outcome } : { action: "run" };
 }
 
@@ -1048,7 +1111,7 @@ const CLOSING_QUERY = `query($owner: String!, $name: String!, $number: Int!, $af
 
 // Every open PR that closes the issue, across pages, so no number of other
 // PRs can push a trusted one out of reach.
-async function closingPulls(github, { owner, name, number }, maxPages = 50) {
+export async function closingPulls(github, { owner, name, number }, maxPages = 50) {
   const nodes = [];
   let after = null;
   for (let page = 1; page <= maxPages; page += 1) {
@@ -1119,6 +1182,9 @@ export async function findPriorMain({ env = process.env, fetch = globalThis.fetc
       if (!Number.isSafeInteger(comparison?.ahead_by) || comparison.ahead_by < 0) {
         throw new Error(`the commits ${ref.name} holds ahead of ${base} could not be read`);
       }
+      if (!Number.isSafeInteger(comparison.behind_by) || comparison.behind_by < 0) {
+        throw new Error(`the commits ${ref.name} lacks from ${base} could not be read`);
+      }
       const pulls = await paginate(github, `${repo}/pulls?state=all&head=${encodeURIComponent(`${owner}:${ref.name}`)}`);
       if (!/^[0-9a-f]{40}$/.test(ref.sha ?? "")) {
         throw new Error(`the tip of ${ref.name} could not be read`);
@@ -1133,7 +1199,7 @@ export async function findPriorMain({ env = process.env, fetch = globalThis.fetc
       // carries no commit list, so it is never resumed.
       const commits =
         Array.isArray(comparison.commits) && comparison.commits.length === comparison.total_commits ? comparison.commits : null;
-      branches.push({ name: ref.name, sha: ref.sha, aheadBy: comparison.ahead_by, tip, tipAt, pulls, commits });
+      branches.push({ name: ref.name, sha: ref.sha, aheadBy: comparison.ahead_by, behindBy: comparison.behind_by, tip, tipAt, pulls, commits });
     }
     const prior = findPrior({ issueNumber, repo: env.GITHUB_REPOSITORY, bot, humans, branches, closing, markers });
     const runs = prior.action === "run" || prior.action === "resume";
@@ -1149,7 +1215,9 @@ export async function findPriorMain({ env = process.env, fetch = globalThis.fetc
       : { proceed: "false", "skip-reason": "not-applicable", "reuse-branch": prior.action === "reuse" ? prior.branch : "" };
     appendFileSync(env.GITHUB_OUTPUT, Object.entries(outputs).map(([key, value]) => `${key}=${value}\n`).join(""));
     console.log(
-      prior.action === "run"
+      prior.stale
+        ? `report-outcome: ${prior.stale.branch} is ${prior.stale.behindBy} commits behind the default branch, so the model starts issue #${issueNumber} fresh from the default branch instead of resuming it; the branch is left as it is`
+        : prior.action === "run"
         ? `report-outcome: no earlier run of issue #${issueNumber} left work to report; the model runs`
         : prior.action === "resume"
           ? `report-outcome: the model resumes issue #${issueNumber} from ${prior.branch} at ${prior.tip} (${prior.cause})`
@@ -1189,6 +1257,10 @@ export async function main({ env = process.env, fetch = globalThis.fetch, now = 
     const dimensionSkip = env.DIMENSION_SKIP ?? "";
     if (dimensionSkip && !Object.hasOwn(DIMENSION_STEPS, dimensionSkip)) {
       throw new Error("DIMENSION_SKIP is not an issue-dimension skip reason");
+    }
+    const escalation = env.ESCALATION_REASON ?? "";
+    if (escalation && !Object.hasOwn(PATCH_REASONS, escalation)) {
+      throw new Error("ESCALATION_REASON is not an apply-issue-patch escalation reason");
     }
     const reuse = env.REUSE_BRANCH ?? "";
     const reused = laneBranch(issueNumber).exec(reuse);
@@ -1343,6 +1415,7 @@ export async function main({ env = process.env, fetch = globalThis.fetch, now = 
           now,
           runId,
           checks,
+          escalation,
         });
     if (plan.action === "turn-cap") {
       // Once per run, like the limited marker: a rerun of this report finds
@@ -1408,11 +1481,6 @@ export async function main({ env = process.env, fetch = globalThis.fetch, now = 
         });
       } else {
         console.log(`report-outcome: opened PR #${pull.number} for issue #${issueNumber}`);
-        if (plan.refsHold) {
-          // The label first, so a failed comment still leaves the issue with a person.
-          await github("POST", `${repo}/issues/${issueNumber}/labels`, { labels: [plan.refsHold] });
-          await github("POST", `${repo}/issues/${issueNumber}/comments`, { body: refsHoldComment(pull.number, plan.refsHold) });
-        }
         return 0;
       }
     }

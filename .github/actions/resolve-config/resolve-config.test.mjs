@@ -15,7 +15,7 @@ import { dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { main, resolveFromBase } from "./resolve-config.mjs";
+import { issueLaneWebHostsFromBase, main, resolveFromBase } from "./resolve-config.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = join(HERE, "resolve-config.mjs");
@@ -202,6 +202,7 @@ test("a valid config writes ResolvedConfig and the selected activity's outputs",
     contents: "read",
     "pull-requests": "read",
     issues: "read",
+    actions: "",
     "can-commit": "false",
   });
 });
@@ -661,28 +662,11 @@ test("on an issues event, a missing label skips with not-applicable", async () =
   assert.equal(outputs["skip-reason"], "not-applicable");
 });
 
-test("labeled-after applies to an issue labeled after the cutover", async () => {
+test("labeled-after is not a predicate key: a config that sets it fails the schema", async (t) => {
   const { env } = workspace();
   issueEvent(env, { number: 7, labels: [], updated_at: "2026-10-20T00:00:01Z" });
   withPredicate(env, { "labeled-after": "2026-10-20T00:00:00Z" });
-  assert.equal(await main({ env, github: noApi }), 0);
-  assert.equal(readOutputs(env.GITHUB_OUTPUT).applies, "true");
-});
-
-test("labeled-after skips an issue labeled before the cutover with not-applicable", async () => {
-  const { env } = workspace();
-  issueEvent(env, { number: 7, labels: [], updated_at: "2026-10-19T23:59:59Z" });
-  withPredicate(env, { "labeled-after": "2026-10-20T00:00:00Z" });
-  assert.equal(await main({ env, github: noApi }), 0);
-  const outputs = readOutputs(env.GITHUB_OUTPUT);
-  assert.equal(outputs.applies, "false");
-  assert.equal(outputs["skip-reason"], "not-applicable");
-});
-
-test("labeled-after fails red off an issues event, which carries no label time", async (t) => {
-  const { env } = workspace();
-  withPredicate(env, { "labeled-after": "2026-10-20T00:00:00Z" });
-  await assertFailsRed(t, env, /needs labeledAt/);
+  await assertFailsRed(t, env, /fails the schema/);
 });
 
 test("on an issues event, labels-absent reads the issue's labels now", async () => {
@@ -1054,6 +1038,25 @@ test("a lane run fails closed on patch rules a row of which does not refuse the 
   const broken = JSON.parse(readFileSync(join(FIXTURES, "patch-rules-missing-universal.json"), "utf8"));
   await assert.rejects(
     resolveFromBase({ env, github: noApi, readRules: rulesWith("./patch-rules.json", broken) }),
-    (error) => error.code === "patch-rules" && /does not refuse claude/.test(error.message),
+    (error) => error.code === "patch-rules" && /does not refuse codeowners/.test(error.message),
   );
+});
+
+test("MODEL_RUNG empty, 0 or 1 resolves; any other value is refused as invalid-rung", async () => {
+  for (const rung of ["", "0"]) {
+    const { env } = workspace();
+    env.MODEL_RUNG = rung;
+    assert.ok(await resolveFromBase({ env, github: noApi }), rung);
+  }
+  for (const rung of ["2", "01", "up", "-1"]) {
+    const { env } = workspace();
+    env.MODEL_RUNG = rung;
+    await assert.rejects(resolveFromBase({ env, github: noApi }), (error) => error.code === "invalid-rung", rung);
+  }
+});
+
+test("issueLaneWebHostsFromBase: resolve-issue's web-access domains from the base config, none when it reads no web", () => {
+  const live = issueLaneWebHostsFromBase({ BASE_PATH: join(HERE, "../../..") });
+  assert.ok(Array.isArray(live) && live.includes("code.claude.com"), JSON.stringify(live));
+  assert.deepEqual(issueLaneWebHostsFromBase(workspace().env), []);
 });

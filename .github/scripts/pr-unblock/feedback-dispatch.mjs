@@ -22,10 +22,14 @@
 //   every comment is the reviewer bot's, a trusted person with write access
 //   asked the lane to fix it (isFixRequest), or a trusted person answered the
 //   lane's escalation (address-feedback.mjs threadAuthors); on a PR carrying
-//   the human-gated label, only a thread where a trusted person with write
-//   access asked the lane to fix it (isFixRequest);
+//   the human-gated label, the same when a lane escalation put the label on
+//   and no review lane holds the PR (gate-source.mjs gateSource), and
+//   otherwise only a thread where a trusted person with write access asked
+//   the lane to fix it (isFixRequest);
 // - that head has no pr-unblock / address-feedback check run yet (one the
-//   usage limit stopped stops counting once its limit resets), and no
+//   usage limit stopped stops counting once its limit resets, and one that
+//   started before the head's newest pr-unblock / publish-feedback check run
+//   when that run skipped no-model-turn: that round handled nothing), and no
 //   pr-unblock.yml address-feedback run for the PR is still queued or going;
 // - the base config's pr-unblock lane is enabled, holds enabled
 //   address-feedback and publish-feedback slots, and address-feedback applies
@@ -33,9 +37,31 @@
 // The gate and the broker re-check the upstream run and the head; this script
 // only decides whether to spend a run.
 //
+// A completed pr-verify run starts the file too, once its post-verify-notes
+// job has posted a fail verdict's notes on the PR (verify-notes.mjs). For
+// that run, which ran on main, main() takes the head the notes name
+// (VERIFY_HEAD_SHA) and decides as above with the newest completed review
+// run at that head as the upstream (reviewRunAt); with none, the review run
+// that completes later dispatches. The dispatched-run record names that review
+// run, so the gate and the broker check one kind of upstream. The notes are
+// new work at a head an earlier round may have handled, so that dispatch
+// counts only check runs started after the pr-verify run was created
+// (notesSince, read back from the API) and skips the head's handled record.
+//
+// A round whose reply job skipped no-model-turn releases its head only for
+// the next review or pr-verify completion there, which may never come. So a
+// completed scheduled pr-unblock-dispatch.yml run, the half-hourly tick, also
+// starts the file, and main() sweeps (sweepNoModelTurn): each open lanes App
+// PR into main whose head's newest reply check skipped no-model-turn, fewer
+// than SWEEP_HEAD_CAP times at that head, is decided as above with the
+// newest completed review run at that head as the upstream (reviewRunAt),
+// which the record names. A sweep dispatches at most once, since the
+// dispatched-run record names one upstream and one run, and keeps no record.
+//
 // Both review lanes, and any re-run, finish on one head, so a run leaves a
 // record for the next run at that head (dispatch-record.mjs, carried in the
-// Actions cache): a head whose check runs handle it for good is skipped before
+// Actions cache): a head whose check runs handle it for good, once a reply
+// check started after its newest address-feedback check, is skipped before
 // any read, and a head whose dispatched run for this PR is still queued or
 // going is skipped after the PR read, with one read of that run in place of
 // the comment, thread and run listings. Each shortcut stands for a skip the
@@ -44,9 +70,11 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
+import { commitPulls } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
 import { fixRequesters, humanGatedLabelFrom, threadAuthors, trustedHumansFrom } from "./address-feedback.mjs";
+import { commentItems, gateSource, listLabelEvents } from "./gate-source.mjs";
 import { emptyRecord, isHandled, markHandled, readRecord, writeRecord } from "./dispatch-record.mjs";
-import { anyHandles, permanentlyHandles } from "./limit-stop.mjs";
+import { anyHandles, limitResetsAt, permanentlyHandles } from "./limit-stop.mjs";
 import { budgetedFetch } from "./request-budget.mjs";
 
 export const DEFAULTS = Object.freeze({
@@ -56,15 +84,21 @@ export const DEFAULTS = Object.freeze({
   activity: "address-feedback",
   replyActivity: "publish-feedback",
   checkName: "pr-unblock / address-feedback",
+  // The reply job's check: its no-model-turn skip releases the round's
+  // address-feedback check runs.
+  replyCheckName: "pr-unblock / publish-feedback",
   reviewWorkflows: Object.freeze([
     ".github/workflows/pr-review-hosted.yml",
     ".github/workflows/pr-review-security-hosted.yml",
   ]),
   // The lanes each review workflow names in its reviewed-head marker
-  // (melodic-software/ci-workflows pr-review.yml and pr-review-security.yml).
+  // (melodic-software/ci-workflows pr-review-cli.yml).
   markerLanes: Object.freeze(["claude-review", "claude-security-review"]),
   holdLabels: Object.freeze(["do-not-merge"]),
-  // claude[bot], the reviewer (.github/standards/trusted-actors/trusted-actors.json).
+  // claude[bot], which posted reviews before both lanes moved to pr-review-cli
+  // (.github/standards/trusted-actors/trusted-actors.json). pr-review-cli posts
+  // as github-actions[bot]; threadAuthors accepts those comments only when the
+  // lane footer is their last line.
   reviewerId: 209825114,
   // github-actions[bot], which writes the reviewed-head markers.
   markerAuthorId: 41898282,
@@ -74,6 +108,16 @@ export const DEFAULTS = Object.freeze({
 
 const SHA = /^[0-9a-f]{40}$/;
 const RUN_ID = /^[1-9][0-9]{0,14}$/;
+
+// The tick whose completion starts the sweep.
+export const SWEEP_WORKFLOW = ".github/workflows/pr-unblock-dispatch.yml";
+// No-model-turn rounds at one head after which the sweep stops sending it
+// (judgment: a third round with no model turn points at a cause a retry does
+// not clear; the select job's round cap may end it sooner).
+export const SWEEP_HEAD_CAP = 3;
+
+const startOf = (run) => Date.parse(run.started_at ?? "");
+const isNoModelTurn = (run) => run?.status === "completed" && run.conclusion === "neutral" && run.output?.title === "Skipped: no-model-turn";
 
 // The SHA the newest marker of `lane` written by the marker author names, or "".
 export function markedHead(comments, lane, markerAuthorId = DEFAULTS.markerAuthorId) {
@@ -104,6 +148,18 @@ export function hasWorkableThread(threads, { reviewerId, appId, trustedHumans, r
   );
 }
 
+export const VERIFY_WORKFLOW = ".github/workflows/pr-verify.yml";
+
+// The newest completed review run at `head` that reviewed something (not
+// skipped or cancelled), or null.
+export async function reviewRunAt({ api, head, settings = DEFAULTS }) {
+  const runs = (await Promise.all(settings.reviewWorkflows.map((path) => api.listCompletedRuns(path, head))))
+    .flat()
+    .filter((run) => run.head_sha === head && run.event === "pull_request" && !["skipped", "cancelled"].includes(run.conclusion));
+  runs.sort((a, b) => Date.parse(b.created_at ?? "") - Date.parse(a.created_at ?? ""));
+  return runs[0] ?? null;
+}
+
 // pr-unblock.yml's run-name, which names the activity and the PR.
 export const runTitle = (activity, number) => `pr-unblock ${activity} #${number}`;
 
@@ -120,6 +176,7 @@ export async function dispatchFeedback({
   humanGatedLabel = "needs-human",
   now = Date.now(),
   record = emptyRecord(),
+  notesSince = null,
 }) {
   const skip = (why) => {
     log(`skip: ${why}`);
@@ -143,7 +200,7 @@ export async function dispatchFeedback({
     return skip(`run ${upstreamRunId} is not a completed same-repository review run`);
   }
   const head = upstream.head_sha;
-  if (isHandled(record, settings.checkName, head)) {
+  if (notesSince === null && isHandled(record, settings.checkName, head)) {
     return skip(`head ${head} already has a ${settings.checkName} check run (recorded)`);
   }
   const title = (number) => runTitle(settings.activity, number);
@@ -193,8 +250,19 @@ export async function dispatchFeedback({
   }
   const threads = await api.listReviewThreads(number);
   // A human-gated PR dispatches only for a thread a trusted person with
-  // write access asked the lane to fix.
-  const gated = (pull.labels ?? []).some((label) => label.name === humanGatedLabel);
+  // write access asked the lane to fix, unless a lane escalation put the
+  // label on and no review lane holds the PR. The label stays on either way:
+  // clear-escalations.mjs owns taking it off.
+  const labeled = (pull.labels ?? []).some((label) => label.name === humanGatedLabel);
+  const gate = labeled
+    ? gateSource({
+        timeline: [...commentItems(comments), ...(await api.listLabelEvents(number))],
+        label: humanGatedLabel,
+        head,
+        isLanesApp: (user) => user?.id === appSenderId && user?.type === "Bot",
+      })
+    : null;
+  const gated = labeled && gate.source !== "lane-escalation";
   const fixers = await fixRequesters({
     comments: threads.flatMap((thread) =>
       thread.comments.nodes.map((node) => ({ authorId: node.author?.databaseId, login: node.author?.login, body: node.body })),
@@ -206,7 +274,7 @@ export async function dispatchFeedback({
   if (!hasWorkableThread(threads, { reviewerId: settings.reviewerId, appId: appSenderId, trustedHumans, requesters, fixers })) {
     return skip(
       gated
-        ? `#${number} is labeled ${humanGatedLabel} and has no thread a trusted person with write access asked the lane to fix`
+        ? `#${number} is labeled ${humanGatedLabel} (${gate.source}: ${gate.reason}) and has no thread a trusted person with write access asked the lane to fix`
         : `#${number} has no unresolved thread left by the reviewer bot alone, asked to be fixed, or answered by a trusted person`,
     );
   }
@@ -227,8 +295,31 @@ export async function dispatchFeedback({
   if (resolved.selected?.applies !== true) {
     return skip(`#${number}: ${settings.activity} does not apply (${resolved.selected?.["skip-reason"] ?? "unknown"})`);
   }
-  const existing = await api.listCheckRuns({ sha: head, checkName: settings.checkName, appId: settings.appId });
-  if (permanentlyHandles(existing)) {
+  // NaN compares false, so a run with no readable start still counts.
+  const sinceNotes = (run) => notesSince === null || !(Date.parse(run.started_at ?? "") <= notesSince);
+  let existing = (await api.listCheckRuns({ sha: head, checkName: settings.checkName, appId: settings.appId })).filter(sinceNotes);
+  // A round whose reply job skipped no-model-turn (decided from the scan
+  // job's outputs and the select job's head) handled nothing: the
+  // address-feedback check runs that started before that reply job stop
+  // counting, so the next trigger dispatches the head again. Each such
+  // round posted its round marker, so the select job's round cap ends it. A
+  // limit stop is never released: limit-stop.mjs still holds the head until
+  // its reset and counts it toward limits.limit-stops-per-head.
+  let replies = [];
+  if (anyHandles(existing, { now, limits: resolved.limits })) {
+    replies = (await api.listCheckRuns({ sha: head, checkName: settings.replyCheckName, appId: settings.appId })).filter(sinceNotes);
+    const newest = replies.reduce((a, b) => (startOf(b) > startOf(a) ? b : a), replies[0]);
+    if (isNoModelTurn(newest)) {
+      const cut = startOf(newest);
+      existing = existing.filter((run) => limitResetsAt(run, resolved.limits) !== null || !(startOf(run) < cut));
+    }
+  }
+  // The round's reply job posts its check after the round's address-feedback
+  // check, so until a reply check started after the newest address-feedback
+  // check, a no-model-turn skip may still release the head: it is not
+  // recorded as handled yet (#9362). An unreadable start records nothing.
+  const newestCheck = Math.max(...existing.map(startOf));
+  if (permanentlyHandles(existing, { limits: resolved.limits }) && replies.some((run) => startOf(run) > newestCheck)) {
     markHandled(record, settings.checkName, head);
   }
   if (anyHandles(existing, { now, limits: resolved.limits })) {
@@ -252,6 +343,51 @@ export async function dispatchFeedback({
   return { number, workflowRunId: id };
 }
 
+// The sweep: the first open lanes App PR into main whose head's newest
+// reply check skipped no-model-turn, under SWEEP_HEAD_CAP such checks, that
+// dispatchFeedback dispatches for the head's newest completed review run.
+// Returns dispatchFeedback's result with that run's id, or null.
+export async function sweepNoModelTurn({ api, repository, appSenderId, log, settings = DEFAULTS, ...rest }) {
+  const pulls = (await api.listOpenPulls(settings.base)).filter(
+    (pull) => pull.user?.id === appSenderId && pull.draft === false && pull.head?.repo?.full_name === repository && SHA.test(pull.head?.sha ?? ""),
+  );
+  for (const pull of pulls) {
+    const head = pull.head.sha;
+    let dispatched = null;
+    try {
+      dispatched = await sweepOne({ api, pull, head, repository, appSenderId, log, settings, rest });
+    } catch (error) {
+      // One PR's failed read leaves the PRs after it to the sweep.
+      log(`::warning::#${pull.number}: the sweep could not decide head ${head}: ${error.message}`);
+    }
+    if (dispatched !== null) {
+      return dispatched;
+    }
+  }
+  log("sweep: no head whose last round had no model turn to dispatch");
+  return null;
+}
+
+async function sweepOne({ api, pull, head, repository, appSenderId, log, settings, rest }) {
+  const replies = await api.listCheckRuns({ sha: head, checkName: settings.replyCheckName, appId: settings.appId });
+  const newest = replies.reduce((a, b) => (startOf(b) > startOf(a) ? b : a), replies[0]);
+  if (!isNoModelTurn(newest)) {
+    return null;
+  }
+  const skips = replies.filter(isNoModelTurn).length;
+  if (skips >= SWEEP_HEAD_CAP) {
+    log(`skip: #${pull.number}: head ${head} skipped no-model-turn ${skips} times, the sweep's cap`);
+    return null;
+  }
+  const upstream = await reviewRunAt({ api, head, settings });
+  if (upstream === null) {
+    log(`skip: #${pull.number}: head ${head} has no completed review run`);
+    return null;
+  }
+  const dispatched = await dispatchFeedback({ ...rest, api, repository, appSenderId, log, settings, upstream });
+  return dispatched === null ? null : { ...dispatched, upstreamRunId: upstream.id };
+}
+
 const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
@@ -273,7 +409,7 @@ const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $af
   }
 }`;
 
-export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch = globalThis.fetch }) {
+export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch = globalThis.fetch, attemptTimeoutMs }) {
   const [owner, name] = repository.split("/");
   const repo = `${apiUrl}/repos/${owner}/${name}`;
   const headers = {
@@ -282,11 +418,12 @@ export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch =
     "X-GitHub-Api-Version": "2022-11-28",
   };
 
-  async function request(url, method = "GET", body) {
+  async function request(url, method = "GET", body, signal) {
     const response = await fetch(url, {
       method,
       headers: body === undefined ? headers : { ...headers, "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     });
     if (!response.ok) {
       throw new Error(`${method} ${url} returned ${response.status}`);
@@ -294,8 +431,8 @@ export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch =
     return response.status === 204 ? {} : response.json();
   }
 
-  async function graphql(query, variables) {
-    const result = await request(graphqlUrl, "POST", { query, variables });
+  async function graphql(query, variables, signal) {
+    const result = await request(graphqlUrl, "POST", { query, variables }, signal);
     if (result.errors?.length) {
       throw new Error(`GraphQL: ${result.errors.map((error) => error.message).join("; ")}`);
     }
@@ -303,7 +440,14 @@ export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch =
   }
 
   return {
-    pullsForCommit: (sha) => request(`${repo}/commits/${sha}/pulls`),
+    pullsForCommit: (sha) =>
+      commitPulls({
+        repository,
+        sha,
+        readRest: () => request(`${repo}/commits/${sha}/pulls`),
+        readGraphQL: graphql,
+        timeoutMs: attemptTimeoutMs,
+      }),
     // Metadata read, which every token holds. A 404 (not a collaborator) is none.
     async getPermission(login) {
       const url = `${repo}/collaborators/${encodeURIComponent(login)}/permission`;
@@ -327,6 +471,7 @@ export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch =
       }
       throw new Error(`#${number} has more than 5000 comments`);
     },
+    listLabelEvents: (number) => listLabelEvents({ graphql, repository, number }),
     async listReviewThreads(number) {
       const threads = [];
       let after = null;
@@ -355,6 +500,22 @@ export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch =
       return (await request(`${repo}/actions/workflows/${workflow}/runs?event=workflow_dispatch&per_page=100`)).workflow_runs ?? [];
     },
     getWorkflowRun: (id) => request(`${repo}/actions/runs/${encodeURIComponent(id)}`),
+    async listOpenPulls(base) {
+      const pulls = [];
+      for (let page = 1; page <= 10; page += 1) {
+        const batch = await request(`${repo}/pulls?state=open&base=${encodeURIComponent(base)}&per_page=100&page=${page}`);
+        pulls.push(...batch);
+        if (batch.length < 100) {
+          return pulls;
+        }
+      }
+      throw new Error(`more than 1000 open PRs into ${base}`);
+    },
+    // The newest completed pull_request runs of a workflow file at a head.
+    async listCompletedRuns(path, head) {
+      const query = new URLSearchParams({ head_sha: head, event: "pull_request", status: "completed", per_page: "10" });
+      return (await request(`${repo}/actions/workflows/${path.split("/").at(-1)}/runs?${query}`)).workflow_runs ?? [];
+    },
     async dispatchWorkflow({ workflow, ref, inputs }) {
       const result = await request(`${repo}/actions/workflows/${workflow}/dispatches`, "POST", {
         ref,
@@ -386,8 +547,11 @@ export async function resolveFeedbackSlot({ number, head, env, github, settings 
       EVENT_NAME: "workflow_dispatch",
       PR_NUMBER: String(number),
       HEAD_SHA: head,
-      // Only reading: the dispatched write runner performs the prepare step.
+      // Only reading: the dispatched runners perform the prepare step and
+      // hand on what the read runner's address-feedback leaves (its patch
+      // and its replies), as that runner's applied-by-supported names them.
       PREPARE_SUPPORTED: "true",
+      APPLIED_BY_SUPPORTED: "patch feedback-replies",
       GITHUB_TOKEN: env.GITHUB_TOKEN,
       GITHUB_API_URL: env.GITHUB_API_URL,
       REPOSITORY: env.GITHUB_REPOSITORY,
@@ -407,33 +571,62 @@ export async function main(env, { api, github, resolveSlot, log = (line) => cons
   }
   const budget = api ? null : budgetedFetch({ log });
   const { record, text } = readRecord(env.DISPATCH_RECORD);
-  const dispatched = await dispatchFeedback({
-    api:
-      api ??
-      createGitHubApi({
-        token: env.GITHUB_TOKEN,
-        repository: env.GITHUB_REPOSITORY,
-        apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
-        graphqlUrl: env.GITHUB_GRAPHQL_URL ?? "https://api.github.com/graphql",
-        fetch: budget.fetch,
-      }),
-    record,
+  const client =
+    api ??
+    createGitHubApi({
+      token: env.GITHUB_TOKEN,
+      repository: env.GITHUB_REPOSITORY,
+      apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
+      graphqlUrl: env.GITHUB_GRAPHQL_URL ?? "https://api.github.com/graphql",
+      fetch: budget.fetch,
+    });
+  let upstream = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, "utf8")).workflow_run;
+  const common = {
+    api: client,
     repository: env.GITHUB_REPOSITORY,
     runId: env.GITHUB_RUN_ID,
-    upstream: JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, "utf8")).workflow_run,
     appSenderId: Number(env.APP_SENDER_ID),
     // The base checkout's list, the one resolve-config reads beside it.
     trustedHumans: trustedHumansFrom(env.TRUSTED_ACTORS || `${env.BASE_PATH || ".base"}/.github/standards/trusted-actors/trusted-actors.json`),
     humanGatedLabel: humanGatedLabelFrom(env.TRACKER_CONFIG || `${env.BASE_PATH || ".base"}/.work-item-tracker.json`),
     resolveSlot: resolveSlot ?? (({ number, head }) => resolveFeedbackSlot({ number, head, env, github })),
     log,
-  }).finally(() => {
+  };
+  const summary = () => {
     if (budget) {
       log(budget.summary());
     }
-  });
+  };
+  if (upstream?.path === SWEEP_WORKFLOW) {
+    if (upstream.event !== "schedule") {
+      log(`skip: run ${upstream.id} is not a scheduled tick`);
+      return 0;
+    }
+    const swept = await sweepNoModelTurn(common).finally(summary);
+    if (swept !== null) {
+      appendFileSync(env.GITHUB_OUTPUT, `run-id=${swept.workflowRunId}\nupstream-run-id=${swept.upstreamRunId}\n`);
+    }
+    return 0;
+  }
+  let notesSince = null;
+  if (upstream?.path === VERIFY_WORKFLOW) {
+    const head = env.VERIFY_HEAD_SHA ?? "";
+    if (!SHA.test(head)) {
+      throw new Error("a pr-verify run names no posted head in VERIFY_HEAD_SHA");
+    }
+    notesSince = Date.parse((await client.getWorkflowRun(upstream.id)).created_at ?? "");
+    if (Number.isNaN(notesSince)) {
+      throw new Error(`pr-verify run ${upstream.id} has no readable creation time`);
+    }
+    upstream = await reviewRunAt({ api: client, head });
+    if (upstream === null) {
+      log(`skip: head ${head} has no completed review run yet; the review run dispatches when it completes`);
+      return 0;
+    }
+  }
+  const dispatched = await dispatchFeedback({ ...common, record, upstream, notesSince }).finally(summary);
   if (dispatched !== null) {
-    appendFileSync(env.GITHUB_OUTPUT, `run-id=${dispatched.workflowRunId}\n`);
+    appendFileSync(env.GITHUB_OUTPUT, `run-id=${dispatched.workflowRunId}\nupstream-run-id=${upstream.id}\n`);
   }
   if (writeRecord(env.DISPATCH_RECORD, record, text)) {
     appendFileSync(env.GITHUB_OUTPUT, "record-changed=true\n");

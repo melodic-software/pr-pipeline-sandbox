@@ -33,6 +33,11 @@ SYNCED=(
   .github/scripts/pr-unblock
   .github/scripts/read-patch
   .github/scripts/work-resolve-issue
+  # Modules the synced scripts and tests import from outside those folders.
+  .github/scripts/intake-triage/admit.mjs
+  .github/scripts/maintenance-reconcile-lost-runs/infra-failure.mjs
+  .github/scripts/pr-merge/merge-holds.mjs
+  .github/scripts/pr-verify/write-verdict.mjs
   .github/standards/dependabot-policy
   .github/standards/github-actions-conventions
   .github/standards/runner-policy
@@ -66,7 +71,7 @@ ADAPTED=(
   # Sandbox activities and lanes, migrated to schema version 2.
   # review-dependency, apply-dependency-verdict, fix-ci and apply-ci-fix are
   # main's, unchanged; resolve-issue takes main's labels and holds but keeps
-  # the sandbox's go-live time and no checks.
+  # no checks.
   docs/conventions/pr-pipeline.yaml
   # Sandbox activities fix-marker and audit-env-write, with the role input,
   # and the fix-ci fallback probe (pr-unblock.yml's fix-ci jobs on this lane).
@@ -82,9 +87,13 @@ ADAPTED=(
 
 # "<path> <commit>": compared against that commit instead of the ref.
 PINNED=(
-  # A sync-manifest-managed file: check-managed-files refuses a hand edit, and
-  # nothing in the lane runtime reads it.
+  # Sync-manifest-managed files: check-managed-files refuses a hand edit, and
+  # standards-sync lands them. The runners read only the runner-policy
+  # lockfile, for an install.
   ".github/standards/runner-policy/policy.json 9329c4cd64765267e43aef0ceef58c40961cd676"
+  ".github/standards/dependabot-policy/policy.json add8219a557d432d9f4dbd1cac98b0e8a2114b10"
+  ".github/standards/runner-policy/package-lock.json 4ac70b2c402920d9c42b9a9f00e86c14d7f785ea"
+  ".github/standards/runner-policy/runner-policy.mjs c277271481af37c9761bcf802a3bc692540bb53a"
 )
 
 usage() {

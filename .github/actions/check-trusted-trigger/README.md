@@ -57,7 +57,8 @@ condition 1 and the actor and author parts of condition 2).
   - its `head_sha` is an ancestor of the branch tip: the tip SHA is resolved once through
     `GET /git/ref/heads/{default branch}`, and `GET /compare/{head_sha}...{tip SHA}` reports
     `ahead` or `identical`;
-  - its `event` is `push`, or `workflow_dispatch` with an `actor` listed as `kind: human`;
+  - its `event` is `push`, `schedule`, or `workflow_dispatch` with an `actor` listed as
+    `kind: human`;
   - when its `run_attempt` is above 1, its `triggering_actor` is listed as `kind: human`;
   - this run's own `created_at` falls between the dispatcher run's `run_started_at` and the
     earlier of its `updated_at` and ten minutes after `run_started_at`, inclusive. The window is
@@ -127,7 +128,8 @@ condition 1 and the actor and author parts of condition 2).
   repository. The PR is looked up from the run's head SHA, because `pull_requests` is empty for
   more than forks: exactly one open same-repository PR whose head is still that SHA, or `no-pr`.
   Actors are `sender`, `workflow_run.actor` and `workflow_run.triggering_actor`: all three must
-  be listed, because ADR 0051 requires the actor that started the failed run to be trusted.
+  be listed, because ADR 0051 requires the actor that started the failed run to be trusted. The
+  one exception is the reconciler's re-run of the upstream run, below.
 - **Author.** The PR's `user.id` must be listed.
 - **Re-runner.** A re-run keeps the original event and its actors, so the account that started
   this attempt is checked as well, by id: this run's own record, read through
@@ -163,6 +165,15 @@ condition 1 and the actor and author parts of condition 2).
   reconciler uploads the record before it calls the re-run, so an absent record is read once more
   after 5 s and then refused.
 
+  The same record vouches for the upstream run on the `workflow_run` path. When
+  `reconciler-workflow` is set, `workflow_run.run_attempt` is `2` and
+  `workflow_run.triggering_actor.id` is 41898282, that actor need not be listed; `sender` and
+  `workflow_run.actor` still must be. Every check above then runs against the upstream run,
+  `workflow_run.id` in place of `github.run_id`, and any failure stops with `untrusted-actor`.
+  The reconciler records each re-run that makes attempt 2 of a CI run this lane runs after. A
+  github-actions[bot] upstream at any other attempt, or with no record, stops with
+  `untrusted-actor`. This run's own re-runner is then checked as above.
+
   Residuals: whether one run can write another run's artifacts is unverified, as for the
   dispatcher record. A re-run that waits in a queue past the ten-minute window is refused, red;
   a person re-runs it. More than 1,000 forged artifacts of one name would push the real record
@@ -175,6 +186,11 @@ condition 1 and the actor and author parts of condition 2).
   value that is not a list of positive integers stops with `list-unreadable`.
 - **Head ref.** The PR's head branch must match `^[A-Za-z0-9._/-]+$`; any other branch name, such
   as one carrying `$(`, stops with `no-pr`.
+- **Base.** The PR's `base.ref` must equal the payload's `repository.default_branch`, on
+  `pull_request`, `workflow_dispatch` and `workflow_run` alike: lanes read the list and scripts
+  from the default branch, so a PR stacked on any other branch stops with `untrusted-base`, as
+  does a payload without the default branch. `report-check-run` maps it to no skip reason, so the
+  check posts failure, not neutral.
 - **`no-pr` for everything unhandled.** Any other event (including `pull_request_target`), a
   missing or malformed `pr-number`, an empty repository, an unreadable event payload, a PR fetch
   that fails, and a `workflow_run` with zero or more than one matching open PR all stop with
@@ -197,10 +213,10 @@ that cannot stops it with `untrusted-rerunner`.
 | Output | Values |
 |---|---|
 | `proceed` | `true` or `false` |
-| `reason` | `ok`, `fork`, `no-pr`, `head-lag`, `bot-actor`, `untrusted-actor`, `untrusted-rerunner`, `untrusted-author`, `list-unreadable` |
+| `reason` | `ok`, `fork`, `no-pr`, `head-lag`, `untrusted-base`, `bot-actor`, `untrusted-actor`, `untrusted-rerunner`, `untrusted-author`, `list-unreadable` |
 | `pr-number`, `head-ref`, `head-sha`, `base-sha` | The resolved PR; empty unless `proceed` is `true` |
 
-Reasons are checked in the order list and denied ids, event and PR, head lag, fork, denied actor, actor,
+Reasons are checked in the order list and denied ids, event and PR, head lag, fork, base, denied actor, actor,
 re-runner, author. Every failure, including
 an unreadable payload or a failed API call, ends in `proceed=false`, and the step always exits 0.
 Set `CLAUDE_BRANCH` for the model step from `head-ref`, and record `head-sha` before the model runs

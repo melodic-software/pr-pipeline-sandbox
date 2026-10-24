@@ -210,17 +210,19 @@ function checkLeaves(activities, activityRules) {
       continue;
     }
     // ci-context is the read runner's one mode, apply-patch a branch-writing
-    // script's; every other mode needs a skill that can write.
+    // script's; every other mode needs a skill that can write, or a read
+    // skill whose patch a script applies.
     const needs = { "ci-context": "read", "apply-patch": "mutate-branch" }[activity.prepare];
+    const handsOnPatch = isObject(activity["applied-by"]) && typeof activity["applied-by"].patch === "string";
     if (
       activity.prepare !== undefined &&
-      (needs ? activity.effect !== needs : activity.effect === "read")
+      (needs ? activity.effect !== needs : activity.effect === "read" && !handsOnPatch)
     ) {
       throw new Rejection(
         "invalid-prepare",
         needs
           ? `activity \`${name}\` sets prepare: ${activity.prepare}, which needs effect ${needs}`
-          : `activity \`${name}\` sets prepare with effect read; prepare needs a skill that can write`,
+          : `activity \`${name}\` sets prepare with effect read and no applied-by.patch; prepare needs a skill that can write or hands on a patch`,
       );
     }
     const rule = Object.hasOwn(activityRules, name)
@@ -274,54 +276,6 @@ function checkAppliedBy(doc) {
   }
 }
 
-// Every patch-rules.json row refuses these, so no row can admit them.
-const UNIVERSAL_REFUSE = Object.freeze([
-  "github",
-  "claude",
-  "mcp-config",
-  "gitmodules",
-  "settings",
-  "symlink",
-  "gitlink",
-  "new-executable",
-  "rename-into-refused",
-]);
-
-// patch-rules.json against its schema, which names every refusal and allow
-// rule apply-patch knows; then what the schema cannot check: each row refuses
-// the universal set, a two-parent commit allows exactly merge-result, and
-// each prepare mode a patch-producing activity uses has a row.
-export function checkPatchRules(patchRules, schema, activities = {}) {
-  const fail = (message) => {
-    throw new Rejection("patch-rules", message);
-  };
-  if (!isObject(patchRules) || !isObject(schema)) {
-    fail("patch-rules.json and patch-rules.schema.json must be present");
-  }
-  const validate = new Ajv2020({ allErrors: true, strict: false, validateFormats: false }).compile(schema);
-  if (!validate(patchRules)) {
-    fail(
-      `patch-rules.json fails its schema: ${validate.errors.map((error) => `${error.instancePath || "/"} ${error.message}`).join("; ")}`,
-    );
-  }
-  for (const [row, rules] of Object.entries(patchRules)) {
-    const missing = UNIVERSAL_REFUSE.filter((name) => !rules.refuse.includes(name));
-    if (missing.length > 0) {
-      fail(`patch-rules.json row \`${row}\` does not refuse ${missing.join(", ")}`);
-    }
-    if (rules.commit.parents.includes("base") && (rules.allow.length !== 1 || rules.allow[0] !== "merge-result")) {
-      fail(`patch-rules.json row \`${row}\` commits with the base as a parent, so its allow must be exactly [merge-result]`);
-    }
-  }
-  for (const [name, activity] of Object.entries(activities)) {
-    const row = activity?.prepare ?? "default";
-    if (activity?.["applied-by"]?.patch !== undefined && !Object.hasOwn(patchRules, row)) {
-      fail(`activity \`${name}\` hands on a patch with prepare: ${row}, and patch-rules.json has no \`${row}\` row`);
-    }
-  }
-  return patchRules;
-}
-
 // A runner names the applied-by keys it hands on (applied-by-supported, a
 // comma- or space-separated list); an applying leaf with any other key would
 // hand nothing on, so it fails before the head checkout.
@@ -336,17 +290,23 @@ export function checkAppliedBySupported(selected, supported = "") {
   }
 }
 
-// What the schema cannot check about `models`: every profile a route or
-// default-profile names exists, and every route names a skill activity or a
-// run route, so a mistyped route cannot silently take the default.
+// What the schema cannot check about `models`: every profile a route,
+// default-profile, escalate-to or complexity profile names exists, a
+// complexity profile's key is a complexity, and every route names a skill
+// activity or a run route, so a mistyped route cannot silently take the default.
 function checkModels(models, activities) {
   if (models === undefined) {
     return;
   }
   const { profiles } = models;
+  const complexityProfiles = models["issue-dimensions"]?.["complexity-profiles"] ?? {};
   for (const [route, profile] of [
     ["default-profile", models["default-profile"]],
     ...Object.entries(models.routes ?? {}),
+    ...Object.entries(profiles).flatMap(([name, values]) =>
+      values["escalate-to"] === undefined ? [] : [[`profiles.${name}.escalate-to`, values["escalate-to"]]],
+    ),
+    ...Object.entries(complexityProfiles).map(([complexity, profile]) => [`complexity-profiles.${complexity}`, profile]),
   ]) {
     if (!Object.hasOwn(profiles, profile)) {
       throw new Rejection(
@@ -366,6 +326,14 @@ function checkModels(models, activities) {
   }
   if (models["issue-dimensions"] !== undefined) {
     checkDimensions(models["issue-dimensions"]);
+    const known = models["issue-dimensions"].complexity;
+    const stray = Object.keys(complexityProfiles).find((complexity) => !Object.hasOwn(known, complexity));
+    if (stray !== undefined) {
+      throw new Rejection(
+        "undefined-dimension",
+        `models.issue-dimensions.complexity-profiles names \`${stray}\`, which is not a key of complexity`,
+      );
+    }
   }
 }
 
@@ -460,6 +428,7 @@ export function loadConfig(files, { configPath }) {
         `lane \`${laneName}\` holds activity \`${repeated}\` more than once; a leaf may appear once in a lane`,
       );
     }
+    checkActivityGrants(laneName, rule["activity-grants"]);
     for (const name of leaves) {
       const activity = doc.activities[name];
       // The lane rule compares strictly, so it must not depend on the schema enum.
@@ -659,9 +628,38 @@ export function changedPathTargets({
 const GRANT_SCOPES = ["contents", "issues", "pull-requests"];
 const GRANT_LEVELS = new Set(["read", "write"]);
 
+// A lane-rules.json row may add `actions: read`, and nothing else, to named
+// activities of its lane through `activity-grants`; the effect row stays the
+// base. The row serves every config that runs the lane, so a name the lane
+// does not hold adds nothing.
+function checkActivityGrants(laneName, activityGrants) {
+  if (activityGrants === undefined) {
+    return;
+  }
+  const valid =
+    isObject(activityGrants) &&
+    Object.entries(activityGrants).every(
+      ([, extra]) =>
+        isObject(extra) &&
+        Object.keys(extra).join() === "actions" &&
+        extra.actions === "read",
+    );
+  if (!valid) {
+    throw new Rejection(
+      "lane-grant",
+      `lane-rules.json row \`${laneName}\` activity-grants must map each activity to exactly { "actions": "read" }`,
+    );
+  }
+}
+
+function activityGrantOf(laneRules, lane, activity) {
+  const grants = Object.hasOwn(laneRules, lane) ? laneRules[lane]["activity-grants"] : undefined;
+  return isObject(grants) && Object.hasOwn(grants, activity) ? grants[activity] : {};
+}
+
 // An empty or partial grant would mint a token with every App permission, so a
 // row must name exactly the three scopes, each read or write.
-function grantFor(effectGrants, effect) {
+function grantFor(effectGrants, effect, extra = {}) {
   if (typeof effect !== "string" || !Object.hasOwn(effectGrants, effect)) {
     throw new Rejection(
       "effect-grant",
@@ -679,7 +677,7 @@ function grantFor(effectGrants, effect) {
       `effect-grants.json row \`${effect}\` must set exactly ${GRANT_SCOPES.join(", ")}, each read or write`,
     );
   }
-  return Object.freeze({ ...row });
+  return Object.freeze({ ...row, ...extra });
 }
 
 // The owner's model for a role route that resolves to no alias: CI has no
@@ -735,11 +733,22 @@ function roleModels(values, roleMapText) {
 }
 
 // The profile a route takes, with every default applied: its route's profile,
-// else default-profile; the built-in one when the config has no `models`. A
-// role profile takes its model and effort from the role map.
-function routeModels(models = BUILTIN_MODELS, route, roleMapText) {
+// else default-profile; the built-in one when the config has no `models`.
+const routeProfile = (models, route) => {
   const routes = models.routes ?? {};
-  const profile = Object.hasOwn(routes, route) ? routes[route] : models["default-profile"];
+  return Object.hasOwn(routes, route) ? routes[route] : models["default-profile"];
+};
+
+// A profile's resolved values, at `rung` 1 its escalate-to profile's: one
+// rung at most, never the escalate-to's own, and a profile with no rung above
+// is refused, so a retry never reruns the same model. A role profile takes
+// its model and effort from the role map.
+function profileModels(models, start, roleMapText, rung = 0) {
+  const climbed = rung === 1 ? models.profiles[start]["escalate-to"] : undefined;
+  if (rung === 1 && climbed === undefined) {
+    throw new Rejection("no-rung-up", `model rung 1 asks for the rung above profile \`${start}\`, which names no escalate-to`);
+  }
+  const profile = climbed ?? start;
   const values = models.profiles[profile];
   return {
     profile,
@@ -771,6 +780,17 @@ export function modelSettings(models) {
     : JSON.stringify({ env: { CLAUDE_CODE_SUBAGENT_MODEL: models["subagent-model"] } });
 }
 
+const routeModels = (models = BUILTIN_MODELS, route, roleMapText, rung = 0) =>
+  profileModels(models, routeProfile(models, route), roleMapText, rung);
+
+// The model rung a run asks for: 0 (or none) is its profile, 1 the rung above.
+function checkRung(rung) {
+  if (rung !== undefined && rung !== 0 && rung !== 1) {
+    throw new Rejection("invalid-rung", `model rung \`${rung}\` is neither 0 nor 1`);
+  }
+  return rung ?? 0;
+}
+
 // The resolved profile of a run that is no lane activity (RUN_ROUTES), after
 // the same file checks as resolve().
 export function resolveRoute(files, { route, configPath }) {
@@ -790,8 +810,10 @@ function resolveSlot(
   decided,
   models,
   pinnedDimensions,
+  rung,
+  extraGrant,
 ) {
-  const grant = grantFor(effectGrants, activity.effect);
+  const grant = grantFor(effectGrants, activity.effect, extraGrant);
   let outcome = { applies: null, skipReason: null };
   if (!enabled) {
     outcome = { applies: false, skipReason: "disabled-by-config" };
@@ -823,7 +845,7 @@ function resolveSlot(
     }
   }
   const kind = activity.skill === undefined ? "script" : "skill";
-  let runModels = kind === "skill" ? routeModels(models, name, roleMap) : null;
+  let runModels = kind === "skill" ? routeModels(models, name, roleMap, rung) : null;
   let sizing = {};
   if (dimensionedBy(activity, models)) {
     const config = models["issue-dimensions"];
@@ -847,6 +869,11 @@ function resolveSlot(
       outcome = { applies: false, skipReason: budget.skip };
     }
     if (budget.skip === null) {
+      // The issue's Complexity may pick the profile the run starts on.
+      const start = config["complexity-profiles"]?.[dims.complexity];
+      if (start !== undefined) {
+        runModels = profileModels(models, start, roleMap, rung);
+      }
       runModels = { ...runModels, "max-turns": budget["max-turns"] };
     }
     sizing = { "issue-dimensions": budget.pin, "timeout-minutes": budget["timeout-minutes"] };
@@ -900,7 +927,11 @@ export function resolveGrant(files, { lane, activity, configPath }) {
   }
   return {
     effect: entry.activity.effect,
-    grant: grantFor(files.effectGrants, entry.activity.effect),
+    grant: grantFor(
+      files.effectGrants,
+      entry.activity.effect,
+      activityGrantOf(files.laneRules, lane, activity),
+    ),
   };
 }
 
@@ -910,7 +941,6 @@ function resolveMerge(merge = {}, configPath) {
     ...new Set([
       ...(diffCheck["denied-paths"] ?? []),
       configPath,
-      ".github/**",
       TRUSTED_ACTORS_PATH,
     ]),
   ];
@@ -918,6 +948,7 @@ function resolveMerge(merge = {}, configPath) {
     rung: merge.rung ?? "off",
     "diff-check": { ...diffCheck, "denied-paths": denied },
     "stack-landing": merge["stack-landing"] ?? "manual",
+    "lane-prs": merge["lane-prs"] ?? "native",
   };
 }
 
@@ -935,7 +966,7 @@ const limitsOf = (limits = {}) => ({
   "turn-cap-restarts": limits["turn-cap-restarts"] ?? 0,
   "fix-ci-per-run": limits["fix-ci-per-run"] ?? 2,
   "fix-ci-restarts": limits["fix-ci-restarts"] ?? 1,
-  "admission-window-hours": limits["admission-window-hours"] ?? 24,
+  "fix-docs-per-run": limits["fix-docs-per-run"] ?? 2,
   "admission-factor": limits["admission-factor"] ?? 0.8,
   "admission-min-per-hour": limits["admission-min-per-hour"] ?? 1,
 });
@@ -969,14 +1000,25 @@ export function resolveWipLeaf(files, { configPath }) {
 
 export function resolve(
   files,
-  { lane, activity, configPath, basePath, facts, pinnedDimensions },
+  { lane, activity, configPath, basePath, facts, pinnedDimensions, rung },
 ) {
+  const modelRung = checkRung(rung);
   const doc = loadConfig(files, { configPath });
   const section = laneSection(doc, lane);
   const entries = laneSlots(doc, lane);
   const index = selectedIndex(entries, lane, activity);
   const slots = entries.map((entry, i) =>
-    resolveSlot(entry, files, facts, decides(i, index), doc.models, pinnedDimensions),
+    // Only the selected slot runs, so only it climbs.
+    resolveSlot(
+      entry,
+      files,
+      facts,
+      decides(i, index),
+      doc.models,
+      pinnedDimensions,
+      i === index ? modelRung : 0,
+      activityGrantOf(files.laneRules, lane, entry.name),
+    ),
   );
   return {
     version: 1,

@@ -1,15 +1,17 @@
-// The pr-unblock lane's review-dependency selection, shared by the model job's
-// runner step and the verdict job's script (apply-dependency-verdict.mjs). It
-// runs no PR head code and hands the model no decision.
+// The pr-unblock lane's review-dependency selection, shared by the select job
+// and the verdict job's script (apply-dependency-verdict.mjs). It runs no PR
+// head code and hands the model no decision.
 //
-//   select  run by .github/workflows/pr-run-activity-write.yml around a
-//           `prepare: dependency-review` skill, before the head checkout and
-//           any model turn, with the job's read-only token: skips a pull
-//           request Dependabot did not open, one whose head is no longer the
-//           gated head (superseded-sha), or one dependency-classify.mjs
-//           sorts `auto` (pr-merge owns those), escalates once the configured
-//           number of review rounds ran, and otherwise writes the context
-//           file the skill reads.
+//   select  run by pr-unblock.yml's review-dependency-select job, before any
+//           model turn, with the job's read-only token: skips a pull request
+//           Dependabot did not open, one whose head is no longer the gated
+//           head (superseded-sha), or one dependency-classify.mjs sorts `auto`
+//           (pr-merge owns those), escalates once the configured number of
+//           review rounds ran, and otherwise writes the context file the skill
+//           reads (DEPENDENCY_FILE) and the run fields the verdict job reads
+//           (CONTEXT_RUN_FILE): the gated head, the security, config and
+//           truncation flags, the review-only controls, the base config's
+//           pairs, and the time before any model turn.
 //
 // The PR body holds third-party release notes: it is copied into the context
 // file as data and never logged or interpolated into a command.
@@ -32,11 +34,13 @@ import {
 export const DEFAULT_MAX_ROUNDS = 2;
 export const MODEL_CHECK = "pr-unblock / review-dependency";
 export const VERDICTS = Object.freeze(["merge", "fix", "close", "escalate"]);
+const ROUND_PREFIX = "<!-- pr-unblock:review-dependency-round ";
+const ROUND_HEAD = /\shead=([0-9a-f]{40})\s/;
 const ROUND_LINE = /^<!-- pr-unblock:review-dependency-round head=([0-9a-f]{40}) verdict=(merge|fix|close|escalate|invalid) run=([1-9][0-9]{0,14}-[1-9][0-9]{0,4}|none) -->$/;
 // The pulls files listing stops here
 // (docs.github.com/en/rest/pulls/pulls#list-pull-requests-files, as of
 // 2026-10-15; recheck when that section changes its limit).
-const FILES_CAP = 3000;
+export const FILES_CAP = 3000;
 // Lockfile patches run long; the model reads the rest from the checkout.
 // Judgment, sized to keep the context file well inside one model turn.
 const PATCH_CAP = 20_000;
@@ -58,7 +62,22 @@ export function rounds(issueComments, appId) {
     .map((match) => ({ head: match[1], verdict: match[2], run: match[3] }));
 }
 
-export const countRounds = (issueComments, appId) => rounds(issueComments, appId).length;
+// The lanes App's round markers at the pull request's current commits
+// (`shas`): a marker at a head a recreate or force push replaced is not a round
+// of this pull request. A marker that names no head counts, so a malformed one
+// stops the lane sooner, never later; with no `shas` (a listing that is not the
+// whole pull request), every marker counts.
+export function countRounds(issueComments, appId, shas = null) {
+  const current = Array.isArray(shas) ? new Set(shas) : null;
+  return issueComments
+    .filter((comment) => comment.user?.id === appId)
+    .map((comment) => firstLine(comment.body))
+    .filter((line) => line.startsWith(ROUND_PREFIX))
+    .filter((line) => {
+      const head = ROUND_HEAD.exec(line)?.[1];
+      return head === undefined || current === null || current.has(head);
+    }).length;
+}
 
 // The model job's check run, posted by its report job on the head it gated.
 // It counts a round whose verdict job never ran; a forged one only stops the
@@ -174,7 +193,10 @@ export async function select({ api, pr, headSha, appId, dependabotId, config = n
   }
   const comments = await api.listIssueComments(pr);
   const checkRuns = await Promise.all(commits.map((commit) => api.listCheckRuns(commit.sha, MODEL_CHECK)));
-  const done = Math.max(countRounds(comments, appId), countCheckRounds(checkRuns));
+  // The commits listing stops at 250: a partial one cannot show a head is gone.
+  const whole = commits.length === pull.commits && commits.at(-1)?.sha === headSha;
+  const shas = whole ? commits.map((commit) => commit.sha) : null;
+  const done = Math.max(countRounds(comments, appId, shas), countCheckRounds(checkRuns));
   if (done >= maxRounds) {
     return { decision: "escalate", escalationReason: "dependency-round-cap", rounds: done, classification };
   }
@@ -248,11 +270,47 @@ export function maxRoundsFrom(value) {
   return value === undefined || value === "" ? DEFAULT_MAX_ROUNDS : positive(value, "DEPENDENCY_REVIEW_ROUNDS");
 }
 
-export async function main(argv, env, { api, log = (line) => console.log(line), provenance } = {}) {
+// The run fields the verdict job reads, all decided here before any model
+// turn: no field comes from the model or its runner.
+export function contextRun({ pr, headSha, classification, file, config, startedAt }) {
+  return {
+    version: 1,
+    pr,
+    head_sha: headSha,
+    security: classification?.security === true,
+    config_unreadable: (classification?.reasons ?? []).includes("dependabot-config-unreadable"),
+    files_truncated: file?.files_truncated === true,
+    started_at: startedAt,
+    // Each matched review-only entry's control, which a merge verdict must quote.
+    controls: reviewControls(classification),
+    // The base config's [ecosystem, directory] pairs; an unreadable config is [].
+    config: config ?? [],
+  };
+}
+
+// `date -u +%Y-%m-%dT%H:%M:%SZ`'s shape, which the verdict job requires.
+const utcSeconds = (date) => date.toISOString().replace(/\.\d{3}Z$/, "Z");
+
+export async function main(argv, env, { api, log = (line) => console.log(line), provenance, now = () => new Date() } = {}) {
   if (argv[0] !== "select") {
     throw new Error("usage: review-dependency.mjs select");
   }
-  need(env, ["GITHUB_TOKEN", "GITHUB_REPOSITORY", "GITHUB_OUTPUT", "PR_NUMBER", "HEAD_SHA", "APP_SENDER_ID", "TRUSTED_ACTORS", "DEPENDENCY_FILE", "DEPENDABOT_CONFIG", "DEPENDABOT_POLICY"]);
+  need(env, [
+    "GITHUB_TOKEN",
+    "GITHUB_REPOSITORY",
+    "GITHUB_OUTPUT",
+    "PR_NUMBER",
+    "HEAD_SHA",
+    "APP_SENDER_ID",
+    "TRUSTED_ACTORS",
+    "DEPENDENCY_FILE",
+    "CONTEXT_RUN_FILE",
+    "DEPENDABOT_CONFIG",
+    "DEPENDABOT_POLICY",
+  ]);
+  // Before any model turn and before the upload: no lanes App fix commit of
+  // this round is older.
+  const startedAt = utcSeconds(now());
   const pr = positive(env.PR_NUMBER, "PR_NUMBER");
   if (!SHA.test(env.HEAD_SHA)) {
     throw new Error("HEAD_SHA is not a commit id");
@@ -265,6 +323,7 @@ export async function main(argv, env, { api, log = (line) => console.log(line), 
       apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
       graphqlUrl: env.GITHUB_GRAPHQL_URL ?? "https://api.github.com/graphql",
     });
+  const config = readConfig(env.DEPENDABOT_CONFIG, log);
   const result = await select({
     api: client,
     pr,
@@ -273,23 +332,19 @@ export async function main(argv, env, { api, log = (line) => console.log(line), 
     dependabotId: dependabotIdFrom(env.TRUSTED_ACTORS),
     repository: env.GITHUB_REPOSITORY,
     maxRounds: maxRoundsFrom(env.DEPENDENCY_REVIEW_ROUNDS),
-    config: readConfig(env.DEPENDABOT_CONFIG, log),
+    config,
     policy: readPolicy(env.DEPENDABOT_POLICY, log),
     provenance,
   });
   if (result.file) {
     writeFileSync(env.DEPENDENCY_FILE, `${JSON.stringify(result.file, null, 2)}\n`);
+    const run = contextRun({ pr, headSha: env.HEAD_SHA, classification: result.classification, file: result.file, config, startedAt });
+    writeFileSync(env.CONTEXT_RUN_FILE, `${JSON.stringify(run)}\n`);
   }
   const output = (key, value) => appendFileSync(env.GITHUB_OUTPUT, `${key}=${value}\n`);
   output("proceed", String(result.decision === "proceed"));
   output("skip-reason", result.decision === "skip" ? result.skipReason : result.decision === "escalate" ? "awaiting-human" : "");
   output("escalation-reason", result.escalationReason ?? "");
-  output("security", String(result.classification?.security === true));
-  output("config-unreadable", String((result.classification?.reasons ?? []).includes("dependabot-config-unreadable")));
-  output("files-truncated", String(result.file?.files_truncated === true));
-  // Each matched review-only entry's control, which a merge verdict must
-  // quote (apply-dependency-verdict.mjs); JSON keeps it on one line.
-  output("controls", JSON.stringify(reviewControls(result.classification)));
   const gaps = classifierGaps(result.classification?.tier === "review" ? result.classification.reasons : []);
   if (gaps.length) {
     log(`::warning::classifier gap: #${pr} goes to review only because the classifier could not read it (${gaps.join(", ")}); fix the classifier, not the pull request`);

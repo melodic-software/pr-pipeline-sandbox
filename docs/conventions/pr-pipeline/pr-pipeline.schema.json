@@ -99,7 +99,7 @@
           "minimum": 1,
           "maximum": 10,
           "default": 3,
-          "description": "Limit stops on one PR head after which the pr-unblock dispatchers stop dispatching it again."
+          "description": "Limit stops on one PR head after which the pr-unblock dispatchers stop dispatching it again; also the failed resolve-conflicts runs, and the failed or not-applicable fix-ci runs across base moves, one head gets."
         },
         "limit-stops-per-issue": {
           "type": "integer",
@@ -136,26 +136,26 @@
           "default": 1,
           "description": "Further fix-ci dispatches on one PR head after its first fix-ci run ended in failure."
         },
-        "admission-window-hours": {
+        "fix-docs-per-run": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 720,
-          "default": 24,
-          "description": "Hours of issue-lane admissions the admitted backlog (open issues labeled agent-ready) may hold before new agent-ready labels pause. Admissions are open while that backlog is under the admission factor times lane merges per hour times this window."
+          "maximum": 20,
+          "default": 2,
+          "description": "fix-docs dispatches one pr-unblock-dispatch run sends at most."
         },
         "admission-factor": {
           "type": "number",
           "exclusiveMinimum": 0,
           "maximum": 1,
           "default": 0.8,
-          "description": "Share of the issue lane's hourly merge rate (lanes App PRs merged in the last 24 hours, divided by 24) admitted per hour. The release point is this factor times hourly merges times admission-window-hours."
+          "description": "Share of the issue lane's merge rate (lanes App PRs merged per hour over wip.merge-rate-window-hours) admitted per hour. The queued cap is the larger of this share and admission-min-per-hour, times wip.merge-rate-window-hours."
         },
         "admission-min-per-hour": {
           "type": "number",
           "minimum": 0,
           "maximum": 100,
           "default": 1,
-          "description": "Admissions per hour the release point never falls below: it is at least this rate times admission-window-hours, so a day with no lane merges cannot hold admissions shut. 0 removes the floor."
+          "description": "Admissions per hour the queued cap never falls below: it is at least this rate times wip.merge-rate-window-hours, so a day with no lane merges cannot hold admissions shut. 0 removes the floor."
         }
       }
     },
@@ -244,6 +244,46 @@
           "maximum": 45,
           "default": 40,
           "description": "Minutes the report waits for the one re-run of a red full run to finish; a run with no finished re-run is not confirmed red."
+        },
+        "remedy": {
+          "type": "string",
+          "enum": ["rollback", "fail-forward"],
+          "default": "rollback",
+          "description": "How a pinned culprit is repaired. rollback: the revert rule decides who reverts it. fail-forward: no revert is planned, and a person or a fix pull request repairs main."
+        }
+      }
+    },
+    "adoption": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The lanes adopt every trusted-actor-list account's non-draft pull requests, a person's once idle: fix-ci fixes a failed ci-status, and pr-merge merges under its usual gates. Absent: none. Contract: README.md, Adoption.",
+      "properties": {
+        "idle-hours": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 720,
+          "description": "Hours both a person's pull request (its last update) and its head commit (its committer date) must be unchanged before it is adopted. Absent: nothing is adopted."
+        },
+        "spec-from-body-apps": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 1 },
+          "default": [],
+          "description": "App account ids whose pull request bodies a script writes: an adopted one that closes no issue is judged against its title and body, as a person's is. Any other App needs a closing issue a trusted person wrote."
+        }
+      }
+    },
+    "branch-cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The scheduled branch cleanup: how many branches it deletes in one run. Contract: README.md, Branch cleanup.",
+      "properties": {
+        "max-deletes-per-run": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 25,
+          "description": "Branches one run deletes at most; the rest wait for the next run. 0 deletes none."
         }
       }
     },
@@ -327,11 +367,6 @@
             }
           }
         },
-        "labeled-after": {
-          "type": "string",
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
-          "description": "An issues lane's cutover, a UTC time such as 2026-10-20T00:00:00Z: matches only an issue labeled after it. Off an issues event it cannot be decided and fails the run."
-        },
         "events": {
           "type": "array",
           "minItems": 1,
@@ -366,7 +401,10 @@
         "split-required",
         "research-first",
         "probe-first",
-        "workflow-modified"
+        "workflow-modified",
+        "rung-up",
+        "no-model-turn",
+        "clean-merge"
       ],
       "description": "The one reason a skipped activity's neutral check carries. Not used by the config file; the runner and check-run reporter validate reasons against it. Meaning: README.md, Outputs and skips."
     },
@@ -443,11 +481,25 @@
         "properties": { "reads-untrusted": { "const": true } },
         "$ref": "#/$defs/edit-runner"
       },
+      "allOf": [
+        {
+          "if": { "required": ["effect", "prepare"], "properties": { "effect": { "const": "read" }, "prepare": { "enum": ["ci-context", "review-threads", "merge-base"] } } },
+          "then": { "required": ["applied-by"], "properties": { "applied-by": { "required": ["patch"] } } }
+        },
+        {
+          "if": { "required": ["effect", "prepare"], "properties": { "effect": { "const": "read" }, "prepare": { "const": "review-threads" } } },
+          "then": { "properties": { "applied-by": { "required": ["feedback-replies"] } } }
+        },
+        {
+          "if": { "required": ["effect", "prepare"], "properties": { "effect": { "const": "read" }, "prepare": { "const": "dependency-review" } } },
+          "then": { "required": ["applied-by"], "properties": { "applied-by": { "required": ["patch", "dependency-verdict"] } } }
+        }
+      ],
       "properties": {
         "skill": { "$ref": "#/$defs/skill" },
         "prepare": {
           "enum": ["merge-base", "review-threads", "dependency-review", "ci-context", "apply-patch"],
-          "description": "What the runner does around the activity (README.md, Activities; pr-run-activity.md, the prepare sections). apply-patch is the one mode for a script, a mutate-branch one; the others run around a skill. ci-context needs effect read and hands its change on as a patch; merge-base, review-threads and dependency-review need an effect other than read until their activity hands its change on as a patch. ci-context: download the failing-check context file a base job wrote, check its SHA-256 and head, make it read-only and name it to the skill, which also gets Bash, Edit and Write. apply-patch: check the patch artifact a producer left (one patch.diff with its SHA-256, on the head it worked on), apply it to the gated head, and push it as one commit without force; patch-rules.json registers the rules each producer's patch is to be held to (README.md, Patch rules). merge-base: merge the base tip without committing before the skill, then commit with the gated head and the base tip as parents. review-threads: before any model turn, keep the PR's unresolved reviewer-bot threads on a reviewed head and escalate on a .github/** diff or the round cap; give the skill the review-thread tool; after it, upload the replies it recorded for a script job to validate and post. dependency-review: before any model turn, skip a PR Dependabot did not open or one sorted auto, and escalate on the round cap; give the skill a read-only context file and a verdict schema for its structured output; after it, upload the verdict for a script job to validate and act on."
+          "description": "What the runner does around the activity (README.md, Activities; pr-run-activity.md, the prepare sections). apply-patch is the one mode for a script, a mutate-branch one; the others run around a skill. ci-context needs effect read and hands its change on as a patch; merge-base, review-threads and dependency-review need an effect other than read unless their activity hands its change on as a patch, review-threads with effect read also hands on its replies (applied-by.feedback-replies), and dependency-review with effect read its verdict (applied-by.dependency-verdict). ci-context: download the failing-check context file a base job wrote, check its SHA-256 and head, make it read-only and name it to the skill, which also gets Bash, Edit and Write. apply-patch: check the patch artifact a producer left (one patch.diff with its SHA-256, on the head it worked on), apply it to the gated head, and push it as one commit without force; patch-rules.json registers the rules each producer's patch is to be held to (README.md, Patch rules). merge-base: merge the base tip without committing before the skill, then commit with the gated head and the base tip as parents (with effect read, a base job of the caller merges first and decides, the read runner merges the same base again and hands the skill's resolutions on as a patch measured from the conflict tree, and a prepare: apply-patch script commits the merge). review-threads: before any model turn, keep the PR's unresolved reviewer-bot threads on a reviewed head and escalate on a .github/** diff or the round cap (on the read runner, a base job of the caller does this and the runner checks its thread file); give the skill the review-thread tool; after it, upload the replies it recorded for a script job to validate and post. dependency-review: before any model turn, skip a PR Dependabot did not open or one sorted auto, and escalate on the round cap (on the read runner, a base job of the caller does this and the runner checks its context file); give the skill a read-only context file and a verdict schema for its structured output; after it, upload the verdict for a script job to validate and act on, and the fix as a patch a prepare: apply-patch script pushes only on a fix verdict."
         },
         "applied-by": {
           "type": "object",
@@ -625,7 +677,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["fields", "sizes", "complexity", "uncertainty"],
-      "description": "The budget of a skill activity with input issue, from the issue's Size, Complexity and Uncertainty org issue fields, read by field and option id. A field with no value, or whose latest setter is neither a listed human nor the lanes App, is not assessed and skips the activity with not-assessed; an option no entry maps fails the resolve. The turn cap is the size's base-turns times the complexity factor, rounded up, and replaces the profile's max-turns (README.md, Models).",
+      "description": "The budget of a skill activity with input issue, from the issue's Size, Complexity and Uncertainty org issue fields, read by field and option id. A field with no value, or whose latest setter is neither a listed human nor the lanes App, reads as size small, complexity medium or uncertainty known, which the tables must define; an option no entry maps fails the resolve. The turn cap is the size's base-turns times the complexity factor, rounded up, and replaces the profile's max-turns (README.md, Models).",
       "properties": {
         "fields": {
           "type": "object",
@@ -674,6 +726,12 @@
           "propertyNames": { "$ref": "#/$defs/name" },
           "additionalProperties": { "enum": ["run", "research-first", "probe-first"] },
           "description": "Uncertainty -> run, or the skip reason that sends the issue to research or a probe first."
+        },
+        "complexity-profiles": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/name" },
+          "additionalProperties": { "$ref": "#/$defs/name" },
+          "description": "Complexity -> the profile the run starts on, in place of its route's; a key is a key of complexity, a value a key of profiles. A complexity with no entry keeps the route's profile. The dimensions' turn cap still applies (README.md, Models)."
         }
       }
     },
@@ -738,6 +796,10 @@
           "type": "integer",
           "minimum": 1,
           "description": "Turn budget, passed as --max-turns."
+        },
+        "escalate-to": {
+          "$ref": "#/$defs/name",
+          "description": "The profile one model rung up, a key of profiles, which a run resolved at model-rung 1 takes in place of this one. A run climbs at most one rung (README.md, Models)."
         }
       }
     },
@@ -801,6 +863,11 @@
           "default": false,
           "description": "true: the merge authority reports each decision and writes nothing (no enqueue, dequeue or comment). The pr-merge lane starts true; the owner sets false to let it merge (README.md, Merge authority)."
         },
+        "lane-prs": {
+          "enum": ["native", "gate"],
+          "default": "native",
+          "description": "How the agent identity's own pull requests merge. native: GitHub's auto-merge, armed by the enable-auto-merge activity and gated by ci-status; the pr-merge gate does not list, score or enqueue them. gate: the pr-merge gate lists, scores and enqueues them as well (README.md, Native auto-merge)."
+        },
         "require-verifier-verdict": {
           "type": "boolean",
           "default": false,
@@ -816,6 +883,16 @@
           "type": "integer",
           "minimum": 1,
           "description": "Minutes the pr-merge workflow's gate loop runs before it starts no further candidate. The candidate in progress finishes, so no gate stops between its check and its enqueue; the next run starts after the last candidate reached. Keep it below the merge job's timeout-minutes less the longest single candidate. Absent: no budget."
+        },
+        "gate-candidate-minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Minutes one candidate's gate may spend in its read phases (the merge policy, then the verdict). Past it the gate starts no further read command and reports the candidate unknown (exit 11, reason unknown:candidate-deadline), never ready; no write is bounded, so none is cut short. The loop goes on to the next candidate within gate-budget-minutes. The first candidate a run stops is gated first in the next run under gate-deferred-minutes, so one that always runs past it still gets a longer gate. Absent: no limit."
+        },
+        "gate-deferred-minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Minutes the gate may read for the candidate the last run deferred at gate-candidate-minutes, gated first in its run; writes are never bounded, as there. A candidate stopped at this ceiling gets a warning annotation and goes back to the capped rotation, never deferred again. Keep it below the merge job's timeout-minutes less the closing steps. Absent: no limit."
         },
         "skip-unchanged": {
           "type": "object",
@@ -843,6 +920,13 @@
           "default": 2,
           "description": "Merge-queue removals for failed checks since the pull request's head last changed (a pushed commit or a force push) at which the unattended merge gate stops enqueuing that head: the queue would eject it again on the same commits. A push resets the count."
         },
+        "quarantine-days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30,
+          "default": 7,
+          "description": "Days a quarantine issue excuses its suite's failures outside the merges' affected set from post-merge demotion, counted from when it was filed (README.md, The local babysit lane, Quarantined suites). At most 30, so a flaky suite goes no more than a month without its failures demoting again (judgment) and the date arithmetic stays in range; any other value is 7."
+        },
         "max-verify-fails": {
           "type": "integer",
           "minimum": 1,
@@ -862,9 +946,9 @@
           "description": "Git pathspecs of files the pull request checks read but a pull request rarely changes (a registry, an allowlist). When the base changed one since a pull request's merge base, the unattended merge gate updates its branch from the base (a merge, never a rebase) instead of enqueuing it, and enqueues the new head once its checks pass. `scripts/shared-copies.txt` counts only for a pull request whose own changes touch a path it registers. Empty or absent: nothing is updated."
         },
         "verify-authors": {
-          "enum": ["lane", "any"],
+          "enum": ["lane", "lane-or-owner", "any"],
           "default": "lane",
-          "description": "Whose pull requests pr-verify.yml judges. lane: only those the lanes App (agent-identity, a Bot account) opened; any: every author's. The resolver skips on any other value (README.md, Verifier verdict)."
+          "description": "Whose pull requests pr-verify.yml judges. lane: only those the lanes App (agent-identity, a Bot account) opened; lane-or-owner: those and the owner account's (a User matched by account id), whose idle pull requests the pr-merge lane adopts; any: every author's. The resolver skips on any other value (README.md, Verifier verdict)."
         },
         "agent-identity": {
           "type": "string",
@@ -896,17 +980,7 @@
             "high-path-floor": {
               "type": "boolean",
               "default": false,
-              "description": "true scores a diff touching the risk scorer's fixed HIGH path floor or floor-paths HIGH, as it does a SKILL.md, agents/**/*.md or commands/**/*.md file whose head text, compared with its base text, gains or changes hooks, allowed-tools, tools, permissionMode, mcpServers, memory or another capability key babysit_risk.py lists in its frontmatter, adds or changes a ! backtick command, gains a ```! block, changes a line inside a ```! block, or cannot be read, and a script file in floor-script-scopes HIGH. Absent or false: only denied-paths count. The local babysit lane keeps the rest of the fixed floor, but false also leaves out floor-paths, floor-script-scopes, the capability check and the plugin monitors and workflows floor entries there."
-            },
-            "floor-paths": {
-              "type": "array",
-              "items": { "type": "string", "minLength": 1 },
-              "description": "Globs joined to the risk scorer's HIGH path floor while it applies: a diff touching one scores HIGH and waits for a human, where a denied path makes the pull request ineligible. They add to the fixed floor, never replace it. A glob whose last segment other than ** is scripts does not hold a test file (a *.test.mjs, *.test.sh, *.test.js or test_*.py name; a tests or fixtures directory alone is not one) under no declared path and named by no other changed file."
-            },
-            "floor-script-scopes": {
-              "type": "array",
-              "items": { "type": "string", "minLength": 1 },
-              "description": "Globs inside which, as at the repository top level, a .ps1 or .cjs file, or a file with git mode 100755, scores HIGH while the floor applies and waits for a human. Outside the top level, a test file (a *.test.mjs, *.test.sh, *.test.js or test_*.py name; a tests or fixtures directory alone is not one) under no declared path and named by no other changed file is exempt."
+              "description": "true scores a diff touching the risk scorer's fixed HIGH path floor (the trusted-actor list, the trusted-trigger check, code owners, submodules and resolve-config) HIGH, as it does a plugin or marketplace manifest change that installs or runs something new. Absent or false: only denied-paths count. The local babysit lane always applies the floor."
             },
             "c2-contradictions": {
               "type": "boolean",

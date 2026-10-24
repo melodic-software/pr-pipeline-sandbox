@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { inThreadScope, isProtectedPath } from "./thread-scope.mjs";
+import { inThreadScope, isProtectedPath, prPathsOf } from "./thread-scope.mjs";
 
 const kept = new Set(["plugins/p/evals/c/graders/x.md", "src/a.js"]);
 
@@ -44,22 +44,34 @@ test("the four recorded trips are in scope", () => {
   }
 });
 
-test("hooks, manifests, agent rules and non-test code in the same plugin are refused", () => {
+test("permission config and non-test code in the same plugin are refused", () => {
   const named = new Set(["plugins/p/skills/s/SKILL.md"]);
   for (const path of [
-    "plugins/p/hooks/hooks.json",
-    "plugins/p/hooks/guard.md",
-    "plugins/p/.claude-plugin/plugin.json",
     "plugins/p/scripts/run.sh",
     "plugins/p/skills/s/scripts/helper.py",
     "plugins/p/lib/x.mjs",
     "plugins/p/lib/x.js",
     "plugins/p/lib/x.ts",
     "plugins/p/lib/X.SH",
+    "plugins/p/.claude/settings.json",
+    "plugins/p/package.json",
+  ]) {
+    assert.equal(inThreadScope(path, named), false, path);
+  }
+});
+
+test("hooks, manifests, agent rules, monitors, bin and MCP config in the same plugin are out of scope", () => {
+  const named = new Set(["plugins/p/skills/s/SKILL.md"]);
+  for (const path of [
+    "plugins/p/hooks/hooks.json",
+    "plugins/p/.claude-plugin/plugin.json",
     "plugins/p/AGENTS.md",
     "plugins/p/skills/s/CLAUDE.md",
     "plugins/p/.claude/rules/r.md",
-    "plugins/p/.claude/settings.json",
+    "plugins/p/monitors/monitors.json",
+    "plugins/p/bin/tool",
+    "plugins/p/.mcp.json",
+    "plugins/p/.lsp.json",
   ]) {
     assert.equal(inThreadScope(path, named), false, path);
   }
@@ -106,8 +118,14 @@ test("outside plugins/, a test file in another directory, or a same-directory fi
   }
 });
 
-test("a test file under .github/ is refused even beside a kept thread's path there", () => {
-  assert.equal(inThreadScope(".github/scripts/x.test.mjs", new Set([".github/scripts/x.mjs"])), false);
+test("a test file under .github/workflows/ is refused even beside a kept thread's path there", () => {
+  assert.equal(inThreadScope(".github/workflows/x.test.mjs", new Set([".github/workflows/x.mjs"])), false);
+});
+
+test("a kept thread's path under .github/scripts/ and a test file beside it are in scope", () => {
+  const kept = new Set([".github/scripts/x.mjs"]);
+  assert.equal(inThreadScope(".github/scripts/x.mjs", kept), true);
+  assert.equal(inThreadScope(".github/scripts/x.test.mjs", kept), true);
 });
 
 test("a path with an empty, . or .. segment, or a leading /, is refused before any other rule", () => {
@@ -122,16 +140,18 @@ test("a path with an empty, . or .. segment, or a leading /, is refused before a
   }
 });
 
-test(".github/ is refused even when a kept thread names a file there", () => {
-  const github = new Set([".github/workflows/x.yml", ".GitHub/evals/c/a.md"]);
+test(".github/workflows/ is refused even when a kept thread names a file there", () => {
+  const github = new Set([".github/workflows/x.yml", ".GitHub/Workflows/a.yml"]);
   assert.equal(inThreadScope(".github/workflows/x.yml", github), false);
-  assert.equal(inThreadScope(".GitHub/evals/c/b.md", github), false);
-  assert.equal(isProtectedPath(".github"), true);
-  assert.equal(isProtectedPath(".githubx/a"), false);
+  assert.equal(inThreadScope(".GitHub/Workflows/a.yml", github), false);
+  assert.equal(isProtectedPath(".github/workflows"), true);
+  assert.equal(isProtectedPath(".github"), false);
+  assert.equal(isProtectedPath(".github/scripts/x.mjs"), false);
+  assert.equal(isProtectedPath(".github/workflowsx/a"), false);
 });
 
-test("a plugin's .mcp.json, .gitmodules or CODEOWNERS is outside the plugin-wide part of its scope", () => {
-  for (const path of ["plugins/p/.mcp.json", "plugins/p/skills/s/.gitmodules", "plugins/p/CODEOWNERS"]) {
+test("a plugin's .gitmodules, CODEOWNERS or settings file is outside the plugin-wide part of its scope", () => {
+  for (const path of ["plugins/p/skills/s/.gitmodules", "plugins/p/CODEOWNERS", "plugins/p/settings.json"]) {
     assert.equal(inThreadScope(path, kept), false, path);
   }
 });
@@ -156,13 +176,8 @@ test("a named path in another plugin, under .github/, or on an instruction path 
     "plugins/knowledgebase/x.js",
     "src/x.js",
     ".github/workflows/x.yml",
-    "plugins/knowledge/AGENTS.md",
-    "plugins/knowledge/skills/s/claude.md",
-    "plugins/knowledge/hooks/guard.mjs",
-    "plugins/knowledge/Hooks/hooks.json",
-    "plugins/knowledge/.claude-plugin/plugin.json",
     "plugins/knowledge/.claude/settings.json",
-    "plugins/knowledge/.mcp.json",
+    "plugins/knowledge/package-lock.json",
     "plugins/knowledge/.gitmodules",
     "plugins/knowledge/CODEOWNERS",
   ]) {
@@ -191,14 +206,8 @@ test("a named path off normal form or outside plain ASCII is refused", () => {
 // From the security review of #8461: a segment named exactly hooks or
 // .claude, plugin monitors, bin and .lsp.json, more code extensions, and
 // non-ASCII letters JS /i does not fold (U+212A KELVIN SIGN, U+017F LONG S).
-test("instruction segments with no trailing /, plugin monitors, bin and .lsp.json, and more code files are refused", () => {
+test("more code files are refused", () => {
   for (const path of [
-    "plugins/p/hooks",
-    "plugins/p/.claude",
-    "plugins/p/skills/s/.claude-plugin",
-    "plugins/p/monitors/monitors.json",
-    "plugins/p/bin/tool",
-    "plugins/p/.lsp.json",
     "plugins/p/lib/x.cjs",
     "plugins/p/lib/x.mts",
     "plugins/p/lib/x.cts",
@@ -213,5 +222,68 @@ test("instruction segments with no trailing /, plugin monitors, bin and .lsp.jso
 test("a path with a non-ASCII letter is refused, even as a kept thread's own path", () => {
   for (const path of ["plugins/p/hooKs/hooks.json", "plugins/p/AGENTſ.md", "plugins/p/run.ſh", "plugins/p/café.md"]) {
     assert.equal(inThreadScope(path, new Set([...kept, path])), false, path);
+  }
+});
+
+// A finding on a doc whose fix lives in a script the pull request also
+// changes: thread on A, fix in B.
+const DOC = "plugins/p/skills/s/converge.md";
+const SCRIPT = "plugins/p/skills/s/scripts/converge-plan.sh";
+
+test("a file the PR already changes is in every kept thread's scope", () => {
+  const prPaths = new Set(prPathsOf([{ filename: DOC }, { filename: SCRIPT }, { filename: "src/b.js", previous_filename: "src/old.js" }]));
+  for (const path of [SCRIPT, "src/b.js", "src/old.js"]) {
+    assert.equal(inThreadScope(path, new Set([DOC]), [], { prPaths }), true, path);
+  }
+});
+
+test("a file the PR does not change stays outside a thread's scope", () => {
+  const prPaths = new Set([DOC]);
+  assert.equal(inThreadScope(SCRIPT, new Set([DOC]), [], { prPaths }), false);
+  assert.equal(inThreadScope("src/b.js", new Set([DOC]), [], { prPaths }), false);
+});
+
+test("a fix that adds a file the PR lists gets no pr_paths scope", () => {
+  const prPaths = new Set([DOC, SCRIPT, "src/b.js"]);
+  assert.equal(inThreadScope(SCRIPT, new Set([DOC]), [], { prPaths, added: true }), false);
+  assert.equal(inThreadScope("src/b.js", new Set([DOC]), [], { prPaths, added: true }), false);
+  // A new file stays in the thread's own scope as before.
+  assert.equal(inThreadScope("plugins/p/skills/s/new.md", new Set([DOC]), [], { prPaths, added: true }), true);
+});
+
+test("a protected, instruction, HIGH floor or control-plane path the PR changes is refused", () => {
+  const refused = [
+    ".github/workflows/x.yml",
+    ".GitHub/Workflows/x.yml",
+    "CODEOWNERS",
+    ".github/CODEOWNERS",
+    ".gitmodules",
+    "plugins/p/.claude/settings.json",
+    "plugins/p/package.json",
+    ".github/standards/trusted-actors/trusted-actors.json",
+    ".github/actions/check-trusted-trigger/action.yml",
+    ".github/actions/resolve-config/resolve.mjs",
+    ".github/scripts/pr-unblock/thread-scope.mjs",
+    ".github/actions/setup-runner-isolation/action.yml",
+    ".github/standards/runner-policy/x.json",
+    "CLAUDE.md",
+    "plugins/p/AGENTS.md",
+    ".mcp.json",
+    "plugins/p/.lsp.json",
+    ".claude/rules/r.md",
+    "plugins/p/.claude-plugin/plugin.json",
+    "plugins/p/hooks/guard.sh",
+    "plugins/p/monitors/monitors.json",
+    "plugins/p/bin/tool",
+    "a\\b.md",
+    "a b.md",
+    "src/../x.md",
+  ];
+  const listed = refused.map((filename) => ({ filename }));
+  assert.deepEqual(prPathsOf(listed), []);
+  // Even when a thread file lists them, inThreadScope refuses each beside a
+  // thread outside their plugin.
+  for (const path of refused) {
+    assert.equal(inThreadScope(path, new Set(["docs/x.md"]), [], { prPaths: new Set(refused) }), false, path);
   }
 });

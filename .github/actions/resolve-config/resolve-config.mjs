@@ -12,11 +12,11 @@ import {
   createGitHub,
   paginate,
 } from "../check-trusted-trigger/check-trusted-trigger.mjs";
+import { checkPatchRules } from "./patch-rules.mjs";
 import { pipelineEvent } from "./predicate.mjs";
 import {
   checkAppliedBySupported,
   checkConfigPath,
-  checkPatchRules,
   laneHasActivity,
   loadConfig,
   modelArgs,
@@ -152,13 +152,9 @@ async function gatherFacts(
     facts.draft = event.pull_request?.draft ?? (await fetchPull()).draft;
   }
   // An issues event has no PR: labels come from the issue (the payload's, or
-  // read now for labels-absent and admission), and its update time is when it
-  // was labeled.
+  // read now for labels-absent and admission).
   const issue = eventName === "issues" ? event.issue : undefined;
   if (issue !== undefined) {
-    if (needed.includes("labeledAt") && typeof issue.updated_at === "string") {
-      facts.labeledAt = issue.updated_at;
-    }
     if (needed.includes("fieldValues")) {
       // The issue's org field values: REST answers the integer field and
       // option ids the config maps (GraphQL answers only node ids).
@@ -256,6 +252,7 @@ function outputsFor({ lane, selected }) {
     contents: selected.grant.contents,
     "pull-requests": selected.grant["pull-requests"],
     issues: selected.grant.issues,
+    actions: selected.grant.actions ?? "",
     // Only a read grant cannot commit; any other value keeps the signed-commit check.
     "can-commit": String(selected.grant.contents !== "read"),
     ...(selected["applied-by"]?.patch === undefined ? {} : { "applied-by-patch": selected["applied-by"].patch }),
@@ -298,6 +295,10 @@ function filesUnderBase(basePath, configPath, readRules = readOwn) {
   };
 }
 
+// MODEL_RUNG as resolve()'s rung: empty is none, 0 or 1 that rung; anything
+// else is passed on for resolve() to refuse.
+const modelRung = (value) => (value === undefined || value === "" ? undefined : /^[01]$/.test(value) ? Number(value) : value);
+
 // The ResolvedConfig for the request env names, or a throw: a Rejection
 // (with its code) for a config or request the resolver refuses. `event` is the
 // payload; by default it is read from EVENT_PATH. With `absentAsNull`, a valid
@@ -315,6 +316,7 @@ export async function resolveFromBase({ env, github, sleep = wait, event, absent
     configPath,
     basePath,
     pinnedDimensions: env.ISSUE_DIMENSIONS || undefined,
+    rung: modelRung(env.MODEL_RUNG),
   };
   if (absentAsNull && !laneHasActivity(files, request)) {
     return null;
@@ -367,6 +369,22 @@ export function loopFromBase(env) {
   return resolveLoop(filesUnderBase(basePath, configPath), { configPath });
 }
 
+// The base config's `adoption` section as set, after the same file checks as
+// resolve(), for fix-ci-dispatch.mjs, which applies its defaults.
+export function adoptionFromBase(env) {
+  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
+  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  return loadConfig(filesUnderBase(basePath, configPath), { configPath }).adoption ?? {};
+}
+
+// The base config's `models.issue-dimensions` leaf as set, or null, after the
+// same file checks as resolve(), for intake triage's verdict writer.
+export function issueDimensionsFromBase(env) {
+  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
+  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  return loadConfig(filesUnderBase(basePath, configPath), { configPath }).models?.["issue-dimensions"] ?? null;
+}
+
 // The base config's `red-main` leaf as set and `merge.agent-identity`, after
 // the same file checks as resolve(), for the post-merge red-main report. The
 // leaf's defaults have one copy, in
@@ -376,6 +394,23 @@ export function redMainFromBase(env) {
   const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
   const doc = loadConfig(filesUnderBase(basePath, configPath), { configPath });
   return { redMain: doc["red-main"] ?? {}, agentIdentity: doc.merge?.["agent-identity"] ?? "" };
+}
+
+// The hosts the issue lane (resolve-issue) may read, for intake admission:
+// its web-access domains, "any", or [] when web access is off.
+export function issueLaneWebHostsFromBase(env) {
+  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
+  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  const web = loadConfig(filesUnderBase(basePath, configPath), { configPath }).activities?.["resolve-issue"]?.["web-access"];
+  return web?.enabled ? web.domains : [];
+}
+
+// The base config's `branch-cleanup` leaf as set, likewise; its defaults have
+// one copy, in .github/scripts/branch-cleanup/rules.mjs.
+export function branchCleanupFromBase(env) {
+  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
+  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  return loadConfig(filesUnderBase(basePath, configPath), { configPath })["branch-cleanup"] ?? {};
 }
 
 // A run that is no lane activity resolves only its model route.
