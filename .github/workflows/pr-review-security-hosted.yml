@@ -1,7 +1,7 @@
 name: pr-review-security-hosted
 
 # Sandbox caller of the org pr-review-cli reusable, lane `security`, at the
-# pin and hold inputs claude-code-plugins#9361 uses. The job id
+# pin claude-code-plugins#9848 uses and its hold inputs. The job id
 # `pr-review-security` keeps the check `pr-review-security / security-review`,
 # which ci-status's `Require both review lanes on this head` step reads. No
 # resolve-model job: the review runs on the reusable's default model.
@@ -63,9 +63,11 @@ jobs:
     needs: [kill-switch]
     if: ${{ !cancelled() && github.event.pull_request.draft == false && needs.kill-switch.outputs.proceed == 'true' }}
     permissions:
+      actions: read # the reusable's check-key-credit job reads this workflow's
+                    # runs for the key's recent credit stop
       contents: read
       pull-requests: write # the review, its comments, the marker and the hold label
-    uses: melodic-software/ci-workflows/.github/workflows/pr-review-cli.yml@9aca743c4ed9aaf7870288a36586c3994e9321e4 # v0.64.1
+    uses: melodic-software/ci-workflows/.github/workflows/pr-review-cli.yml@4f79cc9244498ae856504cf74aeeb05dcc9c6b43 # v0.65.8
     with:
       lane: security
       publish: comments
@@ -74,6 +76,10 @@ jobs:
         docs/**/*.md
         **/README.md
         **/CHANGELOG.md
+      # A hold adds this label and a `claude-lane-hold` marker comment; ci-status
+      # fails while the label is on. The review holds only for a real-charge
+      # cost or a CRITICAL security finding; hold-paths names the files the
+      # prompt sends to extra security scrutiny and never holds by itself.
       # Keep both lists equal in the two callers.
       hold-label: needs-human
       hold-paths: |
