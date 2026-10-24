@@ -33,6 +33,11 @@ SYNCED=(
   .github/scripts/pr-unblock
   .github/scripts/read-patch
   .github/scripts/work-resolve-issue
+  # Modules the synced scripts and tests import from outside those folders.
+  .github/scripts/intake-triage/admit.mjs
+  .github/scripts/maintenance-reconcile-lost-runs/infra-failure.mjs
+  .github/scripts/pr-merge/merge-holds.mjs
+  .github/scripts/pr-verify/write-verdict.mjs
   .github/standards/dependabot-policy
   .github/standards/github-actions-conventions
   .github/standards/runner-policy
