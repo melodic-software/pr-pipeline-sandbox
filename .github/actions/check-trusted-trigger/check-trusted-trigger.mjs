@@ -22,7 +22,9 @@ const RUN_ID = /^[1-9][0-9]{0,19}$/;
 const RUN_ATTEMPT = /^[1-9][0-9]{0,4}$/;
 // github-actions[bot], the sender of every GITHUB_TOKEN workflow dispatch.
 const ACTIONS_BOT_ID = 41898282;
-const DISPATCHER_EVENTS = new Set(["push", "workflow_dispatch"]);
+// A workflow_dispatch dispatcher must come from a listed human; push and
+// schedule name none.
+const DISPATCHER_EVENTS = new Set(["push", "schedule", "workflow_dispatch"]);
 // The dispatcher dispatches within seconds of starting; a longer run must not
 // keep its window open.
 const WINDOW_MS = 10 * 60 * 1000;
@@ -61,12 +63,122 @@ export class GitHubError extends Error {
   }
 }
 
+// Wraps a fetch so a GET attempt is aborted after attemptTimeoutMs, and a GET
+// that GitHub answers 5xx, answers 200 with an empty body or with JSON that
+// does not parse, or that fails on the network (a timeout, "fetch failed", an
+// error with a cause code) is sent again after 2 s, 4 s and 8 s, each with
+// equal jitter (half fixed, half random). The time failed attempts took plus
+// the waits, summed over every call through one wrapper, is capped at 60 s: a
+// wait past the cap is not taken. With 20 s attempts, retrying adds at most
+// about 80 s to a client, inside the shortest step that runs one (3 minutes,
+// pr-merge.yml's gate-check and clear-escalations). The last answer is
+// returned, or the last error thrown. Only GETs are idempotent; a 4xx is the
+// caller's to handle, a rate limit is request-budget.mjs's, and any other
+// thrown error is raised at once. A retry line names an error's name and cause
+// code only: undici puts a whole header value, the token included, in some
+// messages. createGitHub and budgetedFetch both use it.
+const SERVER_RETRY_DELAYS_MS = [2000, 4000, 8000];
+const SERVER_RETRY_BUDGET_MS = 60_000;
+const ATTEMPT_TIMEOUT_MS = 20_000;
+const networkFailure = (error) =>
+  error?.name === "TimeoutError" ||
+  error?.name === "AbortError" ||
+  (error?.name === "TypeError" && error.message === "fetch failed") ||
+  typeof error?.cause?.code === "string";
+// An error's name and cause code, never its message.
+export const errorLabel = (error) =>
+  [error?.name ?? "Error", typeof error?.cause?.code === "string" ? error.cause.code : null].filter(Boolean).join(" ");
+// A 200 whose body is empty, or is labeled JSON and does not parse: no REST
+// read answers 200 with nothing.
+async function brokenBody(response) {
+  if (response.status !== 200) {
+    return false;
+  }
+  const text = await response.clone().text();
+  if (text === "") {
+    return true;
+  }
+  if (!/json/i.test(response.headers.get("content-type") ?? "")) {
+    return false;
+  }
+  try {
+    JSON.parse(text);
+    return false;
+  } catch {
+    return true;
+  }
+}
+export function retryServerErrors(
+  fetchImpl,
+  {
+    sleep = defaultSleep,
+    random = Math.random,
+    log = (line) => console.log(line),
+    now = () => Date.now(),
+    attemptTimeoutMs = ATTEMPT_TIMEOUT_MS,
+  } = {},
+) {
+  let spent = 0;
+  return async function send(url, init = {}) {
+    const method = init.method ?? "GET";
+    for (let attempt = 0; ; attempt += 1) {
+      // Only a GET is timed out: a write GitHub accepted slowly must not look
+      // failed, so writes keep only the caller's signal.
+      const timeout = method === "GET" ? AbortSignal.timeout(attemptTimeoutMs) : undefined;
+      const signal = timeout && init.signal ? AbortSignal.any([init.signal, timeout]) : (timeout ?? init.signal);
+      const started = now();
+      let response;
+      let error;
+      let broken = false;
+      try {
+        response = await fetchImpl(url, { ...init, signal });
+        broken = method === "GET" && (await brokenBody(response));
+      } catch (thrown) {
+        error = thrown;
+      }
+      const failed = error !== undefined ? networkFailure(error) && !init.signal?.aborted : response.status >= 500 || broken;
+      spent += failed ? now() - started : 0;
+      const delay = SERVER_RETRY_DELAYS_MS[attempt];
+      const wait = delay === undefined ? 0 : Math.round(delay / 2 + (random() * delay) / 2);
+      if (!failed || method !== "GET" || delay === undefined || spent + wait > SERVER_RETRY_BUDGET_MS) {
+        if (error !== undefined) {
+          throw error;
+        }
+        return response;
+      }
+      await response?.body?.cancel().catch(() => {});
+      const what =
+        error !== undefined
+          ? `failed (${errorLabel(error)})`
+          : broken
+            ? `answered ${response.status} with an empty or unparsable body`
+            : `answered ${response.status}`;
+      log(`::warning::GET ${url} ${what}; sending it again in ${wait} ms (retry ${attempt + 1} of ${SERVER_RETRY_DELAYS_MS.length})`);
+      spent += wait;
+      await sleep(wait);
+    }
+  };
+}
+
 // One function every API read and write goes through; tests replace it.
 // keepGraphQLErrors returns a GraphQL answer with its errors for the caller to
-// judge, instead of raising on any.
-export function createGitHub({ token, apiUrl = "https://api.github.com", fetchImpl = fetch, onResponse, keepGraphQLErrors = false }) {
-  return async function github(method, apiPath, body, headers = {}) {
-    const response = await fetchImpl(`${apiUrl}${apiPath}`, {
+// judge, instead of raising on any. A GET answered 5xx is sent again
+// (retryServerErrors).
+export function createGitHub({
+  token,
+  apiUrl = "https://api.github.com",
+  fetchImpl = fetch,
+  onResponse,
+  keepGraphQLErrors = false,
+  sleep,
+  random,
+  log,
+  now,
+  attemptTimeoutMs,
+}) {
+  const send = retryServerErrors(fetchImpl, { sleep, random, log, now, attemptTimeoutMs });
+  return async function github(method, apiPath, body, headers = {}, { signal } = {}) {
+    const response = await send(`${apiUrl}${apiPath}`, {
       method,
       headers: {
         Accept: "application/vnd.github+json",
@@ -76,6 +188,7 @@ export function createGitHub({ token, apiUrl = "https://api.github.com", fetchIm
         ...headers,
       },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     });
     onResponse?.(response);
     if (!response.ok) {
@@ -92,6 +205,129 @@ export function createGitHub({ token, apiUrl = "https://api.github.com", fetchIm
     }
     return json;
   };
+}
+
+// A commit's pull requests through GraphQL, for when GET
+// /commits/{sha}/pulls still fails after retryServerErrors (it answered 200
+// with an empty body while this query read the PR, 2026-10-22). Both list the
+// same set: the PR that merged the commit, plus open ones while it is off the
+// default branch. commitPullsFromGraphQL maps the answer to the REST fields
+// the lane scripts read; more than 100 PRs or labels is a failed read.
+export const COMMIT_PULLS_QUERY = `query($owner: String!, $name: String!, $oid: GitObjectID!) {
+  repository(owner: $owner, name: $name) {
+    object(oid: $oid) {
+      ... on Commit {
+        associatedPullRequests(first: 100) {
+          pageInfo { hasNextPage }
+          nodes {
+            number state isDraft headRefName headRefOid baseRefName baseRefOid
+            headRepository { nameWithOwner }
+            author { __typename login ... on User { databaseId } ... on Bot { databaseId } }
+            labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+export function commitPullsFromGraphQL(data) {
+  const list = data?.repository?.object?.associatedPullRequests;
+  if (
+    !Array.isArray(list?.nodes) ||
+    list.pageInfo?.hasNextPage !== false ||
+    list.nodes.some((node) => !Array.isArray(node?.labels?.nodes) || node.labels.pageInfo?.hasNextPage !== false)
+  ) {
+    throw new Error("the commit's pull requests could not be read through GraphQL");
+  }
+  return list.nodes.map((node) => ({
+    number: node.number,
+    state: node.state === "OPEN" ? "open" : "closed",
+    draft: node.isDraft,
+    // REST spells an App's login `app[bot]`; GraphQL spells it `app`.
+    user: node.author
+      ? {
+          id: node.author.databaseId ?? null,
+          login: node.author.__typename === "Bot" ? `${node.author.login}[bot]` : node.author.login,
+          type: node.author.__typename,
+        }
+      : null,
+    labels: node.labels.nodes.map((label) => ({ name: label.name })),
+    head: { sha: node.headRefOid, ref: node.headRefName, repo: node.headRepository ? { full_name: node.headRepository.nameWithOwner } : null },
+    base: { ref: node.baseRefName, sha: node.baseRefOid },
+  }));
+}
+
+// The commit's pull requests: readRest's list, else COMMIT_PULLS_QUERY sent
+// through readGraphQL(query, variables), which returns the answer's data.
+// Throws when both fail, or at once on an error readRest marks
+// `fallback: false` (a list too long to read, which GraphQL cannot read
+// either). The query is a read sent as a POST, so readGraphQL gets a signal
+// that aborts it after timeoutMs, as a GET attempt is.
+export async function commitPulls({
+  repository,
+  sha,
+  readRest,
+  readGraphQL,
+  log = (line) => console.log(line),
+  timeoutMs = ATTEMPT_TIMEOUT_MS,
+}) {
+  try {
+    const pulls = await readRest();
+    if (Array.isArray(pulls)) {
+      return pulls;
+    }
+    throw new Error("the answer is not a list");
+  } catch (error) {
+    if (error?.fallback === false) {
+      throw error;
+    }
+    log(`::warning::the REST read of ${sha}'s pull requests failed (${errorLabel(error)}${Number.isInteger(error?.status) ? ` ${error.status}` : ""}); reading them through GraphQL`);
+    const [owner, name] = repository.split("/");
+    return commitPullsFromGraphQL(await readGraphQL(COMMIT_PULLS_QUERY, { owner, name, oid: sha }, AbortSignal.timeout(timeoutMs)));
+  }
+}
+
+// readGraphQL for a createGitHub client.
+export const graphQLReader = (github) => async (query, variables, signal) =>
+  (await github("POST", "/graphql", { query, variables }, {}, { signal }))?.data;
+
+// Whether a close counts: (a) a listed human made it, matched by id; or (b) a
+// merge in this repository closed it: the `closer` GraphQL gives the issue's
+// last ClosedEvent is a merged pull request or a commit here, whoever merged
+// it. The REST close event carries no link to the pull request, so GraphQL
+// is the read. Any
+// other close, such as a workflow's GITHUB_TOKEN or an outside author closing
+// their own issue, counts for nothing.
+const CLOSER_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      timelineItems(itemTypes: CLOSED_EVENT, last: 1) {
+        nodes { ... on ClosedEvent { closer {
+          __typename
+          ... on PullRequest { merged repository { nameWithOwner } }
+          ... on Commit { repository { nameWithOwner } }
+        } } }
+      }
+    }
+  }
+}`;
+export async function isTrustedClose(github, repo, closedIssue, humans) {
+  const closer = closedIssue?.closed_by;
+  if (humans.has(closer?.id)) {
+    return true;
+  }
+  if (closedIssue?.state !== "closed" || !/^[1-9][0-9]{0,9}$/.test(String(closedIssue.number))) {
+    return false;
+  }
+  const [owner, name] = repo.split("/");
+  const answer = await github("POST", "/graphql", {
+    query: CLOSER_QUERY,
+    variables: { owner, name, number: Number(closedIssue.number) },
+  });
+  const by = answer?.data?.repository?.issue?.timelineItems?.nodes?.at(-1)?.closer;
+  const here = String(by?.repository?.nameWithOwner ?? "").toLowerCase() === repo.toLowerCase();
+  return here && (by.__typename === "Commit" || (by.__typename === "PullRequest" && by.merged === true));
 }
 
 // Reads every page of a list endpoint (100 per page).
@@ -230,13 +466,19 @@ async function fetchPull(github, repository, number, sleep) {
 
 // The PR a workflow_run belongs to. An empty `pull_requests` array is not a
 // fork signal, so the PR is always looked up from the run's head SHA.
-async function resolveRunPull(github, repository, run) {
+async function resolveRunPull(github, repository, run, attemptTimeoutMs) {
   if (!/^[0-9a-f]{40}$/.test(run.head_sha ?? "")) {
     throw new Stop("no-pr");
   }
   let pulls;
   try {
-    pulls = await github("GET", `/repos/${repository}/commits/${run.head_sha}/pulls`);
+    pulls = await commitPulls({
+      repository,
+      sha: run.head_sha,
+      readRest: () => github("GET", `/repos/${repository}/commits/${run.head_sha}/pulls`),
+      readGraphQL: graphQLReader(github),
+      timeoutMs: attemptTimeoutMs,
+    });
   } catch {
     throw new Stop("no-pr");
   }
@@ -389,8 +631,8 @@ async function requireRecorded({ github, repository, dispatcherRunId, runId, via
 
 // A dispatch sent by github-actions[bot] names no human, so it is trusted only
 // through the dispatcher run it names: that workflow, on the default branch,
-// started by a push or a listed human, its head SHA an ancestor of the branch
-// tip, a re-run attempt started by a listed human, its record listing this
+// started by a push, a schedule or a listed human, its head SHA an ancestor
+// of the branch tip, a re-run attempt started by a listed human, its record listing this
 // run, and this run, the dispatched workflow on the default branch, created
 // between the dispatcher run's start and the earlier of its last update and
 // WINDOW_MS after its start. A dispatcher started by workflow_run must be
@@ -451,7 +693,7 @@ async function verifyDispatcher({
     dispatcher.head_branch === defaultBranch &&
     (viaRun ||
       (DISPATCHER_EVENTS.has(dispatcher.event) &&
-        (dispatcher.event === "push" || isListedHuman(dispatcher.actor)))) &&
+        (dispatcher.event !== "workflow_dispatch" || isListedHuman(dispatcher.actor)))) &&
     SHA.test(dispatcher.head_sha ?? "") &&
     Number.isInteger(attempt) &&
     attempt >= 1 &&
@@ -546,8 +788,9 @@ function checkDispatchedRerunner({ ids }, deniedIds, own) {
 }
 
 // A re-run github-actions[bot] started names no human, so it is trusted only
-// as the lost-run reconciler's re-run of this run: this run's attempt
-// RERUN_ATTEMPT, started by github-actions[bot], and an unexpired
+// as the lost-run reconciler's re-run of runId, this run or the upstream run a
+// workflow_run event names: its attempt RERUN_ATTEMPT, started by
+// github-actions[bot], and an unexpired
 // rerunRecordName artifact, created no later than that attempt started, of a
 // reconcilerWorkflow run in this repository on the default branch, started by
 // its schedule or a listed human's dispatch, any re-run of it by a listed
@@ -555,10 +798,10 @@ function checkDispatchedRerunner({ ids }, deniedIds, own) {
 // started between that run's start and WINDOW_MS after it. A run id names one
 // run and its second attempt starts once, so a record vouches for one attempt.
 // The reconciler uploads the record before it re-runs; one more read follows
-// RECORD_WAIT_MS for any lag in the artifact list. Every refusal is
-// untrusted-rerunner, as for an unlisted re-runner.
-async function verifyReconcilerRerun({ github, repository, event, list, deniedIds, reconcilerWorkflow, runId, runAttempt, sleep }) {
-  const refuse = "untrusted-rerunner";
+// RECORD_WAIT_MS for any lag in the artifact list. Every refusal is refuse:
+// untrusted-rerunner for this run, as for an unlisted re-runner, and
+// untrusted-actor for an upstream run, as for an unlisted actor.
+async function verifyReconcilerRerun({ github, repository, event, list, deniedIds, reconcilerWorkflow, runId, runAttempt, sleep, refuse = "untrusted-rerunner" }) {
   const defaultBranch = event.repository?.default_branch;
   if (
     deniedIds.has(ACTIONS_BOT_ID) ||
@@ -725,6 +968,7 @@ export async function evaluateTrigger({
   dispatchedWorkflow = "",
   github,
   sleep = defaultSleep,
+  attemptTimeoutMs,
 }) {
   const { ids } = list;
   if (typeof repository !== "string" || !repository.includes("/")) {
@@ -757,7 +1001,7 @@ export async function evaluateTrigger({
       throw new Stop("fork");
     }
     actors = [event.sender, run.actor, run.triggering_actor];
-    pull = await resolveRunPull(github, repository, run);
+    pull = await resolveRunPull(github, repository, run, attemptTimeoutMs);
   } else {
     throw new Stop("no-pr");
   }
@@ -770,6 +1014,12 @@ export async function evaluateTrigger({
     !SHA.test(pull.base?.sha ?? "")
   ) {
     throw new Stop("no-pr");
+  }
+  // Lanes read the list and scripts from the base, so only the default branch
+  // is a trusted one; a payload without it cannot prove the base.
+  const defaultBranch = event.repository?.default_branch;
+  if (typeof defaultBranch !== "string" || !HEAD_REF.test(defaultBranch) || pull.base.ref !== defaultBranch) {
+    throw new Stop("untrusted-base");
   }
   if (actors.some((actor) => Number.isInteger(actor?.id) && deniedIds.has(actor.id))) {
     throw new Stop("bot-actor");
@@ -800,8 +1050,31 @@ export async function evaluateTrigger({
   } else if (expectedUpstreamHead !== "") {
     throw new Stop("untrusted-actor");
   } else {
-    if (!actors.every((actor) => isListed(ids, actor))) {
+    // A CI run the reconciler re-ran is started by github-actions[bot] at
+    // attempt RERUN_ATTEMPT; that actor is vouched for only by its record, and
+    // every other actor must still be listed.
+    const upstream = eventName === "workflow_run" ? event.workflow_run : undefined;
+    const upstreamRerun =
+      reconcilerWorkflow !== "" &&
+      upstream?.triggering_actor?.id === ACTIONS_BOT_ID &&
+      upstream.run_attempt === RERUN_ATTEMPT;
+    const vouched = upstreamRerun ? [event.sender, upstream.actor] : actors;
+    if (!vouched.every((actor) => isListed(ids, actor))) {
       throw new Stop("untrusted-actor");
+    }
+    if (upstreamRerun) {
+      await verifyReconcilerRerun({
+        github,
+        repository,
+        event,
+        list,
+        deniedIds,
+        reconcilerWorkflow,
+        runId: String(upstream.id),
+        runAttempt: String(RERUN_ATTEMPT),
+        sleep,
+        refuse: "untrusted-actor",
+      });
     }
     if (reconcilerWorkflow !== "" && String(triggeringActor).toLowerCase() === "github-actions[bot]") {
       await verifyReconcilerRerun({ github, repository, event, list, deniedIds, reconcilerWorkflow, runId, runAttempt, sleep });
@@ -833,7 +1106,7 @@ function stopped(reason) {
   };
 }
 
-export async function main({ env = process.env, github, sleep = defaultSleep } = {}) {
+export async function main({ env = process.env, github, sleep = defaultSleep, attemptTimeoutMs } = {}) {
   let result;
   try {
     let list;
@@ -873,6 +1146,7 @@ export async function main({ env = process.env, github, sleep = defaultSleep } =
       reconcilerWorkflow: env.RECONCILER_WORKFLOW ?? "",
       github: github ?? createGitHub({ token: env.GITHUB_TOKEN, apiUrl: env.GITHUB_API_URL }),
       sleep,
+      attemptTimeoutMs,
     });
   } catch (error) {
     if (!(error instanceof Stop)) {

@@ -1,71 +1,108 @@
 #!/usr/bin/env node
 // apply-dependency-verdict.mjs: the verdict job of the pr-unblock lane's
-// review-dependency round, a script activity with no model. The model job's
-// runner step recorded the verdict in an artifact; this validates it and acts
-// on it with the lane token (pull-requests and issues write, contents read),
-// adding no judgment of its own.
+// review-dependency round, a script activity with no model. The select job
+// recorded the round's run fields, and the read runner's scan job uploaded the
+// model's verdict after its leak scan; this validates both and acts on them
+// with the lane token (pull-requests and issues write, contents read), adding
+// no judgment of its own.
 //
-//   1. Validates run.json strictly: the bytes the model job's runner wrote
-//      (SHA-256 from that job), its gated head, and the model's structured
-//      verdict, with exactly the template's fields within the limits below.
-//      Anything else escalates dependency-invalid.
+//   1. Validates context.json, the select job's run fields (SHA-256 and head
+//      from that job, which ran no model or head code), and dependency-verdict.json, the
+//      model's structured verdict (SHA-256 from the scan job), each strictly,
+//      with exactly the template's fields within the limits below. Anything
+//      else escalates dependency-invalid. No verdict at all, with the same
+//      call's scan handing on no patch, refusing nothing, and the head still
+//      the select job's, is a round with no model turn: it counts and skips
+//      no-model-turn. A scan that refused an oversize patch escalates
+//      dependency-fix-not-landed.
 //   2. Re-reads the pull request. Closed: nothing, unless it is a close this
 //      job started (its issue or marker is there), which resumes. merge,
 //      close and escalate need the head the model reviewed; a moved head is
 //      superseded and the next dispatcher run reviews the new one. fix needs
 //      only commits GitHub signed for the lanes App during this workflow run
-//      on top of that head, listed whole and touching nothing under .github/
-//      (else dependency-invalid), else dependency-fix-not-landed (no commit)
-//      or superseded (Dependabot rebased, or another commit).
+//      on top of that head, listed whole (else dependency-invalid), each file
+//      only modified, a regular file, an npm or pip manifest or lock file
+//      outside .github/ in a directory the base's dependabot.yml (read here,
+//      never from context.json) lists, and changed only by a version change
+//      (fixRefusal; else dependency-fix-refused), else
+//      dependency-fix-not-landed (no commit) or superseded (Dependabot
+//      rebased, or another commit).
 //   3. merge: the round marker it posts, naming the reviewed head, is the
 //      record the pr-merge lane merges on; this job never merges or enqueues.
 //      A model that saw a truncated files listing escalates
-//      dependency-files-truncated instead.
+//      dependency-files-truncated instead, and a pull request that changes a
+//      workflow or action file escalates dependency-workflow-held: a person
+//      merges those. Every commit on the pull request must be Dependabot's
+//      own (its account ids, web-flow, a valid signature), the repository's
+//      version-bump commit changing only plugin.json `version` and
+//      CHANGELOG.md (bumpRefusal), or a single-parent commit whose files pass the
+//      fix rule above against its parent; else dependency-fix-refused, so a
+//      commit the lanes App pushed outside a fix round is never merged on.
 //      A merge on a review-only dependency whose evidence does not quote each
-//      matched entry's control (run.json `controls`) escalates
+//      matched entry's control (context.json `controls`) escalates
 //      dependency-control-uncited instead.
 //      close: never on a security update (the security label or an advisory
-//      in the body, read fresh here, or the model job's flag), which escalates
+//      in the body, read fresh here, or the select job's flag), which escalates
 //      dependency-security-close; otherwise finds or files the issue
 //      proposing the dependabot.yml ignore entry (keyed by PR and head), posts
 //      the marker, then closes the pull request, so a re-run after any
 //      partial failure resumes. escalate: dependency-escalate. fix: nothing
 //      more; CI judges the push.
 //   4. Posts the round marker, as the lanes App, once per model run (a run
-//      with no attempt is named `none`).
+//      with no verdict attempt is named `none`, and its marker always posts).
 //
 // Environment:
 //   GH_TOKEN                the lane token
 //   GITHUB_REPOSITORY       owner/repo
 //   PR_NUMBER, HEAD_SHA     the gated pull request and its head
-//   GITHUB_RUN_ID, DEPENDENCY_RUN_ATTEMPT  the model run the round marker names
+//   BASE_SHA                the trusted base commit; its .github/dependabot.yml
+//                           gives the fix rule's [ecosystem, directory] pairs
+//   DEPENDENCY_HEAD_SHA     the head the select job read, which context.json's
+//                           head_sha must name
+//   GITHUB_RUN_ID, DEPENDENCY_RUN_ATTEMPT  the model run the round marker
+//                           names: the scan job's verdict attempt
 //   APP_SENDER_ID           the lanes App bot's user id
-//   DEPENDENCY_VERDICT_DIR  the downloaded artifact holding run.json
-//   DEPENDENCY_RUN_SHA256   run.json's SHA-256, from the model job's runner step
+//   DEPENDENCY_VERDICT_DIR  the downloaded artifacts: the select job's
+//                           context.json and the scan job's dependency-verdict.json
+//   DEPENDENCY_RUN_SHA256   context.json's SHA-256, from the select job
+//   DEPENDENCY_VERDICT_SHA256  dependency-verdict.json's SHA-256, from the scan job
+//   DEPENDENCY_PATCH_STATE  the same call's scan patch state ('' for none)
+//   SCAN_REFUSED_DIR, SCAN_REFUSED_READ  the scan-refusal job's markers for
+//                           the model call and their download's outcome
+//                           (address-feedback.mjs scanRefusal)
 //   SKIP_REASON_FILE, ESCALATION_REASON_FILE  where the runner reads them
 
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { createGitHubApi, need, positive, SHA } from "./address-feedback.mjs";
-import { isSecurityUpdate } from "./dependency-classify.mjs";
-import { roundLine, rounds, VERDICTS } from "./review-dependency.mjs";
+import { createGitHubApi, need, positive, scanRefusal, SHA } from "./address-feedback.mjs";
+import {
+  bumpRefusal,
+  COMMIT_FILES_LIMIT,
+  commitRefusal,
+  fixRefusal,
+  isActionsCommit,
+  isDependabotSigned,
+  isSecurityUpdate,
+  isWorkflowFile,
+  parseConfig,
+  WEB_FLOW_ID,
+} from "./dependency-classify.mjs";
+import { FILES_CAP, roundLine, rounds, VERDICTS } from "./review-dependency.mjs";
 
-export const LIMITS = { bytes: 65536, reasons: 10, reason: 500, evidence: 20, evidenceItem: 300 };
+export const LIMITS = { bytes: 65536, reasons: 10, reason: 500, evidence: 20, evidenceItem: 300, config: 200 };
 // The compare listing stops at 250 commits and 300 files
 // (docs.github.com/en/rest/commits/commits#compare-two-commits, as of
 // 2026-10-17; recheck when that section changes its limits).
 export const COMPARE_LIMITS = { commits: 250, files: 300 };
-// web-flow, the committer GitHub records on commits it signs, as
-// check-trusted-trigger.mjs reads it.
-const WEB_FLOW_ID = 19864447;
+export const CONFIG_PATH = ".github/dependabot.yml";
 
 // A commit GitHub signed for the lanes App during this workflow run: author
 // the App, committer web-flow, signature valid, committed no earlier than
-// run.json's started_at, which the model job's select step recorded before
-// any model turn. An author id alone is whatever a pusher claims.
+// context.json's started_at, which the select job recorded before any model
+// turn. An author id alone is whatever a pusher claims.
 export const isLaneCommit = (commit, appId, started) =>
   Number.isInteger(commit?.author?.id) &&
   commit.author.id === appId &&
@@ -76,14 +113,16 @@ export const isLaneCommit = (commit, appId, started) =>
 
 class Invalid extends Error {}
 
-// `date -u +%Y-%m-%dT%H:%M:%SZ`, as the model job's select step records it.
+// `date -u +%Y-%m-%dT%H:%M:%SZ`, as the select job records it.
 const STARTED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 
 const exactKeys = (value, keys) =>
   value !== null && typeof value === "object" && !Array.isArray(value) && Object.keys(value).sort().join() === [...keys].sort().join();
 
 // Plain prose: posted inside a fence, so no control character, fence, HTML
-// comment or @-mention can change what the comment shows or who it pings.
+// comment or user @-mention can change what the comment shows or who it pings.
+// An @ after a slash (a URL) or opening a scoped package (@scope/name) passes;
+// that also lets a team-style @org/team through, left to the fence.
 function plain(text, max) {
   return (
     typeof text === "string" &&
@@ -91,15 +130,18 @@ function plain(text, max) {
     text.length <= max &&
     !/[\u0000-\u001f\u007f]/.test(text) &&
     !/```|~~~|<!--|-->/.test(text) &&
-    !/(^|[^A-Za-z0-9`])@[A-Za-z0-9]/.test(text)
+    !/(^|[^A-Za-z0-9`/])@[A-Za-z0-9](?![A-Za-z0-9._-]*\/)/.test(text)
   );
 }
 
-export function validateRun(run, pr) {
+export const CONTEXT_KEYS = Object.freeze(["version", "pr", "head_sha", "security", "config_unreadable", "files_truncated", "started_at", "controls", "config"]);
+
+// The select job's run fields.
+export function validateContext(run, pr) {
   const fail = (why) => {
-    throw new Invalid(`run.json is invalid: ${why}`);
+    throw new Invalid(`context.json is invalid: ${why}`);
   };
-  if (!exactKeys(run, ["version", "pr", "head_sha", "security", "config_unreadable", "files_truncated", "started_at", "controls", "output"])) fail("its fields are not the runner's");
+  if (!exactKeys(run, CONTEXT_KEYS)) fail("its fields are not the select job's");
   if (run.version !== 1) fail("version is not 1");
   if (run.pr !== pr) fail("it names another pull request");
   if (!SHA.test(String(run.head_sha))) fail("head_sha is not a commit id");
@@ -110,14 +152,85 @@ export function validateRun(run, pr) {
   if (!Array.isArray(run.controls) || run.controls.length > LIMITS.evidence || !run.controls.every((c) => typeof c === "string" && c.length >= 1)) {
     fail("controls is not a list of review-only controls");
   }
-  const out = run.output;
+  if (!Array.isArray(run.config) || run.config.length > LIMITS.config || !run.config.every((pair) => Array.isArray(pair) && pair.length === 2 && pair.every((part) => typeof part === "string" && part.length >= 1))) {
+    fail("config is not a list of [ecosystem, directory] pairs");
+  }
+  return run;
+}
+
+// The model's structured verdict, as the scan job uploaded it.
+export function validateVerdict(out) {
+  const fail = (why) => {
+    throw new Invalid(`dependency-verdict.json is invalid: ${why}`);
+  };
   if (!exactKeys(out, ["verdict", "reasons", "evidence"])) fail("the verdict's fields are not the template's");
   if (!VERDICTS.includes(out.verdict)) fail("the verdict is not merge, fix, close or escalate");
   if (!Array.isArray(out.reasons) || out.reasons.length < 1 || out.reasons.length > LIMITS.reasons) fail("reasons is not 1-10 entries");
   if (!out.reasons.every((reason) => plain(reason, LIMITS.reason))) fail("a reason is not plain prose within the limit");
   if (!Array.isArray(out.evidence) || out.evidence.length > LIMITS.evidence) fail("evidence is not 0-20 entries");
   if (!out.evidence.every((item) => plain(item, LIMITS.evidenceItem))) fail("an evidence entry is not plain prose within the limit");
-  return run;
+  return out;
+}
+
+// Both, as the one record apply() acts on.
+export function validateRun(run, pr) {
+  if (run === null || typeof run !== "object" || Array.isArray(run)) {
+    throw new Invalid("the round's record is not an object");
+  }
+  const { output, ...context } = run;
+  return { ...validateContext(context, pr), output: validateVerdict(output) };
+}
+
+// The tree entry for `path` at `sha`, or undefined.
+async function entryAt(api, sha, path) {
+  const dir = path.slice(0, Math.max(path.lastIndexOf("/"), 0));
+  const name = path.slice(dir ? dir.length + 1 : 0);
+  return (await api.listTree(sha, dir)).find((entry) => entry.name === name);
+}
+
+// fixRefusal (or, with `bump`, bumpRefusal) over `files`, the change from
+// `before` to `after`; a read that fails is a refusal, never a pass.
+async function changeRefusal(api, files, pairs, before, after, bump = false) {
+  const reads = {
+    entry: (path) => entryAt(api, after, path),
+    text: (side, path) => api.getText(path, side === "before" ? before : after),
+  };
+  try {
+    return await (bump ? bumpRefusal(files, reads) : fixRefusal(files, pairs, reads));
+  } catch (error) {
+    return `fix-unreadable:${String(error?.message ?? error).slice(0, 120)}`;
+  }
+}
+
+// Why one pull-request commit is not one the merge path may stand on, or
+// null: Dependabot's own, the version-bump commit, or a single-parent commit
+// whose files pass the fix rule against its parent.
+async function commitFixRefusal(api, item, pairs) {
+  const sha = String(item?.sha ?? "");
+  if (isDependabotSigned(item)) return null;
+  let detail;
+  try {
+    detail = SHA.test(sha) ? await api.getCommit(sha) : null;
+  } catch {
+    detail = null;
+  }
+  const files = detail?.files;
+  if (!Array.isArray(files) || files.length === 0 || files.length >= COMMIT_FILES_LIMIT) return `commit-files-unreadable:${sha.slice(0, 12)}`;
+  if (!Array.isArray(detail.parents) || detail.parents.length !== 1 || !SHA.test(String(detail.parents[0]?.sha))) {
+    return `commit-parents:${sha.slice(0, 12)}`;
+  }
+  // The version-bump commit: its paths, then only a version in plugin.json.
+  const bump = isActionsCommit(item) && commitRefusal(item, () => files.map((file) => String(file?.filename ?? ""))) === null;
+  return changeRefusal(api, files, pairs, detail.parents[0].sha, sha, bump);
+}
+
+// The base's dependabot.yml pairs, or null when it does not read.
+async function basePairs(api, baseSha) {
+  try {
+    return SHA.test(String(baseSha)) ? parseConfig(await api.getText(CONFIG_PATH, baseSha)) : null;
+  } catch {
+    return null;
+  }
 }
 
 const fenced = (lines) => ["~~~text", ...lines, "~~~"].join("\n");
@@ -165,18 +278,23 @@ function ignoreIssue({ pr, head, title, reasons }) {
   };
 }
 
-export async function apply({ api, pr, appId, modelRun, run, log }) {
-  // One value names the model run in the marker and in the re-run check.
+// `context` is the select job's valid run fields when `run` is null; with
+// `missing` true no verdict arrived, and `patchState` and `refused` are the
+// same call's scan outputs.
+export async function apply({ api, pr, appId, modelRun, run, context = null, missing = false, patchState = "", refused = "", baseSha, log }) {
+  // One value names the model run in the marker and in the re-run check. A
+  // run with none is always posted: counting a round twice hands the PR to a
+  // person sooner, and skipping one would not.
   const runKey = modelRun ?? "none";
   const pull = await api.getPull(pr);
   const comments = await api.listIssueComments(pr);
-  const posted = rounds(comments, appId).some((round) => round.run === runKey);
+  const posted = modelRun !== null && modelRun !== undefined && rounds(comments, appId).some((round) => round.run === runKey);
   const record = async (verdict, output = {}) => {
     if (posted) {
       log(`the round marker for model run ${runKey} is already posted`);
       return;
     }
-    await api.createIssueComment(pr, roundBody({ head: run?.head_sha ?? pull.head.sha, verdict, run: runKey, ...output }));
+    await api.createIssueComment(pr, roundBody({ head: (run ?? context)?.head_sha ?? pull.head.sha, verdict, run: runKey, ...output }));
   };
   if (pull.state !== "open") {
     // A close this job started and did not finish resumes: the PR is closed
@@ -191,7 +309,20 @@ export async function apply({ api, pr, appId, modelRun, run, log }) {
     }
   }
   if (!run) {
+    // The round counts whatever arrived. Only the scan job's own outputs and
+    // the select job's head decide a round with no model turn: no patch, no
+    // refusal, and the head unmoved.
     await record("invalid");
+    if (context !== null && missing) {
+      if (refused === "patch") {
+        log(`#${pr}: the scan refused the round's patch as too large, so no fix can land`);
+        return { escalationReason: "dependency-fix-not-landed", skipReason: "" };
+      }
+      if (refused === "" && patchState === "" && pull.head.sha === context.head_sha) {
+        log(`#${pr}: no verdict and no patch: the model took no turn`);
+        return { escalationReason: "", skipReason: "no-model-turn" };
+      }
+    }
     return { escalationReason: "dependency-invalid", skipReason: "" };
   }
   const { verdict, reasons, evidence } = run.output;
@@ -225,11 +356,18 @@ export async function apply({ api, pr, appId, modelRun, run, log }) {
       log(`#${pr}: the head moved from ${run.head_sha} to ${head} by more than the lane's fix; the next run reviews it`);
       return { escalationReason: "", skipReason: "superseded-sha" };
     }
-    // The promote step already refuses this; checked again on what landed.
-    if (files.some((file) => [file.filename, file.previous_filename].some((path) => /^\.github(\/|$)/i.test(path ?? "")))) {
-      log(`#${pr}: the lane's fix changes a path under .github/, which it may not push`);
+    // apply-patch's content rule already refuses this; checked again on what
+    // landed, since anyone with write access could push the branch.
+    const pairs = await basePairs(api, baseSha);
+    if (pairs === null) {
       await record("invalid", { reasons, evidence });
-      return { escalationReason: "dependency-invalid", skipReason: "" };
+      return { escalationReason: "dependency-config-unreadable", skipReason: "" };
+    }
+    const refusal = await changeRefusal(api, files, pairs, run.head_sha, head);
+    if (refusal) {
+      log(`#${pr}: the lane's fix is refused (${refusal})`);
+      await record("invalid", { reasons, evidence });
+      return { escalationReason: "dependency-fix-refused", skipReason: "" };
     }
     await record("fix", { reasons, evidence });
     return { escalationReason: "", skipReason: "" };
@@ -240,7 +378,8 @@ export async function apply({ api, pr, appId, modelRun, run, log }) {
   }
   if (verdict === "merge") {
     // The content rule could not run, so no merge marker is posted on it.
-    if (run.config_unreadable) {
+    const pairs = await basePairs(api, baseSha);
+    if (run.config_unreadable || pairs === null) {
       await record("escalate", { reasons, evidence });
       return { escalationReason: "dependency-config-unreadable", skipReason: "" };
     }
@@ -248,6 +387,40 @@ export async function apply({ api, pr, appId, modelRun, run, log }) {
     if (run.files_truncated) {
       await record("escalate", { reasons, evidence });
       return { escalationReason: "dependency-files-truncated", skipReason: "" };
+    }
+    // A bump that changes a workflow or action file waits for a person.
+    const files = await api.listPullFiles(pr);
+    if (!Array.isArray(files) || files.length >= FILES_CAP) {
+      await record("escalate", { reasons, evidence });
+      return { escalationReason: "dependency-files-truncated", skipReason: "" };
+    }
+    if (files.some((file) => [file.filename, file.previous_filename].filter(Boolean).some(isWorkflowFile))) {
+      log(`#${pr}: the pull request changes a workflow or action file; a person merges it`);
+      await record("escalate", { reasons, evidence });
+      return { escalationReason: "dependency-workflow-held", skipReason: "" };
+    }
+    // Every commit that is not Dependabot's own: a lanes App commit pushed
+    // outside a fix round reaches the head the model reviewed, and pr-merge
+    // merges on this marker.
+    const commits = await api.listPullCommits(pr);
+    let refusal = null;
+    if (
+      !Array.isArray(commits) ||
+      commits.length === 0 ||
+      commits.length >= COMPARE_LIMITS.commits ||
+      commits.length !== pull.commits ||
+      commits.at(-1)?.sha !== head
+    ) {
+      refusal = "commits-not-listed-whole";
+    }
+    for (const item of refusal ? [] : commits) {
+      refusal = await commitFixRefusal(api, item, pairs);
+      if (refusal) break;
+    }
+    if (refusal) {
+      log(`#${pr}: a commit is not Dependabot's or a lane fix (${refusal}); a person decides`);
+      await record("escalate", { reasons, evidence });
+      return { escalationReason: "dependency-fix-refused", skipReason: "" };
     }
     // A review-only dependency merges only on a verdict that quotes each
     // matched entry's control verbatim in an evidence entry.
@@ -283,12 +456,34 @@ export async function apply({ api, pr, appId, modelRun, run, log }) {
   return { escalationReason: "dependency-escalate", skipReason: "" };
 }
 
+// A regular file of at most LIMITS.bytes whose SHA-256 is `sha256`, parsed;
+// null when it is absent.
+function readChecked(path, sha256, who) {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stat.isFile() || stat.size > LIMITS.bytes) {
+    throw new Invalid(`${basename(path)} is not a regular file within the size limit`);
+  }
+  const text = readFileSync(path, "utf8");
+  if (!/^[0-9a-f]{64}$/.test(sha256 ?? "") || createHash("sha256").update(text).digest("hex") !== sha256) {
+    throw new Invalid(`${basename(path)} does not match the SHA-256 ${who} recorded`);
+  }
+  return JSON.parse(text);
+}
+
 export async function main(env, { api, log = (line) => console.log(line) } = {}) {
   need(env, [
     "GH_TOKEN",
     "GITHUB_REPOSITORY",
     "PR_NUMBER",
     "HEAD_SHA",
+    "BASE_SHA",
+    "DEPENDENCY_HEAD_SHA",
     "GITHUB_RUN_ID",
     "APP_SENDER_ID",
     "DEPENDENCY_VERDICT_DIR",
@@ -304,22 +499,41 @@ export async function main(env, { api, log = (line) => console.log(line) } = {})
   if (attempt !== "" && !/^[1-9][0-9]{0,4}$/.test(attempt)) {
     throw new Error("DEPENDENCY_RUN_ATTEMPT is not a run attempt");
   }
+  const patchState = env.DEPENDENCY_PATCH_STATE ?? "";
+  if (!["", "written", "empty"].includes(patchState)) {
+    throw new Error("DEPENDENCY_PATCH_STATE is not a scan output");
+  }
+  const refused = scanRefusal({ dir: env.SCAN_REFUSED_DIR ?? "", read: env.SCAN_REFUSED_READ ?? "" });
   const modelRun = attempt ? `${positive(env.GITHUB_RUN_ID, "GITHUB_RUN_ID")}-${attempt}` : null;
+  let context = null;
   let run = null;
+  let missing = false;
   try {
-    const path = join(env.DEPENDENCY_VERDICT_DIR, "run.json");
-    const stat = lstatSync(path);
-    if (!stat.isFile() || stat.size > LIMITS.bytes) {
-      throw new Invalid("run.json is not a regular file within the size limit");
+    context = readChecked(join(env.DEPENDENCY_VERDICT_DIR, "context.json"), env.DEPENDENCY_RUN_SHA256, "the select job");
+    if (context === null) throw new Invalid("context.json is missing");
+    validateContext(context, pr);
+    // The head comes from the select job, not from the file.
+    if (!SHA.test(env.DEPENDENCY_HEAD_SHA) || context.head_sha !== env.DEPENDENCY_HEAD_SHA) {
+      throw new Invalid("context.json's head_sha is not the head the select job read");
     }
-    const text = readFileSync(path, "utf8");
-    if (!/^[0-9a-f]{64}$/.test(env.DEPENDENCY_RUN_SHA256 ?? "") || createHash("sha256").update(text).digest("hex") !== env.DEPENDENCY_RUN_SHA256) {
-      throw new Invalid("run.json does not match the SHA-256 the model job recorded");
-    }
-    run = validateRun(JSON.parse(text), pr);
   } catch (error) {
-    log(`the verdict is refused: ${String(error?.message ?? error).slice(0, 300)}`);
-    run = null;
+    log(`the round's record is refused: ${String(error?.message ?? error).slice(0, 300)}`);
+    context = null;
+  }
+  if (context !== null) {
+    try {
+      // No attempt: the scan uploaded no verdict, so none is read.
+      const output = attempt ? readChecked(join(env.DEPENDENCY_VERDICT_DIR, "dependency-verdict.json"), env.DEPENDENCY_VERDICT_SHA256, "the scan job") : null;
+      if (output === null) {
+        missing = true;
+        log("no verdict arrived from the model call");
+      } else {
+        run = { ...context, output: validateVerdict(output) };
+      }
+    } catch (error) {
+      log(`the verdict is refused: ${String(error?.message ?? error).slice(0, 300)}`);
+      run = null;
+    }
   }
   const { escalationReason, skipReason } = await apply({
     api:
@@ -334,6 +548,11 @@ export async function main(env, { api, log = (line) => console.log(line) } = {})
     appId,
     modelRun,
     run,
+    context,
+    missing,
+    patchState,
+    refused,
+    baseSha: env.BASE_SHA,
     log,
   });
   if (escalationReason) {

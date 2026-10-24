@@ -66,7 +66,7 @@ ADAPTED=(
   # Sandbox activities and lanes, migrated to schema version 2.
   # review-dependency, apply-dependency-verdict, fix-ci and apply-ci-fix are
   # main's, unchanged; resolve-issue takes main's labels and holds but keeps
-  # the sandbox's go-live time and no checks.
+  # no checks.
   docs/conventions/pr-pipeline.yaml
   # Sandbox activities fix-marker and audit-env-write, with the role input,
   # and the fix-ci fallback probe (pr-unblock.yml's fix-ci jobs on this lane).

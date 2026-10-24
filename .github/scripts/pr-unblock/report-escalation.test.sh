@@ -98,7 +98,8 @@ run() {
 }
 writes() { grep -c '^POST' "$STUB/requests" || true; }
 comment() { printf '[{"body":%s,"user":{"login":"%s","type":"%s"}}]' "$(jq -Rs . <<<"$1")" "$2" "$3"; }
-bot_marker() { comment "$MARKER"$'\n'"<!-- pr-unblock resume-key=$1 -->"$'\nbody' 'melodic-automation-lanes[bot]' Bot; }
+# bot_marker <head> [reason]: the lanes App's escalation comment for that head and reason.
+bot_marker() { comment "$MARKER"$'\n'"<!-- pr-unblock resume-key=$1 -->"$'\nbody\n\n- Reason: `'"${2:-unresolved-conflict}"'`' 'melodic-automation-lanes[bot]' Bot; }
 
 # Rejected reasons: workflow-files is the retired name, the rest are not in the enum.
 for reason in workflow-files bogus '' 'repeat-cap ' REPEAT-CAP; do
@@ -113,8 +114,9 @@ for reason in protected-path-conflict workflow-staged unexpected-path-staged rep
   feedback-protected-path feedback-round-cap feedback-uncertain feedback-not-landed feedback-invalid \
   feedback-partial feedback-incomplete feedback-disputed \
   dependency-round-cap dependency-invalid dependency-fix-not-landed dependency-security-close dependency-escalate \
-  dependency-config-unreadable dependency-files-truncated dependency-control-uncited \
-  ci-fix-round-cap ci-fix-empty ci-fix-invalid ci-fix-protected-path ci-fix-not-applied ci-fix-escalated; do
+  dependency-config-unreadable dependency-files-truncated dependency-control-uncited dependency-workflow-held dependency-fix-refused \
+  ci-fix-round-cap ci-fix-empty ci-fix-invalid ci-fix-protected-path ci-fix-not-applied ci-fix-escalated \
+  conflict-patch-invalid conflict-patch-not-applied conflict-patch-protected-path; do
   setup '[]' '[]'
   run "$reason"
   check "$reason: exit 0" 0 "$RC"
@@ -142,8 +144,9 @@ ALL_REASONS=(protected-path-conflict workflow-staged unexpected-path-staged repe
   feedback-protected-path feedback-round-cap feedback-uncertain feedback-not-landed feedback-invalid
   feedback-partial feedback-incomplete feedback-disputed
   dependency-round-cap dependency-invalid dependency-fix-not-landed dependency-security-close dependency-escalate
-  dependency-config-unreadable dependency-files-truncated dependency-control-uncited
-  ci-fix-round-cap ci-fix-empty ci-fix-invalid ci-fix-protected-path ci-fix-not-applied ci-fix-escalated)
+  dependency-config-unreadable dependency-files-truncated dependency-control-uncited dependency-workflow-held dependency-fix-refused
+  ci-fix-round-cap ci-fix-empty ci-fix-invalid ci-fix-protected-path ci-fix-not-applied ci-fix-escalated
+  conflict-patch-invalid conflict-patch-not-applied conflict-patch-protected-path)
 
 # Status mode: a failing pr-unblock/conflict status on the head, only for unresolved-conflict.
 setup '[]' '[]'
@@ -220,6 +223,13 @@ setup '[{"name":"needs-human"}]' "$(bot_marker "$HEAD_B")"
 run unresolved-conflict
 check "labeled, marker for another head: comment only" 'POST repos/o/r/issues/42/comments' "$(grep '^POST' "$STUB/requests")"
 
+# Another activity's escalation on the same head is recorded too, so
+# gate-source.mjs reads every reason the label stands for.
+setup '[{"name":"needs-human"}]' "$(bot_marker "$HEAD_A" feedback-disputed)"
+run ci-fix-round-cap
+check "labeled, same head, another reason: comment only" 'POST repos/o/r/issues/42/comments' "$(grep '^POST' "$STUB/requests")"
+has "labeled, same head, another reason: comment names the new reason" 'ci-fix-round-cap' "$STUB/bodies"
+
 setup '[]' "$(bot_marker "$HEAD_A")"
 run unresolved-conflict
 check "label removed by a human, same head: escalates again" \
@@ -279,7 +289,7 @@ setup '[{"name":"needs-human"}]' "$(comment "$MARKER"$'\n'"<!-- pr-unblock resum
 run unresolved-conflict
 check "marker written by another bot does not count" 'POST repos/o/r/issues/42/comments' "$(grep '^POST' "$STUB/requests")"
 
-setup '[{"name":"needs-human"}]' "$(comment "$MARKER"$'\n'"<!-- pr-unblock resume-key=$HEAD_A -->" 'other-app[bot]' Bot)"
+setup '[{"name":"needs-human"}]' "$(comment "$MARKER"$'\n'"<!-- pr-unblock resume-key=$HEAD_A -->"$'\n- Reason: `unresolved-conflict`' 'other-app[bot]' Bot)"
 LBL='other-app[bot]' run unresolved-conflict
 check "LANES_BOT_LOGIN names the lanes identity: no write" 0 "$(writes)"
 

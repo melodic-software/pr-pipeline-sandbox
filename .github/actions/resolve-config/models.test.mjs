@@ -67,7 +67,6 @@ const LIVE_FACTS = {
   workClasses: [],
   mergeable: "conflicting",
   draft: false,
-  labeledAt: "2026-10-16T00:00:00Z",
   // A listed human set the issue Small, Low and Known (the org's option ids).
   fieldValues: [
     { field: 15462270, option: 27053568 },
@@ -86,19 +85,6 @@ const DEFAULT_RUN = {
   "subagent-model": "inherit",
   "max-turns": 75,
 };
-
-for (const [lane, activity] of [
-  ["pr-unblock", "resolve-conflicts"],
-  ["pr-unblock", "address-feedback"],
-  ["pr-unblock", "review-dependency"],
-]) {
-  test(`live config: ${lane} / ${activity} keeps no --model and 75 turns`, () => {
-    const slot = liveSlot(lane, activity);
-    assert.deepEqual(slot.models, { profile: "standard", ...DEFAULT_RUN });
-    assert.equal(modelArgs(slot.models), "--max-turns 75");
-    assert.equal(modelSettings(slot.models), "");
-  });
-}
 
 // models.issue-dimensions: the live config's field and option ids (the org's,
 // 2026-10-18) with fixture budgets in place of its tuning, so a tuning PR is a
@@ -155,10 +141,23 @@ for (const [size, complexity, turns, minutes] of [
   });
 }
 
+// A field no listed account set reads as small, medium or known: the run
+// goes ahead at that budget instead of being refused.
+for (const [why, dims, options] of [
+  ["an issue with no Complexity", { size: "small", uncertainty: "known" }, {}],
+  ["an issue with no fields", {}, {}],
+  ["fields an unlisted account set", { size: "medium", complexity: "high", uncertainty: "unknown" }, { setter: UNLISTED }],
+]) {
+  test(`live config: ${why} runs as small, medium, known`, () => {
+    const slot = issueSlot(dims, options);
+    assert.equal(slot.applies, true);
+    assert.equal(slot["issue-dimensions"], "small/medium/known");
+    assert.equal(slot["timeout-minutes"], 7);
+    assert.equal(modelArgs(slot.models), "--max-turns 17");
+  });
+}
+
 for (const [why, dims, options, reason] of [
-  ["an issue with no Complexity", { size: "small", uncertainty: "known" }, {}, "not-assessed"],
-  ["an issue with no fields", {}, {}, "not-assessed"],
-  ["fields an unlisted account set", { size: "small", complexity: "low", uncertainty: "known" }, { setter: UNLISTED }, "not-assessed"],
   ["a large issue", { size: "large", complexity: "low", uncertainty: "known" }, {}, "split-required"],
   ["a knowable issue", { size: "small", complexity: "low", uncertainty: "knowable" }, {}, "research-first"],
   ["an unknown issue", { size: "small", complexity: "low", uncertainty: "unknown" }, {}, "probe-first"],
@@ -221,6 +220,96 @@ test("live config: resolve-issue keeps the standard profile's model, its turns f
   assert.equal(modelSettings(slot.models), "");
 });
 
+// An issue's Complexity picks the starting
+// profile. High runs Opus at effort xhigh; low, medium and unset keep the
+// activity's default (resolve-issue has no route, so standard). The turn cap
+// still comes from the dimensions.
+const liveIssueSlot = (dims, pinnedDimensions) =>
+  resolve(LIVE, {
+    lane: "work-resolve-issue",
+    activity: "resolve-issue",
+    configPath: CONFIG_PATH,
+    basePath: ".base",
+    facts: { ...LIVE_FACTS, ...fieldFacts(dims) },
+    pinnedDimensions,
+  }).selected;
+
+test("live config: a high-Complexity issue runs resolve-issue on Opus at effort xhigh", () => {
+  const slot = liveIssueSlot({ size: "small", complexity: "high", uncertainty: "known" });
+  assert.equal(slot.applies, true);
+  assert.equal(slot.models.model, "opus");
+  assert.equal(slot.models.effort, "xhigh");
+  assert.match(modelArgs(slot.models), /^--model opus --max-turns \d+ --effort xhigh$/);
+});
+
+test("live config: pinned high-Complexity dimensions pick the same Opus xhigh profile", () => {
+  const read = liveIssueSlot({ size: "small", complexity: "high", uncertainty: "known" });
+  const pinned = liveIssueSlot({ size: "small", complexity: "low", uncertainty: "known" }, "small/high/known");
+  assert.deepEqual(pinned.models, read.models);
+});
+
+for (const complexity of ["low", "medium"]) {
+  test(`live config: a ${complexity}-Complexity issue keeps resolve-issue's default profile`, () => {
+    const slot = liveIssueSlot({ size: "small", complexity, uncertainty: "known" });
+    assert.equal(slot.applies, true);
+    assert.equal(slot.models.profile, "standard");
+    assert.equal(slot.models.model, "default");
+    assert.equal(slot.models.effort, null);
+  });
+}
+
+test("live config: an issue with no Complexity keeps the default profile and runs at medium's turns", () => {
+  const slot = liveIssueSlot({ size: "small", uncertainty: "known" });
+  assert.equal(slot.applies, true);
+  assert.equal(slot["issue-dimensions"], "small/medium/known");
+  assert.equal(slot.models.profile, "standard");
+  assert.equal(slot.models["max-turns"], 113);
+});
+
+test("live config: an issue with no fields runs at 113 turns for 50 minutes", () => {
+  const slot = liveIssueSlot({});
+  assert.equal(slot.applies, true);
+  assert.equal(slot["issue-dimensions"], "small/medium/known");
+  assert.equal(slot["timeout-minutes"], 50);
+  assert.equal(slot.models["max-turns"], 113);
+});
+
+test("live config: a Knowable issue runs", () => {
+  const slot = liveIssueSlot({ size: "small", complexity: "low", uncertainty: "knowable" });
+  assert.equal(slot.applies, true);
+  assert.equal(slot["issue-dimensions"], "small/low/knowable");
+});
+
+// fix-ci's retry one rung up: rung 1 takes code-fix's
+// escalate-to profile, Opus at effort xhigh; rung 0 keeps code-fix.
+const fixCiSlot = (rung) =>
+  resolve(LIVE, { lane: "pr-unblock", activity: "fix-ci", configPath: CONFIG_PATH, basePath: ".base", facts: LIVE_FACTS, rung })
+    .selected.models;
+
+test("live config: fix-ci one rung up runs Opus at effort xhigh", () => {
+  const up = fixCiSlot(1);
+  assert.equal(up.model, "opus");
+  assert.equal(up.effort, "xhigh");
+  assert.notEqual(up.profile, "code-fix");
+  assert.equal(fixCiSlot(0).profile, "code-fix");
+  assert.deepEqual(fixCiSlot(undefined), fixCiSlot(0));
+});
+
+test("live config: the rung-up profile has no rung above it, so a rung cannot climb twice", () => {
+  const doc = parse(LIVE.config);
+  const up = fixCiSlot(1).profile;
+  assert.equal(doc.models.profiles[up]["escalate-to"], undefined);
+});
+
+// Fable is owner-gated pending a per-week allowance: no live profile names
+// the frontier tier, so no route, rung or Complexity can reach it.
+test("live config: no profile names fable or best", () => {
+  for (const [name, profile] of Object.entries(parse(LIVE.config).models.profiles)) {
+    assert.ok(!["fable", "best"].includes(profile.model), name);
+    assert.ok(!["fable", "best"].includes(profile["subagent-model"]), name);
+  }
+});
+
 // The live tuning is checked for shape only: it loads, every org option is
 // mapped, and an assessed, known issue of a size that runs applies.
 test("live config: the live issue-dimensions maps every org option and runs a known small issue", () => {
@@ -270,8 +359,74 @@ for (const [why, dims, code] of [
   });
 }
 
+for (const [why, models, code] of [
+  [
+    "an escalate-to naming no profile",
+    { profiles: { p: { model: "opus", "max-turns": 5, "escalate-to": "nope" } }, "default-profile": "p" },
+    "undefined-profile",
+  ],
+  [
+    "a complexity profile naming no profile",
+    { profiles: { p: { model: "opus", "max-turns": 5 } }, "default-profile": "p", "issue-dimensions": { ...DIMS, "complexity-profiles": { low: "nope" } } },
+    "undefined-profile",
+  ],
+  [
+    "a complexity profile keyed by no complexity",
+    { profiles: { p: { model: "opus", "max-turns": 5 } }, "default-profile": "p", "issue-dimensions": { ...DIMS, "complexity-profiles": { huge: "p" } } },
+    "undefined-dimension",
+  ],
+]) {
+  test(`models: ${why} is rejected`, () => {
+    assertRejected(() => fixtureSlot(withModels(models)), code);
+  });
+}
+
+// The model rung: only the selected slot climbs, one hop at most, and only
+// from a profile that names a rung above it.
+const LADDER = {
+  profiles: {
+    p1: { model: "sonnet", "max-turns": 5, "escalate-to": "p2" },
+    p2: { model: "opus", effort: "high", "max-turns": 5, "escalate-to": "p3" },
+    p3: { model: "opus", effort: "xhigh", "max-turns": 5 },
+  },
+  "default-profile": "p3",
+  routes: { "fix-prose": "p1" },
+};
+const rungSlot = (models, rung) =>
+  resolve(withModels(models), { lane: "pr-refine", activity: "fix-prose", configPath: CONFIG_PATH, basePath: ".base", facts: { event: "synchronize", changedPaths: ["src/app.js"] }, rung });
+
+test("models: rung 1 climbs one rung, p1 to p2, never on to p3", () => {
+  assert.equal(rungSlot(LADDER, 1).selected.models.profile, "p2");
+  assert.equal(rungSlot(LADDER, 0).selected.models.profile, "p1");
+});
+
+test("models: rung 1 on a profile with no rung above is refused, so a retry never reruns the same model", () => {
+  assertRejected(() => rungSlot({ ...LADDER, routes: { "fix-prose": "p3" } }, 1), "no-rung-up");
+});
+
+test("models: rung 1 leaves every slot but the selected one at its own profile", () => {
+  const { lane, selected } = rungSlot({ ...LADDER, routes: { "fix-prose": "p1" } }, 1);
+  for (const slot of lane.slots.filter((entry) => entry.models !== null && entry.name !== selected.name)) {
+    assert.equal(slot.models.profile, "p3", slot.name);
+  }
+});
+
+for (const rung of [2, -1, "1", 0.5]) {
+  test(`models: model rung ${JSON.stringify(rung)} is refused as invalid-rung`, () => {
+    assertRejected(() => rungSlot(LADDER, rung), "invalid-rung");
+  });
+}
+
 test("live config: a script activity resolves no models", () => {
   assert.equal(liveSlot("pr-unblock", "report-escalation").models, null);
+});
+
+// run-claude-cli needs a model alias (the read runner refuses `default`), so
+// review-dependency routes to verify-pr's profile (plan Q3).
+test("live config: pr-unblock / review-dependency runs opus at 60 turns, the review profile", () => {
+  const slot = liveSlot("pr-unblock", "review-dependency");
+  assert.deepEqual(slot.models, { profile: "review", model: "opus", effort: null, "subagent-model": "inherit", "max-turns": 60 });
+  assert.equal(modelArgs(slot.models), "--model opus --max-turns 60");
 });
 
 test("live config: verify-pr keeps --model opus and 60 turns", () => {
@@ -310,19 +465,23 @@ for (const [route, profile, args] of [
 // (plugins/multi-agent/reference/defaults.yaml): worker's model is inherit and
 // its mechanical workload sonnet, verifier's effort high; the owner's rule
 // sends inherit, and any role route that resolves no alias, to opus.
-test("live config: fix-ci runs as a worker on code, opus at the verifier's effort, 75 turns", () => {
-  const slot = liveSlot("pr-unblock", "fix-ci");
-  assert.deepEqual(slot.models, {
-    profile: "code-fix",
-    role: "worker",
-    workload: "code",
-    model: "opus",
-    effort: "high",
-    "subagent-model": "inherit",
-    "max-turns": 75,
+// address-feedback and resolve-conflicts run on run-claude-cli, which cannot
+// pass the default model, so they take fix-ci's code-fix route.
+for (const activity of ["fix-ci", "address-feedback", "resolve-conflicts"]) {
+  test(`live config: ${activity} runs as a worker on code, opus at the verifier's effort, 75 turns`, () => {
+    const slot = liveSlot("pr-unblock", activity);
+    assert.deepEqual(slot.models, {
+      profile: "code-fix",
+      role: "worker",
+      workload: "code",
+      model: "opus",
+      effort: "high",
+      "subagent-model": "inherit",
+      "max-turns": 75,
+    });
+    assert.equal(modelArgs(slot.models), "--model opus --max-turns 75 --effort high");
   });
-  assert.equal(modelArgs(slot.models), "--model opus --max-turns 75 --effort high");
-});
+}
 
 // The role map's worker runs mechanical work on sonnet at its own effort,
 // medium; the profile keeps standard's 75 turns.
@@ -673,6 +832,7 @@ test("main gives fix-ci opus and no effort when the base has no role map", async
 test("main writes applied-by-patch as the activity that applies the selected one's patch", async () => {
   const doc = parse(LIVE.config);
   const applier = doc.lanes["pr-unblock"].slots
+    .filter((slot) => (slot.needs ?? []).includes("fix-ci"))
     .map((slot) => slot.activity)
     .find((name) => doc.activities[name].prepare === "apply-patch");
   assert.ok(applier, "pr-unblock holds no apply-patch activity");
@@ -739,7 +899,7 @@ test("main on an issue set Medium, High, Known writes its turn cap, dimensions a
   assert.equal(read.headers["X-GitHub-Api-Version"], "2026-03-10");
 });
 
-test("main refuses an issue whose latest Size setter is unlisted", async () => {
+test("main reads a Size an unlisted account set last as small", async () => {
   const { code, outputs } = await mainOnIssue([
     fieldEvent("IssueFieldAddedEvent", 15462270, LISTED),
     fieldEvent("IssueFieldAddedEvent", 48625720, LISTED),
@@ -747,9 +907,9 @@ test("main refuses an issue whose latest Size setter is unlisted", async () => {
     fieldEvent("IssueFieldChangedEvent", 15462270, UNLISTED),
   ]);
   assert.equal(code, 0);
-  assert.equal(outputs.applies, "false");
-  assert.equal(outputs["skip-reason"], "not-assessed");
-  assert.equal(outputs["issue-dimensions"], "not-assessed");
+  assert.equal(outputs.applies, "true");
+  assert.equal(outputs["issue-dimensions"], "small/high/known");
+  assert.equal(outputs["claude-args"], "--max-turns 28");
 });
 
 test("main fails when the field events answer with GraphQL errors", async () => {
@@ -758,14 +918,15 @@ test("main fails when the field events answer with GraphQL errors", async () => 
   await assert.rejects(() => fieldSetters(github, "o/r", 7), /field events could not be read: Resource not accessible/);
 });
 
-test("main refuses an issue whose field was removed after it was set", async () => {
+test("main reads a field removed after it was set as unset", async () => {
   const { outputs } = await mainOnIssue([
     fieldEvent("IssueFieldAddedEvent", 15462270, LISTED),
     fieldEvent("IssueFieldAddedEvent", 48625720, LISTED),
     fieldEvent("IssueFieldAddedEvent", 48625721, LISTED),
     fieldEvent("IssueFieldRemovedEvent", 48625721, LISTED),
   ]);
-  assert.equal(outputs["skip-reason"], "not-assessed");
+  assert.equal(outputs.applies, "true");
+  assert.equal(outputs["issue-dimensions"], "medium/high/known");
 });
 
 test("main refuses an unknown model-route, and writes no file", async () => {

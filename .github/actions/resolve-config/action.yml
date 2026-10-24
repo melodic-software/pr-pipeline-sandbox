@@ -64,6 +64,13 @@ inputs:
       them instead of reading the issue's fields again.
     required: false
     default: ""
+  model-rung:
+    description: >
+      The model rung of a skill activity's run: empty or 0 takes its profile,
+      1 the profile's escalate-to (fix-ci's one retry one rung up). Any other
+      value fails the step.
+    required: false
+    default: ""
   prepare-supported:
     description: >
       `true` only from a runner that performs a leaf's `prepare` step. An
@@ -151,8 +158,8 @@ outputs:
   issue-dimensions:
     description: >
       `<size>/<complexity>/<uncertainty>` as models.issue-dimensions reads
-      the issue's fields, or `not-assessed`, for a skill activity with input
-      issue; empty otherwise.
+      the issue's fields, an unset field read as small, medium or known, for
+      a skill activity with input issue; empty otherwise.
     value: ${{ steps.resolve.outputs.issue-dimensions }}
   timeout-minutes:
     description: The issue size's job timeout in minutes; empty when issue-dimensions is.
@@ -178,6 +185,9 @@ outputs:
   issues:
     description: The App grant's `issues` permission for the activity's effect.
     value: ${{ steps.resolve.outputs.issues }}
+  actions:
+    description: "The App grant's `actions` permission: `read` when lane-rules.json's `activity-grants` adds it, else empty."
+    value: ${{ steps.resolve.outputs.actions }}
   can-commit:
     description: "`false` only when the grant's `contents` is `read`."
     value: ${{ steps.resolve.outputs.can-commit }}
@@ -202,8 +212,9 @@ runs:
         PREPARE_SUPPORTED: ${{ inputs.prepare-supported }}
         APPLIED_BY_SUPPORTED: ${{ inputs.applied-by-supported }}
         ISSUE_DIMENSIONS: ${{ inputs.issue-dimensions }}
+        MODEL_RUNG: ${{ inputs.model-rung }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         REPOSITORY: ${{ github.repository }}
       run: |
-        npm ci --ignore-scripts --omit=dev --prefix "$GITHUB_ACTION_PATH"
+        npm ci --ignore-scripts --omit=dev --no-audit --no-fund --prefix "$GITHUB_ACTION_PATH"
         node "$GITHUB_ACTION_PATH/resolve-config.mjs"

@@ -2,19 +2,26 @@
 // job, from the default branch tip, before the fix-ci model job and with a
 // read-only token. It checks out no PR head and runs no head code.
 //
-// It escalates `ci-fix-round-cap` once the lanes App has pushed
+// It skips a pull request the human-gated label holds (awaiting-human) unless
+// another lane's escalation put the label on (gate-source.mjs prHold),
+// escalates `ci-fix-round-cap` once the lanes App has pushed
 // `loop.fix-ci-rounds` fix-ci commits to the pull request, skips a closed pull
 // request or a head with no failing check, and otherwise writes the context
 // file the `source-control:pull-request ci --ci` skill reads: each failing
 // check's name, the workflow file that defines its job, its annotations and
-// the end of its log. Check names, annotations and logs are data: they are
-// copied into the file, capped, and never logged or run.
+// the end of its log, and the review findings address-feedback would work
+// (keepThreads with no trusted person's direction: unresolved threads the
+// reviewer bot or a verifier note opened on a reviewed head and only it
+// wrote), so a fix the reviewer already named is not escalated. Check names,
+// annotations, logs and findings are data: they are copied into the file,
+// capped, and never logged or run.
 
 import { createHash } from "node:crypto";
 import { appendFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-import { createGitHubApi, need, positive, SHA } from "./address-feedback.mjs";
+import { createGitHubApi, humanGatedLabelFrom, keepThreads, need, positive, reviewedHeads, reviewerIdFrom, SHA } from "./address-feedback.mjs";
+import { prHold } from "./gate-source.mjs";
 
 // The trailer apply-patch.mjs writes on every fix commit, from the ci-context
 // row of patch-rules.json; a round is one.
@@ -28,6 +35,8 @@ const MAX_ANNOTATIONS = 20;
 const MAX_MESSAGE = 500;
 const MAX_EXCERPT = 3000;
 const MAX_EXCERPT_LINES = 80;
+const MAX_FINDINGS = 10;
+const MAX_FINDING = 2000;
 
 export function countFixRounds(commits, appId) {
   return commits.filter(
@@ -107,7 +116,20 @@ async function contextOf(api, run) {
   return { name: String(run.name), workflow, annotations, log_excerpt: excerpt };
 }
 
-export async function select({ api, pr, appId, maxRounds }) {
+// Each kept thread's opening comment: where it points and what it says.
+async function reviewFindings(api, pr, { appId, reviewerId }) {
+  const [issueComments, reviews, reviewComments, threads] = await Promise.all([
+    api.listIssueComments(pr),
+    api.listReviews(pr),
+    api.listReviewComments(pr),
+    api.listThreads(pr),
+  ]);
+  return keepThreads({ threads, reviewComments, reviews, heads: reviewedHeads(issueComments), reviewerId, appId })
+    .slice(0, MAX_FINDINGS)
+    .map((thread) => ({ path: String(thread.path ?? ""), line: thread.line, body: String(thread.comments[0].body).slice(0, MAX_FINDING) }));
+}
+
+export async function select({ api, pr, appId, reviewerId, maxRounds, humanGatedLabel = "needs-human", log = (line) => console.log(line) }) {
   const pull = await api.getPull(pr);
   const headSha = pull.head?.sha;
   if (!SHA.test(String(headSha))) {
@@ -116,9 +138,23 @@ export async function select({ api, pr, appId, maxRounds }) {
   if (pull.state !== "open") {
     return { decision: "skip", skipReason: "not-applicable", headSha };
   }
+  // The human-gated label holds fix-ci unless another lane's escalation put
+  // it on; the label stays on, and laneEscalated lets the push past it.
+  const { held, laneEscalated } = await prHold({
+    labels: (pull.labels ?? []).map((label) => label?.name),
+    holdLabels: [],
+    gateLabel: humanGatedLabel,
+    head: headSha,
+    activity: "fix-ci",
+    appId,
+    readTimeline: () => api.listTimeline(pr),
+  });
+  if (held) {
+    return { decision: "skip", skipReason: "awaiting-human", headSha };
+  }
   const rounds = countFixRounds(await api.listPullCommits(pr), appId);
   if (rounds >= maxRounds) {
-    return { decision: "escalate", escalationReason: "ci-fix-round-cap", rounds, headSha };
+    return { decision: "escalate", escalationReason: "ci-fix-round-cap", rounds, headSha, laneEscalated };
   }
   const checks = [];
   for (const run of failingChecks(await api.listCommitCheckRuns(headSha))) {
@@ -131,9 +167,16 @@ export async function select({ api, pr, appId, maxRounds }) {
     }
   }
   if (checks.length === 0) {
-    return { decision: "skip", skipReason: "not-applicable", rounds, headSha };
+    return { decision: "skip", skipReason: "not-applicable", rounds, headSha, laneEscalated };
   }
-  return { decision: "proceed", rounds, headSha, file: { pr, head_sha: headSha, checks } };
+  // The findings are a lead, so a failed read costs them, not the run.
+  let review_findings = [];
+  try {
+    review_findings = await reviewFindings(api, pr, { appId, reviewerId });
+  } catch (error) {
+    log(`::warning::the review findings could not be read (${error.message}); the context holds none`);
+  }
+  return { decision: "proceed", rounds, headSha, laneEscalated, file: { pr, head_sha: headSha, checks, review_findings } };
 }
 
 // The base config's resolved loop caps, through the base checkout's
@@ -151,6 +194,8 @@ export async function main(env, { api, log = (line) => console.log(line) } = {})
   const pr = positive(env.PR_NUMBER, "PR_NUMBER");
   const appId = positive(env.APP_SENDER_ID, "APP_SENDER_ID");
   const maxRounds = positive(env.FIX_CI_ROUNDS ?? (await loopFromBase(env))["fix-ci-rounds"], "FIX_CI_ROUNDS");
+  // The base checkout's list, the one address-feedback reads.
+  const reviewerId = reviewerIdFrom(env.TRUSTED_ACTORS || `${env.BASE_PATH || ".base"}/.github/standards/trusted-actors/trusted-actors.json`);
   const client =
     api ??
     createGitHubApi({
@@ -159,7 +204,8 @@ export async function main(env, { api, log = (line) => console.log(line) } = {})
       apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
       graphqlUrl: env.GITHUB_GRAPHQL_URL ?? "https://api.github.com/graphql",
     });
-  const result = await select({ api: client, pr, appId, maxRounds });
+  const humanGatedLabel = humanGatedLabelFrom(env.TRACKER_CONFIG || `${env.BASE_PATH || ".base"}/.work-item-tracker.json`);
+  const result = await select({ api: client, pr, appId, reviewerId, maxRounds, humanGatedLabel, log });
   let sha256 = "";
   if (result.file) {
     const text = `${JSON.stringify(result.file, null, 2)}\n`;
@@ -171,8 +217,12 @@ export async function main(env, { api, log = (line) => console.log(line) } = {})
   output("head-sha", result.headSha);
   output("escalation-reason", result.escalationReason ?? "");
   output("context-sha256", sha256);
+  // fix-ci-not-run's check, and whether apply-patch may push past the
+  // human-gated label a lane escalation put on.
+  output("skip-reason", result.decision === "skip" ? result.skipReason : "");
+  output("lane-escalated", String(result.laneEscalated === true));
   log(
-    `${result.decision}: ${result.file?.checks.length ?? 0} failing check(s), ${result.rounds ?? 0} earlier round(s)${result.escalationReason ? `, ${result.escalationReason}` : ""}`,
+    `${result.decision}: ${result.file?.checks.length ?? 0} failing check(s), ${result.file?.review_findings.length ?? 0} review finding(s), ${result.rounds ?? 0} earlier round(s)${result.escalationReason ? `, ${result.escalationReason}` : ""}`,
   );
   return 0;
 }

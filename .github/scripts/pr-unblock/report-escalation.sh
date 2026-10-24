@@ -22,10 +22,14 @@
 #                       | dependency-security-close | dependency-escalate
 #                       | dependency-config-unreadable
 #                       | dependency-files-truncated
-#                       | dependency-control-uncited | ci-fix-round-cap
+#                       | dependency-control-uncited
+#                       | dependency-workflow-held
+#                       | dependency-fix-refused | ci-fix-round-cap
 #                       | ci-fix-empty | ci-fix-invalid
 #                       | ci-fix-protected-path | ci-fix-not-applied
-#                       | ci-fix-escalated
+#                       | ci-fix-escalated | conflict-patch-invalid
+#                       | conflict-patch-not-applied
+#                       | conflict-patch-protected-path
 #   TRACKER_CONFIG      base .work-item-tracker.json
 #                       (default .base/.work-item-tracker.json)
 #   LANES_BOT_LOGIN     the lanes App bot login, the only author whose marker
@@ -34,7 +38,9 @@
 # The role label is config.role_labels["human-gated"]. A missing file or entry
 # means needs-human; a present entry that is not a non-empty string fails.
 # Idempotent: with the label on the PR and a LANES_BOT_LOGIN marker for this
-# resume key, it writes nothing. Without the label (a person removed it to resume), it
+# resume key and reason, it writes nothing; another reason on the same head
+# gets its own comment, so gate-source.mjs reads every reason the label holds
+# for. Without the label (a person removed it to resume), it
 # escalates again. The label is written before the comment, so a retry after a
 # failure between the two finds the label and posts at most one comment. The
 # comment write is tried three times, so a transient failure does not leave the
@@ -55,12 +61,12 @@ die() {
 }
 
 case ${ESCALATION_REASON:-} in
-  protected-path-conflict) why='a conflicted path is protected, so the lane does not resolve it' ;;
+  protected-path-conflict) why='a conflicted path is a workflow, submodule config or a settings file, which the lane does not resolve' ;;
   workflow-staged) why='the merge stages a change under .github/workflows/, which the lane does not push' ;;
-  unexpected-path-staged) why='the merge stages a change to a path that did not conflict, which the lane does not push' ;;
+  unexpected-path-staged) why='the conflict resolution changes a path outside the conflicted ones, which the lane does not push' ;;
   repeat-cap) why='the lane has resolved conflicts on this branch as many times in a row as its cap allows' ;;
   unresolved-conflict) why='the lane could not resolve every conflict' ;;
-  feedback-protected-path) why='the pull request changes .github/, so the lane does not address its review threads' ;;
+  feedback-protected-path) why='the pull request changes .github/workflows/, which the lane token cannot push, so the lane does not address its review threads' ;;
   feedback-round-cap) why='the lane has addressed review threads on this pull request as many rounds as its cap allows' ;;
   feedback-uncertain) why='a review finding is uncertain or deferred, so a person decides it' ;;
   feedback-not-landed) why='a fix the lane recorded did not reach the branch, so none of its review replies was posted' ;;
@@ -70,18 +76,23 @@ case ${ESCALATION_REASON:-} in
   feedback-disputed) why='the lane replied with evidence that a review finding is incorrect; a person decides and resolves that thread' ;;
   dependency-round-cap) why='the lane has reviewed this dependency update as many rounds as its cap allows' ;;
   dependency-invalid) why='the dependency review verdict did not pass validation, so the lane acted on none of it' ;;
-  dependency-fix-not-landed) why='the dependency review chose a fix, but no fix commit reached the branch' ;;
+  dependency-fix-not-landed) why='the dependency review chose a fix, but no fix commit reached the branch (the lane lands a fix only when it changes nothing but the versions in npm or pip manifest and lock files outside .github/)' ;;
   dependency-security-close) why='the dependency review would close a security update, which the lane never closes' ;;
   dependency-escalate) why='the dependency review found a risk the lane does not decide alone' ;;
   dependency-config-unreadable) why='the lane could not read the base .github/dependabot.yml, so it does not mark this dependency update for merge' ;;
   dependency-files-truncated) why='the dependency review chose merge, but the files listing it read was cut short, so the lane does not mark this dependency update for merge' ;;
+  dependency-workflow-held) why='the dependency review chose merge, but the update changes a workflow or action file, which a person merges' ;;
+  dependency-fix-refused) why='a commit on the dependency update other than Dependabot'"'"'s changes more than a version of an npm or pip manifest or lock file, as a regular file outside .github/, so the lane does not act on the review' ;;
   dependency-control-uncited) why='the dependency review chose merge for a review-only dependency without quoting its control, so the lane does not mark it for merge' ;;
   ci-fix-round-cap) why='the lane has pushed as many CI fixes to this pull request as its cap allows, and CI still fails' ;;
   ci-fix-empty) why='the lane changed nothing that fixes the failing checks' ;;
   ci-fix-invalid) why='the CI fix the lane wrote did not pass validation, so it was not pushed' ;;
-  ci-fix-protected-path) why='the CI fix changes .github/, which the lane does not push' ;;
+  ci-fix-protected-path) why='the CI fix changes a path the lane does not push: .github/workflows/, CODEOWNERS, .gitmodules or a settings file' ;;
   ci-fix-not-applied) why='the CI fix did not apply to the head it was written for, so it was not pushed' ;;
   ci-fix-escalated) why='the lane could not fix every failing check; its run log names each one and why' ;;
+  conflict-patch-invalid) why='the conflict resolution the lane wrote did not pass validation, so the merge was not pushed' ;;
+  conflict-patch-not-applied) why='the conflict resolution did not apply to the merge it was written for, so the merge was not pushed' ;;
+  conflict-patch-protected-path) why='the conflict resolution changes a path the lane does not push: .github/workflows/, CODEOWNERS, .gitmodules or a settings file' ;;
   *) die "unknown escalation reason [${ESCALATION_REASON:-}]" ;;
 esac
 case $ESCALATION_REASON in
@@ -127,10 +138,11 @@ key_line="<!-- pr-unblock resume-key=$HEAD_SHA -->"
 labeled=$(gh api "$issue" | jq --arg l "$label" '[.labels[].name] | index($l) != null')
 if [[ $labeled == true ]]; then
   marked=$(gh api --paginate "$issue/comments" | jq -s --arg bot "$bot" --arg m "$marker" --arg k "$key_line" \
-    '[add[] | select(.user.login == $bot) | (.body // "") | split("\n")
-      | select((.[0] | rtrimstr("\r")) == $m and (.[1] // "" | rtrimstr("\r")) == $k)] | length > 0')
+    --arg r "- Reason: \`$ESCALATION_REASON\`" \
+    '[add[] | select(.user.login == $bot) | (.body // "") | split("\n") | map(rtrimstr("\r"))
+      | select(.[0] == $m and (.[1] // "") == $k and any(.[]; . == $r))] | length > 0')
   if [[ $marked == true ]]; then
-    echo "already escalated for resume key $HEAD_SHA"
+    echo "already escalated $ESCALATION_REASON for resume key $HEAD_SHA"
     exit 0
   fi
 fi

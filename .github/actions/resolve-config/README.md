@@ -42,7 +42,9 @@ The step fails and writes no file when:
    `activity-rules.json` row forbids, in any lane or none (`forbidden-by-activity`). A leaf with no
    row in `activity-rules.json` is valid; a missing or malformed file, or a forbidden effect `effect-grants.json` lacks, is rejected
    (`activity-rules`).
-4. A lane's `stage` differs from its `lane-rules.json` row, or the lane has no row.
+4. A lane's `stage` differs from its `lane-rules.json` row, or the lane has no row; or the row's
+   `activity-grants` maps an activity to anything but exactly `{ "actions": "read" }`
+   (`lane-grant`). A name the lane does not hold adds nothing.
 5. A lane slot's `needs:` names an activity that is not one of the lane's slots
    (`needs-outside-lane`), or a composite child's names one that is not its sibling
    (`needs-not-sibling`).
@@ -93,9 +95,7 @@ predicate always reads labels from that response, never from the payload, so a h
 the event still holds a queued run.
 
 On an `issues` event there is no PR: `labeled` maps to the `labeled` event, labels come from the
-issue in the payload (a `labels-absent` or `admission` predicate reads `GET /issues/{n}` instead), and
-`labeled-after` compares its time with the issue's `updated_at`. A `labeled-after` predicate off
-an `issues` event cannot be decided and fails the step.
+issue in the payload (a `labels-absent` or `admission` predicate reads `GET /issues/{n}` instead).
 
 ## Output
 
@@ -106,17 +106,19 @@ the `limits` ([README, Limits](../../../docs/conventions/pr-pipeline/README.md#l
 `merge.rung` `off`, `stack-landing` `manual`. A skill slot carries `models`: its profile name and
 that profile's `model`, `effort` (null when unset), `subagent-model` (`inherit` when unset) and
 `max-turns`, from its activity's route, else `models.default-profile`, else, with no `models`
-block, the built-in `standard` profile (model `default`, 75 turns); a script slot carries `models`
+block, the built-in `standard` profile (model `default`, 75 turns); at input `model-rung` 1 the
+profile's `escalate-to` replaces it, one rung at most; a script slot carries `models`
 null. A skill slot with input `issue`, in a config with `models.issue-dimensions`, also carries
-`issue-dimensions` and `timeout-minutes`, and its `max-turns` is the dimensions' turn cap. The
+`issue-dimensions` and `timeout-minutes`, and its `max-turns` is the dimensions' turn cap; its
+Complexity's `complexity-profiles` entry, when there is one, replaces the route's profile. The
 issue's field values are read over REST (`issue-field-values`, which needs `issues: read`) and
 their setters from the GraphQL field events, unless input `issue-dimensions` names what an
 earlier resolve read. A value counts only when its latest setter is a listed human on the base
-trusted-actor list or the lanes App; an option no entry maps fails the step
-(`unmapped-dimension`); an applying slot becomes `not-assessed`, `research-first`,
-`probe-first` or `split-required` in that order
+trusted-actor list or the lanes App, and a field with no counted value reads as small, medium or
+known; an option no entry maps fails the step (`unmapped-dimension`); an applying slot becomes
+`research-first`, `probe-first` or `split-required` in that order
 ([README, Models](../../../docs/conventions/pr-pipeline/README.md#models)). A slot's `applies-when` replaces its activity's. `merge.diff-check.denied-paths` always
-gains the config path, `.github/**` and the trusted-actor list.
+gains the config path and the trusted-actor list.
 
 The lane's slots are its leaves: each composite is replaced by its children, depth first in list
 order. A leaf is enabled only when the lane, every slot on its path and its own slot are; it must
@@ -128,10 +130,11 @@ leaf that sets `prepare` carries it.
 Each resolved slot carries `applies` and `skip-reason`: `disabled-by-config` when the lane or a
 slot on the path sets `enabled: false`, `not-applicable-paths` when a `paths` predicate misses,
 `awaiting-human` when a `labels-absent` label is on the PR, `not-applicable` when a `labels`,
-`events`, `work-classes`, `admission`, `mergeable`, `draft` or `labeled-after` predicate misses, and `prerequisite-missing` when
+`events`, `work-classes`, `admission`, `mergeable` or `draft` predicate misses, and `prerequisite-missing` when
 mergeability stayed unknown, in that order when several miss. An enabled slot whose predicate was
 not decided carries `applies` and `skip-reason` null. Its `grant` is the effect's row in
-`effect-grants.json`. The step fails when that row does not set exactly `contents`,
+`effect-grants.json`, plus `actions: read` when its lane's `lane-rules.json` row lists the leaf
+under `activity-grants`. The step fails when that row does not set exactly `contents`,
 `pull-requests` and `issues`, each `read` or `write`, or when an `effect` is not a string: an empty
 grant would mint a token with every App permission.
 
@@ -147,7 +150,7 @@ input makes the reader fetch the PR's files even without a `paths` predicate.
 Step outputs: `enabled` and `slots` (a JSON list of names); with `activity`, also `kind`,
 `effect`, `gating` (`gate` or `advisory`), `skill`, `script`, `profile`, `claude-args`,
 `settings-json`, `max-turns`, `model`, `effort`, `reads-untrusted`, `applies`, `skip-reason`, `contents`,
-`pull-requests`, `issues` and `can-commit` (`false` only when `contents` is `read`), `prepare`
+`pull-requests`, `issues`, `actions` (`read`, or empty when the grant has none) and `can-commit` (`false` only when `contents` is `read`), `prepare`
 only when the leaf sets it, and `issue-dimensions` and `timeout-minutes` only when the slot reads
 issue dimensions. `args` is free text and stays in the file.
 
@@ -169,15 +172,19 @@ and `effort` for that route.
 which fetches `effect-grants.json` and `lane-rules.json` from this repository's default-branch tip
 and decides a lane's App token grant through it. It runs the same file checks as the action
 (rejections 1-11, 13 and 16 above) and the effect-grant check, for one required leaf `activity`, and returns
-`{ effect, grant }`, where `grant` is a frozen copy of the effect's row in `effect-grants.json`. A
+`{ effect, grant }`, where `grant` is a frozen copy of the effect's row in `effect-grants.json` with
+the activity's `activity-grants` entry added. A
 slot whose lane or slot sets `enabled: false` gets no grant: it rejects with `slot-disabled`. It
 decides no `applies-when` predicate, so it takes no facts. `applies-when` is not an authorization
 control: it decides whether a slot runs, never what its token may do. Like `resolve()`, it throws
 a `Rejection` whose `code` names the failure. `files.activityRules` is required: a caller that
 passes none is rejected with `activity-rules`. The broker passes only the files its
 `binding.mjs` lists, so a file `loadConfig` comes to need must join that list, and the
-`test_files` list of azure-iac's `scripts/deploy/fetch-resolve-config.sh`, in the same pin bump;
-[`broker-vendoring.test.mjs`](broker-vendoring.test.mjs) checks both against a copy of those lists.
+`test_files` list of azure-iac's `scripts/deploy/fetch-resolve-config.sh`, in an azure-iac change
+deployed before this one merges. The broker loads `resolve.mjs` and the sibling modules it imports
+from this repository's `main`, whichever repository calls, beside its own `ajv` and `yaml`;
+[`broker-vendoring.test.mjs`](broker-vendoring.test.mjs) checks the lists, the import walk and the
+packages against a copy of the broker's.
 
 ## Job contract
 
