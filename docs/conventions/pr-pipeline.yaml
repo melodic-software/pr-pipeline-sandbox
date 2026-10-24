@@ -583,6 +583,9 @@ models:
     review-gate: turns-5
     audit-env: turns-6
     audit-env-write: turns-6
+    # Probe-only (claude-code-plugins#9624 probes 2, 4, 5): a turn cap, so a
+    # run stops on it. Reverted after the probe.
+    resolve-issue: turns-6
     resolve-conflicts: code-fix
     address-feedback: code-fix
     review-dependency: review
