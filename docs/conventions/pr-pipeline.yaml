@@ -307,10 +307,14 @@ activities:
   # Phase 3 of the issue-work lane: copied from claude-code-plugins' config,
   # with the go-live time set to when this sandbox case was staged.
   resolve-issue:
-    # Sandbox: main's, with no checks, self-checks, verify-scripts or web
-    # access, since claude-code-plugins' scripts are not here.
+    # Sandbox: main's, with only the self-check and verify-script the sandbox
+    # has (check-affected.sh, which skips each check whose script or tool is not
+    # here, and git-mv-rm.sh), no checks and no web access.
     skill: work-items:work
     args: --ci
+    self-checks: [scripts/check-affected.sh --uncommitted]
+    verify-scripts:
+      - scripts/git-mv-rm.sh
     # Runs model-chosen commands, so no write token: the change leaves as a
     # patch, and the run's outcome file goes to report-outcome.
     effect: read
@@ -591,6 +595,61 @@ models:
     review-security: pr-review
     triage-issue: triage
     summarize-reuse: summary
+    resolve-issue: code-fix
+  issue-dimensions:
+    fields:
+      size:
+        field-id: 15462270
+        options:
+          "27053568": small
+          "27053567": medium
+          "27053566": large
+      complexity:
+        field-id: 48625720
+        options:
+          "85127651": low
+          "85127652": medium
+          "85127653": high
+      uncertainty:
+        field-id: 48625721
+        options:
+          "85127654": known
+          "85127655": knowable
+          "85127656": unknown
+    sizes:
+      # 75 turns is the cap every lane run had; a 50-minute leg covers the
+      # high factor at the 20 seconds a turn the old 75-turn, 25-minute run
+      # allowed, and the job holds 15 minutes more, for the steps around the
+      # launcher's leg (pr-run-activity-read.yml's launch step).
+      small:
+        base-turns: 75
+        timeout-minutes: 65
+      # Twice small's turns and leg time.
+      medium:
+        base-turns: 150
+        timeout-minutes: 115
+      # Too big for one run: the lane skips it (split-required) before any
+      # model turn, and triage sends it to /work-items:decompose.
+      large: split
+    complexity:
+      # Base turns as they are: a small low-complexity issue runs as before.
+      low: 1
+      # Half again, for an issue with several moving parts.
+      medium: 1.5
+      # Double, the most a size's timeout covers.
+      high: 2
+    # The profile a run starts on by Complexity, in place of its route's:
+    # high runs Opus at effort xhigh; low, medium and an unset field keep the
+    # activity's default.
+    complexity-profiles:
+      high: code-xhigh
+    uncertainty:
+      # The approach is known: run it.
+      known: run
+      # Answerable by reading first: the run researches, then works it.
+      knowable: run
+      # Only an experiment answers it: skip until a probe has (probe-first).
+      unknown: probe-first
 
 merge:
   # The lane auto-merges only PRs labeled `work-class: mechanical` (C2):

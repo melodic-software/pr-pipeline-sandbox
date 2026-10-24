@@ -64,6 +64,11 @@ SYNCED=(
   scripts/check-read-caller-keys.mjs
   scripts/check-read-caller-keys.sh
   scripts/check-scan-carrier-secret-shadow.sh
+  # resolve-issue's self-check and verify-script, staged as .lane wrappers.
+  # check-affected.sh skips each check whose script or tool is not here.
+  scripts/check-affected.sh
+  scripts/git-mv-rm.sh
+  scripts/lib/checkout-path.sh
 )
 
 # The sandbox's own versions of files claude-code-plugins also has.
