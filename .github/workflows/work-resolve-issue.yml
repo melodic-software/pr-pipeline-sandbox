@@ -198,9 +198,7 @@ jobs:
       issue-number: ${{ format('{0}', github.event.issue.number) }}
       trusted-base: default-tip
       app-label: agent-ready
-      # Probe-only (claude-code-plugins#9624 probe 5): issue 207's run job
-      # times out after a minute. Reverted after the probe.
-      timeout-minutes: ${{ github.event.issue.number == 207 && 1 || fromJSON(needs.pick-slot.outputs.timeout-minutes || '25') }}
+      timeout-minutes: ${{ fromJSON(needs.pick-slot.outputs.timeout-minutes || '25') }}
       issue-dimensions: ${{ needs.pick-slot.outputs.issue-dimensions }}
     secrets:
       claude-code-oauth-token: ${{ secrets.ISSUE_LANE_CLAUDE_CODE_OAUTH_TOKEN }}
