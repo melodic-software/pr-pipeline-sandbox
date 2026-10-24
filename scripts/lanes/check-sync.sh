@@ -87,9 +87,13 @@ ADAPTED=(
 
 # "<path> <commit>": compared against that commit instead of the ref.
 PINNED=(
-  # A sync-manifest-managed file: check-managed-files refuses a hand edit, and
-  # nothing in the lane runtime reads it.
+  # Sync-manifest-managed files: check-managed-files refuses a hand edit, and
+  # standards-sync lands them. The runners read only the runner-policy
+  # lockfile, for an install.
   ".github/standards/runner-policy/policy.json 9329c4cd64765267e43aef0ceef58c40961cd676"
+  ".github/standards/dependabot-policy/policy.json add8219a557d432d9f4dbd1cac98b0e8a2114b10"
+  ".github/standards/runner-policy/package-lock.json 4ac70b2c402920d9c42b9a9f00e86c14d7f785ea"
+  ".github/standards/runner-policy/runner-policy.mjs c277271481af37c9761bcf802a3bc692540bb53a"
 )
 
 usage() {
