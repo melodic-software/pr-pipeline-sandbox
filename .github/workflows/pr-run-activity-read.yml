@@ -2211,14 +2211,6 @@ jobs:
             exit 1
           fi
 
-      # Probe-only (claude-code-plugins#9624 probe 4): fail the scan job after
-      # its first step for issue 206. Reverted after the probe.
-      - name: Fail the scan for probe 4
-        if: inputs.issue-number == '206'
-        run: |
-          echo "::error::probe 4: the scan job fails after its first step"
-          exit 1
-
       # The opener and the public key, from the default branch's tip, named
       # by the event, never by a run job output: this code runs with the
       # private key, and head code with sudo on the run job's runner could
