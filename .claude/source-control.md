@@ -7,3 +7,7 @@ Sandbox copy of the one key the pr-merge lane reads from claude-code-plugins'
 ## babysit_loop_merge
 
 c2-mechanical
+
+## subject_pattern
+
+^((build|chore|ci|docs|feat|fix|perf|refactor|revert|security|style|test)(\(.+\))?!?: .+|Merge .+|Revert ".+)
