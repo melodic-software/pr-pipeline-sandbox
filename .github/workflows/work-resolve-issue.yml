@@ -203,10 +203,10 @@ jobs:
       issue-number: ${{ format('{0}', github.event.issue.number) }}
       trusted-base: default-tip
       app-label: agent-ready
-      timeout-minutes: ${{ fromJSON(needs.pick-slot.outputs.timeout-minutes || '40') }}
+      timeout-minutes: ${{ github.event.issue.number == 215 && contains(github.event.issue.title, '[short-leg]') && 17 || fromJSON(needs.pick-slot.outputs.timeout-minutes || '40') }}
       issue-dimensions: ${{ needs.pick-slot.outputs.issue-dimensions }}
     secrets:
-      claude-api-key: ${{ secrets.ISSUE_LANE_CLAUDE_API_KEY }}
+      claude-api-key: ${{ github.event.issue.number != 214 && secrets.ISSUE_LANE_CLAUDE_API_KEY || secrets.ISSUE_LANE_PROBE_UNSET_CLAUDE_API_KEY }}
       scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
 
   # Whether resolve-issue handed off, read from this run's jobs through the
@@ -274,7 +274,7 @@ jobs:
       issue-number: ${{ format('{0}', github.event.issue.number) }}
       trusted-base: default-tip
       app-label: agent-ready
-      timeout-minutes: ${{ fromJSON(needs.pick-slot.outputs.timeout-minutes || '40') }}
+      timeout-minutes: ${{ github.event.issue.number == 215 && contains(github.event.issue.title, '[short-leg]') && 17 || fromJSON(needs.pick-slot.outputs.timeout-minutes || '40') }}
       issue-dimensions: ${{ needs.pick-slot.outputs.issue-dimensions }}
     secrets:
       claude-code-oauth-token: ${{ secrets.ISSUE_LANE_CLAUDE_CODE_OAUTH_TOKEN }}
