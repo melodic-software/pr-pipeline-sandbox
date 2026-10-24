@@ -29,6 +29,8 @@ SYNCED=(
   .github/actions/setup-runner-isolation
   .github/lane-keys
   .github/scripts/apply-patch
+  # The handoff jobs' evidence reader, checked out from the default branch tip.
+  .github/scripts/lib/handoff-evidence.sh
   .github/scripts/merge-base
   .github/scripts/pr-unblock
   .github/scripts/read-patch
