@@ -1,0 +1,118 @@
+---
+description: "Report (check, the default) or resolve (apply) the knowledge plugin's library_dir against the repository's artifact convention and its extraction prerequisites; apply install-deps provisions the extraction node deps and Chromium."
+argument-hint: "[check|apply] [install-deps]"
+user-invocable: true
+disable-model-invocation: true
+---
+
+## Purpose
+
+Bring the knowledge plugin to a working state: confirm the effective `library_dir` against this
+repository's artifact convention, and verify (or provision) the extraction pipelines'
+prerequisites. `library_dir` is a personal `userConfig` option that Claude Code prompts for and
+stores; this skill reports where the effective value came from and never writes it.
+
+- **Pointer**: when deciding where a `library_dir` value is stored and which settings scopes are
+  read for it, fetch
+  <https://code.claude.com/docs/en/plugins/manifest-reference#where-values-are-stored> and
+  <https://code.claude.com/docs/en/settings-reference#pluginconfigs> live; the option contract is
+  <https://code.claude.com/docs/en/plugins/manifest-reference#user-configuration>.
+- **As of**: 2026-10-11
+- **Recheck trigger**: either section changes where non-sensitive option values are stored or
+  which settings scopes a `pluginConfigs` entry is read from.
+
+Check-centric per the uniform setup contract (`docs/plugin-philosophy.md`
+"Setup is explicit and repeatable" in the marketplace repository): `check` inspects and
+reports, `apply` resolves what `check` found, and the extraction-dependency provisioning is a
+distinct opt-in subaction. The `library_dir` option is Claude-Code-owned; this skill never
+writes it, only reports and routes.
+
+Action routing: no argument or `check` runs the check; `apply` runs the check first, then the
+`library_dir` guidance; `apply install-deps` additionally provisions the extraction dependencies
+below. All actions are non-interactive when the action is given, never prompt.
+
+## `check` (read-only)
+
+Report a PASS/FAIL/INFO table with one remediation line per FAIL. Do not edit settings, write
+config, or install anything.
+
+1. **`library_dir` vs repository convention.** Read the rendered `${user_config.library_dir}`
+   value (default `.` = repository root). Inspect the consumer's `CLAUDE.md`, `AGENTS.md`,
+   `.claude/rules`, and existing artifact directories for a declared knowledge/artifact
+   convention, the team source of truth. Do not infer `library_dir` from the lifecycle
+   `memory_dir`: the memory root holds lifecycle working documents, while `library_dir` owns the
+   knowledge corpus. Mapping both to `.work` would nest the video-digest pipeline's own
+   `.work/<watch-epic>/...` layout as `.work/.work/...`. PASS when the personal value matches the
+   convention (or the portable `.` default with no distinct convention). FAIL on a mismatch
+   (remediation: Claude Code's plugin configuration prompt for `knowledge`) or a machine-absolute
+   path (not portable for repository work).
+2. **Extraction node deps**. INFO. Probe whether
+   `${CLAUDE_PLUGIN_DATA}/node_modules/@melodic/video-digestion` exists (the video-digest and
+   course-digest pipelines share it). Missing is INFO, not FAIL: each ingest skill self-provisions
+   on first run, and `apply install-deps` pre-provisions. Remediation: `apply install-deps`.
+3. **Playwright Chromium**. INFO. Probe whether the browsers path
+   (`PLAYWRIGHT_BROWSERS_PATH`, else `${CLAUDE_PLUGIN_DATA}/ms-playwright`) holds a `chromium-*`
+   or `chromium_headless_shell-*` build (course-digest frame capture). Missing is INFO with
+   remediation `apply install-deps`.
+4. **OS-level media tools**. INFO. Probe `yt-dlp --version` (video acquisition), `ffmpeg
+   -version` (frame extraction, watch/course actions), and `magick -version` (ImageMagick 7,
+   contact sheets. Watch/course actions). Each absence is INFO with the platform install command
+   from the ingest skill's Prerequisites; this skill never installs system packages. `book-distill`
+   (PDF) needs none of these.
+
+## `apply` (idempotent)
+
+Run `check`, then resolve each finding. Re-running after everything passes changes nothing and
+reports "already configured".
+
+1. **`library_dir` mismatch. Guidance only.** `library_dir` is a personal `userConfig` scalar;
+   never hand-edit `pluginConfigs` or write Claude Code settings. Reconfigure through Claude
+   Code's native flow, per the marketplace's plugin-reconfiguration convention
+   (<https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/plugin-reconfiguration/README.md>,
+   which owns the verified-version record): interactive `/plugin configure knowledge@<marketplace>`
+   any time, or headless `claude plugin install knowledge@<marketplace> -s <scope> --config library_dir=<value>`
+   (repeatable per key). Against an already-installed plugin it prints `already installed` and
+   still writes the value. Do **not** uninstall to reconfigure: that drops the plugin's entire
+   stored `pluginConfigs` entry, resetting every option in the README's Options reference to its
+   manifest default. `-s` defaults to `user`; pass the scope `claude plugin list` reports, and run
+   from that project's directory for a `project`/`local` scope, or the rerun adds a second
+   install record at the scope passed and enables the plugin there; the value itself always
+   lands in user settings. A rejected value prints a warning yet exits 0, so read the output.
+   Afterwards rerun `check` in a **fresh session**, because the rendered
+   `${user_config.*}` is injected at skill load, so a same-session check still reports the OLD
+   value; report the observed effective value, never an unobserved change.
+   For a root outside the project and home directories, recommend the portable value forms from the
+   README's option table (`~` prefix or `${NAME}` / `%NAME%` env-var reference) instead of a literal
+   machine path, which guardrail hardcoded-path checks rightly block.
+2. **`apply install-deps`. Provision the extraction dependencies.** Only with this subaction, run
+   both idempotent provisioners (each installs the vendored node dependencies into
+   `${CLAUDE_PLUGIN_DATA}`, and course-digest additionally provisions Chromium into
+   `${CLAUDE_PLUGIN_DATA}/ms-playwright`):
+
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/skills/video-digest/extraction/setup-deps.mjs" --data-dir "${CLAUDE_PLUGIN_DATA}"
+   node "${CLAUDE_PLUGIN_ROOT}/skills/course-digest/extraction/setup-deps.mjs" --data-dir "${CLAUDE_PLUGIN_DATA}"
+   ```
+
+   A stored fingerprint gates reinstalls, so re-running is safe and cheap. After provisioning,
+   re-run the `check` node-deps and Chromium probes and report their actual results, never claim
+   provisioned on the script exit codes alone.
+3. **OS-level media tools. Guidance only.** For a missing `yt-dlp`, `ffmpeg`, or ImageMagick 7,
+   give the platform install command from the ingest skill's Prerequisites. This skill never
+   installs system packages.
+4. **Confirm.** Report the observed `library_dir`, the repository convention and any mismatch, and
+   whether extraction dependencies were provisioned or intentionally skipped. Note that
+   `/knowledge:book-distill` writes to its explicitly named target skill rather than this setting.
+
+## Output
+
+Report the observed personal value, the repository convention, any mismatch, the state of each
+prerequisite, and the exact next action (`/plugin configure knowledge` for `library_dir`,
+or `apply install-deps` for provisioning). A `library_dir` change takes effect in a fresh session,
+not this one. Do not claim it this session.
+
+## Boundaries
+
+- Do not run an ingestion pipeline. Provisioning dependencies is not the same as running one.
+- Do not write the plugin cache, Claude Code user settings, or `pluginConfigs`.
+- Do not invent organization-specific paths or environment-variable prefixes.

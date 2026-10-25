@@ -1,0 +1,65 @@
+/**
+ * Semantic naming for synthesis key-frame promotions.
+ */
+
+import path from "node:path";
+
+const IMAGE_EXT = /\.(png|jpe?g|webp)$/i;
+
+/**
+ * @param {number} timestampSec
+ * @returns {string}
+ */
+export function formatTimestampSlug(timestampSec) {
+  const totalSec = Math.max(0, Math.round(timestampSec));
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  return `${min}m${String(sec).padStart(2, "0")}s`;
+}
+
+/**
+ * @param {string} sourceFile
+ * @returns {string}
+ */
+function sourceStem(sourceFile) {
+  return sourceFile.replace(IMAGE_EXT, "").toLowerCase();
+}
+
+/**
+ * @param {string} sourceFile
+ * @param {number|null} timestampSec - `null` for an untimed frame
+ * @param {Record<string, string>} [knownDestBySource]
+ * @returns {string}
+ */
+export function synthesisDestName(sourceFile, timestampSec, knownDestBySource = {}) {
+  if (knownDestBySource[sourceFile]) {
+    return knownDestBySource[sourceFile];
+  }
+  if (timestampSec == null || !Number.isFinite(timestampSec)) {
+    return `untimed-${sourceStem(sourceFile)}.png`;
+  }
+  return `at-${formatTimestampSlug(timestampSec)}-${sourceStem(sourceFile)}.png`;
+}
+
+/**
+ * Prefer semantic names when two files share identical pixels.
+ *
+ * @param {string} fileName
+ * @returns {number}
+ */
+export function synthesisNameQualityScore(fileName) {
+  const base = path.basename(fileName, path.extname(fileName));
+  let score = 0;
+  const generated = base.startsWith("at-") || base.startsWith("untimed-");
+  if (/[a-z]/i.test(base)) score += 20;
+  if (generated) {
+    if (base.includes("scene_")) score += 5;
+    if (base.includes("anchor_")) score += 8;
+  }
+  if (/^\d+(-\d+)*$/.test(base)) score -= 15;
+  if (/-\d+(-\d+)+$/.test(base)) score -= 10;
+  if (!generated && !fileName.startsWith("scene_") && !fileName.startsWith("anchor_")) {
+    score += 30;
+  }
+  return score;
+}

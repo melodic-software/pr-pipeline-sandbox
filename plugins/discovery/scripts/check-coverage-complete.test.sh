@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# Black-box contract test for check-coverage-complete.sh and its .py twin.
+#
+# Self-contained and cwd-independent; mutates only its own mktemp dir.
+#
+# The cases that matter are the ones where a wrong answer is invisible: a
+# malformed ledger must never read as "complete", and an unmarked box in a
+# column that is not Done must never read as "incomplete". Both
+# implementations must agree on every exit code and greppable summary.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY_SUT="python3:$SCRIPT_DIR/check-coverage-complete.py"
+SUTS=(
+  "bash:$SCRIPT_DIR/check-coverage-complete.sh"
+  "$PY_SUT"
+)
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+fails=0
+pass() { printf 'ok   - %s\n' "$1"; }
+fail() {
+  printf 'FAIL - %s\n' "$1" >&2
+  fails=$((fails + 1))
+}
+
+# run_one <sut-spec> <expected-exit> <label> [args...]
+run_one() {
+  local sut_spec="$1" expected="$2" label="$3"
+  shift 3
+  local runner="${sut_spec%%:*}" path="${sut_spec#*:}"
+  local out actual
+  out="$("$runner" "$path" "$@" 2>&1)"
+  actual=$?
+  if [[ "$actual" -eq "$expected" ]]; then
+    pass "$label [$runner] (exit $actual)"
+  else
+    fail "$label [$runner] — expected exit $expected, got $actual: $out"
+  fi
+}
+
+# run <expected-exit> <label> [args...]  — every SUT
+run() {
+  local expected="$1" label="$2"
+  shift 2
+  local sut
+  for sut in "${SUTS[@]}"; do
+    run_one "$sut" "$expected" "$label" "$@"
+  done
+}
+
+ledger() {
+  local path="$WORK/$1"
+  shift
+  {
+    printf '# Coverage ledger\n\n'
+    printf '| # | Corpus item | Depth criterion | Done |\n'
+    printf '|---|-------------|-----------------|------|\n'
+    printf '%s\n' "$@"
+  } >"$path"
+  printf '%s' "$path"
+}
+
+# --- complete ---------------------------------------------------------------
+
+all_marked="$(ledger all-marked.md \
+  '| 1 | alpha | its API reference read end to end | [x] |' \
+  '| 2 | beta  | its changelog fetched this turn   | [X] |')"
+run 0 "all rows marked passes" "$all_marked"
+
+# An unmarked box in a NON-Done column is not an unmarked row. A blind
+# `grep -q '\[ \]'` would fail this ledger, which is why the gate is
+# column-aware rather than pattern-matched.
+other_col="$(ledger other-column.md \
+  '| 1 | alpha [ ] | criterion mentioning [ ] literally | [x] |')"
+run 0 "unmarked box outside the Done column passes" "$other_col"
+
+# --- incomplete -------------------------------------------------------------
+
+one_unmarked="$(ledger one-unmarked.md \
+  '| 1 | alpha | its API reference read end to end | [x] |' \
+  '| 2 | beta  | its changelog fetched this turn   | [ ] |')"
+run 1 "one unmarked row fails" "$one_unmarked"
+
+none_marked="$(ledger none-marked.md \
+  '| 1 | alpha | criterion | [ ] |' \
+  '| 2 | beta  | criterion | [ ] |')"
+run 1 "no rows marked fails" "$none_marked"
+
+# --- fail closed ------------------------------------------------------------
+# Every case below is a ledger the gate cannot honestly grade. Each must exit 2
+# — never 0. A hand-edited or half-written ledger reading as "complete" is the
+# exact failure this gate exists to prevent.
+
+run 2 "missing file fails closed" "$WORK/does-not-exist.md"
+run 2 "no arguments fails closed"
+
+no_table="$WORK/no-table.md"
+printf '# Coverage ledger\n\nNothing tabular here.\n' >"$no_table"
+run 2 "no table at all fails closed" "$no_table"
+
+no_rows="$WORK/no-rows.md"
+{
+  printf '| # | Corpus item | Depth criterion | Done |\n'
+  printf '|---|-------------|-----------------|------|\n'
+} >"$no_rows"
+run 2 "header with zero data rows fails closed" "$no_rows"
+
+# A Done column alone does not make a table the ledger. An unrelated status table
+# would otherwise be graded as coverage — criterion 11 satisfied by a table about
+# something else, with no corpus item ever enumerated.
+foreign_table="$WORK/foreign-table.md"
+{
+  printf '# Notes\n\n'
+  printf '| Done | Note |\n'
+  printf '|------|------|\n'
+  printf '| [x] | status |\n'
+} >"$foreign_table"
+run 2 "unrelated table with a Done column is not the ledger" "$foreign_table"
+
+# ...and a real ledger later in the same document is still found.
+foreign_then_real="$WORK/foreign-then-real.md"
+{
+  printf '| Done | Note |\n'
+  printf '|------|------|\n'
+  printf '| [x] | status |\n\n'
+  printf '| # | Corpus item | Depth criterion | Done |\n'
+  printf '|---|-------------|-----------------|------|\n'
+  printf '| 1 | alpha | criterion | [x] |\n'
+} >"$foreign_then_real"
+run 0 "a real ledger after an unrelated table is still graded" "$foreign_then_real"
+
+# A backslash-escaped pipe is content, not a delimiter. A corpus item carrying a
+# TypeScript union must not be unparsable — the alternative is rewriting the
+# ledger to say something less accurate so the gate will read it.
+escaped_pipe="$(ledger escaped-pipe.md \
+  '| 1 | the read \| grep \| inferred union | every member documented | [x] |')"
+run 0 "escaped pipes inside a cell are content, not delimiters" "$escaped_pipe"
+
+no_hash="$WORK/no-hash-column.md"
+{
+  printf '| Corpus item | Depth criterion | Done |\n'
+  printf '|-------------|-----------------|------|\n'
+  printf '| alpha | criterion | [x] |\n'
+} >"$no_hash"
+run 2 "header missing the # column fails closed" "$no_hash"
+
+dup_header="$WORK/duplicate-header.md"
+{
+  printf '| # | Corpus item | Depth criterion | Done | Done |\n'
+  printf '|---|-------------|-----------------|------|------|\n'
+  printf '| 1 | alpha | criterion | [x] | [x] |\n'
+} >"$dup_header"
+run 2 "duplicated required column fails closed" "$dup_header"
+
+partial_header="$WORK/partial-header.md"
+{
+  printf '| # | Corpus item | Done |\n'
+  printf '|---|-------------|------|\n'
+  printf '| 1 | alpha | [x] |\n'
+} >"$partial_header"
+run 2 "header missing the depth-criterion column fails closed" "$partial_header"
+
+no_done_col="$WORK/no-done-column.md"
+{
+  printf '| # | Corpus item | Depth criterion |\n'
+  printf '|---|-------------|-----------------|\n'
+  printf '| 1 | alpha | criterion |\n'
+} >"$no_done_col"
+run 2 "table without a Done column fails closed" "$no_done_col"
+
+mangled="$(ledger mangled.md \
+  '| 1 | alpha | criterion | [x] |' \
+  '| 2 | beta | criterion |')"
+run 2 "row with too few columns fails closed" "$mangled"
+
+# A stray pipe inside a cell shifts every column after it, so the cell read as
+# Done is some other cell — an extra column is as ungradeable as a missing one.
+wide="$(ledger too-wide.md \
+  '| 1 | alpha | criterion with a stray | pipe | [x] |')"
+run 2 "row with too many columns fails closed" "$wide"
+
+# A marked box on a row with no depth criterion certifies nothing — there is no
+# statement of what covering that item meant. Criterion 11 reads exit 0 as proof
+# of coverage, so this must never be one.
+no_criterion="$(ledger no-criterion.md '| 1 | alpha |  | [x] |')"
+run 2 "marked row with an empty depth criterion fails closed" "$no_criterion"
+
+no_item="$(ledger no-item.md '| 1 |  | criterion | [x] |')"
+run 2 "marked row with an empty corpus item fails closed" "$no_item"
+
+# The same emptiness on an UNMARKED row is still ungradeable — a ledger cannot be
+# completed later against a criterion nobody wrote.
+unmarked_no_criterion="$(ledger unmarked-no-criterion.md '| 1 | alpha |  | [ ] |')"
+run 2 "unmarked row with an empty depth criterion fails closed" "$unmarked_no_criterion"
+
+junk_cell="$(ledger junk-cell.md '| 1 | alpha | criterion | done? |')"
+run 2 "Done cell that is neither marked nor unmarked fails closed" "$junk_cell"
+
+empty="$WORK/empty.md"
+: >"$empty"
+run 2 "empty file fails closed" "$empty"
+
+# A ledger that exists but cannot be decoded as UTF-8 is ungradeable (exit 2), not
+# incomplete (exit 1). The Python twin must catch UnicodeDecodeError rather than
+# letting an uncaught exception become exit 1.
+bad_utf8="$WORK/bad-utf8.md"
+{
+  printf '| # | Corpus item | Depth criterion | Done |\n'
+  printf '|---|-------------|-----------------|------|\n'
+  printf '| 1 | '
+  printf '\xff'
+  printf ' alpha | criterion | [x] |\n'
+} >"$bad_utf8"
+# Bash/awk may still grade bytes; the .py twin must exit 2. Run the twin alone.
+run_one "$PY_SUT" 2 "non-UTF-8 ledger fails closed as ungradeable" "$bad_utf8"
+
+# Permission denied after is_file() is likewise ungradeable for the Python twin.
+#
+# Owner decision for #3375 (simulate, not chmod-as-contract and not
+# runuser/sudo): chmod 000 is not a reliable fault injector for a privileged
+# process. Linux CAP_DAC_OVERRIDE lets root bypass mode bits, so a mode-000
+# fixture still grades as complete in root containers (a common CI shape) and
+# the fail-closed branch is never entered. The contract case therefore imports
+# the Python twin, patches pathlib.Path.read_text with unittest.mock.patch.object
+# to raise PermissionError(errno.EACCES) for an otherwise regular fully-marked
+# fixture, calls grade(), and asserts exit 2 plus the "ledger unreadable"
+# diagnostic. That path runs as every user, including root.
+#
+# chmod 000 stays only as a supplemental integration check: it asserts exit 2
+# when the host actually denies the read, and prints a visible SKIP when the
+# file stays readable. A skip there is acceptable because the simulated case
+# has already exercised the exception-to-exit-2 contract on every host.
+unreadable="$(ledger unreadable.md '| 1 | alpha | criterion | [x] |')"
+
+sim_out="$(
+  PY_TWIN="$SCRIPT_DIR/check-coverage-complete.py" \
+    LEDGER="$unreadable" \
+    python3 - <<'PY' 2>&1
+import contextlib
+import errno
+import importlib.util
+import io
+import os
+import pathlib
+import sys
+from unittest.mock import patch
+
+twin = os.environ["PY_TWIN"]
+ledger = os.environ["LEDGER"]
+spec = importlib.util.spec_from_file_location("check_coverage_complete", twin)
+if spec is None or spec.loader is None:
+    print("could not load Python twin", file=sys.stderr)
+    sys.exit(1)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+target = pathlib.Path(ledger)
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    baseline = mod.grade(target)
+if baseline != 0:
+    print(
+        f"fixture is not an otherwise regular complete ledger: grade() returned {baseline}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+err = io.StringIO()
+denied = PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(target))
+with patch.object(pathlib.Path, "read_text", side_effect=denied):
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        rc = mod.grade(target)
+diag = err.getvalue()
+if rc != 2:
+    print(f"expected grade() to return 2, got {rc}; stderr={diag!r}", file=sys.stderr)
+    sys.exit(1)
+if "ledger unreadable" not in diag:
+    print(f"expected 'ledger unreadable' in stderr, got {diag!r}", file=sys.stderr)
+    sys.exit(1)
+PY
+)"
+sim_rc=$?
+if [[ "$sim_rc" -eq 0 ]]; then
+  pass "simulated PermissionError on read_text fails closed as ungradeable [python]"
+else
+  fail "simulated PermissionError on read_text fails closed as ungradeable [python] - ${sim_out}"
+fi
+
+chmod 000 "$unreadable" 2>/dev/null
+if [[ -r "$unreadable" ]]; then
+  echo "SKIP: chmod-000 unreadable-ledger integration check - this platform/user does not enforce chmod 000 on the fixture (simulated PermissionError case above already covered the contract)" >&2
+else
+  run_one "$PY_SUT" 2 "unreadable ledger fails closed as ungradeable" "$unreadable"
+fi
+chmod 644 "$unreadable" 2>/dev/null || true
+
+# --- usage ------------------------------------------------------------------
+
+run 0 "--help exits 0" --help
+run 2 "unknown flag fails closed" --nope "$all_marked"
+run 2 "two ledgers is a usage error" "$all_marked" "$one_unmarked"
+
+# --- output contract --------------------------------------------------------
+
+for sut in "${SUTS[@]}"; do
+  runner="${sut%%:*}"
+  path="${sut#*:}"
+  out="$("$runner" "$path" "$all_marked" 2>&1)"
+  if [[ "$out" == *"rows=2"* && "$out" == *"unmarked=0"* && "$out" == *"status=complete"* ]]; then
+    pass "complete ledger prints a greppable summary [$runner]"
+  else
+    fail "complete ledger summary [$runner] — got: $out"
+  fi
+
+  out="$("$runner" "$path" "$one_unmarked" 2>&1)"
+  if [[ "$out" == *"rows=2"* && "$out" == *"unmarked=1"* && "$out" == *"status=incomplete"* ]]; then
+    pass "incomplete ledger prints a greppable summary [$runner]"
+  else
+    fail "incomplete ledger summary [$runner] — got: $out"
+  fi
+
+  # The failing case must name WHICH rows are unmarked; "some row somewhere" sends
+  # the reader back to eyeball the table the gate exists to replace.
+  out="$("$runner" "$path" "$none_marked" 2>&1)"
+  if [[ "$out" == *"alpha"* && "$out" == *"beta"* ]]; then
+    pass "incomplete ledger names the unmarked items [$runner]"
+  else
+    fail "incomplete ledger should name unmarked items [$runner] — got: $out"
+  fi
+done
+
+if [[ "$fails" -eq 0 ]]; then
+  printf '\nAll checks passed.\n'
+  exit 0
+fi
+printf '\n%d check(s) failed.\n' "$fails" >&2
+exit 1

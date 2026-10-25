@@ -1,0 +1,373 @@
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { CELL_IDS } from "../lib/watch-vision-validation.js";
+import { listPromotionCandidates } from "./list-promotion-candidates.js";
+import { mergeTriageJson } from "./merge-triage-json.js";
+import { renderKeyFramesManifest } from "./render-key-frames-manifest.js";
+import { renderQualityAudit } from "./render-quality-audit.js";
+import { renderTriageLog } from "./render-triage-log.js";
+import { runValidatePromotionDecisions } from "./validate-promotion-decisions.js";
+import { runValidateTriageJson } from "./validate-triage-json.js";
+import { checkContainedFrame, visionGatedPromote } from "./vision-gated-promote.js";
+
+const tempDirs = [];
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * @param {{ invalidTriage?: boolean, forbiddenDest?: boolean, sourceFile?: string }} [options]
+ */
+function makeVisionSliceDir(options = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vision-gated-cli-"));
+  const framesDir = fs.mkdtempSync(path.join(os.tmpdir(), "vision-frames-"));
+  tempDirs.push(dir, framesDir);
+
+  const sourceFile = options.sourceFile ?? "anchor_00000000_0001.png";
+
+  const selectedFrames = CELL_IDS.map((_, index) => ({
+    file: `anchor_${String(index).padStart(8, "0")}_0001.png`,
+    timestampSec: 60 + index * 10,
+    priorityScore: index === 0 ? 8 : 1,
+    textDense: index === 0,
+    likelyDuplicate: false,
+  }));
+
+  for (const frame of selectedFrames) {
+    fs.writeFileSync(path.join(framesDir, frame.file), "fake-png");
+  }
+
+  const inputFiles = selectedFrames.map((frame) => frame.file);
+  const contactSheets = [
+    {
+      file: path.join(os.tmpdir(), "sheet_001.jpg"),
+      path: path.join(os.tmpdir(), "sheet_001.jpg"),
+      inputFiles,
+    },
+  ];
+
+  const tempSession = { framesDir, contactSheetsDir: os.tmpdir() };
+  const watch = { tempSession };
+  const selection = {
+    durationSec: 600,
+    tempSession,
+    selectedFrames,
+    contactSheets,
+    densificationWindows: [],
+  };
+
+  fs.mkdirSync(path.join(dir, "run-state"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "key-frames"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "run-state", "watch.json"), JSON.stringify(watch));
+  fs.writeFileSync(path.join(dir, "key-frames", "selection.json"), JSON.stringify(selection));
+
+  fs.mkdirSync(path.join(dir, "research"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "research", "claim-inventory.md"),
+    "## 1. Session one\n\n**Boundary:** [0:00] intro → [10:00] session one\n",
+  );
+
+  const cells = CELL_IDS.map((cell, index) => ({
+    cell,
+    frame: selectedFrames[index].file,
+    verdict: index === 0 ? "promote-key-frame" : "skip",
+    note: "",
+    ...(index === 8 ? { timestampSec: selectedFrames[8].timestampSec } : {}),
+  }));
+
+  const sheet = {
+    sheetId: "sheet_001",
+    reviewedAt: "2026-06-11T00:00:00.000Z",
+    model: "composer-2.5",
+    cells: options.invalidTriage ? cells.slice(0, 4) : cells,
+  };
+
+  const manifest = { sheetCount: 1, sheets: [sheet] };
+  const batchesDir = path.join(dir, "key-frames", "triage", "batches");
+  fs.mkdirSync(batchesDir, { recursive: true });
+  fs.writeFileSync(path.join(batchesDir, "sheet_001.json"), JSON.stringify(sheet, null, 2));
+  fs.writeFileSync(
+    path.join(dir, "key-frames", "triage", "manifest.json"),
+    JSON.stringify(manifest, null, 2),
+  );
+
+  fs.writeFileSync(
+    path.join(dir, "key-frames", "sheet-frame-index.json"),
+    JSON.stringify(
+      {
+        sheets: [
+          {
+            sheetId: "sheet_001",
+            cells: cells.map((cell) => ({ cell: cell.cell, frame: cell.frame })),
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+  );
+
+  const destName = options.forbiddenDest ? "at-12m30s-slide.png" : "demo-slide.png";
+  fs.writeFileSync(
+    path.join(dir, "key-frames", "promotion-decisions.json"),
+    JSON.stringify(
+      {
+        decisions: [
+          {
+            sourceFile,
+            verdict: "promote",
+            destName,
+            gapNote: "unique diagram on slide",
+            session: "session one",
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+  );
+
+  fs.writeFileSync(
+    path.join(dir, "key-frames", "key-frame-quality-audit.json"),
+    JSON.stringify(
+      {
+        reviewedAt: "2026-06-11T00:00:00.000Z",
+        files: [{ name: destName, pass: true, note: "sharp slide, legible text, no occlusion" }],
+      },
+      null,
+      2,
+    ),
+  );
+
+  return { dir, framesDir };
+}
+
+describe("runValidateTriageJson", () => {
+  it("exits 0 for a valid manifest", () => {
+    const { dir } = makeVisionSliceDir();
+    expect(runValidateTriageJson(dir)).toBe(0);
+  });
+
+  it("exits 1 for an invalid manifest", () => {
+    const { dir } = makeVisionSliceDir({ invalidTriage: true });
+    expect(runValidateTriageJson(dir)).toBe(1);
+  });
+});
+
+describe("runValidatePromotionDecisions", () => {
+  it("exits 0 for valid decisions", () => {
+    const { dir } = makeVisionSliceDir();
+    expect(runValidatePromotionDecisions(dir)).toBe(0);
+  });
+
+  it("exits 1 when decisions file is missing", () => {
+    const { dir } = makeVisionSliceDir();
+    fs.unlinkSync(path.join(dir, "key-frames", "promotion-decisions.json"));
+    expect(runValidatePromotionDecisions(dir)).toBe(1);
+  });
+});
+
+describe("visionGatedPromote", () => {
+  it("dry-run returns planned promotions", async () => {
+    const { dir } = makeVisionSliceDir();
+    const result = await visionGatedPromote(dir, { dryRun: true });
+    expect(result.promoted).toContain("frames/demo-slide.png");
+  });
+
+  it("rejects forbidden destination names", async () => {
+    const { dir } = makeVisionSliceDir({ forbiddenDest: true });
+    await expect(visionGatedPromote(dir, { dryRun: true })).rejects.toThrow(/forbidden/);
+  });
+
+  it("copies frames and writes promotion-map.json", async () => {
+    const { dir } = makeVisionSliceDir();
+    const result = await visionGatedPromote(dir);
+    expect(result.promoted).toContain("demo-slide.png");
+    expect(fs.existsSync(path.join(dir, "key-frames", "promotion-map.json"))).toBe(true);
+    expect(fs.existsSync(path.join(dir, "key-frames", "frames", "demo-slide.png"))).toBe(true);
+  });
+
+  it("refuses a sourceFile that climbs out of the frames directory and copies nothing", async () => {
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "vision-outside-"));
+    tempDirs.push(outsideDir);
+    fs.writeFileSync(path.join(outsideDir, "secret.png"), "outside");
+    const { dir } = makeVisionSliceDir({
+      sourceFile: `../${path.basename(outsideDir)}/secret.png`,
+    });
+
+    await expect(visionGatedPromote(dir)).rejects.toThrow(/sourceFile/);
+    expect(fs.existsSync(path.join(dir, "key-frames", "frames", "demo-slide.png"))).toBe(false);
+  });
+
+  it("refuses a frame that is a symlink to a file outside the frames directory", async (ctx) => {
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "vision-outside-"));
+    tempDirs.push(outsideDir);
+    const target = path.join(outsideDir, "secret.png");
+    fs.writeFileSync(target, "outside");
+    const { dir, framesDir } = makeVisionSliceDir({ sourceFile: "linked.png" });
+    try {
+      fs.symlinkSync(target, path.join(framesDir, "linked.png"));
+    } catch {
+      ctx.skip();
+    }
+
+    await expect(visionGatedPromote(dir)).rejects.toThrow(/outside the frames directory/);
+    expect(fs.existsSync(path.join(dir, "key-frames", "frames", "demo-slide.png"))).toBe(false);
+  });
+
+  it("refuses a checked frame swapped for an outside symlink before the copy", async (ctx) => {
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "vision-outside-"));
+    tempDirs.push(outsideDir);
+    const target = path.join(outsideDir, "secret.png");
+    fs.writeFileSync(target, "outside");
+    const { dir, framesDir } = makeVisionSliceDir();
+    const frame = path.join(framesDir, "anchor_00000000_0001.png");
+    const probe = path.join(framesDir, "probe-link");
+    try {
+      fs.symlinkSync(target, probe);
+      fs.unlinkSync(probe);
+    } catch {
+      ctx.skip();
+    }
+
+    // promoteKeyFrames creates the lane directory after the containment check and before the
+    // copy, so swapping the frame there lands in exactly that window.
+    const realMkdir = fsp.mkdir.bind(fsp);
+    let swapped = false;
+    const spy = vi.spyOn(fsp, "mkdir").mockImplementation(async (...args) => {
+      if (!swapped) {
+        swapped = true;
+        fs.unlinkSync(frame);
+        fs.symlinkSync(target, frame);
+      }
+      return realMkdir(...args);
+    });
+    try {
+      await expect(visionGatedPromote(dir)).rejects.toThrow(/changed after it was checked/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(swapped).toBe(true);
+    const dest = path.join(dir, "key-frames", "frames", "demo-slide.png");
+    expect(fs.existsSync(dest) && fs.readFileSync(dest, "utf8")).not.toBe("outside");
+  });
+});
+
+describe("checkContainedFrame", () => {
+  function makeFramesDir() {
+    const framesDir = fs.mkdtempSync(path.join(os.tmpdir(), "vision-contained-"));
+    tempDirs.push(framesDir);
+    fs.writeFileSync(path.join(framesDir, "scene_0001.png"), "frame");
+    return framesDir;
+  }
+
+  it("returns the real path of a frame directly inside the frames directory", () => {
+    const framesDir = makeFramesDir();
+    expect(checkContainedFrame(framesDir, "scene_0001.png").path).toBe(
+      path.join(fs.realpathSync(framesDir), "scene_0001.png"),
+    );
+  });
+
+  it("accepts a symlink whose target stays inside the frames directory", (ctx) => {
+    const framesDir = makeFramesDir();
+    try {
+      fs.symlinkSync(path.join(framesDir, "scene_0001.png"), path.join(framesDir, "alias.png"));
+    } catch {
+      ctx.skip();
+    }
+    expect(checkContainedFrame(framesDir, "alias.png").path).toBe(
+      path.join(fs.realpathSync(framesDir), "scene_0001.png"),
+    );
+  });
+
+  it.each([
+    "../scene_0001.png",
+    "..",
+    ".",
+    "sub/scene_0001.png",
+    "..\\scene_0001.png",
+    "/etc/passwd",
+  ])("refuses %j before touching the file system", (sourceFile) => {
+    const framesDir = makeFramesDir();
+    expect(() => checkContainedFrame(framesDir, sourceFile)).toThrow(/sourceFile/);
+  });
+
+  it("refuses a directory inside the frames directory", () => {
+    const framesDir = makeFramesDir();
+    fs.mkdirSync(path.join(framesDir, "nested"));
+    expect(() => checkContainedFrame(framesDir, "nested")).toThrow(/not a regular file/);
+  });
+
+  it("reports a missing frame as missing", () => {
+    const framesDir = makeFramesDir();
+    expect(() => checkContainedFrame(framesDir, "absent.png")).toThrow(/source frame missing/);
+  });
+
+  it("reports a frame that cannot be resolved with its error code, not as missing", (ctx) => {
+    const framesDir = makeFramesDir();
+    try {
+      fs.symlinkSync(path.join(framesDir, "loop.png"), path.join(framesDir, "loop.png"));
+    } catch {
+      ctx.skip();
+    }
+    expect(() => checkContainedFrame(framesDir, "loop.png")).toThrow(
+      /cannot be resolved \(ELOOP\)/,
+    );
+  });
+});
+
+describe("mergeTriageJson", () => {
+  it("merges batch files into manifest.json", () => {
+    // makeVisionSliceDir already writes key-frames/triage/batches/sheet_001.json.
+    const { dir } = makeVisionSliceDir();
+    const batchPath = path.join(dir, "key-frames", "triage", "batches", "sheet_001.json");
+
+    const manifestPath = mergeTriageJson(dir, [batchPath]);
+    expect(manifestPath).toContain("manifest.json");
+    const merged = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    expect(merged.sheets).toHaveLength(1);
+  });
+});
+
+describe("renderTriageLog", () => {
+  it("writes frame-triage-log.md from manifest", () => {
+    const { dir } = makeVisionSliceDir();
+    const outPath = renderTriageLog(dir);
+    expect(outPath).toContain("frame-triage-log.md");
+    expect(fs.readFileSync(outPath, "utf8")).toContain("sheet_001");
+  });
+});
+
+describe("renderKeyFramesManifest", () => {
+  it("writes key-frames-manifest.md", () => {
+    const { dir } = makeVisionSliceDir();
+    const outPath = renderKeyFramesManifest(dir);
+    expect(outPath).toContain("key-frames-manifest.md");
+    expect(fs.readFileSync(outPath, "utf8")).toContain("demo-slide.png");
+  });
+});
+
+describe("renderQualityAudit", () => {
+  it("writes key-frame-quality-audit.md", () => {
+    const { dir } = makeVisionSliceDir();
+    const outPath = renderQualityAudit(dir);
+    expect(fs.readFileSync(outPath, "utf8")).toContain("demo-slide.png");
+  });
+});
+
+describe("listPromotionCandidates", () => {
+  it("lists triage promote-key-frame cells", () => {
+    const { dir } = makeVisionSliceDir();
+    const candidates = listPromotionCandidates(dir);
+    expect(candidates.length).toBeGreaterThan(0);
+    expect(candidates[0].sourceFile).toMatch(/^anchor_/);
+  });
+});

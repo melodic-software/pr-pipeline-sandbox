@@ -1,0 +1,445 @@
+#!/usr/bin/env bash
+# Deterministic acceptance gate for a dispatched /discovery:explore or
+# /discovery:research run.
+#
+# The dispatched agent's return payload is a CLAIM about a run; this gate reads
+# the run's actual output off disk instead. It takes the memory-slice path the
+# PARENT resolved before dispatching — never a path read out of the payload —
+# because the failure it exists to catch is a payload that arrives malformed,
+# carrying no artifact pointer at all. A check that sources its own input from
+# the suspect payload cannot see that failure.
+#
+# It grades EXACTLY that path, and never scans for candidates. The parent
+# assigns every slice path before dispatching — including the collision
+# sub-slice when the slice root is already occupied, and the per-topic
+# sub-slices on a fan-out — so the assigned path IS the artifact's one
+# sanctioned home, and an index anywhere else under the slice is some other
+# run's artifact. Reaching for it is how a prior run's output gets accepted as
+# evidence that this dispatch succeeded.
+#
+# One gate serves both skills because they share one on-disk shape: an index
+# plus section-keyed sidecars beside it, the same parent-assigned sub-slice
+# rule, and the same two placement rules
+# (`skills/research/context/artifact-shape.md`).
+# The part that differs between them is the sidecar YAML header — tiers and
+# publishing pools for research, `verified: read | ran | grep | inferred` for
+# exploration — and this gate never reads a header. `--index-name` is therefore
+# the whole difference, and it is REQUIRED rather than defaulted: a gate that
+# fails closed everywhere else must not silently grade the wrong artifact
+# family because a caller omitted a flag.
+#
+# Usage:
+#   bash check-dispatch-artifact.sh <memory-slice-path> \
+#     --index-name <EXPLORE.md|RESEARCH.md> \
+#     [--newer-than <pre-dispatch baseline file>] \
+#     [--expect-index <the payload's artifact: value>] \
+#     [--expect-sidecars <the payload's sidecars: count>]
+#   bash check-dispatch-artifact.sh --help
+#
+# What it checks, in order:
+#   1. <index-name> exists at the root of the given slice path — and nowhere
+#      else is looked. A research fan-out that has synthesized a slice-root
+#      index beside its sub-slice ones confuses nothing: each invocation names
+#      which artifact it is asking about, so grade each fan-out run against its
+#      own assigned sub-slice, before synthesis.
+#   2. That index is non-empty.
+#   2a. Its marker slot does not hold `Run status: in progress`. The slot is
+#      the first non-blank line after the index's first level-1 title heading
+#      (past any BOM and CR, and never a heading-shaped line inside a code
+#      fence: a fence opens on 3+ backticks or tildes after at most 3 spaces
+#      of indent and closes only on a run of the same character, at least as
+#      long, followed by whitespace only). YAML front matter is skipped: line 1
+#      `---` counts as front matter only when a `---` or `...` closer follows
+#      and every line between is YAML-shaped (blank, indented, a hash comment,
+#      a `-` list item, or a `key:` line); otherwise it is a horizontal rule.
+#      A dispatched agent writes the marker there in its early
+#      skeleton and replaces it with `Run status: complete` in its final
+#      write, so a marked slot is a run that stopped before finishing. Only
+#      the slot is read: a later line quoting the marker does not trigger, and
+#      an index with no marker in its slot (inline or legacy) grades as before.
+#   3. It names at least one `<PREFIX>-<section>.md` sidecar, and every sidecar
+#      it names exists beside it and is non-empty. A mid-stream stub passes a
+#      bare non-empty test; it does not pass this one.
+#   4. With --newer-than, the index is strictly newer than a file the parent
+#      touched immediately BEFORE dispatching. Existence alone cannot tell this
+#      run's artifact from one an earlier run left in the same slice, so without
+#      a baseline a dispatch that wrote nothing can be accepted on stale
+#      evidence and planning proceeds against an outdated snapshot.
+#   5. With --expect-index, the pointer the payload returned resolves to the
+#      same file this gate graded. A payload naming some OTHER path is not
+#      corroborating this artifact, and its verification_request.target would
+#      send the verifier at the wrong file.
+#   6. With --expect-sidecars, the count the payload reported matches the count
+#      the index actually names. Secondary: the payload is the suspect party.
+#
+# Checks 4-6 are opt-in, so each reports `unchecked` in the output line rather
+# than passing silently — a skipped check that looks like a passed one is the
+# same failure class this gate exists to refuse.
+#
+# Exit 0 = a usable artifact set is on disk (status=usable)
+# Exit 1 = the slice is readable but its artifact set is NOT usable — no index,
+#          an empty index, an index still marked `Run status: in progress`,
+#          an index naming no sidecars, a named sidecar that is
+#          missing or empty, an index no newer than the baseline, a payload
+#          pointer naming a different file, or a sidecar-count mismatch
+#          (status=unusable). The parent discards the run; it does not proceed.
+# Exit 2 = the gate cannot grade — the slice path is missing, is not a
+#          directory, or names a baseline file that does not exist — plus usage
+#          errors, including a missing or malformed `--index-name`. FAIL
+#          CLOSED: a slice this gate cannot read is never reported as usable.
+#
+# What it deliberately does NOT check: the coverage ledger a bounded-corpus
+# research run writes. `research-checklist.md` has its own gate
+# (`check-coverage-complete.sh`), which grades the marks in its table rather
+# than the presence of a file, and the research skill composes the two. Folding
+# a ledger flag in here would put one caller's file into the shape-agnostic
+# half of the pair.
+#
+# Output (stdout, greppable):
+#   `index=<path> sidecars=<n> missing=<m> freshness=<newer|stale|unchecked>
+#    pointer=<matches|mismatch|unchecked> status=<usable|unusable>`
+#   (one line; wrapped here only for the comment width)
+#   On exit 0 a second line follows: `verification=<value>`, the index
+#   frontmatter's `verification:` value, or `unrecorded` when it has none.
+#   `pending` there means the sibling verifier has not run or its verdict
+#   was never written back. It never changes the exit status.
+# On a failure the specific reason is named on stderr.
+
+set -uo pipefail
+
+usage() {
+  # Sentinel range (not fixed line numbers) so the printed usage never silently
+  # truncates when the header grows or shrinks on a future edit.
+  sed -n '/^# Deterministic acceptance gate/,/^# Output/ s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"
+}
+
+slice=""
+index_name=""
+expect_sidecars=""
+newer_than=""
+expect_index=""
+
+# Resolve a path to its canonical directory plus its basename, so that two
+# spellings of one file compare equal. Deliberately not `realpath`, which is not
+# everywhere, and deliberately NOT resolving the basename itself — the question
+# is which file the payload named, not what a symlink points at. A path whose
+# directory does not exist is returned unchanged, which cannot match a real
+# index, and mismatch is the correct verdict for a pointer into nowhere.
+canonical() {
+  local path="$1" dir base
+  dir="$(dirname "$path")"
+  base="$(basename "$path")"
+  if [[ -d "$dir" ]]; then
+    printf '%s/%s' "$(cd "$dir" && pwd -P)" "$base"
+  else
+    printf '%s' "$path"
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --help | -h)
+    usage
+    exit 0
+    ;;
+  --index-name)
+    if [[ $# -lt 2 ]]; then
+      echo "error: --index-name requires an index filename (EXPLORE.md or RESEARCH.md)" >&2
+      exit 2
+    fi
+    # The name is not just echoed — its stem becomes the sidecar-matching
+    # pattern below, so it is constrained to characters that carry no meaning in
+    # an ERE. A name with a `.` or a `*` in its stem would silently widen that
+    # pattern and start counting files the run never wrote as sidecars.
+    if [[ ! "$2" =~ ^[A-Za-z0-9_-]+\.md$ ]]; then
+      echo "error: --index-name must be <NAME>.md with NAME in [A-Za-z0-9_-], got: $2" >&2
+      exit 2
+    fi
+    index_name="$2"
+    shift 2
+    ;;
+  --newer-than)
+    if [[ $# -lt 2 ]]; then
+      echo "error: --newer-than requires a baseline file path" >&2
+      exit 2
+    fi
+    newer_than="$2"
+    shift 2
+    ;;
+  --expect-index)
+    if [[ $# -lt 2 ]]; then
+      echo "error: --expect-index requires the payload's artifact: path" >&2
+      exit 2
+    fi
+    expect_index="$2"
+    shift 2
+    ;;
+  --expect-sidecars)
+    if [[ $# -lt 2 ]]; then
+      echo "error: --expect-sidecars requires a count" >&2
+      exit 2
+    fi
+    if [[ ! "$2" =~ ^[0-9]+$ ]]; then
+      echo "error: --expect-sidecars takes a non-negative integer, got: $2" >&2
+      exit 2
+    fi
+    expect_sidecars="$2"
+    shift 2
+    ;;
+  -*)
+    echo "error: unknown argument: $1" >&2
+    exit 2
+    ;;
+  *)
+    if [[ -n "$slice" ]]; then
+      echo "error: expected exactly one memory-slice path, got a second: $1" >&2
+      exit 2
+    fi
+    slice="$1"
+    shift
+    ;;
+  esac
+done
+
+if [[ -z "$slice" ]]; then
+  echo "error: a memory-slice path is required" >&2
+  exit 2
+fi
+
+# No default. The two artifact families this gate serves differ only in this
+# name, so guessing one would grade a research slice against EXPLORE.md, find
+# nothing, and report `unusable` for a run that in fact succeeded — or, worse,
+# find an unrelated EXPLORE.md a prior exploration left in the same slice and
+# report a research dispatch that wrote nothing as usable.
+if [[ -z "$index_name" ]]; then
+  echo "error: --index-name is required (EXPLORE.md or RESEARCH.md)" >&2
+  exit 2
+fi
+sidecar_prefix="${index_name%.md}"
+
+# A trailing slash would turn `$slice/$index_name` into a double-slashed path in
+# every message this gate prints, and the printed path is what the parent acts
+# on. Strip it, while leaving a bare `/` intact.
+while [[ "$slice" == */ && "$slice" != "/" ]]; do
+  slice="${slice%/}"
+done
+
+if [[ ! -d "$slice" ]]; then
+  echo "error: memory slice not found or not a directory: $slice" >&2
+  exit 2
+fi
+
+# A baseline that is not there makes freshness ungradeable, and the parent asked
+# for it — so this is an envelope error (2), never a quiet downgrade to
+# `freshness=unchecked`. Downgrading would turn the check the caller requested
+# into one it only appeared to get.
+if [[ -n "$newer_than" && ! -e "$newer_than" ]]; then
+  echo "error: --newer-than baseline does not exist: $newer_than" >&2
+  exit 2
+fi
+
+# Reported in every verdict line, so an opt-in check that did not run says so
+# rather than looking like one that passed.
+freshness="unchecked"
+pointer="unchecked"
+
+# verdict <index> <sidecars> <missing> <status>
+verdict() {
+  printf 'index=%s sidecars=%s missing=%s freshness=%s pointer=%s status=%s\n' \
+    "$1" "$2" "$3" "$freshness" "$pointer" "$4"
+}
+
+index="$slice/$index_name"
+
+if [[ ! -f "$index" ]]; then
+  echo "unusable: no $index_name at $slice" >&2
+  verdict "<none>" 0 0 unusable
+  exit 1
+fi
+
+if [[ ! -s "$index" ]]; then
+  echo "unusable: index is empty: $index" >&2
+  verdict "$index" 0 0 unusable
+  exit 1
+fi
+
+# A dispatched agent writes its index skeleton early with the marker in a
+# reserved slot and replaces it only in its final write, so an index whose slot
+# still holds it is a run that stopped short. Checked before the sidecar scan
+# so a bare skeleton reports this reason rather than "names no sidecar".
+#
+# The slot is the first non-blank line after the first level-1 title heading
+# (a line starting with one hash and a space), after dropping a UTF-8 BOM and
+# every CR, skipping leading YAML front matter, and ignoring heading-shaped
+# lines inside a code fence. Nothing else is read, so a restated task or quoted
+# source text carrying the marker's literal line is content, and an index with
+# no marker in its slot grades as before. The match tolerates case, spacing, a
+# tab, and `in-progress` / `in_progress`; words after the marker, or markdown
+# around it, make it prose.
+#
+# Front matter: line 1 `---` opens it only when a `---` or `...` closer exists
+# and every line between is YAML-shaped (blank, indented, a hash comment, a
+# list item, or a `key:` line). Otherwise line 1 is a horizontal rule and the
+# parse starts there. That needs a look ahead, so awk reads the file twice:
+# the first pass finds the closer, the second reads the slot.
+#
+# Fences follow CommonMark: an opener is three or more backticks or tildes
+# after at most three spaces; only a run of the SAME character, at least as
+# long and followed by nothing but whitespace, closes it.
+#
+# Plain awk (tolower, index, substr, match) so it runs in any POSIX awk.
+slot_state="$(awk '
+  function norm(s) {
+    sub(/\r+$/, "", s)
+    if (FNR == 1 && index(s, bom) == 1) s = substr(s, length(bom) + 1)
+    return s
+  }
+  function yamlish(s) {
+    return s ~ /^[ \t]*$/ || s ~ /^[ \t]/ || s ~ /^#/ || s == "-" || s ~ /^- / ||
+      s ~ /^[^:[:space:]][^:]*:([ \t]|$)/
+  }
+  BEGIN { bom = "\357\273\277" }
+  NR == FNR {
+    line = norm($0)
+    if (FNR == 1) { opened = (line == "---"); next }
+    if (opened && !fm_end) {
+      if (line == "---" || line == "...") fm_end = FNR
+      else if (!yamlish(line)) opened = 0
+    }
+    next
+  }
+  FNR <= fm_end { next }
+  { line = norm($0) }
+  titled {
+    if (line ~ /^[ \t]*$/) next
+    if (tolower(line) ~ /^run[ \t]+status[ \t]*:[ \t]*in[ \t_-]*progress[ \t]*$/) print "in-progress"
+    exit
+  }
+  {
+    match(line, /^ */)
+    if (RLENGTH <= 3) {
+      rest = substr(line, RLENGTH + 1)
+      c = substr(rest, 1, 1)
+      if (c == "`" || c == "~") {
+        n = 0
+        while (substr(rest, n + 1, 1) == c) n++
+        if (n >= 3 && !fenced) { fenced = 1; fchar = c; flen = n; next }
+        if (n >= 3 && c == fchar && n >= flen && substr(rest, n + 1) ~ /^[ \t]*$/) { fenced = 0; next }
+      }
+    }
+  }
+  !fenced && line ~ /^# / { titled = 1 }
+' "$index" "$index")"
+if [[ "$slot_state" == "in-progress" ]]; then
+  echo "unusable: index is still marked Run status: in progress; the run stopped before its final write: $index" >&2
+  verdict "$index" 0 0 unusable
+  exit 1
+fi
+
+# Sidecar references are harvested by filename pattern rather than by parsing
+# the index's section -> file table. The table's markdown shape is free to
+# change; the sidecar filename contract (`<PREFIX>-<section>.md`, a sibling of
+# the index) is the part the artifact-shape spoke pins down, so keying on it
+# keeps this gate from breaking on a formatting edit. The angle-bracketed
+# placeholder itself does not match, so an index that only ever wrote
+# `<PREFIX>-<section>.md` reads as naming no sidecar — which it does not.
+#
+# The prefix is interpolated into an ERE, which is safe because `--index-name`
+# already refused every character that would mean anything in one.
+#
+# Read with a while loop rather than `mapfile`, which is bash 4+ only; this
+# gate has to run wherever a consuming project's shell does.
+referenced=()
+while IFS= read -r name; do
+  [[ -n "$name" ]] || continue
+  referenced+=("$name")
+done < <(grep -oE "${sidecar_prefix}-[A-Za-z0-9._-]+\.md" "$index" | sort -u)
+
+if [[ ${#referenced[@]} -eq 0 ]]; then
+  echo "unusable: index names no ${sidecar_prefix}-<section>.md sidecar: $index" >&2
+  # Through `verdict`, not a hand-rolled printf, so this failure path emits
+  # the `freshness=`/`pointer=` fields the header documents and a parent
+  # grepping the verdict line for them finds them here too.
+  verdict "$index" 0 0 unusable
+  exit 1
+fi
+
+missing=0
+for name in "${referenced[@]}"; do
+  sidecar="$slice/$name"
+  if [[ ! -f "$sidecar" ]]; then
+    echo "unusable: index names a sidecar that was never written: $sidecar" >&2
+    missing=$((missing + 1))
+  elif [[ ! -s "$sidecar" ]]; then
+    echo "unusable: index names an empty sidecar: $sidecar" >&2
+    missing=$((missing + 1))
+  fi
+done
+
+count=${#referenced[@]}
+unusable=$((missing > 0 ? 1 : 0))
+
+# `-nt` compares mtimes without `stat`, whose flags differ across platforms. It
+# is strict, so an index written inside the filesystem's mtime granularity of
+# the baseline reads as stale — a false halt, which is the safe direction, and
+# not a realistic one for a run that reads a codebase first.
+if [[ -n "$newer_than" ]]; then
+  if [[ "$index" -nt "$newer_than" ]]; then
+    freshness="newer"
+  else
+    freshness="stale"
+    echo "unusable: index is not newer than the pre-dispatch baseline — this run may have written nothing: $index" >&2
+    unusable=1
+  fi
+fi
+
+# Pointer agreement. The gate finds the index from the parent's own slice path,
+# so a payload whose `artifact:` names some OTHER file is not corroborating what
+# was graded — and its `verification_request.target` would aim the sibling
+# verifier at a file this gate never looked at. Disagreement is a defect in the
+# payload, not a naming preference to reconcile silently.
+if [[ -n "$expect_index" ]]; then
+  if [[ "$(canonical "$expect_index")" == "$(canonical "$index")" ]]; then
+    pointer="matches"
+  else
+    pointer="mismatch"
+    echo "unusable: payload pointer names $expect_index; this gate graded $index" >&2
+    unusable=1
+  fi
+fi
+
+if [[ -n "$expect_sidecars" && "$expect_sidecars" -ne "$count" ]]; then
+  echo "unusable: payload reported $expect_sidecars sidecar(s); the index names $count" >&2
+  unusable=1
+fi
+
+if [[ "$unusable" -ne 0 ]]; then
+  verdict "$index" "$count" "$missing" unusable
+  exit 1
+fi
+
+# The index frontmatter's `verification:` value, or `unrecorded`. Informational:
+# it never changes the exit status. It is printed so a parent that stops at this
+# gate still sees an artifact whose sibling verifier has not run yet.
+verification="$(awk '
+  BEGIN { bom = "\357\273\277" }
+  { sub(/\r+$/, "") }
+  NR == 1 {
+    if (index($0, bom) == 1) $0 = substr($0, length(bom) + 1)
+    if ($0 != "---") exit
+    next
+  }
+  $0 == "---" || $0 == "..." { exit }
+  /^verification:/ {
+    v = $0
+    sub(/^verification:[ \t]*/, "", v)
+    sub(/[ \t]+$/, "", v)
+    if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v = substr(v, 2, length(v) - 2)
+    print v
+    exit
+  }
+' "$index")"
+
+verdict "$index" "$count" "$missing" usable
+printf 'verification=%s\n' "${verification:-unrecorded}"
+exit 0

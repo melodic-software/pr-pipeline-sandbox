@@ -1,0 +1,260 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import {
+  acquireYouTubeMedia,
+  listWorkDirFiles,
+  resolveAcquirePhaseGapMs,
+  resolveMediaArtifacts,
+} from "./acquire.js";
+
+const DRIVER_WATCH_URL = "https://www.youtube.com/watch?v=7zZy1QTvokM";
+const DRIVER_VIDEO_ID = "7zZy1QTvokM";
+
+describe("resolveMediaArtifacts", () => {
+  it("collects caption, metadata, and video paths", () => {
+    const artifacts = resolveMediaArtifacts(
+      ["/tmp/7zZy1QTvokM.en.en-orig.vtt", "/tmp/7zZy1QTvokM.info.json", "/tmp/7zZy1QTvokM.mp4"],
+      "7zZy1QTvokM",
+    );
+
+    expect(artifacts.captionPaths).toHaveLength(1);
+    expect(artifacts.metadataPath).toContain(".info.json");
+    expect(artifacts.videoPath).toContain(".mp4");
+  });
+});
+
+const NO_THROTTLE = { withThrottle: (/** @type {() => Promise<unknown>} */ fn) => fn() };
+
+const spawnOk = async () => ({
+  success: true,
+  code: 0,
+  signal: null,
+  stdout: "",
+  stderr: "",
+  timedOut: false,
+});
+
+describe("acquireYouTubeMedia", () => {
+  it("uses injected spawn and file readers without real yt-dlp", async () => {
+    const workDir = "/tmp/fake-work";
+    const infoJson = JSON.stringify({
+      id: "7zZy1QTvokM",
+      title: "Driver Video",
+      description: "desc",
+      chapters: [],
+      comments: [],
+    });
+
+    const result = await acquireYouTubeMedia(
+      DRIVER_WATCH_URL,
+      { workDir, mode: "transcript", videoId: DRIVER_VIDEO_ID },
+      {
+        ...NO_THROTTLE,
+        spawn: spawnOk,
+        listFiles: async () => [
+          `${workDir}/7zZy1QTvokM.en.en-orig.vtt`,
+          `${workDir}/7zZy1QTvokM.info.json`,
+        ],
+        readFile: async (filePath) => {
+          if (filePath.endsWith(".info.json")) return infoJson;
+          return "WEBVTT\n\n";
+        },
+      },
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data?.caption.rung).toBe("auto-en");
+      expect(result.data?.metadata.title).toBe("Driver Video");
+      expect(result.data?.artifacts.videoPath).toBe("");
+    }
+  });
+
+  it("reclassifies a bare .en.vtt as auto when info.json has no English manual subtitles", async () => {
+    const workDir = "/tmp/fake-work";
+    /** @param {object} infoFields */
+    const acquireWith = (infoFields) =>
+      acquireYouTubeMedia(
+        DRIVER_WATCH_URL,
+        { workDir, mode: "transcript", videoId: DRIVER_VIDEO_ID },
+        {
+          ...NO_THROTTLE,
+          spawn: spawnOk,
+          listFiles: async () => [
+            `${workDir}/7zZy1QTvokM.en.vtt`,
+            `${workDir}/7zZy1QTvokM.en-orig.vtt`,
+            `${workDir}/7zZy1QTvokM.info.json`,
+          ],
+          readFile: async () =>
+            JSON.stringify({ id: "7zZy1QTvokM", title: "Driver Video", ...infoFields }),
+        },
+      );
+
+    const autoOnly = await acquireWith({
+      subtitles: {},
+      automatic_captions: { en: [], "en-orig": [] },
+    });
+    expect(autoOnly.success).toBe(true);
+    if (autoOnly.success) {
+      expect(autoOnly.data?.caption.rung).toBe("auto-en");
+      expect(autoOnly.data?.caption.isAutoCaption).toBe(true);
+      // #6740: the original speech track beats the bare auto `en` (a translation).
+      expect(autoOnly.data?.caption.path).toBe(`${workDir}/7zZy1QTvokM.en-orig.vtt`);
+    }
+
+    const withManual = await acquireWith({ subtitles: { en: [] } });
+    expect(withManual.success).toBe(true);
+    if (withManual.success) {
+      expect(withManual.data?.caption.rung).toBe("manual-en");
+      expect(withManual.data?.caption.isAutoCaption).toBe(false);
+    }
+  });
+
+  it("surfaces caption ladder failure", async () => {
+    const result = await acquireYouTubeMedia(
+      DRIVER_WATCH_URL,
+      { workDir: "/tmp/fake-work", mode: "transcript", videoId: DRIVER_VIDEO_ID },
+      {
+        ...NO_THROTTLE,
+        spawn: spawnOk,
+        listFiles: async () => ["/tmp/fake-work/7zZy1QTvokM.info.json"],
+        readFile: async () => JSON.stringify({ id: "7zZy1QTvokM", title: "Driver Video" }),
+      },
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("ladder exhausted");
+  });
+
+  it("returns caption: null in full mode when the ladder is exhausted but the video downloaded", async () => {
+    const workDir = "/tmp/fake-work";
+    const result = await acquireYouTubeMedia(
+      DRIVER_WATCH_URL,
+      { workDir, mode: "full", videoId: DRIVER_VIDEO_ID },
+      {
+        ...NO_THROTTLE,
+        sleep: async () => {},
+        spawn: spawnOk,
+        listFiles: async () => [
+          `${workDir}/7zZy1QTvokM.mp4`,
+          `${workDir}/7zZy1QTvokM.info.json`,
+        ],
+        readFile: async () => JSON.stringify({ id: "7zZy1QTvokM", title: "Driver Video" }),
+      },
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data?.caption).toBeNull();
+      expect(result.data?.artifacts.videoPath).toBe(`${workDir}/7zZy1QTvokM.mp4`);
+    }
+  });
+
+  it("still fails in full mode when no video downloaded and no captions exist", async () => {
+    const workDir = "/tmp/fake-work";
+    const result = await acquireYouTubeMedia(
+      DRIVER_WATCH_URL,
+      { workDir, mode: "full", videoId: DRIVER_VIDEO_ID },
+      {
+        ...NO_THROTTLE,
+        sleep: async () => {},
+        spawn: spawnOk,
+        listFiles: async () => [`${workDir}/7zZy1QTvokM.info.json`],
+        readFile: async () => JSON.stringify({ id: "7zZy1QTvokM", title: "Driver Video" }),
+      },
+    );
+
+    expect(result.success).toBe(false);
+  });
+
+  it("classifies a bare .en.vtt as platform-asr when the source declares that class", async () => {
+    const workDir = "/tmp/fake-work";
+    const videoId = "1001551417340022785";
+    const infoJson = JSON.stringify({
+      id: videoId,
+      title: "Platform ASR Video",
+      description: "desc",
+      chapters: [],
+      comments: [],
+    });
+
+    const result = await acquireYouTubeMedia(
+      `https://www.youtube.com/watch?v=${videoId}`,
+      {
+        workDir,
+        mode: "transcript",
+        videoId,
+        source: { captionClass: "platform-asr" },
+      },
+      {
+        ...NO_THROTTLE,
+        spawn: spawnOk,
+        listFiles: async () => [
+          `${workDir}/${videoId}.en.vtt`,
+          `${workDir}/${videoId}.info.json`,
+        ],
+        readFile: async (filePath) => {
+          if (filePath.endsWith(".info.json")) return infoJson;
+          return "WEBVTT\n\n";
+        },
+      },
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data?.caption.rung).toBe("platform-asr-en");
+      expect(result.data?.caption.isAutoCaption).toBe(true);
+    }
+  });
+});
+
+describe("listWorkDirFiles", () => {
+  it("lists files recursively in its own temp fixture for integration smoke", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "acquire-list-"));
+    try {
+      await fs.mkdir(path.join(root, "nested"));
+      await fs.writeFile(path.join(root, "a.vtt"), "");
+      await fs.writeFile(path.join(root, "b.info.json"), "{}");
+      await fs.writeFile(path.join(root, "nested", "c.mp4"), "");
+
+      const files = await listWorkDirFiles(root);
+
+      expect([...files].sort()).toEqual(
+        [
+          path.join(root, "a.vtt"),
+          path.join(root, "b.info.json"),
+          path.join(root, "nested", "c.mp4"),
+        ].sort(),
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resolveAcquirePhaseGapMs env resolution", () => {
+  afterEach(() => {
+    delete process.env.VIDEO_DIGEST_ACQUIRE_PHASE_GAP_SEC;
+    delete process.env.YOUTUBE_ACQUIRE_PHASE_GAP_SEC;
+  });
+
+  it("reads the new VIDEO_DIGEST_ name", () => {
+    process.env.VIDEO_DIGEST_ACQUIRE_PHASE_GAP_SEC = "1.5";
+    expect(resolveAcquirePhaseGapMs()).toBe(1500);
+  });
+
+  it("still honors the deprecated YOUTUBE_ name", () => {
+    process.env.YOUTUBE_ACQUIRE_PHASE_GAP_SEC = "2";
+    expect(resolveAcquirePhaseGapMs()).toBe(2000);
+  });
+
+  it("prefers the new name when both are set", () => {
+    process.env.VIDEO_DIGEST_ACQUIRE_PHASE_GAP_SEC = "1";
+    process.env.YOUTUBE_ACQUIRE_PHASE_GAP_SEC = "9";
+    expect(resolveAcquirePhaseGapMs()).toBe(1000);
+  });
+});

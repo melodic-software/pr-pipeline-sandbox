@@ -1,0 +1,44 @@
+# Video digest gotchas
+
+Observed failure modes and their recovery behavior. Terse operational directives live at their decision points in `SKILL.md`; this file explains the *why*.
+
+## YouTube bot / sign-in check
+
+Acquisition tries without cookies first; on *"Sign in to confirm you're not a bot"* it auto-retries with `--cookies-from-browser` using installed browsers (on Windows: Edge, Chrome, Firefox, Brave, Chromium), moving to the next browser when one's cookies cannot be read. No configuration required when you are signed into YouTube in a local browser. Optional overrides via the plugin's personal `userConfig`: the `yt_dlp_cookies_from_browser` option (force one browser) or the `yt_dlp_cookies_file` option (Netscape cookies.txt path). Never commit cookie files.
+
+This skill's decision: a browser whose cookies yt-dlp cannot read counts as a failed rung, so the fallback moves on (the stderr patterns it matches live in `extraction/acquisition/acquire-yt-dlp-auth.js`). On Windows, when forcing one browser, prefer Firefox or a cookies file over Chromium-based browsers.
+
+- **Pointer**: when Chromium-based cookie extraction fails on Windows, fetch
+  <https://github.com/yt-dlp/yt-dlp/issues/7271> (database locked while the browser runs) and
+  <https://github.com/yt-dlp/yt-dlp/issues/10927> (DPAPI decryption) live.
+- **As of**: 2026-10-10
+- **Recheck trigger**: either issue closes, or a yt-dlp release note changes `--cookies-from-browser`
+  on Windows.
+
+## HTTP 429 throttling
+
+Acquisition applies yt-dlp `--retries`, `--sleep-requests`, `--sleep-subtitles` plus an **outer exponential backoff on HTTP 429**. Batch runs cap concurrency via the `max_concurrent_acquires` option (default 1, max 3); raising it increases 429 risk. A `watch` also pauses 3 seconds between its video and caption passes; a 429 on the caption pass is a reason to lengthen that pause with the leading `run.mjs` flag `--acquire-phase-gap <sec>` (`reference/sources/youtube.md`, "Auth and throttle overrides").
+
+A caption download still throttled after that backoff fails the run with a rate-limit error naming the yt-dlp message, not "No English captions found": the captions may exist. Wait several minutes and re-run. When another track already landed a usable English caption, the run continues on it and records the failed track's `ERROR:` line in `transcriptDegradation`.
+
+## Companion found after vision
+
+Phase 0b normally runs before bootstrap, but a companion source (a longer talk, an essay) can surface during research or after `close`. Run a late Phase 0b ("Late Phase 0b" in `context/companion-primary-sources.md`) that writes `source/companion-digest/`. Companion subagents that write `analysis/companion/*.md` put output in a lane the output contract does not list.
+
+## Temp-session expiry
+
+Bulk frames and contact sheets stay in OS `tempSession` dirs, not the repo. When those dirs have been reaped, `run-state/watch.json` `tempSession` paths are stale, so **re-run `run-watch.js`** before vision. `resume` checks those dirs, reports `tempSessionPresent` and `missingTempDirs`, and exits 1 with that instruction when the next phase is vision and a dir is gone.
+
+A successful `close` removes those recorded dirs on purpose, after it marks the slice complete. To keep the media in a project layout, run `watch/relayout-slice.js` before `close` (`output-contract.md` "Scope of the setting"); afterwards the media is gone and only `--no-media` works. When one is locked (on Windows, a scanner or player holding a file open), `close` warns on stderr with the path and still succeeds; delete that dir by hand once the lock is gone.
+
+## Cloud agent without media toolchain
+
+`watch` needs ffmpeg + ImageMagick for frame extraction and contact sheets. A cloud agent lacking the media toolchain must **fail closed and not run watch**; route to the prerequisites fix path instead of producing a frameless run. The tools can often be installed in place: `SKILL.md` "Prerequisites" lists the fallbacks to try when the platform package is missing or below its floor.
+
+## Video download blocked (HTTP 403 on the media stream)
+
+Captions and metadata can come through while the video itself is refused: yt-dlp fetches the caption track and then fails the media download with HTTP 403. YouTube applies this most to requests from datacenter IP ranges, so a cloud container sees it where a home connection does not. The full acquisition runs the video pass first, so `run-watch.js` exits non-zero before any slice is written, and the watch stops there ("No video, no watch" in `SKILL.md`). The fix path is to run the watch from a machine whose connection YouTube serves, such as a local session. Cookies (the `yt_dlp_cookies_file` option) and a proof-of-origin token provider plugin are the other levers; before reaching for either, read what each can and cannot clear and what it risks for the account in the yt-dlp [PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide), the [cookies FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp), and the [bgutil-ytdlp-pot-provider README](https://github.com/Brainicism/bgutil-ytdlp-pot-provider), as of 2026-10-06; recheck when a yt-dlp release changes which clients need a token or how cookies are passed.
+
+## Phase state lives only in `watch.json`
+
+`run-state/watch.json` holds the phase map and the `tempSession` paths, and it is the only phase-state file. A slice that carries a `watch-progress.json` is stale: read neither it nor into it, and never write one.

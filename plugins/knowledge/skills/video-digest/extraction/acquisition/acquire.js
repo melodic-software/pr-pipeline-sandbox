@@ -1,0 +1,446 @@
+/**
+ * yt-dlp acquisition machinery the source adapters compose. Source dispatch
+ * lives in `adapters/registry.js` (`acquireMedia`); this module never imports
+ * the registry, keeping the adapter module graph acyclic.
+ */
+
+import fs from "node:fs/promises";
+import path from "node:path";
+
+import { spawnAsync } from "@melodic/video-digestion/shared/process";
+import { fail, ok } from "@melodic/video-digestion/shared/result";
+
+import { resolveEnvWithLegacy } from "../lib/env-compat.js";
+import {
+  CAPTION_ONLY_SLEEP_SUBTITLES_SEC,
+  isRetryableAcquireError,
+  sleepMs,
+} from "./acquire-retry-policy.js";
+import { withAcquireThrottle } from "./acquire-throttle.js";
+import { spawnFailureDetail } from "./acquire-with-retry.js";
+import { allowTranslatedSubs, buildYtDlpArgs } from "./build-yt-dlp-args.js";
+import { selectCaptionFile } from "./select-caption.js";
+import { spawnYtDlpWithAuthFallback } from "./spawn-yt-dlp-with-auth-fallback.js";
+import { parseVideoMetadata } from "./video-metadata.js";
+
+/** @typedef {import('@melodic/video-digestion/shared/media-artifacts').MediaArtifacts} MediaArtifacts */
+/** @typedef {import('./video-metadata.js').VideoMetadata} VideoMetadata */
+/** @typedef {import('./build-yt-dlp-args.js').AcquisitionMode} AcquisitionMode */
+
+/**
+ * Adapter-declared acquisition declarations: yt-dlp arg flags plus spawn-level
+ * classification. Closed by default — omitted fields declare the behavior off.
+ *
+ * @typedef {import('./build-yt-dlp-args.js').YtDlpSourceOptions &
+ *   import('./spawn-yt-dlp-with-auth-fallback.js').SourceSpawnClassification & {
+ *     captionClass?: import('./select-caption.js').CaptionClass
+ *   }} SourceAcquisitionDeclarations
+ */
+
+/**
+ * Map a source adapter's declared attributes onto the option bundle the shared
+ * yt-dlp machinery consumes (arg flags + spawn classification + caption class).
+ * The adapter declarations are the single source of truth; production never
+ * re-states them in a side object.
+ *
+ * @param {import('../adapters/adapter-contract.js').SourceAdapter} adapter
+ * @returns {SourceAcquisitionDeclarations}
+ */
+export function adapterSourceDeclarations(adapter) {
+  return {
+    writeComments: adapter.capabilities.comments === true,
+    extractorArgs: adapter.extractorArgs,
+    allowedExtractors: adapter.allowedExtractors,
+    ignoreNoFormatsError: adapter.capabilities.mediaOptional === true,
+    errorPatterns: adapter.errorPatterns,
+    allowBrowserCookieProfileFallback: adapter.capabilities.browserCookieFallback === true,
+    captionClass: adapter.captionClass,
+  };
+}
+
+const DEFAULT_ACQUIRE_PHASE_GAP_MS = 3000;
+const ACQUIRE_PHASE_GAP_ENV = "VIDEO_DIGEST_ACQUIRE_PHASE_GAP_SEC";
+const LEGACY_ACQUIRE_PHASE_GAP_ENV = "YOUTUBE_ACQUIRE_PHASE_GAP_SEC";
+
+/**
+ * @typedef {Object} AcquisitionResult
+ * @property {MediaArtifacts} artifacts
+ * @property {VideoMetadata} metadata
+ * @property {import('./select-caption.js').CaptionSelection|null} caption - null only in full mode when the caption ladder is exhausted
+ * @property {string} workDir
+ * @property {object} [acquireMetrics]
+ */
+
+/**
+ * @typedef {Object} AcquireDeps
+ * @property {(command: string, args: string[], options?: object) => ReturnType<typeof spawnAsync>} spawn
+ * @property {(dir: string) => Promise<string[]>} listFiles
+ * @property {(filePath: string) => Promise<string>} readFile
+ * @property {(ms: number) => Promise<void>} [sleep]
+ * @property {<T>(fn: () => Promise<T>) => Promise<T>} [withThrottle]
+ */
+
+/** @type {AcquireDeps} */
+const DEFAULT_DEPS = {
+  spawn: spawnAsync,
+  listFiles: listWorkDirFiles,
+  readFile: (/** @type {string} */ filePath) => fs.readFile(filePath, "utf8"),
+  sleep: sleepMs,
+};
+
+/**
+ * @returns {number}
+ */
+export function resolveAcquirePhaseGapMs() {
+  const raw = resolveEnvWithLegacy(ACQUIRE_PHASE_GAP_ENV, LEGACY_ACQUIRE_PHASE_GAP_ENV);
+  if (!raw) return DEFAULT_ACQUIRE_PHASE_GAP_MS;
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_ACQUIRE_PHASE_GAP_MS;
+  return Math.round(parsed * 1000);
+}
+
+/**
+ * List files recursively under a working directory.
+ *
+ * @param {string} dir
+ * @returns {Promise<string[]>}
+ */
+export async function listWorkDirFiles(dir) {
+  /** @type {string[]} */
+  const files = [];
+  /** @type {string[]} */
+  const pending = [dir];
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current) continue;
+
+    let entries;
+    try {
+      entries = await fs.readdir(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(fullPath);
+      } else {
+        files.push(fullPath);
+      }
+    }
+  }
+
+  return files;
+}
+
+/**
+ * @param {string[]} files
+ * @param {string} videoId
+ * @returns {MediaArtifacts}
+ */
+export function resolveMediaArtifacts(files, videoId) {
+  const captionPaths = files.filter((filePath) => filePath.endsWith(".vtt"));
+  const metadataPath =
+    files.find((filePath) => filePath.endsWith(".info.json")) ??
+    files.find((filePath) => filePath.includes(videoId) && filePath.endsWith(".json")) ??
+    "";
+  const videoPath =
+    files.find(
+      (filePath) =>
+        filePath.endsWith(".mp4") || filePath.endsWith(".mkv") || filePath.endsWith(".webm"),
+    ) ?? "";
+
+  return { videoPath, captionPaths, metadataPath };
+}
+
+/**
+ * @param {{
+ *   spawn: AcquireDeps['spawn'],
+ *   url: string,
+ *   workDir: string,
+ *   mode: AcquisitionMode,
+ *   source: SourceAcquisitionDeclarations,
+ *   sleepSubtitlesSec?: number,
+ *   env?: NodeJS.ProcessEnv,
+ * }} params
+ */
+async function runYtDlpAcquire({
+  spawn,
+  url,
+  workDir,
+  mode,
+  source,
+  sleepSubtitlesSec,
+  env = process.env,
+}) {
+  const outputTemplate = path.join(workDir, "%(id)s.%(ext)s");
+  const buildArgs = (authOverride = {}) =>
+    buildYtDlpArgs(url, {
+      mode,
+      outputTemplate,
+      workDir,
+      sleepSubtitlesSec,
+      env,
+      authOverride,
+      source,
+    });
+  return spawnYtDlpWithAuthFallback(spawn, buildArgs, { cwd: workDir, env, source });
+}
+
+/**
+ * @param {AcquireDeps} deps
+ * @param {string} url
+ * @param {string} workDir
+ * @param {{ mode: AcquisitionMode, source: SourceAcquisitionDeclarations, sleepSubtitlesSec?: number }} pass
+ */
+async function runAcquirePass(deps, url, workDir, { mode, source, sleepSubtitlesSec }) {
+  const { spawn, listFiles } = deps;
+  const spawnResult = await runYtDlpAcquire({ spawn, url, workDir, mode, source, sleepSubtitlesSec });
+  // Listed on failure too: yt-dlp stops at the first failed caption track,
+  // so tracks written before it are still usable.
+  const files = await listFiles(workDir);
+  return { spawnResult, detail: spawnResult.success ? "" : spawnFailureDetail(spawnResult), files };
+}
+
+/**
+ * The `ERROR:` lines of a yt-dlp failure detail (its last line when none),
+ * naming the track that failed and why.
+ *
+ * @param {string} detail
+ * @returns {string}
+ */
+function captionErrorLine(detail) {
+  const lines = detail
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const errors = lines.filter((line) => line.startsWith("ERROR:"));
+  return (errors.length > 0 ? errors : lines.slice(-1)).join("; ");
+}
+
+/**
+ * Pass descriptor for the captions-only phase, shared by the staged driver and
+ * the post-ladder caption retry.
+ *
+ * @param {SourceAcquisitionDeclarations} source
+ * @returns {{mode: AcquisitionMode, source: SourceAcquisitionDeclarations, sleepSubtitlesSec: number}}
+ */
+function captionsOnlyPass(source) {
+  return { mode: "captions-only", source, sleepSubtitlesSec: CAPTION_ONLY_SLEEP_SUBTITLES_SEC };
+}
+
+/**
+ * @param {AcquireDeps} deps
+ * @param {string} url
+ * @param {string} workDir
+ * @param {string} videoId
+ * @param {SourceAcquisitionDeclarations} source
+ * @returns {Promise<
+ *   {ok: true, artifacts: MediaArtifacts, acquireMetrics: object, captionError: string} |
+ *   {ok: false, error: string, acquireMetrics: object}
+ * >}
+ */
+async function acquireFullStaged(deps, url, workDir, videoId, source) {
+  const { sleep = sleepMs } = deps;
+  const videoStarted = Date.now();
+
+  /**
+   * @param {string} error
+   * @returns {{ok: false, error: string, acquireMetrics: object}}
+   */
+  const failStaged = (error) => ({
+    ok: false,
+    error,
+    acquireMetrics: { stagedAcquire: true, videoPassMs: Date.now() - videoStarted },
+  });
+
+  const throttle = deps.withThrottle ?? withAcquireThrottle;
+  const videoPass = await throttle(() =>
+    runAcquirePass(deps, url, workDir, { mode: "video-only", source }),
+  );
+  if (!videoPass.spawnResult.success) {
+    return failStaged(videoPass.detail || "yt-dlp video-only pass failed");
+  }
+
+  let artifacts = resolveMediaArtifacts(videoPass.files, videoId);
+  if (!artifacts.videoPath) {
+    return failStaged("yt-dlp did not download video file");
+  }
+
+  const videoPassMs = Date.now() - videoStarted;
+  await sleep(resolveAcquirePhaseGapMs());
+
+  const captionStarted = Date.now();
+  const captionPass = await throttle(() =>
+    runAcquirePass(deps, url, workDir, captionsOnlyPass(source)),
+  );
+
+  artifacts = resolveMediaArtifacts(captionPass.files, videoId);
+
+  const captionPassMs = Date.now() - captionStarted;
+
+  return {
+    ok: true,
+    artifacts,
+    acquireMetrics: { stagedAcquire: true, videoPassMs, captionPassMs },
+    captionError: captionPass.detail,
+  };
+}
+
+/**
+ * @param {string} url
+ * @param {{workDir: string, mode?: AcquisitionMode, source?: SourceAcquisitionDeclarations, videoId?: string}} options -
+ *   `videoId` is the URL-claim id the adapter derived (`matchUrl`); this driver
+ *   never re-derives it
+ * @param {Partial<AcquireDeps>} [deps]
+ */
+export async function acquireYouTubeMedia(
+  url,
+  { workDir, mode = "full", source = {}, videoId },
+  deps = {},
+) {
+  const started = Date.now();
+  const mergedDeps = { ...DEFAULT_DEPS, ...deps };
+  const { readFile, withThrottle = withAcquireThrottle } = mergedDeps;
+  const throttle = /** @type {<T>(fn: () => Promise<T>) => Promise<T>} */ (withThrottle);
+
+  if (!videoId) {
+    return fail(
+      "No YouTube video id supplied for acquisition (the adapter's URL claim derives it)",
+      "acquire-youtube-media",
+      { label: url },
+      Date.now() - started,
+    );
+  }
+
+  /** @param {string} message */
+  const failVideo = (message) =>
+    fail(message, "acquire-youtube-media", { label: videoId }, Date.now() - started);
+
+  /** @type {MediaArtifacts} */
+  let artifacts;
+  /** @type {object | undefined} */
+  let acquireMetrics;
+  // yt-dlp failure detail of the caption download the selection comes from.
+  let captionError = "";
+
+  if (mode === "full") {
+    const staged = await acquireFullStaged(mergedDeps, url, workDir, videoId, source);
+    acquireMetrics = staged.acquireMetrics;
+    if (!staged.ok) {
+      return failVideo(staged.error);
+    }
+    artifacts = staged.artifacts;
+    captionError = staged.captionError;
+  } else {
+    const single = await throttle(() =>
+      runAcquirePass(mergedDeps, url, workDir, { mode, source }),
+    );
+    artifacts = resolveMediaArtifacts(single.files, videoId);
+    if (!single.spawnResult.success) {
+      const salvageable =
+        mode !== "video-only" &&
+        artifacts.metadataPath &&
+        selectCaptionFile(artifacts.captionPaths, source.captionClass).success;
+      if (!salvageable) {
+        return failVideo(single.detail || "yt-dlp failed");
+      }
+      captionError = single.detail;
+    }
+  }
+
+  let captionResult = selectCaptionFile(artifacts.captionPaths, source.captionClass);
+
+  const retryCaptions = (mode === "full" && artifacts.videoPath) || mode === "transcript";
+  if (!captionResult.success && retryCaptions) {
+    // No English landed, so the ladder needs the translated tracks the first pass skipped.
+    const retrySource = { ...source, extractorArgs: allowTranslatedSubs(source.extractorArgs) };
+    const captionRetry = await throttle(() =>
+      runAcquirePass(mergedDeps, url, workDir, captionsOnlyPass(retrySource)),
+    );
+    artifacts = resolveMediaArtifacts(captionRetry.files, videoId);
+    captionResult = selectCaptionFile(artifacts.captionPaths, source.captionClass);
+    captionError = captionRetry.detail;
+    if (!captionResult.success && !captionRetry.spawnResult.success) {
+      // No caption file was fetched, so the ladder's "no captions" message would hide the cause.
+      return failVideo(
+        isRetryableAcquireError(captionRetry.detail)
+          ? `Caption download rate-limited or temporarily unavailable after retries; the captions may exist, so wait several minutes and retry. yt-dlp: ${captionRetry.detail}`
+          : `Caption download failed: ${captionRetry.detail || "yt-dlp failed"}`,
+      );
+    }
+  }
+
+  // Full mode holds the downloaded video, so an exhausted ladder proceeds caption-less and the
+  // transcript strategy picks ASR or records a degradation. Transcript mode has no media and stops.
+  const captionOptional = mode === "full" && Boolean(artifacts.videoPath);
+  if (!captionResult.success && !captionOptional) {
+    return failVideo(captionResult.error);
+  }
+
+  if (!artifacts.metadataPath) {
+    return failVideo("yt-dlp did not write info JSON");
+  }
+
+  if (mode === "full" && !artifacts.videoPath) {
+    return failVideo("yt-dlp did not download video file");
+  }
+
+  if (mode === "transcript" && artifacts.videoPath) {
+    return failVideo("Transcript mode must not download video");
+  }
+
+  let info;
+  let metadata;
+  try {
+    info = JSON.parse(await readFile(artifacts.metadataPath));
+    metadata = parseVideoMetadata(info);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return failVideo(`Invalid info JSON: ${message}`);
+  }
+
+  // info.json `subtitles` lists the manual tracks; the filename cannot tell
+  // a manual `.en.vtt` from an auto one.
+  const manualLanguages =
+    info?.subtitles && typeof info.subtitles === "object"
+      ? Object.keys(info.subtitles)
+      : undefined;
+  const finalCaption = selectCaptionFile(artifacts.captionPaths, source.captionClass, {
+    manualLanguages,
+  });
+  if (!finalCaption.success && !captionOptional) {
+    return failVideo(finalCaption.error);
+  }
+
+  let caption = finalCaption.success ? finalCaption.selection : null;
+  if (caption && captionError) {
+    // A failed track beside the chosen one is recorded, not dropped.
+    const errorLine = captionErrorLine(captionError);
+    caption = {
+      ...caption,
+      provenanceNote: [
+        caption.provenanceNote,
+        `caption download exited non-zero (${errorLine}); ${path.basename(caption.path)} was already written and is used`,
+      ]
+        .filter(Boolean)
+        .join("; "),
+    };
+    acquireMetrics = { ...acquireMetrics, captionDownloadErrors: [errorLine] };
+  }
+
+  return ok(
+    {
+      artifacts,
+      metadata,
+      caption,
+      workDir,
+      acquireMetrics,
+    },
+    "acquire-youtube-media",
+    { label: videoId },
+    Date.now() - started,
+  );
+}

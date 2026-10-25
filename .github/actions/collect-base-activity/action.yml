@@ -313,6 +313,9 @@ runs:
         fi
         mkdir -p "$MARKETPLACE"
         cp -R "$BASE_PATH/plugins" "$BASE_PATH/.claude-plugin" "$MARKETPLACE/"
+        # The plugin loads in place from this copy, so its hooks run from
+        # here: no process the skill starts may rewrite them.
+        chmod -R a-w "$MARKETPLACE"
         marketplace=$(jq -r '.name' "$MARKETPLACE/.claude-plugin/marketplace.json")
         name='^[a-z0-9][a-z0-9-]*$'
         [[ $marketplace =~ $name ]] || fail "the base marketplace name is malformed"
@@ -483,9 +486,11 @@ runs:
             # .lane/git that runs only git status, diff, log and show, with
             # no system, global, fsmonitor, hook, pager, external-diff or
             # textconv program. It refuses the options that write a file or
-            # read one outside the checkout (--output, --no-index, -O and
-            # their prefixes) and any path argument that resolves outside the
-            # checkout, since git diff on such a path reads it as --no-index.
+            # read one outside the checkout (--output, --no-index, --orderfile,
+            # their prefixes, and -O alone or in a bundle of short options),
+            # status --verbose (it runs textconv), and any path argument that
+            # resolves outside the checkout, since git diff on such a path
+            # reads it as --no-index.
             # Bash(git *) stays denied, so git runs only through it.
             if [ -n "${ISSUE_NUMBER:-}" ]; then
               mkdir -p "$STAGE/git"
@@ -495,12 +500,13 @@ runs:
                   'cd "$workspace" && workspace=$(pwd -P) || exit 2' \
                   'case ${1:-} in status | diff | log | show) ;; *) echo "refused: git-read runs git status, diff, log or show" >&2 && exit 2 ;; esac' \
                   'for arg in "${@:2}"; do' \
+                  '  [ "$1" != status ] || case $arg in -v* | -[!-]*v* | --v*) echo "refused: $arg" >&2 && exit 2 ;; esac' \
                   '  case $arg in' \
-                  '    -O*) echo "refused: $arg" >&2 && exit 2 ;;' \
+                  '    -O* | -[!-]*O*) echo "refused: $arg" >&2 && exit 2 ;;' \
                   '    --?*)' \
                   '      name=${arg%%=*}' \
                   '      name=${name#--}' \
-                  '      for bad in output no-index ext-diff textconv open-files-in-pager paginate exec-path git-dir work-tree; do' \
+                  '      for bad in output no-index orderfile ext-diff textconv open-files-in-pager paginate exec-path git-dir work-tree; do' \
                   '        if [ "${#name}" -ge 2 ] && [ "${bad#"$name"}" != "$bad" ] || [ "${name#"$bad"}" != "$name" ]; then' \
                   '          echo "refused: $arg" >&2 && exit 2' \
                   '        fi' \
@@ -768,6 +774,11 @@ runs:
               disallowed="${disallowed:+$disallowed,}Edit(/$VERIFY_DIR/**),Write(/$VERIFY_DIR/**)"
               system_prompt="$system_prompt $verify_prompt"
             fi
+            # The skill's bare Edit and Write must not reach the plugin copy.
+            # An Edit rule covers every built-in file tool and the Bash file
+            # writes Claude Code recognizes; a Write path rule is never
+            # consulted (https://code.claude.com/docs/en/permissions#read-and-edit).
+            disallowed="${disallowed:+$disallowed,}Edit(/$MARKETPLACE/**)"
             # The shell deny set above; the Read rules keep the skill out of
             # process files and out of the checkout's git config, where the
             # action stores its token.

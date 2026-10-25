@@ -1,0 +1,74 @@
+{
+  "skill_name": "blindspot",
+  "evals": [
+    {
+      "id": 1,
+      "name": "blindspot-builds-user-knowledge",
+      "prompt": "I'm about to start working in the geofencing area and I honestly don't know it well. Run blindspot geofencing so I write a better prompt.",
+      "expected_output": "Enters the blindspot workflow: asks one intake question about the user's starting point, scans the area (codebase lane) for things the user's framing missed, emits one blindspot card per gap (gap, why it matters here, copyable prompt-fix line), and assembles the fixes into one improved implementation prompt. Does NOT write EXPLORE.md.",
+      "files": [],
+      "expectations": [
+        "Output builds the USER's understanding (blindspot cards + an improved prompt), not just the agent's internal findings",
+        "The run asks one intake question about the user's starting point before scanning",
+        "Each blindspot is expressed as a card naming the gap, why it matters here, and a copyable prompt-fix line",
+        "Each card carries a finding type from the four-way taxonomy: Landmine, History, Convention, or Missing concept",
+        "Output closes by assembling the fixes into a single improved implementation prompt the user can run next",
+        "The output ends with a one-line scan-scope disclosure naming which lane(s) ran and what was and was not scanned",
+        "The run does not write EXPLORE.md"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "domain-lane-grounds-in-sources-not-recall",
+      "prompt": "I need to work on our event-sourcing projections but I don't know the domain vocabulary. Run blindspot on event sourcing so I understand the terms before I write a prompt.",
+      "expected_output": "Runs the domain lane: builds a lightweight vocabulary ladder grounded in sources fetched this session (repo files, official docs) rather than bare training recall, emits blindspot cards for the terms/assumptions the user's framing missed, and assembles an improved prompt. If the domain is too deep for a lightweight ladder, it recommends escalating to /education:teach topic when available, otherwise external research (/discovery:research), instead of over-claiming.",
+      "files": [],
+      "expectations": [
+        "The domain vocabulary ladder is grounded in sources fetched this session (repo files or official docs), not presented as bare training recall",
+        "Output is expressed as blindspot cards plus a single improved prompt",
+        "When the domain is too deep for a lightweight ladder, the run recommends escalating to structured learning (/education:teach topic when available) or external research (/discovery:research) rather than fabricating depth"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "offers-explore-handoff-not-duplicate-artifact",
+      "prompt": "Run blindspot on the payments module — and if the scan is thorough enough, save it as our exploration notes.",
+      "expected_output": "Produces blindspot cards and an improved prompt, and when the codebase-lane findings double as stage-1 exploration, offers to hand off to /discovery:explore to persist EXPLORE.md rather than writing that handoff artifact itself.",
+      "files": [],
+      "expectations": [
+        "Output produces blindspot cards and an improved prompt as its primary deliverable",
+        "The run offers to hand off to /discovery:explore to persist EXPLORE.md rather than writing the handoff artifact from this skill",
+        "The run does not itself write EXPLORE.md as a default step"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "offers-built-blindspot-view",
+      "prompt": "Run blindspot on the payments module. There will be a lot of cards, so I would like to filter them and tick the ones that were news to me.",
+      "expected_output": "The skill presents the blindspot cards and the improved prompt in the conversation first, then offers an interactive view built with the checked-in builder from JSON data. It resolves the publish destination from the medium cascade key and never writes HTML or script itself.",
+      "files": [],
+      "expectations": [
+        "Output presents the cards and the improved prompt in the conversation, which stays the record, before any view is mentioned",
+        "Output offers the view in one sentence and builds only after the reader accepts",
+        "The view is built by piping JSON to scripts/build-view.mjs, not by writing HTML or script in the session",
+        "Text read from repository files or fetched pages reaches the page only as data in that JSON",
+        "The publish destination comes from the medium key of the rendered-views cascade, with file as the default when unset"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "domain-lane-adds-quality-axes-with-examples",
+      "prompt": "I have to review our team's database schema migrations but I have never judged migration work before. Run blindspot on database migrations so I know what to ask for.",
+      "expected_output": "Runs the domain lane for an unfamiliar domain: asks one intake question, builds a vocabulary ladder, then lists the quality axes experts judge migration work by with a worked good-vs-bad example per axis, each grounded in a source fetched this session. The improved prompt carries the axes as prompt-fix lines.",
+      "files": [],
+      "expectations": [
+        "The run asks exactly one intake question about the user's starting point",
+        "Output lists the quality axes experts judge the work by, after the vocabulary ladder and before the cards",
+        "Each axis has a worked example pair contrasting a strong and a weak version, not an abstract description",
+        "Each example pair cites a source fetched this session rather than training recall",
+        "The improved prompt carries each axis as a prompt-fix line the user can keep or delete",
+        "The axes are not presented as a fifth card type"
+      ]
+    }
+  ]
+}

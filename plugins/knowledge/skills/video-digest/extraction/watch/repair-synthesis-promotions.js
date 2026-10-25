@@ -1,0 +1,297 @@
+#!/usr/bin/env node
+/**
+ * Repair synthesis promotions: semantic renames, session fixes, pipeline-junk rejects, audit notes.
+ *
+ * Content rejection (low-value frames, mislabels, etc.) is agent vision work — not encoded here.
+ *
+ * Usage: node watch/repair-synthesis-promotions.js <slice-dir> [--dry-run]
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+
+import { isMainModule } from "@melodic/video-digestion/shared/main-module";
+import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/terminal";
+
+import { LANES, lanePath } from "../lib/slice-lanes.js";
+import {
+  deriveSemanticNameFromGapNote,
+  forbiddenSynthesisFileNameReason,
+  isForbiddenPipelineSessionSlug,
+  isPipelinePlaceholderGapNote,
+  normalizeSynthesisDestName,
+} from "../lib/synthesis-filename.js";
+import { parseSessionsFromClaimInventory } from "../lib/watch-slice-sessions.js";
+import { slugifyTitle } from "../transcript/derive-video-slug.js";
+import { renderKeyFramesManifest } from "./render-key-frames-manifest.js";
+import { renderQualityAudit } from "./render-quality-audit.js";
+
+/**
+ * @param {string} sessionName
+ * @returns {string}
+ */
+function sessionSlugFromName(sessionName) {
+  return slugifyTitle(sessionName).slice(0, 32);
+}
+
+/**
+ * @typedef {{ selectedFrames: { file: string, timestampSec?: number }[], sessions: ReturnType<typeof parseSessionsFromClaimInventory> }} SessionIndex
+ */
+
+/**
+ * Read the frame/session lookup a slice needs to re-derive session slugs.
+ * Loaded once per repair run — {@link repairPromotionRows} would otherwise
+ * re-parse selection.json and claim-inventory.md for every fixed row.
+ *
+ * @param {string} sliceDir
+ * @returns {SessionIndex|null} null when either artifact is missing
+ */
+function loadSessionIndex(sliceDir) {
+  const selectionPath = lanePath(sliceDir, LANES.keyFrames, "selection.json");
+  const claimPath = lanePath(sliceDir, LANES.research, "claim-inventory.md");
+  if (!fs.existsSync(selectionPath) || !fs.existsSync(claimPath)) {
+    return null;
+  }
+  const selection = JSON.parse(fs.readFileSync(selectionPath, "utf8"));
+  return {
+    selectedFrames: selection.selectedFrames ?? [],
+    sessions: parseSessionsFromClaimInventory(fs.readFileSync(claimPath, "utf8")),
+  };
+}
+
+/**
+ * @param {SessionIndex|null} index
+ * @param {string} sourceFile
+ * @returns {string}
+ */
+function resolveSessionForSource(index, sourceFile) {
+  if (!index) {
+    return "misc";
+  }
+  const frame = index.selectedFrames.find((f) => f.file === sourceFile);
+  if (!frame || frame.timestampSec == null) {
+    return "misc";
+  }
+  const ts = frame.timestampSec;
+  for (const session of index.sessions) {
+    if (ts >= session.startSec && (session.endSec === null || ts < session.endSec)) {
+      return sessionSlugFromName(session.name);
+    }
+  }
+  return "misc";
+}
+
+/**
+ * @param {{ verdict: string, destName?: string, gapNote?: string, rejectReason?: string }} row
+ * @param {string} oldDest
+ * @returns {boolean}
+ */
+function rejectPipelinePlaceholder(row, oldDest) {
+  const gapNote = row.gapNote ?? "";
+  if (!forbiddenSynthesisFileNameReason(oldDest) || !isPipelinePlaceholderGapNote(gapNote)) {
+    return false;
+  }
+  row.verdict = "reject";
+  row.rejectReason = "pipeline placeholder name with placeholder gap note — no vision evidence";
+  row.destName = undefined;
+  return true;
+}
+
+/**
+ * Rewrite a forbidden destName in place, recording the rename to apply on disk.
+ * A permitted name is left untouched — including its unnormalized spelling, which
+ * must survive into the persisted decisions doc byte-for-byte.
+ *
+ * @param {{ destName: string, gapNote?: string }} row
+ * @param {string} oldDest normalized current destName
+ * @param {Set<string>} reserved
+ * @param {[string, string][]} renamePairs
+ */
+function repairDestName(row, oldDest, reserved, renamePairs) {
+  if (!forbiddenSynthesisFileNameReason(oldDest)) {
+    return;
+  }
+  reserved.delete(oldDest);
+  const destName = deriveSemanticNameFromGapNote(row.gapNote ?? "", reserved);
+  row.destName = destName;
+  if (destName !== oldDest) {
+    renamePairs.push([oldDest, destName]);
+  }
+}
+
+/**
+ * @typedef {{ verdict: string, destName: string, sourceFile: string, gapNote?: string, session?: string }} PromotionDecisionRow
+ * @typedef {{ decisions: PromotionDecisionRow[] }} PromotionDecisionsDoc
+ */
+
+/**
+ * @param {PromotionDecisionsDoc} doc
+ * @returns {PromotionDecisionRow[]}
+ */
+function promotedDecisions(doc) {
+  return doc.decisions.filter((d) => d.verdict === "promote");
+}
+
+/**
+ * @param {string} synthesisDir
+ * @param {[string, string][]} renamePairs
+ */
+function applyFileRenames(synthesisDir, renamePairs) {
+  for (const [oldName, newName] of renamePairs) {
+    const oldPath = path.join(synthesisDir, oldName);
+    const newPath = path.join(synthesisDir, newName);
+    if (fs.existsSync(oldPath) && !fs.existsSync(newPath)) {
+      fs.renameSync(oldPath, newPath);
+    }
+  }
+}
+
+/**
+ * @param {string} synthesisDir
+ * @param {PromotionDecisionsDoc} doc
+ */
+function pruneUnpromotedSynthesisFiles(synthesisDir, doc) {
+  const promotedNames = new Set(
+    promotedDecisions(doc).map((d) => normalizeSynthesisDestName(d.destName)),
+  );
+
+  for (const name of fs.readdirSync(synthesisDir)) {
+    if (!name.endsWith(".png")) {
+      continue;
+    }
+    if (!promotedNames.has(name)) {
+      fs.unlinkSync(path.join(synthesisDir, name));
+    }
+  }
+}
+
+/**
+ * @param {string} absSlice
+ * @param {PromotionDecisionsDoc} doc
+ */
+function writePromotionArtifacts(absSlice, doc) {
+  const promotes = promotedDecisions(doc);
+
+  /** @type {Record<string, { sourceFile: string, gapNote?: string, session?: string }>} */
+  const promotionMap = {};
+  for (const row of promotes) {
+    const destName = normalizeSynthesisDestName(row.destName);
+    if (forbiddenSynthesisFileNameReason(destName)) {
+      throw new Error(`still forbidden after repair: ${destName}`);
+    }
+    promotionMap[destName] = {
+      sourceFile: row.sourceFile,
+      gapNote: row.gapNote,
+      session: row.session,
+    };
+  }
+
+  fs.writeFileSync(
+    lanePath(absSlice, LANES.keyFrames, "promotion-map.json"),
+    `${JSON.stringify(promotionMap, null, 2)}\n`,
+    "utf8",
+  );
+
+  const auditDoc = {
+    reviewedAt: new Date().toISOString(),
+    model: "repair-synthesis-promotions",
+    files: promotes.map((row) => ({
+      name: normalizeSynthesisDestName(row.destName),
+      pass: true,
+      note: (row.gapNote ?? "vision-gated promotion").slice(0, 120),
+    })),
+  };
+  fs.writeFileSync(
+    lanePath(absSlice, LANES.keyFrames, "key-frame-quality-audit.json"),
+    `${JSON.stringify(auditDoc, null, 2)}\n`,
+    "utf8",
+  );
+  renderKeyFramesManifest(absSlice);
+  renderQualityAudit(absSlice);
+}
+
+/**
+ * @param {PromotionDecisionsDoc} doc
+ * @param {Set<string>} reserved
+ * @param {string} absSlice
+ * @returns {{ renamed: number, rejected: number, sessionsFixed: number, renamePairs: [string, string][] }}
+ */
+function repairPromotionRows(doc, reserved, absSlice) {
+  let rejected = 0;
+  let sessionsFixed = 0;
+  /** @type {[string, string][]} */
+  const renamePairs = [];
+  // Loaded on the first row that needs a session fix, then reused.
+  /** @type {SessionIndex|null|undefined} */
+  let sessionIndex;
+
+  for (const row of doc.decisions) {
+    if (row.verdict !== "promote") {
+      continue;
+    }
+
+    const oldDest = normalizeSynthesisDestName(row.destName);
+    if (rejectPipelinePlaceholder(row, oldDest)) {
+      rejected += 1;
+      continue;
+    }
+
+    repairDestName(row, oldDest, reserved, renamePairs);
+
+    if (typeof row.session === "string" && isForbiddenPipelineSessionSlug(row.session)) {
+      if (sessionIndex === undefined) {
+        sessionIndex = loadSessionIndex(absSlice);
+      }
+      row.session = resolveSessionForSource(sessionIndex, row.sourceFile);
+      sessionsFixed += 1;
+    }
+  }
+
+  // Every rename recorded a pair, so the pair list IS the rename count.
+  return { renamed: renamePairs.length, rejected, sessionsFixed, renamePairs };
+}
+
+/**
+ * @param {string} sliceDir
+ * @param {{ dryRun?: boolean }} [options]
+ * @returns {{ renamed: number, rejected: number, sessionsFixed: number }}
+ */
+export function repairSynthesisPromotions(sliceDir, { dryRun = false } = {}) {
+  const absSlice = path.resolve(sliceDir);
+  const decisionsPath = lanePath(absSlice, LANES.keyFrames, "promotion-decisions.json");
+  const synthesisDir = lanePath(absSlice, LANES.keyFrames, "frames");
+  const doc = JSON.parse(fs.readFileSync(decisionsPath, "utf8"));
+  const reserved = new Set(
+    fs.existsSync(synthesisDir)
+      ? fs.readdirSync(synthesisDir).filter((f) => f.endsWith(".png"))
+      : [],
+  );
+
+  const { renamed, rejected, sessionsFixed, renamePairs } = repairPromotionRows(
+    doc,
+    reserved,
+    absSlice,
+  );
+
+  if (!dryRun) {
+    fs.writeFileSync(decisionsPath, `${JSON.stringify(doc, null, 2)}\n`, "utf8");
+    applyFileRenames(synthesisDir, renamePairs);
+    pruneUnpromotedSynthesisFiles(synthesisDir, doc);
+    writePromotionArtifacts(absSlice, doc);
+  }
+
+  return { renamed, rejected, sessionsFixed };
+}
+
+if (isMainModule(import.meta.url)) {
+  const sliceDir = process.argv[2];
+  const dryRun = process.argv.includes("--dry-run");
+  if (!sliceDir) {
+    writeStderr("Usage: node watch/repair-synthesis-promotions.js <slice-dir> [--dry-run]");
+    process.exit(2);
+  }
+  const result = repairSynthesisPromotions(sliceDir, { dryRun });
+  writeStdout(
+    `${dryRun ? "DRY RUN" : "Applied"}: renamed=${result.renamed} rejected=${result.rejected} sessionsFixed=${result.sessionsFixed}`,
+  );
+}
