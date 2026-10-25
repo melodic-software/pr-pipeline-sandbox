@@ -981,7 +981,7 @@ jobs:
       # .base.
       - name: Set up Python for the test-file runner
         if: contains(steps.stage.outputs.claude-args, '/lane-verify/bin/run-test-file ')
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: .base/.python-version
       - name: Install the pinned pytest for the test-file runner
@@ -1331,7 +1331,7 @@ jobs:
       - name: Set up Python for the skill
         if: >-
           steps.setup-env.outputs.ready == 'true'
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ${{ runner.temp }}/setup-env/.python-version
 
