@@ -1,0 +1,371 @@
+# Research discipline: sources, recency, falsification, broad topics
+
+Recipes and rationale behind the bars stated in the research skill's SKILL.md body, plus failure patterns observed in real sessions.
+`<plugin-root>` below is the plugin directory that prefixes the `scripts/` paths in the research skill's SKILL.md body; write it out as that absolute path before running a command or writing a brief.
+
+## Contents
+
+- [Source tiers (canonical for this plugin)](#source-tiers-canonical-for-this-plugin)
+- [Source-tier ratio (per claim)](#source-tier-ratio-per-claim)
+- [Single-source first-party content claims](#single-source-first-party-content-claims)
+- [Recency gate (for libraries, tools, CLIs, APIs)](#recency-gate-for-libraries-tools-clis-apis)
+- [Falsification step (mandatory Phase 2 query)](#falsification-step-mandatory-phase-2-query)
+- [Broad-topic auto-detect](#broad-topic-auto-detect)
+- [Effort, source breadth](#effort-source-breadth)
+- [Query scaling: floors are not targets](#query-scaling-floors-are-not-targets)
+- [Per-gap fan-out (Phase 2)](#per-gap-fan-out-phase-2)
+- [Corpus enumeration (Phase 0 recipe)](#corpus-enumeration-phase-0-recipe)
+- [Tool-ecosystem Phase 3 fallback](#tool-ecosystem-phase-3-fallback)
+- [Read-only `gh` forms](#read-only-gh-forms)
+- [Primary-source-first protocol](#primary-source-first-protocol)
+- [Machine-readable doc-index discovery](#machine-readable-doc-index-discovery)
+- [Source-quality red flags](#source-quality-red-flags)
+- [Graceful degradation (missing tools)](#graceful-degradation-missing-tools)
+- [Confidence calibration](#confidence-calibration)
+- [Single-publisher facts](#single-publisher-facts)
+- [Joint-inference check](#joint-inference-check)
+- [Observed failure patterns](#observed-failure-patterns)
+
+## Source tiers (canonical for this plugin)
+
+| Tier | Source | Counts as |
+|---|---|---|
+| Tier 0 | Direct tool output captured this turn (`<bin> --help`, file Read, `gh api`, MCP tool result) | Strongest. Primary |
+| Tier 1 | Official documentation **fetched this turn** with URL captured (vendor docs, GitHub source, language spec, RFC, upstream changelog; for a design pattern's definition, the canonical catalog page that defines it) | Primary |
+| Tier 2 | Secondary synthesized (AI-synthesis answers, Stack Overflow, recognized author blog, vetted vendor blog) | Secondary, corroborator only |
+| Tier 3 | Synthesis without grounding (training-data recall, vague "I remember reading," subagent return without primary citation) | NOT acceptable for claim acceptance. Must promote to Tier 0/1 first |
+
+**Canonical pattern sources.** For what a design pattern is, the primary is the source that defines it, not a vendor's docs and not the most-used template that applies it. A canonical catalog page fetched this turn with its URL captured (for example under `https://martinfowler.com/eaaCatalog/` or `https://www.enterpriseintegrationpatterns.com/patterns/`) is Tier 1 for the pattern's definition. The book behind it (the Gang of Four's *Design Patterns*, *Patterns of Enterprise Application Architecture*, *Enterprise Integration Patterns*, the DDD books by Evans, Vernon and Khononov) cited from training-data recall with no captured page is Tier 3 like any other recall. How many templates, samples or repositories use a pattern is evidence of adoption, never of correctness, and earns no tier. A recommendation built on the research follows the [recommendation-basis contract](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/recommendation-basis/README.md#grounding-bar).
+
+**Scoped exception: a dispatched run of the research skill is not a Tier-3 subagent return.** The Tier-3 rule targets an ad-hoc subagent handing back synthesis with no captured primaries, and it stays in force for that. It does not reach a `discovery:researcher` run that executed this discipline and wrote every primary URL into the artifact: **the tier attaches to the artifact and the sources captured in it, never to the transport that carried the pointer.** Read literally without this exception, dispatch-by-default would demote every run to the tier criterion 1 refuses, and the skill's routing section would contradict its own gate. The exception is exactly as wide as its evidence: a return whose artifact does not carry the fetched primaries is Tier 3 like any other summary, and a missing or mismatched `preload_token` means the discipline never ran at all, so that run is discarded rather than tiered. A matching token is file-identity only. It does not prove preload fired; that is the `preload:` field.
+
+## Source-tier ratio (per claim)
+
+Every accepted claim has at least one Tier 0/1 source plus two independent corroborators of any tier. That is the floor criterion 4 checks; acceptance also needs HIGH (criterion 7), per "Confidence calibration" below. The one exception to the floor is the next section.
+
+**Anti-pattern:** three AI-synthesis citations of three different secondary blogs = 1 Tier 2 source, not 3. They're synthesizing from the same upstream pool. Count INDEPENDENT primary sources, not citation count.
+
+**Track tool diversity per topic in the evidence table.** Two sources both from one synthesis tool / both from one search engine / both from one author's blog network = 1 corroborator, not 2.
+
+## Single-source first-party content claims
+
+Some claims can have only one publisher. A **first-party content claim** states what a vendor's or maintainer's own official page, file, changelog or help text says about its own product. The content exists in one place, so searching for an independent second source finds only copies of it. Such a claim passes criterion 4 with no counted corroborator when all of these hold:
+
+- **The claim states why only one publisher exists**, in the sidecar header's `single_source:` field. The verifier grades that reason; one that does not hold fails criterion 4 like any other uncorroborated claim.
+- **A repost is not a second source.** A blog post, forum answer, mirror or synthesis answer that quotes or restates the page shares its pool. Record it with the page's `pool`, never count it, and keep the flag: a repost does not turn the claim into a corroborated one.
+- **The primary is the named artifact itself, fetched this turn**, and it passes every run-owned row as any other primary does.
+
+The claim's confidence is `HIGH (single source)` (see "Confidence calibration"), and the flag stays visible wherever the claim goes: the evidence table's Confidence cell, the sidecar header, the answer, and any synthesis built from it. A flagged claim may ground a code edit, and the record written beside that edit carries the flag.
+
+**A behavior claim is not a content claim.** What a product does when it runs (a default that takes effect, a limit it enforces, an error it raises) can be checked by a live probe or found in an issue report, so it still needs two independent corroborators, whatever its docs page says. A content claim about a page and a behavior claim drawn from that page are two claims: split them, and only the content claim can carry the flag.
+
+**A content claim is not a single-publisher fact.** Its subject is the named artifact, not the publisher, so it carries no `subject_pool` and the cap in "Single-publisher facts" below does not apply to it, even though its one source is the publisher's. When the artifact states the publisher's own pricing, roadmap, internal metrics, or how its product behaves or performs, "the artifact says X" can carry the flag, while X as a fact about the publisher or its product is a separate claim under "Single-publisher facts" and is never accepted on the publisher's word alone.
+
+## Recency gate (for libraries, tools, CLIs, APIs)
+
+When the topic touches a library, tool, CLI, API or framework that ships releases, one Phase 1 or Phase 2 query fetches the latest upstream changelog or release notes this turn and confirms the claims are current as of it. Acceptable forms: `gh api repos/<owner>/<repo>/releases/latest`, WebFetch on a raw `CHANGELOG.md` URL, the vendor's "What's New" page. When the changelog or release notes are a docs page, read the page itself through the docs lookup, `<plugin-root>/scripts/fetch-docs.sh --cache` per `<plugin-root>/reference/docs-lookup-procedure.md`, not a WebFetch summary of it. The windows below bound how stale a cited doc may be before this cross-check is required. A stable project whose latest release is older than the window still passes once that release is confirmed to be the current one.
+
+**Tightening tiers:**
+
+| Topic class | Recency gate |
+|---|---|
+| Very active project (weekly releases, breaking changes, security-sensitive) | 14 days |
+| Standard library / tool / CLI / API | 30 days |
+| Tool- or vendor-specific architecture guide (a cloud provider's reference architecture, a framework's architecture docs) | 90 days |
+| Pattern definition or canonical pattern book (GoF, PoEAA, EIP, DDD, SOLID, Hexagonal) | No recency gate, since a definition doesn't drift. Tool-specific advice built on it does, and takes its own row |
+
+**Major version bump invalidates prior docs.** When the upstream repo moved `x.y.z` → `(x+1).0.0` since the doc was last updated, treat ALL prior docs as suspect, including first-party docs, which routinely lag a major release. Re-verify every behavior claim against the new release notes regardless of doc age.
+
+**This gate dates claims, not sources.** A current claim passes it however old the sources behind it are. The source side is criterion 13: every source records `published:` and `applies_to:`, and a source that does not cover the claim's target version is `historical` and not counted. Recipe: the artifact-shape file's sidecar header.
+
+## Falsification step (mandatory Phase 2 query)
+
+Exactly one Phase 2 query attempts to falsify the leading hypothesis from Phase 1.
+
+**Falsification query patterns:**
+
+- For a claim "X is canonical": query `"X deprecated"` OR `"X replaced by"` OR `"X removed in version"` OR `"alternative to X"`
+- For a claim "X supports Y": query `"X does NOT support Y"` OR `"X Y incompatible"` OR the upstream issue tracker for Y limitations
+- For a claim "use X for Y": query `"why X is bad for Y"` OR `"X anti-pattern"` OR a recognized author's critique
+- For a claim "the convention is X": fetch the upstream maintainer's own latest writing OR the project's own CHANGELOG to check whether the convention shifted
+
+**Why mandatory, not advisory:** without an explicit "try to break it" step, every Phase 2 query confirms Phase 1 by accident. Confirmation bias is the default behavior, so falsification has to be enforced. Falsification cannot be retroactive: it must be a deliberate "try to break this" query, not a query that happens to surface contradicting evidence.
+
+## Broad-topic auto-detect
+
+When the research topic matches any trigger below, double all phase minimums:
+
+| Trigger | Example topic |
+|---|---|
+| 2+ vendors / 2+ tools / 2+ products named | "tool A vs tool B vs tool C memory conventions" |
+| 3+ proper-noun product names in topic | "ORM + event store + messaging library integration" |
+| Comparison topic ("X vs Y", "X or Y", "best of X/Y/Z") | "identity server A vs identity server B" |
+| Multi-platform topic ("works on Windows, macOS, Linux") | "polyglot version manager comparison" |
+| Migration / rebrand / convention-change topic ("from X to Y", "replaces X", "deprecates X") | "config format X replaces format Y" |
+
+**Doubled minimums:** 6+ queries per phase (was 3+), 12+ queries total (was 9+), 5+ distinct tool types across the topic (was 3+ per phase), 4+ independent Tier 0/1 sources per claim (was 1+).
+
+**Why:** multi-vendor topics have N times more drift surface. Each vendor ships its own changelog cadence, docs site, and naming-convention shifts. Single-vendor minimums under-cover the cross-vendor edges where hallucinations concentrate.
+
+## Effort, source breadth
+
+Effort scales **source breadth**, not outcome-gate honesty. Default `high` (and `xhigh` / `max`)
+is the current full Phase 0 through Phase 3 workflow, plus conditional Phase 4. Task size never
+trims phases; only the Effort table in the skill body does.
+
+Criteria that need a skipped phase are N/A at that effort. Criteria that still apply still bite,
+including the coverage-ledger script verdict when Phase 0 wrote a ledger, and Phase 2
+falsification at every level that runs Phase 2. Name skipped phases in the artifact and report so
+a narrower run is not mistaken for a complete one.
+
+**The Effort row is the ceiling over [Broad-topic auto-detect](#broad-topic-auto-detect).**
+Doubling still applies to a phase the table actually runs at its floor (Phase 1 at every
+level that runs it; Phase 2 at `medium` and above). Skipped phases stay skipped, and Phase 2
+at `low` stays the one falsification query, even when the topic would otherwise double every
+phase to 6+ queries.
+
+## Query scaling: floors are not targets
+
+The per-phase minimums (3+ standard, 6+ broad-topic) are floors to start from, not targets to stop at. The query count is a function of the open-question count: a flat per-phase number would stop a run while numbered gaps are still open.
+
+| Phase | Query count |
+|---|---|
+| Phase 1 | ≥3, a broad seed; the floor genuinely applies because you don't yet know the gaps |
+| Phase 2 | one per numbered gap + one per numbered conflict + the mandatory falsification query (≥3, no cap) |
+| Phase 3 | one per remaining gap after Phase 2, against preferred-source / tool-ecosystem authorities (≥3) |
+| Phase 4 | one per still-open gap or LOW-confidence claim, until all reach HIGH |
+
+Depth scales to the topic's actual open-question surface, not to a higher flat floor. A simple topic with 3 gaps runs ~3 Phase 2 queries; a gnarly one with 9 gaps runs 9.
+
+## Per-gap fan-out (Phase 2)
+
+A single topic with many gaps otherwise runs them one after another against one worker's turn
+limit. The research deep tier splits only topics that share no claims, so gaps that share a
+source stay in one run by design. This step is where those gaps fan out.
+
+**When.** All three hold: the dispatch prompt says `Capability flags: nested spawning available`,
+the `Agent` tool is actually present, and the Phase 1 list (or the brief) carries two or more
+numbered gaps. Otherwise run the gaps one after another: slower, same coverage.
+
+1. **Group, then assign.** Gaps that point at the same primary go to one worker; every other gap
+   gets its own. Cap the fan-out at 5 workers, grouping further past that. Done when every numbered
+   gap has exactly one worker.
+2. **Brief each worker to gather, not to judge.** Use a generic subagent, not another
+   `discovery:researcher`, whose preload would rerun the whole discipline under its own 40-turn
+   limit. The brief carries its gap numbers and text verbatim, the leading hypothesis, the target
+   version, the source categories to try, and the fetch recipe under "Primary-source-first
+   protocol", with `<scratch>` set to a directory inside this run's memory slice. It returns, per
+   gap, each source's URL, its on-disk artifact path, the quoted span, and what the source measures.
+   It returns no verdict. The brief also carries one line: `Credentials: verify presence only, never
+   read or print a value; rule and forbidden commands: <plugin-root>/reference/parent-contract.md,
+   Credentials stay unread`, with `<plugin-root>` written out as an absolute path. Done when every worker is dispatched in one turn.
+3. **Keep the falsification query yourself.** It tests the leading hypothesis the whole run rests
+   on, so it never goes to a gap worker.
+4. **Merge, then confirm.** Append each worker's fetches to the fetch log. A worker's return is
+   Tier 3 until you confirm it (see "Subagent return = Tier 3 by default"): read each cited primary's
+   on-disk artifact yourself before counting it as Tier 0/1. Done when every cited primary is
+   either confirmed or recorded as unconfirmed.
+5. **An empty return leaves the gap open.** A worker that found nothing for a gap leaves that gap
+   in the Phase 2 output; the merge never closes a gap its worker did not answer.
+
+Phases stay sequential ("Phases must be sequential" below); this is parallelism inside Phase 2.
+
+## Corpus enumeration (Phase 0 recipe)
+
+Query scaling above answers *how deep*. This answers *how wide*, and it is the other half: a run can hit every query floor, close every numbered gap, and still have silently covered eleven of a plugin's thirty-nine skills. Gaps are found by searching; a bounded corpus is knowable before searching, and anything knowable up front that is discovered late was skipped.
+
+**Step 1: decide whether the corpus is bounded.** Bounded means finite and enumerable *before* the first query: every skill in a plugin, every endpoint in an API reference, every rule in a linter catalogue, every release between two versions, every vendor named in a comparison. Unbounded means there is no such set: "is this approach sound?", "what are the tradeoffs". Record the verdict in one line either way; an unrecorded verdict becomes an unexamined assumption that the corpus was unbounded, which is the convenient answer.
+
+**Step 2: enumerate from an EXHAUSTIVE surface.** The enumeration source decides the ledger's ceiling, so it must be complete by construction, not by luck:
+
+| Corpus | Exhaustive surface | NOT exhaustive |
+|---|---|---|
+| Pages of a doc site | `sitemap.xml` / `sitemap_index.xml` | `llms.txt` (curated, deliberately partial), site search |
+| Files in a repo | `git ls-tree`, `gh api .../contents` | a code-search hit list |
+| Releases / versions | `gh api repos/<o>/<r>/releases`, tag list | a changelog page's visible entries |
+| API surface | the reference's own index or an OpenAPI document | search results for endpoint names |
+| A named finite set (vendors, options) | the naming source itself: the prompt, the comparison, the spec | "top N" listicles |
+
+A ledger built from search results inherits exactly the blind spot the ledger exists to close. When no exhaustive surface exists, say so in the ledger. The corpus is then *unbounded in practice*, and coverage is reported as a Gap rather than claimed.
+
+**Step 3: write the ledger before the first query**, into the same memory slice as the artifact, as `research-checklist.md`:
+
+```markdown
+| # | Corpus item | Depth criterion | Done |
+|---|-------------|-----------------|------|
+| 1 | skills/foo/SKILL.md | frontmatter + routing section read end to end | [ ] |
+| 2 | skills/bar/SKILL.md | frontmatter + routing section read end to end | [ ] |
+```
+
+**The depth criterion is per-item and fixed at enumeration time.** Per-item, because "covered" differs across a corpus: a config reference needs its defaults table read; a 900-line spec needs one section. Fixed up front, because a criterion written after the results are in drifts down to whatever the run managed, which is self-certification with extra steps. Write criteria you can grade from the artifact: "its `frontmatter` section read end to end", never "researched" or "understood".
+
+**Step 4: mark rows as their own criterion is met**, and let the script grade the ledger: `<plugin-root>/scripts/check-coverage-complete.sh <ledger>` (or the `.py` twin) exits 0 only when every row is marked, non-zero otherwise, and 2 when the ledger cannot be parsed at all. Outcome-gate criterion 11 cites that exit status rather than a reading of the table, because the context most motivated to call the table finished is the one that would be reading it. A checker that could not run is a FAIL, never a hand-grade.
+
+**Narrowing is legitimate; quiet narrowing is not.** If enumeration turns up more than the budget covers, cut the corpus explicitly and record what was cut and why. A 12-row ledger over a 40-item corpus is a scoped answer a reader can act on, while 40 rows with 28 unmarked is an unfinished one. Enumerating only what you already intended to reach produces a ledger that passes the gate and means nothing.
+
+## Tool-ecosystem Phase 3 fallback
+
+When no preferred-source author covers the topic's domain (typical for tool-ecosystem topics: AI coding tools, MCP servers, CI-platform specifics), Phase 3 cites all three:
+
+1. **Official maintainer**: the vendor's own social / GitHub / blog
+2. **Upstream repo changelog or releases**: `gh api repos/<owner>/<repo>/releases` OR a raw `CHANGELOG.md` fetch this turn
+3. **One recognized industry authority**: a named practitioner recognized in the domain for their own work (a canonical book or catalog, a maintained project). Votes, stars and search rank make a post popular, not authoritative
+
+## Read-only `gh` forms
+
+Search and read GitHub with forms that cannot write: `gh search issues`, `gh search prs`, `gh search code`, `gh search repos`, `gh issue view`, `gh pr view`, and `gh api` with the query in the URL and no `-X`, `-f` or `-F` flag (`gh api 'search/issues?q=<terms>'`, `gh api repos/<owner>/<repo>/releases`). The reason is the operator's permission list, not the API: `gh api -X GET search/issues -f q=...` reads nothing more than the URL form does, but it matches ask rules such as `Bash(gh api -X *)` and `Bash(gh api * -f *)` written to catch API writes, so every search prompts the operator.
+
+## Primary-source-first protocol
+
+The "top of Google" is a ranking artifact, not an authority signal. SEO content farms outrank authoritative sources. The defense: never let the SERP BE the source. Three steps per claim.
+
+1. **Name the canonical home before searching**: the official docs site / repo / spec / changelog that OWNS the answer. If the consuming project ships a per-ecosystem source mapping or preferred-sources roster (check its `CLAUDE.md` and rules), use it; otherwise identify the ecosystem's official docs site, package registry, and upstream changelog yourself. Probe for a published doc-index first per "Machine-readable doc-index discovery" below, and walk the artifact ladder below before concluding the answer is not there.
+2. **Fetch it directly**, with whatever direct-fetch tool is connected this session. Discover what's available from your tool list, the injected MCP server-instruction blocks, and the project's MCP registry; don't hard-depend on a specific server. Fetching the canonical home directly bypasses ranking entirely.
+3. **Synthesis + SERP discover and corroborate only**: find the canonical home when unknown, surface independent corroborators. A synthesized answer points you AT the source; it is never the terminal source for an accepted claim.
+
+**The same claim is published at several depths, so walk the artifact ladder top-down.** A SEARCH order for locating a claim's specifics, not an authority order: the tier table above ranks authority, and the recency gate's changelog cross-check stays unconditional at every rung. (The doc-index probe below enumerates *pages*; this ranks *artifact classes*.) Step 1 is not satisfied until the topmost rung that exists for the claim has been fetched. Descend past a rung on exactly three grounds, each recorded: the probe showed **the rung does not exist** for this claim class (rung 1 is routinely absent, see the rung list below); the rung exists and was **fetched and searched** and does not carry the claim; or the escalation ladder below failed on it, which makes it an enumerated Gap, not a silent descent. **A probe locates a rung; it does not grade one.** A title, an index entry, or a search snippet is enough to establish that a rung is *there* and never enough to conclude it lacks the claim. The section you were chasing is exactly what a snippet omits, so probe-only descent is how a system card gets walked past with every gate still passing.
+
+**Nonexistence needs an EXHAUSTIVE surface, not a no-hit.** A search that returned nothing, a curated `llms.txt`, and a guessed URL are all deliberately non-exhaustive, and the doc-index table below says so of `llms.txt` in as many words, so a miss on any of them is silence, not evidence. **But an exhaustive surface is exhaustive only for the artifact class it indexes and the host it covers, and one of them is rarely the whole inventory.** A docs `sitemap.xml` enumerates that host's *pages*, which is exactly what the table below says, while the ladder is ranking artifact *classes*, so a publisher that ships model cards as PDFs its sitemap omits, parks them on an asset or download host, or keeps them outside the docs tree leaves a clean scan of any one surface **silent** about rung 1 rather than negative on it. `probed-and-not-existing` is therefore earned two ways and no others. Either the surfaces checked **together** cover every first-party surface where an artifact of *that class* plausibly lives, namely the docs `sitemap.xml` (or its index), the in-repo docs tree, a releases or asset listing, the download/asset host, and a sibling first-party domain the publisher itself links to, or **the publisher declares its own chosen inventory complete** for that class. *Plausibly, for that class* is the bound and it is a real one: this is the surfaces the class actually uses, never every surface imaginable, so a claim class a publisher only ever ships in-repo is settled by the tree alone. Short of either, the rung is **unresolved**, which is a Gap carrying the discovery surfaces checked and the ones left unchecked, the same enumeration any absence claim owes. Recording unresolved as nonexistent is the shallow walk wearing the new vocabulary, and it is the one substitution that would make this outcome worse than the two-value version it replaced. **"No deeper artifact exists" is an absence claim like any other.** Unprobed, it is the assumption that produces the shallow walk this ladder exists to prevent, and it lets a landing page pass itself off as the top. Discovering a deeper rung and sourcing from a shallower one anyway is the same failure with a receipt attached. The ladder applies to every publisher's own artifacts: a vendor's, an OSS maintainer's, a standards body's.
+
+1. The deepest technical artifact the vendor ships for that claim class. For a model / benchmark / eval claim, the **system or model card**, often a PDF; for a library-behavior claim, the source itself (per "Source code as spec"). Carries methodology, conditions, and per-run numbers. Many claim classes have no such artifact, and then rung 2 is the top
+2. Platform / API reference: normative behavior, parameters, limits
+3. Product docs: feature-level description
+4. Changelog / release notes: what changed, when
+5. Announcement / news post: the **headline** number only
+6. Third-party
+
+**An announcement is the shallowest rung that still carries the claim.** It states the headline figure; the specific run, its conditions, and its methodology live at rung 1. Checking an announcement, an intro page, and a couple of searches, then reporting the figure as unsourced, is a ladder that was never walked.
+
+**Authoritative is not a waiver for corroboration.** Even the canonical doc still needs ≥2 independent corroborators and a freshness check; the one exception is a claim about what the doc itself says, under "Single-source first-party content claims" above. First-party docs routinely lag major releases. When the topic post-dates a major version, cross-check the canonical doc against the upstream changelog/release and treat any lag as a conflict to resolve. A fact only the publisher itself can state has no independent corroborator to find, so it is reported as "Single-publisher facts" below sets out, never accepted.
+
+**Escalate on block, never downgrade.** A direct-fetch 403/429 means wrong fetcher, not vanished source. Escalation order: (1) a headless-browser URL reader if connected; (2) a managed scraping tool if available; (3) a synthesis tool forced to the blocked domain (domain-filter option). Only after those fail, fall back to secondary sources, and document the gap.
+
+**A size failure is the same trigger.** Rung-1 artifacts can be large, whether a model card or spec PDF, a long HTML specification, an API reference, or a source file, and an in-context fetcher may reject one with a content-length error (shape: `maxContentLength size of <N> exceeded`) or return only part of it. Escalate by moving the fetch out of context.
+
+- **Pointer**: when deciding whether a WebFetch result covers the whole page, fetch [tools reference: WebFetch tool behavior](https://code.claude.com/docs/en/tools-reference#webfetch-tool-behavior) live. **As of**: 2026-10-11. **Recheck trigger**: that section changes what a result reports for a page past the read cap, or which route it names for the unprocessed page.
+
+**An upstream docs page goes through the docs lookup**: `<plugin-root>/scripts/fetch-docs.sh --cache` per `<plugin-root>/reference/docs-lookup-procedure.md`. It writes the page to a file, checks it is the page asked for, records a page it cannot read whole as `unread` with a reason, and caches the bytes for other sessions. Cite the manifest's `validated` and `age_seconds` with the source. An `unread` page is a block: walk the escalation order above. A negative claim or any other verification read takes `--max-age 0` and the raw reads in the procedure's step 6, because cached bytes are not a fetch this turn. Every other artifact (a PDF, a spec, a source file) takes the three steps below.
+
+1. **Download** to the session's scratch dir with any available downloader, failing loudly on an HTTP error instead of saving the error body as the document:
+
+   ```bash
+   dir=$(mktemp -d "<scratch>/fetch-XXXXXX")
+   url='<url>'
+   curl -fsSLg -D "$dir/headers" -o "$dir/<claim-slug>-<url-digest>" "$url"
+   ```
+
+   Four properties of that recipe are required, and each one is a failure someone has already shipped.
+
+   **The URL is DATA, never command source, so single-quote it.** `$(…)` and backticks are legal characters in a URL path, and inside *double* quotes the shell expands both before `curl` ever runs, so pasting a discovered link into a double-quoted string executes whatever a hostile page put in it. Single quotes suppress every expansion, which also covers the `&` that would otherwise be a control operator truncating the URL and running the remainder. Single quoting cannot carry a literal `'`, so percent-encode that one character as `%27` before the URL goes in the string. Never interpolate the raw link into the `curl` line itself. **`curl` needs the same treatment separately**: `{}` and `[]` are legal URL characters that `curl` reads as its own sequence-and-range syntax, and shell quoting does nothing about that. It would expand one URL into several requests writing over a single `-o` path, leaving a plausible artifact fetched from the wrong expanded URL. `-g` (`--globoff`) turns that off, per "Disable URL globbing with `{}` and `[]`" (`curl --help all`, curl 8.19.0, checked 2026-07-25), so the URL is data to `curl` as well as to Bash.
+
+   **Download extensionless; settle the type afterwards.** Naming the file by type up front is circular. The path has to exist before `curl` runs, but the type is only known from the response that same command produces, and `-D` writes headers, it cannot retroactively rename an already-chosen output path. Guessing `.pdf` mislabels an HTML spec or a source file and sends step 3 down the wrong branch; re-fetching to learn the type costs a second full transfer of a large or single-use signed download. So the artifact lands with no extension, `-D "$dir/headers"` captures the response headers from the one transfer, and step 2 branches on what the completed download actually is. Nothing needs renaming.
+
+   **Uniqueness rides the DIRECTORY, not the filename.** Phases launch queries in parallel against a shared filesystem, so a fixed `doc` name lets one worker overwrite another's artifact mid-validation and cite the wrong document; a claim slug alone collides the moment one claim is chased across two URLs; and the full claim-plus-URL stem still collides when two parallel queries chase the same claim to the same URL. A per-invocation `mktemp -d` closes all three at once. It has to be the directory because BSD `mktemp(1)` replaces only *trailing* `X`s ("The template may be any file name with some number of `Xs` appended to it … The trailing `Xs` are replaced", <https://man.freebsd.org/cgi/man.cgi?query=mktemp&sektion=1>, fetched 2026-07-25). A `…-XXXXXX.<ext>` template is an invalid-template error on macOS, and under `&&` chaining `curl` never runs, so a directly downloadable artifact gets escalated or filed as a Gap on the strength of a shell error. The stem survives on the filename for diagnosis only: it is what tells a later reader which claim and which URL a scratch directory holds.
+
+   **`--fail` (`-f`) is not optional.** Without it a 4xx/5xx body lands as a "downloaded" file that then fails extraction and reads as an unreadable primary.
+
+   Carry that exact allocated path through steps 2 and 3.
+2. **Confirm the file IS the artifact before parsing it.** `--fail` cannot catch a protected endpoint that answers 200 with a login, consent, or bot-challenge page. **The recorded `Content-Type` is corroborating evidence, never the confirmation itself, and its absence is never a rejection.** It cannot confirm, because a login wall, a consent interstitial, a bot challenge, and the spec you wanted are all `text/html`. Accepting the type as confirmation is exactly how a challenge page gets grepped as a reached source and yields a false absence. It equally cannot *refuse*: servers routinely ship a valid PDF or source archive as `application/octet-stream` or with no useful type at all, and treating that as a failed confirmation throws away a complete local download and sends the run back through fallbacks that will fail on the same large file, reporting as unreachable an artifact already sitting on disk. **A strong signature or artifact-specific marker confirms on its own**, whatever the server said the type was. Confirm against markers specific to the artifact. For a binary type, its magic bytes (a PDF starts `%PDF-`); for a text-shaped one, content the real document must carry and a challenge page cannot: its expected title or top-level headings, the section the claim is being chased into. Then reject the challenge shapes affirmatively: a `<form>` asking for credentials, a consent **interstitial** standing in place of the artifact, a CAPTCHA or bot-check body, a payload a small fraction of the artifact's plausible size. **A cookie or consent banner sitting alongside a document whose expected title, headings, and body are all present is not a challenge shape**. It is furniture on the real page, the confirmation already succeeded, and rejecting on the banner alone sends a complete document back through fallbacks that return the same banner and ends in "unreachable" for a page you have already read. The test is whether the consent surface *replaces or gates* the artifact, not whether it appears in the markup. A mismatch, or a confirmation you cannot make, is a BLOCK, not a size failure: route it back through the escalation order above, all of it, in order, and do NOT count this recipe as having run.
+3. **Extract, confirm the text is searchable, then cite**, branching on the type step 2 confirmed. An HTML, plain-text, or source artifact is **already searchable on disk**: grep it directly, and strip tags only if the markup drowns the match. Treating one as an unreadable binary is how a run reports "unreachable" about a complete document it already has. A binary artifact needs text out with whatever the machine has (for a PDF, probe for a local extractor such as `pdftotext`; else a PDF library in an available interpreter; else a connected parse/scrape tool that extracts server-side). An extractor exits 0 on a scanned or image-only PDF and returns nothing: **empty or garbled output is a FAILED extraction, not an empty document.** Check the text is usable before searching it: a plausible length for the artifact's size, expected headings present. If it is not, try another extractor, then OCR, then the escalation order above; grepping unusable text manufactures a false "not found" about a source nobody read. Only then grep and cite the section the claim lands in.
+
+**"Unreachable" is reserved for exhaustion, and there are two ways to exhaust.** Extraction that failed after the escalation rungs also failed is one. Acquisition that failed through every rung is the other: a source that answers the direct fetch and every escalation fallback with a login, challenge, or block never yields an artifact to confirm, and once that full walk is recorded it is unreachable too, which is what lets criterion 9 descend past a genuinely protected rung and the Gap row name it. An unconfirmed download ALONE proves neither: it says nothing about the source until the escalation order has actually been walked. And the opposite mistake costs just as much: an artifact that WAS confirmed, extracted into usable text, and searched is a REACHED source even when the claim is not in it. It belongs in the checked set of the enumeration, and the finding is *"not found in [that artifact]"*, never "unreachable", which would file a source you read as one you never opened.
+
+**Negative claims need the primary fetched this turn, and ship their enumeration.** "X is undocumented / removed / unsupported" requires fetching the canonical doc this turn and confirming absence. Absence in training data ≠ absence in current docs. Never publish "unsourced" / "unsupported" / "not found" bare: publish the enumeration, *"not found in [the sources actually checked]; unchecked: [the sources not reached]"*. An absence claim is only as strong as the set it was checked against, and naming the unchecked set is what lets a reader close the gap in one step instead of a round trip.
+
+## Machine-readable doc-index discovery
+
+When the topic centers on a specific library / framework / site, probe for a published index BEFORE crawling by hand. **Probe-if-present**: absence is normal; fall through to the next. Each is a `{base}`-relative path on the canonical home.
+
+| Probe | Path | Nature | Use for |
+|---|---|---|---|
+| `llms.txt` | `/llms.txt` (or `/.well-known/llms.txt`) | **Curated** markdown index, a maintainer hand-pick, deliberately partial | Fast orientation + page prioritization; NOT completeness |
+| `llms-full.txt` | `/llms-full.txt` | Full doc content inlined | One fetch for a deep read of the whole curated set |
+| `sitemap.xml` | `/sitemap.xml` | **Exhaustive for that host's listed pages**, every URL it carries (50k URL / 50 MB cap per file); silent about assets it omits and about any sibling first-party host | Completeness over one host's pages, enumerate them ALL. NOT an artifact inventory: see the absence rule above |
+| `sitemap_index.xml` | root | Index of child sitemaps when the site exceeds the cap | Large sites: follow the index to each child |
+| `robots.txt` `Sitemap:` directive | `/robots.txt` | Names the sitemap location when non-default | Locating a non-default sitemap |
+| `.md` page variant | append `.md` to a page URL | **Platform-specific**, native on some doc platforms; absent elsewhere | Markdown of one page without an HTML parse. PROBE first |
+| In-repo docs tree | `gh api repos/<owner>/<repo>/contents/docs` or `git ls-tree` | Tier-0 enumeration when docs live in a Git repo | Doc source is a repo, not a site |
+| Changelog feed | RSS/Atom, or `CHANGELOG.md` / releases | Release/change stream | Feeds the Recency gate above |
+
+**Curated ≠ exhaustive: the completeness trap.** `llms.txt` is the maintainer's hand-pick; using it alone for "go through every page" silently drops whatever was omitted. For full coverage, **sitemap enumerates, llms.txt prioritizes**.
+
+## Source-quality red flags
+
+Down-rank or refuse to cite:
+
+- Domain names that aggregate / repackage other content (sites that summarize without primary research)
+- "Top 10 best X" listicles with no author named
+- Articles where every claim links to other listicles (no terminal primary source)
+- Vendor-comparison pages on a vendor's own marketing site (marketing copy, not technical doc)
+- "AI-generated content" markers / disclaimers: treat as Tier 3 unless verified against Tier 0/1
+
+Prefer: the vendor's own `/docs` subdomain, GitHub source code, RFCs, language specs, vendor changelogs, recognized author personal blogs with author name + bio.
+
+## Graceful degradation (missing tools)
+
+If a required tool category is unavailable this session (no synthesis MCP server, no web access), don't lower the bar. Substitute and document:
+
+- Lost synthesis tool → substitute WebSearch + WebFetch + `gh api` for equivalent coverage. WebFetch only finds which page to read; read the page itself by the [fetch-route rungs](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/upstream-drift/README.md#the-rungs). For a docs page that is `<plugin-root>/scripts/fetch-docs.sh --cache`
+- Lost web access → flag the topic as `verification: incomplete — offline session`; do not edit code based on Tier 3 recall
+- Document the gap in RESEARCH.md's `Gaps` section: which tool was unavailable, what alternative was used, residual risk
+
+## Confidence calibration
+
+The evidence-table `Confidence` column must be set per claim:
+
+- **HIGH**: 3+ independent Tier 0/1 sources agree; recency gate passed; falsification query failed to find counter-evidence
+- **HIGH (single source)**: a first-party content claim whose one publisher is its primary, fetched this turn, with a `single_source:` reason that holds; recency gate passed; falsification query failed to find counter-evidence. The flag is part of the level and is never dropped (see "Single-source first-party content claims")
+- **MEDIUM**: 3+ sources agree but mix of Tier 0/1 + Tier 2; OR 2 Tier 0/1 + open falsification gap; OR primary source > 30d old without changelog cross-check
+- **LOW**: fewer than 3 sources; OR sources conflict; OR Tier 2-only consensus; OR primary source > 90d old
+
+The `> 30d` and `> 90d` age clauses do not apply to a version-independent pattern-definition claim, whose primary is the canonical source however old it is (see "Canonical pattern sources").
+
+Only HIGH and HIGH (single source) claims are accepted (the outcome gate enforces this). A MEDIUM or LOW claim is a **Gap**: return to Phase 4 follow-up and iterate until HIGH, or report it as a gap; never a basis for code edits.
+
+## Single-publisher facts
+
+Some facts only their publisher can state: its own pricing, roadmap, internal metrics, or how its own product behaves. Two sources sharing a `pool` are one corroborator (`artifact-shape.md`), so the publisher's own pages count once toward criterion 4 however many repeat the fact, and such a fact never reaches criterion 7 or counts as independently corroborated.
+
+A claim is single-publisher when every Tier 0/1 source behind it shares one `pool` and that pool is the claim's subject: the publisher speaking about itself. A flagged first-party content claim never fits this definition: its subject is the artifact, and it is graded under "Single-source first-party content claims" above. A claim carries `single_source:` or `subject_pool:`, never both. Carry a single-publisher claim this way:
+
+- **Worded as an attribution.** The claim reads "<publisher> states ...", never as a bare fact, in the sidecar, the evidence table and the answer.
+- **`subject_pool:` on the claim** names the subject publisher and equals the one `pool` its Tier 0/1 sources share (schema: `artifact-shape.md`). A claim that fits the definition and carries no `subject_pool` is unlabeled, and the verifier fails it on criterion 4.
+- **At most MEDIUM, never accepted.** Report it under Gaps labeled `single-publisher (<pool>)`, with its fetch-log entry and date. More of the publisher's own pages cannot close it; an
+  independent Tier 0/1 source outside the subject pool (your own run of the tool, a third party's
+  measurement) can, because the claim then no longer fits the definition.
+- **Independent measurements sit beside it.** A Tier 2 third party that measured the same thing is listed next to it, and a disagreement between them is a Conflicts entry.
+
+## Joint-inference check
+
+Every other criterion grades provenance or process. This one grades whether the claim follows from its sources. A claim can have a Tier 0/1 primary fetched this turn, two independent corroborators, a confirmed changelog, and quotes that match their sources word for word, and still assert something none of those sources measured. A quote can match its source exactly while the claim does not follow from it: re-fetching the quotes grades the first, and only this check grades the second.
+
+**The pass bar, one rule: the claim's primary source measures the claim's variable and population.** The primary is the one `sources[]` entry marked `role: primary` in the sidecar header, and there is exactly one per accepted claim. Every cited source is checked on its own, not only when sources conflict. A corroborator that measured a different variable or population is recorded, not counted toward criterion 4's two independent corroborators; if that leaves fewer than two, the claim fails criterion 4 as well.
+
+For each accepted claim, name what each cited source actually measures: the variable it manipulated or observed, the population it measured, and the era or question it answered. Then state in one line why the claim follows from those sources **jointly**. Record both in the sidecar header (`measures:` per source, `inference:` and `qualifiers:` per claim, per the artifact-shape file) so the check can be graded off disk.
+
+Run the variable, population, era, and scenario checks on **every cited source**, the primary and each corroborator alike. On the primary a failure fails the claim; on a corroborator it means the source is recorded and not counted.
+
+- **Variable check.** Does the source manipulate or observe the variable the claim is about? Papers that varied context or generation order do not support a claim about model identity, however authoritative each is.
+- **Population check.** Is the source's measured population the one the claim generalizes to? Single-function completions with no security prompting do not describe guardrailed agent pull requests.
+- **Era check.** Does the source describe the product and versions the claim is about? Its `applies_to:` and `published:` say which, and criterion 13's script derives `standing:` from them. The verifier checks what the script cannot: that the product string names the claim's product line (a book about a runtime's predecessor framework is another product, not an older version of the same one), and that the recorded date and range match the page. A `historical` source never counts.
+- **Scenario check.** Does the source describe the claim's specific situation, or only the general mechanism the situation uses? A reference that says a primitive never blocks does not show that a particular retry loop built on it keeps the latest value. A source that states only the mechanism measures a different question from the claim, so it is recorded with that scope in `measures:` and not counted, in every evidence-use mode. The claim may still cite it to explain the mechanism.
+- **Hedge-survival check.** Every MEDIUM, "unmeasured", scope limit, or population qualifier a source or sub-slice records stays attached wherever the claim is used. The failure shape is a figure repeated without the qualifier its source attached.
+
+**Counter-evidence already read is resolved in the artifact, not omitted from it.** That includes a source's own headline or aggregate result. Citing a study's demographics table while its aggregate result runs the other way is a claim the study contradicts. Promoting a free-text comment over the result the source itself reports is the same failure.
+
+A claim whose primary measures a different variable, a different population, a different era, or a different question, or whose qualifier did not survive, is a Gap or a Conflicts entry. It is not accepted and not HIGH.
+
+**Evidence the user will publish.** When the index records `evidence_use: publish`, meaning the parent said the output will be quoted outside this session (a pull-request review reply, an issue, a design document, a message to a third party), two rules tighten. An undated source is always `historical`; the `version-independent` exception for undated corroborators does not apply, and criterion 13's script grades that. And the published answer quotes only `current` sources as support: a `historical` source may appear only in a note that labels it historical, never as evidence for the claim. The verifier grades both, and in this mode it grades every cited source for applicability, meaning product line, version range, and scenario, not only whether the quote sits at its link.
+
+**Why the run cannot grade this itself.** Judging whether its own inference holds is judging the quality of its own choices, the same reason the corroboration and HIGH-confidence rows go to a verifier. Outcome-gate criterion 12 is verifier-owned: a fresh context reads the header's `measures:`, `inference:`, and `qualifiers:` against the cited sources and grades each accepted claim.
+
+## Observed failure patterns
+
+- **Synthesis tools give wrong versions.** AI-synthesis tools routinely assert wrong version numbers and hallucinate canonical conventions (a config path that "is canonical" but isn't). Always verify version-specific features empirically (`gh api repos/<owner>/<repo>/releases/latest`, an actual import/call test). Never trust secondary sources for version claims. A single direct fetch of the canonical doc falsifies this class.
+- **Agent consensus can be unanimously wrong.** Multiple subagents agreeing is one source, not N, because they share training priors. Verify claims empirically before shipping, especially env-var / tool-behavior claims.
+- **Two sources can both be wrong.** Two sources parroting the same incorrect information is common. Count INDEPENDENT primary sources, not citation count.
+- **Phases must be sequential.** Phase 2 MUST analyze Phase 1 results before launching. Running all phases in parallel produces redundant queries that miss the gaps Phase 1 would have revealed. Parallelism inside a phase is a different thing and is expected: see "Per-gap fan-out (Phase 2)".
+- **No parallel MCP calls to the same stdio server.** stdio transport serializes. Run queries sequentially within a server; parallelize across different servers/tools.
+- **Subagent return = Tier 3 by default.** Even when a subagent's prompt mandates citation, the return is synthesis. Cited primary sources inside the return promote to Tier 1 once fetched/confirmed; bare claims stay Tier 3.
+- **Cached doc URLs from prior turns are Tier 3, not Tier 1.** A fetch result from months ago that's now in the model's assumption set has aged out. Re-fetch on every research pass for the topic.
+- **Convention / naming decisions need primary sources read directly.** Synthesis summaries are insufficient when deciding on folder names, config patterns, or naming conventions; read 3+ primary sources.

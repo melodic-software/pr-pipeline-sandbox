@@ -1,0 +1,126 @@
+/**
+ * Post-extraction artifact quality validator.
+ *
+ * Runs declarative checks against course.json and the filesystem to verify
+ * extraction completeness, schema consistency, and resource flag accuracy.
+ * Writes validation-report.json for regression detection on subsequent runs.
+ *
+ * Usage:
+ *   node validate-extraction.js --course-dir <path> [--verbose] [--quiet]
+ *
+ * Exit codes:
+ *   0 — all checks passed (or warnings only)
+ *   1 — one or more checks failed
+ */
+
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { createLogger } from "@melodic/video-digestion/shared/logger";
+import { isMainModule } from "@melodic/video-digestion/shared/main-module";
+
+import {
+  checkMetadata,
+  checkRegression,
+  checkResourceFlags,
+  checkSchema,
+  checkTranscripts,
+  FAIL,
+  PASS,
+  WARN,
+} from "./lib/validators.js";
+import { loadCourseDir, parseCliArgs, resolveLogLevel } from "./utils.js";
+
+let args;
+let log;
+
+function bindCli() {
+  args = parseCliArgs();
+  log = createLogger(resolveLogLevel(args));
+}
+
+function summarize(checks) {
+  return {
+    total: checks.length,
+    passed: checks.filter((c) => c.severity === PASS).length,
+    warnings: checks.filter((c) => c.severity === WARN).length,
+    failed: checks.filter((c) => c.severity === FAIL).length,
+  };
+}
+
+function logChecks(heading, glyph, checks) {
+  if (checks.length === 0) return;
+  log.info(`  ${heading}:`);
+  for (const c of checks) {
+    log.info(`    ${glyph} ${c.message}`);
+    log.debug(`      ${JSON.stringify(c.details)}`);
+  }
+}
+
+function main() {
+  bindCli();
+  const { courseDir, course } = loadCourseDir(args, { logger: log });
+  const modulesDir = join(courseDir, "modules");
+  const reportPath = join(courseDir, "validation-report.json");
+  log.info(`\n  ${course.title} — Artifact Validation`);
+  log.debug(`  Node: ${process.version} | OS: ${process.platform}`);
+
+  const allChecks = [];
+
+  log.info("  Running metadata checks...");
+  allChecks.push(...checkMetadata(course));
+
+  log.info("  Running transcript checks...");
+  allChecks.push(...checkTranscripts(course, modulesDir));
+
+  log.info("  Running schema checks...");
+  allChecks.push(...checkSchema(course));
+
+  log.info("  Running resource flag checks...");
+  allChecks.push(...checkResourceFlags(course, modulesDir));
+
+  if (existsSync(reportPath)) {
+    try {
+      const previousReport = JSON.parse(readFileSync(reportPath, "utf-8"));
+      log.info("  Running regression checks...");
+      const regressions = checkRegression(
+        { summary: summarize(allChecks), checks: allChecks },
+        previousReport,
+      );
+      allChecks.push(...regressions);
+    } catch {
+      log.warn("  Could not parse previous validation-report.json — skipping regression checks");
+    }
+  } else {
+    log.debug("  No previous validation-report.json — skipping regression checks");
+  }
+
+  const summary = summarize(allChecks);
+
+  const currentReport = {
+    timestamp: new Date().toISOString(),
+    course: course.title,
+    summary,
+    checks: allChecks,
+  };
+
+  log.info("\n  ────────────────────────────────────────────");
+
+  logChecks("FAILURES", "✗", allChecks.filter((c) => c.severity === FAIL));
+  logChecks("WARNINGS", "⚠", allChecks.filter((c) => c.severity === WARN));
+
+  log.info(
+    `\n  Summary: ${summary.passed} passed, ${summary.warnings} warnings, ${summary.failed} failed (${summary.total} total)`,
+  );
+
+  writeFileSync(reportPath, JSON.stringify(currentReport, null, 2), "utf-8");
+  log.info(`  Report: ${reportPath}\n`);
+
+  if (summary.failed > 0) {
+    process.exit(1);
+  }
+}
+
+if (isMainModule(import.meta.url)) {
+  main();
+}

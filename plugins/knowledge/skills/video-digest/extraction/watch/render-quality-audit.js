@@ -1,0 +1,58 @@
+#!/usr/bin/env node
+/**
+ * Render key-frame-quality-audit.md from key-frame-quality-audit.json
+ *
+ * Usage: node watch/render-quality-audit.js <slice-dir>
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+
+import { isMainModule } from "@melodic/video-digestion/shared/main-module";
+import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/terminal";
+
+import { LANES, lanePath } from "../lib/slice-lanes.js";
+import { readLaneJson } from "../lib/watch-frame-index.js";
+
+/**
+ * @param {string} sliceDir
+ * @returns {string}
+ */
+export function renderQualityAudit(sliceDir) {
+  const absSlice = path.resolve(sliceDir);
+  const doc = readLaneJson(absSlice, LANES.keyFrames, "key-frame-quality-audit.json");
+
+  const failures = doc.files.filter((f) => !f.pass);
+  const lines = [
+    "# Key frame quality audit",
+    "",
+    `Reviewed: ${doc.reviewedAt}`,
+    "",
+    "| File | Pass | Notes |",
+    "| --- | --- | --- |",
+  ];
+
+  for (const file of doc.files) {
+    lines.push(`| ${file.name} | ${file.pass ? "yes" : "no"} | ${file.note ?? ""} |`);
+  }
+
+  lines.push("");
+  if (failures.length > 0) {
+    lines.push(`**Rejected / pending delete:** ${failures.map((f) => f.name).join(", ")}`, "");
+  } else {
+    lines.push("**Rejected / deleted:** none", "");
+  }
+
+  const outPath = lanePath(absSlice, LANES.keyFrames, "key-frame-quality-audit.md");
+  fs.writeFileSync(outPath, `${lines.join("\n")}\n`, "utf8");
+  return outPath;
+}
+
+if (isMainModule(import.meta.url)) {
+  const sliceDir = process.argv[2];
+  if (!sliceDir) {
+    writeStderr("Usage: node watch/render-quality-audit.js <slice-dir>");
+    process.exit(2);
+  }
+  writeStdout(renderQualityAudit(sliceDir));
+}

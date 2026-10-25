@@ -315,6 +315,10 @@ activities:
     self-checks: [scripts/check-affected.sh --uncommitted]
     verify-scripts:
       - scripts/git-mv-rm.sh
+    # Probe-only (claude-code-plugins#9926): main's web access.
+    web-access:
+      enabled: true
+      domains: any
     # Runs model-chosen commands, so no write token: the change leaves as a
     # patch, and the run's outcome file goes to report-outcome.
     effect: read

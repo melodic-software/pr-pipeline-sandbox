@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Negative-control suite for check-fences-exact.py.
+
+These cases are why the gate is a required artifact: PASS is not believed
+until the known-bad fixtures fail. The temp-dir fixture and the gate
+invocation come from gate_harness.py.
+
+Run: python test_check_fences_exact.py
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+
+sys.dont_write_bytecode = True  # the plugin's own tree is not a cache
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gate_harness import KEEP, GateTestCase, gate_path, write  # noqa: E402
+
+GATE = gate_path("check-fences-exact.py")
+SOURCE = (
+    "Intro line.\n" + KEEP + "\nA list:\n* star item\n1. one\nprompt example here\n"
+)
+
+
+class GateHarness(GateTestCase):
+    gate = GATE
+    source_text = SOURCE
+
+
+CLEAN = f"""# Unit
+
+## Summary
+
+A summary.
+
+## Key claims (verbatim)
+
+**C1.** `cc-applicable`
+
+```
+{KEEP}
+```
+
+**C2.** `cc-applicable`
+
+```
+* star item
+```
+
+## Prompt snippets (exact)
+
+```
+prompt example here
+```
+"""
+
+
+class TestCleanPass(GateHarness):
+    def test_clean_pass_names_coverage(self):
+        proc = self.run_gate(CLEAN, 0)
+        out = proc.stdout.decode()
+        self.assertIn("PASS", out)
+        self.assertIn("2 **CN.**", out)
+        self.assertIn("NO per-line strip", out)
+        self.assertIn("Nothing outside Key claims", out)
+
+    def test_trailing_space_preserved(self):
+        # SOURCE has "keep me \\n" — the fence payload must keep the space.
+        proc = self.run_gate(CLEAN, 0)
+        self.assertIn(b"PASS", proc.stdout)
+
+
+FIGURE_SECTION = CLEAN.replace(
+    "## Prompt snippets (exact)",
+    "## Figure claims (verbatim)\n\n**F1.** figure title\n\n```\nIntro line.\n```\n\n"
+    "## Prompt snippets (exact)",
+)
+
+
+class TestFigureClaimsSection(GateHarness):
+    def test_fn_row_under_its_own_h2_passes(self):
+        proc = self.run_gate(FIGURE_SECTION, 0)
+        self.assertIn("2 **CN.**", proc.stdout.decode())
+
+    def test_fn_row_under_key_claims_is_unlabeled(self):
+        misplaced = CLEAN.replace(
+            "## Prompt snippets (exact)",
+            "**F1.** figure title\n\n```\nIntro line.\n```\n\n## Prompt snippets (exact)",
+        )
+        proc = self.run_gate(misplaced, 1)
+        self.assertIn(b"unlabeled fence", proc.stderr)
+
+
+class TestFailLoudZeroParse(GateHarness):
+    def test_no_digest_arg_is_unusable(self):
+        proc = self.invoke_argv("--source", self.source)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(b"no --digest", proc.stderr)
+
+    def test_empty_source_is_unusable(self):
+        empty = write(self.dir, "empty.md", "")
+        digest = write(self.dir, "d.md", CLEAN)
+        proc = self.invoke(empty, digest)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(b"empty", proc.stderr)
+
+    def test_missing_key_claims_heading(self):
+        proc = self.run_gate("# Unit\n\nNo claims section.\n", 1)
+        self.assertIn(b"no '## Key claims'", proc.stderr)
+
+    def test_zero_claims_is_failure_not_pass(self):
+        proc = self.run_gate(
+            "## Key claims (verbatim)\n\nNo labeled claims here.\n", 1
+        )
+        self.assertIn(b"parsed ZERO claims", proc.stderr)
+        self.assertNotIn(b"PASS", proc.stdout)
+
+
+class TestFenceContract(GateHarness):
+    def test_indented_fence_fails(self):
+        # REPAIR-pass corruption: indent the fence. strip() would hide this.
+        text = CLEAN.replace(f"```\n{KEEP}\n```", f"    ```\n    {KEEP}\n    ```")
+        proc = self.run_gate(text, 1)
+        self.assertIn(b"indented", proc.stderr)
+
+    def test_trailing_space_stripped_fails(self):
+        text = CLEAN.replace(f"{KEEP}\n```", "keep me\n```")
+        proc = self.run_gate(text, 1)
+        self.assertIn(b"not an exact contiguous substring", proc.stderr)
+
+    def test_blockquote_instead_of_fence(self):
+        text = f"""## Key claims (verbatim)
+
+**C1.** `cc-applicable`
+
+> {KEEP}
+"""
+        proc = self.run_gate(text, 1)
+        self.assertIn(b"blockquote", proc.stderr)
+
+    def test_inline_code_instead_of_fence(self):
+        text = """## Key claims (verbatim)
+
+**C1.** `cc-applicable`
+
+`keep me `
+"""
+        proc = self.run_gate(text, 1)
+        self.assertIn(b"inline code span", proc.stderr)
+
+    def test_fabricated_quote_fails(self):
+        text = """## Key claims (verbatim)
+
+**C1.** `cc-applicable`
+
+```
+this was never in the source
+```
+"""
+        proc = self.run_gate(text, 1)
+        self.assertIn(b"not an exact contiguous substring", proc.stderr)
+
+    def test_unlabelled_fence_is_unparsed_surface(self):  # identifier, not prose # spellchecker:disable-line
+        text = CLEAN.replace(
+            "## Prompt snippets", "```\nIntro line.\n```\n\n## Prompt snippets"
+        )
+        proc = self.run_gate(text, 1)
+        self.assertIn(b"unlabeled fence", proc.stderr)
+
+    def test_duplicate_label(self):
+        text = f"""## Key claims (verbatim)
+
+**C1.** `cc-applicable`
+
+```
+{KEEP}
+```
+
+**C1.** `cc-applicable`
+
+```
+* star item
+```
+"""
+        proc = self.run_gate(text, 1)
+        self.assertIn(b"duplicate", proc.stderr)
+
+    def test_empty_fence_payload_fails(self):
+        text = """## Key claims (verbatim)
+
+**C1.** `cc-applicable`
+
+```
+```
+"""
+        proc = self.run_gate(text, 1)
+        self.assertIn(b"empty", proc.stderr)
+
+    def test_blockquote_plus_later_fence_still_fails(self):
+        text = f"""## Key claims (verbatim)
+
+**C1.** `cc-applicable`
+
+> fabricated quote
+
+```
+{KEEP}
+```
+"""
+        proc = self.run_gate(text, 1)
+        self.assertIn(b"blockquote", proc.stderr)
+
+    def test_heading_inside_fence_does_not_truncate_section(self):
+        source = write(self.dir, "src2.md", "## Configuration\nkeep me \n")
+        text = """## Key claims (verbatim)
+
+**C1.** `cc-applicable`
+
+```
+## Configuration
+```
+
+## Prompt snippets (exact)
+
+none
+"""
+        digest = write(self.dir, "d2.md", text)
+        proc = self.invoke(source, digest)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"PASS", proc.stdout)
+
+    def test_star_list_inside_fence_is_not_rewritten(self):
+        # The defect the hook caused in a blockquote; a fence holds "* ".
+        proc = self.run_gate(CLEAN, 0)
+        self.assertIn(b"PASS", proc.stdout)
+
+    def test_longer_outer_fence_keeps_inner_backtick_run(self):
+        # CommonMark: a 3-tick line inside a 4-tick wrapper is payload; closing
+        # on it gives a false empty-payload FAIL or a false PASS.
+        inner = "Wrap code like this:\n```\nprint(1)\n```"
+        source = write(self.dir, "src-nested.md", inner + "\n")
+        text = f"""## Key claims (verbatim)
+
+**C1.** `cc-applicable`
+
+````
+{inner}
+````
+"""
+        digest = write(self.dir, "d-nested.md", text)
+        proc = self.invoke(source, digest)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"PASS", proc.stdout)
+        self.assertIn(b"1 **CN.**", proc.stdout)
+
+    def test_four_tick_wrapper_around_immediate_inner_fence(self):
+        # Guards against truncation at the first inner ``` yielding payload ""
+        # and failing the empty-payload check on a valid verbatim quote.
+        inner = "```\nprint(1)\n```"
+        source = write(self.dir, "src-immediate.md", inner + "\n")
+        text = f"""## Key claims (verbatim)
+
+**C1.** `cc-applicable`
+
+````
+{inner}
+````
+"""
+        digest = write(self.dir, "d-immediate.md", text)
+        proc = self.invoke(source, digest)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"PASS", proc.stdout)
+
+
+class TestCliSurface(GateHarness):
+    def test_help_exits_zero_and_documents_exit_codes(self):
+        proc = self.invoke_argv("--help")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn(b"at least one required", proc.stdout)
+        self.assertIn(b"exit codes: 0", proc.stdout)
+        self.assertEqual(proc.stderr, b"")
+
+
+if __name__ == "__main__":
+    unittest.main()

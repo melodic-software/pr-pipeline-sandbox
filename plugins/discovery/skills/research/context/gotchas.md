@@ -1,0 +1,72 @@
+# Gotchas for `/discovery:research`
+
+Failure modes observed in real runs of this skill. Each is a way a run can look finished and be
+wrong, which is why none of them is caught by "did I do a good job?". They are caught by the
+outcome gate's artifact-grounded criteria, or not at all.
+
+- **A silent preload miss looks exactly like a good run.** A dispatched agent whose `skills:` entry
+  did not resolve starts anyway, writes an artifact, and reports `coverage: complete`; the harness
+  logs a warning to the debug log and nowhere else. The dated record for that harness behavior is
+  [`../../../reference/parent-contract.md`](../../../reference/parent-contract.md),
+  "Harness facts the dispatch design rests on". The `preload_token` echo is the check that
+  distinguishes "the discipline body reached the agent" from "it did not"; a missing or mismatched
+  token discards the run rather than downgrading it. It does **not** distinguish preload from the
+  disk fallback. That is the `preload:` field. Treating a matching token as proof preload fired is
+  unsound.
+- **A small, single-topic dispatch can still exhaust `maxTurns: 40` with no payload.** At session
+  effort `high`, one narrow question has stopped at the limit with nothing returned but the
+  harness's partial marking. That is not a discard: resume the agent with `SendMessage` addressed by
+  its agent ID, and it continues from retained context. That has recovered a complete artifact set
+  and a well-formed payload that passed both gates. The dated record is
+  [`../../../reference/parent-contract.md`](../../../reference/parent-contract.md),
+  "A turn-limit stop returns partial output, and the parent can resume the agent".
+- **Enumerating the corpus from search results.** A Phase 0 ledger built from what searching happened
+  to surface inherits precisely the blind spot the ledger exists to close, and then certifies it. Use
+  a surface that is exhaustive by construction, and record the corpus as narrowed when it is.
+- **Stopping at the floor while gaps remain.** Every query minimum reads "at least", never "exactly";
+  the Phase 1 gap count is what sets the Phase 2 query count.
+- **A probe standing in for a fetch.** A title, an index entry, or a search snippet establishes that
+  a rung *exists*, never that it lacks the claim, because the section being chased is exactly what a
+  snippet omits. Criterion 9 grades the fetch.
+- **Treating a curated index as exhaustive.** `llms.txt` is a maintainer hand-pick and deliberately
+  partial. A miss there is silence, not evidence of absence, for a rung, for a page, or for a corpus
+  item.
+- **Treating ONE exhaustive surface as the whole artifact inventory.** The subtler half of the same
+  trap, and the one the curated-vs-exhaustive framing hides: a surface is exhaustive only for the
+  artifact class it indexes and the host it covers. A docs `sitemap.xml` enumerates that host's
+  *pages* and is silent about PDFs it omits, an asset or download host, and a sibling first-party
+  domain, so a model card shipped as a PDF off the docs host survives a clean sitemap scan. One
+  clean surface leaves the rung **unresolved**, not absent; `probed-and-not-existing` needs the
+  sweep across every surface that class plausibly uses, or the publisher's own completeness
+  declaration.
+- **Self-grading the verifier rows.** Criteria 4, 7 and 12 ask the run to judge the quality of its
+  own choices, and criterion 14 counts the accepted set those three leave. They belong to a fresh context whatever the execution posture: a dispatched run returns
+  `verification: pending`, and an inline run hands them off rather than answering them.
+- **Verbatim quotes do not make a claim follow.** Every quote can re-fetch word for word while the
+  claim rests on a source that measured a different variable or population, or drops the qualifier
+  the source attached. Criterion 12 asks whether the claim follows, and the dispatch contract briefs
+  the verifier on it by number.
+- **A real quote from the wrong era, counted as a corroborator.** An accurate quote from a source
+  written for a predecessor product line, and generic about the mechanism, passes every
+  quote-presence check while saying nothing about the claim's version or scenario. The recency gate
+  cannot see it, because it dates claims, not sources. Criterion 13's script derives `current` or
+  `historical` from each source's `published:` and `applies_to:`, and criterion 12's era and
+  scenario checks ask whether the source covers the claim's product line and situation. A
+  `historical` source is labeled and never counted.
+- **Counting a repost as the second source.** A blog post or synthesis answer that restates a
+  publisher's own page is that page again. Counting it lets a first-party content claim pass criterion 4 as
+  corroborated, and the `single source` flag that should travel with the claim disappears. Record
+  the repost under the page's pool and flag the claim. The opposite slip costs as much: flagging a
+  behavior claim because its docs page is the only one found, when a probe or an issue could
+  corroborate it.
+- **Reading the coverage ledger instead of running the gate.** A model cannot reliably audit its own
+  checklist, and the context most motivated to call it finished is the one reading it. Criterion 11
+  cites the script's exit status. Exit 2, a ledger the script could not parse, is a FAIL, never a
+  pass. A script that never ran is the same FAIL: taking the inline escape hatch because Bash was
+  denied, then marking criterion 11 PASS from a table reading, is the silent self-grade the gate
+  exists to prevent. Halt, or run the `.sh` / `.py` checker from a lane that can still invoke it.
+- **Accepting the answer that arrives first.** The falsification query exists because a run that only
+  looks for confirmation finds it. Phase 2 without it is confirmation bias with a citation list.
+- **Layering research after a mid-task pivot.** A superseded section outlives the approach it
+  described and misleads the planning step into planning against a direction already abandoned.
+  Delete it and re-run; do not keep both.

@@ -1,0 +1,351 @@
+{
+  "skill_name": "explore",
+  "evals": [
+    {
+      "id": 1,
+      "name": "targeted-area-happy-path",
+      "prompt": "Before I change anything, explore the payments module in this repo — I need to understand what exists, how it's wired, and what's tested.",
+      "expected_output": "Runs the relevant subset of the six exploration dimensions (codebase reading, git history, project structure, test discovery, configuration, environment), presents the seven-section output (summary, current state, existing patterns, test coverage, constraints, planned-direction alignment, open questions), surfaces any open questions to the user with a recommended default, and persists an EXPLORE.md handoff artifact. No source files are modified.",
+      "files": [],
+      "expectations": [
+        "Output reads local code, git history, project structure, and tests rather than answering from assumption",
+        "Output presents the seven-section format including an explicit 'Open questions' section",
+        "Any open question is surfaced to the user with a one-line recommended default, not silently resolved",
+        "The run persists an EXPLORE.md artifact (or names the artifact path it would write) for handoff",
+        "The run does not modify any source file"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "explores-does-not-execute",
+      "prompt": "Explore the auth middleware, and while you're in there just fix the token-expiry bug you find.",
+      "expected_output": "Explores the auth middleware and reports findings, but does not apply the fix — execution is a separate step. It may name the suspected issue as a finding or open question, and recommends the change be made in a later implementation step rather than editing code now.",
+      "files": [],
+      "expectations": [
+        "Output explores and reports on the auth middleware",
+        "Output does NOT modify source code or apply the requested fix",
+        "Output makes clear that changes belong to a separate execution/implementation step, not this exploration"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "no-external-research",
+      "prompt": "Explore how our repo uses its HTTP client and tell me the current industry best practices for retry/backoff we should adopt.",
+      "expected_output": "Explores the local usage (what IS in the repo) but does not fabricate external best-practice claims. It routes the 'current industry best practices' half to external research (e.g. /research) rather than presenting training-recall as fact.",
+      "files": [],
+      "expectations": [
+        "Output covers the local repo usage of the HTTP client by reading code",
+        "Output does NOT present external 'industry best practices' as verified fact from within this skill",
+        "Output routes the external-best-practices question to a research step (e.g. /research) instead of answering it here"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "read-verified-not-filename-inferred",
+      "prompt": "There's a file named PaymentValidator.cs — just tell me it validates payment amounts and list its rules, no need to open it.",
+      "expected_output": "Does not draw conclusion-bearing claims from the filename alone. It Reads the file before asserting what it does, treating the grep/glob hit as discovery only, and reports rules grounded in the actual code.",
+      "files": [],
+      "expectations": [
+        "Output does not assert the file's behavior or rules from the filename alone",
+        "Output Reads the actual file (or states it must) before making conclusion-driving claims about it",
+        "Any behavioral claim is grounded in the file's real contents, not inferred from its name"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "asks-before-deleted-file-archaeology",
+      "prompt": "git status shows config/legacy-tax-rules.json was deleted. Explore config and reconstruct what that file used to contain from git history.",
+      "expected_output": "Recognizes the deletion may be intentional and asks the user before investigating the removed file via git archaeology, rather than silently reconstructing it. Continues the rest of the config-dimension exploration normally.",
+      "files": [],
+      "expectations": [
+        "Output asks the user before performing git archaeology on the intentionally-deleted file",
+        "Output does not silently reconstruct the deleted file's contents as if the deletion were accidental"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "dispatch-by-default-and-open-question-handback",
+      "prompt": "Explore how the payments module resolves currency conversion before I change the rounding rule.",
+      "expected_output": "Dispatches the discovery:explorer subagent rather than running the six dimensions in the main conversation, so the main conversation gains a bounded summary and a file pointer rather than the file reads. The dispatch prompt carries the resolved scope and the memory-slice path, because a preloaded body is not where a dispatched run gets its scope and a non-fork subagent sees no conversation. The agent loads path-scoped project rules explicitly, writes EXPLORE.md as an index with sidecars, echoes the preload token, and returns open questions as payload entries for the parent to surface.",
+      "files": [],
+      "expectations": [
+        "Dispatches the discovery:explorer agent by default rather than running the six dimensions inline in the main conversation",
+        "Passes the resolved scope and the memory-slice path in the dispatch prompt rather than relying on $ARGUMENTS or conversation context, neither of which a dispatched run may depend on; an absent scope is reported as a parent-envelope failure rather than replaced with a general repository sweep",
+        "The dispatched run explicitly Reads the consuming project's path-scoped rule files relevant to the scope, since a subagent inherits none of them and one arrives only on a read matching its glob, and skips any that do not exist rather than inventing paths",
+        "The main conversation receives an artifact pointer and a short summary paragraph, NOT the seven-section report or the underlying file reads",
+        "The returned payload echoes the preload token discovery-explore-preload-8e2b7d verbatim as preload_token; a missing or mismatched token is a hard failure that discards the run",
+        "Open questions come back as open_questions entries for the parent to surface, each with a recommended default, rather than being surfaced with AskUserQuestion or resolved silently",
+        "A referenced-but-missing file becomes an open_questions entry rather than triggering git archaeology, because the ask-first rule that protects an intentional deletion cannot be satisfied from a subagent",
+        "EXPLORE.md is written as an index with per-sidecar abstracts and a section-to-file table regardless of total size, with sidecars named EXPLORE-<section>.md inside the same memory slice; when the slice root already holds an unrelated EXPLORE.md the whole artifact set goes into a sub-slice under its normal names rather than renaming the index into the sidecar pattern, and the return names the path actually written"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "empty-payload-halts-the-dispatch",
+      "prompt": "Explore the payments rounding rules, then plan the change. [The dispatched discovery:explorer returns: status: completed — 'Reading src/payments/rounding.ts ...' — with no preload_token, no artifact path, no summary.]",
+      "expected_output": "Treats the dispatch as FAILED rather than finished, despite the completed status: the payload carries no preload_token and no artifact pointer. Grades the run off disk by running scripts/check-dispatch-artifact.sh --index-name EXPLORE.md against the memory-slice path the parent itself resolved before dispatching — not a path taken from the payload — and halts on the non-zero exit instead of proceeding to planning. Recovers by resuming the still-live agent by agent ID with SendMessage, or by discarding the slice and re-dispatching with the same envelope.",
+      "files": [],
+      "expectations": [
+        "The completed status is NOT accepted as evidence of a finished exploration; the missing preload_token and the missing artifact pointer each independently mark the dispatch failed",
+        "Verification runs scripts/check-dispatch-artifact.sh with --index-name EXPLORE.md against the memory-slice path the parent resolved pre-dispatch, rather than a path read out of the payload, and cites its exit status rather than eyeballing the directory",
+        "The freshness baseline is established BEFORE the dispatch (the slice is created first, so a first-time scope whose slice does not exist yet does not fail on the touch) and passed as --newer-than, so an artifact an earlier run left in the same slice cannot be accepted as evidence that this dispatch succeeded",
+        "Flags whose values the payload never supplied are dropped rather than guessed at; a malformed payload carries no sidecars: count and no artifact: pointer, so the bare form is run",
+        "A non-zero exit halts the workflow and is reported; the run does NOT proceed to research, planning, or an edit on the strength of an exploration that did not happen",
+        "Recovery resumes the existing agent by agent ID with SendMessage rather than immediately re-dispatching, and falls back to discarding the slice and re-dispatching with the same envelope when the resume is refused"
+      ]
+    },
+    {
+      "id": 8,
+      "name": "complete-but-unpersisted-routes-by-value-not-discard",
+      "prompt": "Explore the payments rounding rules before I change them. [The dispatched discovery:explorer returns a well-formed payload: preload_token matching the sentinel, scope_as_received matching what you sent, status: complete, persistence: by-value, coverage: complete, artifact: <the slice>/EXPLORE.md, sidecars: 4 — followed by the full EXPLORE.md body and four EXPLORE-<section>.md bodies verbatim, and one line saying every Write call was refused by the environment. check-dispatch-artifact.sh exits 1 against the slice.]",
+      "files": [],
+      "expected_output": "Reads persistence: by-value as a routing value, not an acceptance value. The parent writes the returned bodies into the memory-slice path it resolved before dispatch, then re-runs the identical gate command and proceeds only on exit 0. It does not treat the run as truncated, does not discard the slice, does not re-dispatch, and does not proceed on the payload alone.",
+      "expectations": [
+        "The run is NOT graded as truncated and the completed work is NOT discarded; status: complete plus persistence: by-value is recognized as a finished exploration that could not be saved",
+        "The parent writes the payload's verbatim EXPLORE.md and EXPLORE-<section>.md bodies into the memory-slice path IT resolved before dispatch, under those filenames — the payload's artifact: value on this path is a destination, not a claim that a file exists",
+        "The identical check-dispatch-artifact.sh command is re-run against the now-written slice and the workflow proceeds only on exit 0; a non-zero re-run keeps the halt in force and drops back to the ladder",
+        "The exception is applied to the halt, never to the gate: nothing in the payload is accepted in place of the gate passing, and no downstream step proceeds on the payload alone",
+        "The parent does NOT resume or re-dispatch the agent first — a resume asks the worker to redo the write it just proved it cannot do, and a re-dispatch pays for the whole exploration again to reproduce the same refusal"
+      ]
+    },
+    {
+      "id": 9,
+      "name": "by-value-summary-instead-of-artifact-bodies-is-a-failed-dispatch",
+      "prompt": "Explore the payments rounding rules before I change them. [The dispatched discovery:explorer returns: preload_token matching the sentinel, status: complete, persistence: by-value, coverage: complete — followed by three paragraphs summarizing what it found, with no EXPLORE.md body and no sidecar bodies. It says the slice was unwritable.]",
+      "files": [],
+      "expected_output": "Treats this as a failed dispatch rather than a by-value recovery. The by-value rung writes the slice from verbatim artifact bodies; a summary is not an artifact, and accepting it would let the gate grade a claim the agent makes about its own run.",
+      "expectations": [
+        "The payload is graded as a FAILED dispatch, not as a by-value recovery, because it carries findings rather than the artifact bodies the parent would write",
+        "The summary is NOT written into the slice as though it were the artifact, and is NOT accepted as a substitute for a gate-passing artifact set",
+        "The workflow halts and the ladder continues from the resume or discard rung; downstream planning or edits do not proceed"
+      ]
+    },
+    {
+      "id": 10,
+      "name": "echo-back-mismatch-fails-the-dispatch",
+      "prompt": "Explore how ${CLAUDE_PLUGIN_DATA} is used by the harness-ops plugin. [The dispatched discovery:explorer returns a well-formed payload whose scope_as_received reads 'how <the discovery plugin's own data directory> is used by the harness-ops plugin', with a complete EXPLORE.md artifact set on disk and a gate exit of 0.]",
+      "files": [],
+      "expected_output": "Compares scope_as_received against the scope the parent actually sent, notices they differ, and fails the dispatch even though every on-disk check passes. The artifact is a correct answer to the wrong scope. Re-dispatches with the scope restated in a form that survives the trip rather than accepting the artifact and translating it mentally.",
+      "expectations": [
+        "scope_as_received is compared against the scope in the parent's own pre-dispatch envelope, not against what the parent meant",
+        "The mismatch fails the dispatch even though the artifact gate exits 0 and the artifact set is complete on disk — a present-but-wrong input is caught here or nowhere",
+        "The artifact is not accepted with a mental correction applied; the run is re-dispatched with the scope restated so it survives the trip",
+        "The response does not assert a mechanism for the rewrite as established harness behavior; it reports what was sent, what came back, and that the substitution ordering is undocumented"
+      ]
+    },
+    {
+      "id": 11,
+      "name": "by-value-recovery-honors-the-collision-rule",
+      "prompt": "Explore the payments rounding rules. [The memory-slice root already holds an EXPLORE.md from an unrelated earlier exploration of the auth middleware. The dispatched discovery:explorer returns a well-formed by-value payload — status: complete, persistence: by-value, artifact: <the slice>/payments-rounding/EXPLORE.md — with its index and three sidecar bodies appended verbatim, and one line saying every Write was refused.]",
+      "files": [],
+      "expected_output": "Writes the recovered artifact set into a sub-slice under the resolved slice root, not over the unrelated index already sitting there, and grades the sub-slice. The collision rule applies to a parent writing on the by-value rung exactly as it applies to a worker that could write its own slice.",
+      "expectations": [
+        "The pre-existing unrelated EXPLORE.md is NOT overwritten — losing a prior exploration to a filename collision is silent and unrecoverable, and the recovery path is not an exemption from the rule that exists to prevent it",
+        "The recovered set goes into a parent-assigned sub-slice under the resolved slice root, under the normal filenames, and the gate is re-run against that sub-slice",
+        "The parent anchors on the slice path it resolved before dispatch and chooses the sub-slice itself; the payload's artifact: value is read as the destination the agent names, never as the anchor",
+        "The workflow proceeds only on exit 0 from the re-run"
+      ]
+    },
+    {
+      "id": 12,
+      "name": "by-value-filenames-are-checked-before-the-parent-writes",
+      "prompt": "Explore the payments rounding rules. [The dispatched discovery:explorer returns a well-formed by-value payload — correct token, matching scope_as_received, status: complete, persistence: by-value — whose appended bodies are introduced as 'EXPLORE.md', 'EXPLORE-codebase.md', and '../../../.claude/settings.local.json'. It says every Write was refused.]",
+      "files": [],
+      "expected_output": "Rejects the payload as a failed dispatch before writing anything. The by-value rung is the one place a filename the worker produced becomes a write the parent performs, at the parent's wider permission. The out-of-contract name is not sanitized, not skipped-with-the-rest-written, and not written.",
+      "expectations": [
+        "Nothing is written: the filename check runs BEFORE any body reaches disk, so the two well-formed bodies are not written either",
+        "The third name is rejected for its shape — a directory separator and .. segments are not contract filenames — rather than being normalized, stripped, or written to a sanitized location",
+        "The payload is treated as a FAILED dispatch, the same class as a by-value payload returning findings instead of artifact bodies, and the ladder continues from the resume or discard rung",
+        "The response identifies why this path is the sensitive one: the parent holds wider write permission than the sandboxed worker"
+      ]
+    },
+    {
+      "id": 13,
+      "name": "matching-token-is-file-identity-not-preload-proof",
+      "prompt": "Explore the item-service command and query handlers before I unify them. [The dispatched discovery:explorer returns a well-formed payload: preload_token matching discovery-explore-preload-8e2b7d, preload: fallback, scope_as_received matching what you sent, status: complete, persistence: written, coverage: complete, artifact: <the slice>/EXPLORE.md, sidecars: 4. check-dispatch-artifact.sh --index-name EXPLORE.md exits 0 against the slice. open_questions includes: 'The token is echoed because I read the skill file from disk, not because it was preloaded.']",
+      "files": [],
+      "expected_output": "Accepts the run as a successful fallback recovery. The matching token is file-identity evidence that the skill body reached the agent, not proof that skills: preload fired. The parent grades preload: fallback as provenance and does not infer fired from the token. Does not discard the run, does not warn as if preload succeeded, and does not treat the open_questions prose as the provenance seam. Proceeds to the sibling verifier as on any accepted run.",
+      "expectations": [
+        "The matching preload_token is treated as file-identity evidence only — the skill body reached the agent — and is NOT treated as proof that preload fired",
+        "preload: fallback is graded as the structured provenance field and is accepted; fallback is the recovery, not a failed dispatch",
+        "The parent does not infer preload: fired from a matching token, even when the agent also discloses the fallback in open_questions prose",
+        "The run is NOT discarded on the strength of a matching token plus a fallback disclosure; missing or mismatched token remains the discard condition",
+        "A payload that echoed the token but omitted preload: is an out-of-date agent definition, not a pass, the same class as a missing scope_as_received",
+        "The artifact set is still graded off disk against the parent's own slice path; fallback provenance changes nothing about the gate's remaining steps"
+      ]
+    },
+    {
+      "id": 14,
+      "name": "prose-return-with-no-payload-block-is-a-failed-dispatch",
+      "prompt": "Explore the item-service command and query handlers before I unify them. [The dispatched discovery:explorer returns only prose: 'I did not have the exploration instructions in my context, so I summarized the handlers from what I could see.' There is no YAML payload block, no preload_token, and no artifact pointer.]",
+      "files": [],
+      "expected_output": "Treats the return as a failed dispatch. A missing payload block and a missing token are a discard, whatever the prose claims, and the prose summary is not used as the exploration result. Does not accept the run, does not write an artifact from the prose, and continues from the resume or re-dispatch rung.",
+      "expectations": [
+        "The return is graded as a failed dispatch because the payload block, the token and the artifact pointer are all absent",
+        "The missing token is a discard, not a downgrade: the prose summary is not accepted as the exploration result",
+        "The parent does not write EXPLORE.md or any sidecar from the prose",
+        "The ladder continues from the resume or re-dispatch rung rather than finishing the exploration inline from the prose"
+      ]
+    },
+    {
+      "id": 15,
+      "name": "delivered-explorer-hand-back-is-graded-without-waiting",
+      "prompt": "Explore the currency-conversion entry point and its callers. [The dispatched discovery:explorer's final report has been delivered to you as a message, not as a tool result. It is a well-formed payload: matching preload_token, preload: fired, matching scope_as_received, status: complete, persistence: written, artifact: <the slice>/EXPLORE.md. check-dispatch-artifact.sh --index-name EXPLORE.md has not been run yet.]",
+      "files": [],
+      "expected_output": "Treats the delivered message as the explorer's final report and runs the acceptance gate against the slice on disk now. Does not wait, poll, or ask the explorer for the report again, and does not accept the run on the payload alone before the gate has been run.",
+      "expectations": [
+        "The delivered message is treated as the explorer's final report and graded immediately",
+        "The parent does not wait, poll, or re-dispatch to obtain a report it already holds",
+        "The acceptance gate (check-dispatch-artifact.sh against the parent's own slice path) is run before the run is accepted; the payload's own status: complete is not enough",
+        "The artifact set is graded off disk, not from the payload's description of it"
+      ]
+    },
+    {
+      "id": 16,
+      "name": "explore-output-default-auto-how-it-works-gets-walkthrough",
+      "narration": true,
+      "prompt": "How does the invoice retry scheduler in this repo decide when to try a failed charge again? [The repository has no docs/conventions/discovery.yaml. The discovery userConfig option explore_output is not set by the user, so SKILL.md's userConfig line substitutes to its declared default, auto.]",
+      "expected_output": "explore_output resolves to auto at the default level. A person asked how something works, so auto picks explain. The run still writes EXPLORE.md and its sidecars (dispatching with Output: explain), and the reply is a numbered walkthrough of the scheduler with a path:line citation per step, plus the line naming the shape and the default level.",
+      "files": [],
+      "expectations": [
+        "The reported value is auto from the default level, and the concrete shape picked is explain",
+        "The reply is a walkthrough in call order with a path:line citation on each step, not a next-stage handoff summary",
+        "EXPLORE.md is still written (or its path named) for this run",
+        "Under dispatch, the explorer's prompt carries Output: explain, not auto"
+      ]
+    },
+    {
+      "id": 17,
+      "name": "explore-output-default-auto-before-change-gets-handoff",
+      "narration": true,
+      "prompt": "Before I add a signature check to the order-intake webhook endpoint, explore that endpoint and what touches it. [No docs/conventions/discovery.yaml, and the explore_output userConfig option substitutes to its default, auto.]",
+      "expected_output": "explore_output resolves to auto at the default level, and because the request comes before a change, auto picks change-prep. EXPLORE.md is written as usual, and the reply is the handoff summary: what exists, the constraints the change must respect, open questions with recommended defaults, and the next stage.",
+      "files": [],
+      "expectations": [
+        "The reported value is auto from the default level, and the concrete shape picked is change-prep",
+        "The reply is a handoff summary naming the constraints and the next stage, not a step-by-step walkthrough",
+        "EXPLORE.md is written (or its path named) for this run"
+      ]
+    },
+    {
+      "id": 18,
+      "name": "explore-output-userconfig-explain-holds-for-change-request",
+      "narration": true,
+      "prompt": "I'm about to rewrite the shipment-label printer module. Explore it first. [No docs/conventions/discovery.yaml. The discovery userConfig option explore_output is set to explain, so SKILL.md's userConfig line substitutes to explain.]",
+      "expected_output": "The per-user level pins explain, so the change request does not switch the reply to change-prep: the reply is a cited walkthrough of the label printer, the line names explain and the userConfig level, and EXPLORE.md is still written.",
+      "files": [],
+      "expectations": [
+        "The value resolves to explain from the userConfig level, and the reply names that level",
+        "The reply is a walkthrough with path:line citations even though the request precedes a change",
+        "EXPLORE.md is still written (or its path named) for this run"
+      ]
+    },
+    {
+      "id": 19,
+      "name": "explore-output-repo-file-change-prep-holds-for-how-it-works",
+      "prompt": "How does the coupon stacking logic work? [The repository's docs/conventions/discovery.yaml is captured in evals/fixtures/discovery-output-change-prep.yaml relative to the skill directory. The explore_output userConfig option substitutes to its default, auto.]",
+      "expected_output": "The repository file sets change-prep, which wins over the default auto, so the how-does-it-work question gets the handoff summary rather than a walkthrough. The line names change-prep and docs/conventions/discovery.yaml as the level.",
+      "files": [
+        "evals/fixtures/discovery-output-change-prep.yaml"
+      ],
+      "expectations": [
+        "The value resolves to change-prep from docs/conventions/discovery.yaml",
+        "The reply is the handoff summary, not a walkthrough, despite the how-does-it-work wording",
+        "The reported level is the repository file, not userConfig or the default"
+      ]
+    },
+    {
+      "id": 20,
+      "name": "explore-output-repo-file-wins-over-userconfig",
+      "prompt": "Explore the tenant provisioning job before I change its retry limit. [The repository's docs/conventions/discovery.yaml is captured in evals/fixtures/discovery-output-explain.yaml relative to the skill directory. The explore_output userConfig option is set to change-prep.]",
+      "expected_output": "Both levels set the key and the repository level wins: the value is explain from docs/conventions/discovery.yaml even though userConfig says change-prep. The reply is a cited walkthrough, the line names the repository level, and EXPLORE.md is written.",
+      "files": [
+        "evals/fixtures/discovery-output-explain.yaml"
+      ],
+      "expectations": [
+        "The repository file's explain wins over the userConfig value change-prep",
+        "The reply is a walkthrough with path:line citations",
+        "The reported level is docs/conventions/discovery.yaml, not userConfig"
+      ]
+    },
+    {
+      "id": 21,
+      "name": "explore-output-unknown-value-falls-back-to-auto",
+      "prompt": "Explore the audit-log exporter before I change its batch size. [The repository's docs/conventions/discovery.yaml is captured in evals/fixtures/discovery-output-invalid.yaml relative to the skill directory. The explore_output userConfig option is set to explain.]",
+      "expected_output": "The repository level holds tutorial, which is not auto, change-prep or explain. The run names docs/conventions/discovery.yaml, the key explore_output and the value tutorial, then continues on the default auto rather than the userConfig value explain. Because the request comes before a change, auto picks change-prep: the explorer is dispatched with Output: change-prep, EXPLORE.md is written, and the reply is the handoff summary with the level reported as the default and the invalid value named.",
+      "files": [
+        "evals/fixtures/discovery-output-invalid.yaml"
+      ],
+      "expectations": [
+        "The reply names docs/conventions/discovery.yaml, explore_output and the invalid value tutorial",
+        "The value used is the default auto, not the userConfig value explain, and the reported level is the default",
+        "The run continues: the explorer is dispatched (with Output: change-prep under dispatch) and EXPLORE.md is written",
+        "The reply is the change-prep handoff summary, not a walkthrough"
+      ]
+    },
+    {
+      "id": 22,
+      "name": "explore-output-auto-skill-caller-gets-handoff",
+      "narration": true,
+      "prompt": "[You are the fresh sub-agent /planning:devils-advocate dispatched in incumbent mode. Its procedure tells you to invoke /discovery:explore on the incumbent.] /discovery:explore the in-house feature-flag client: what it is, where it is used, what it is coupled to, and any recorded reason it was chosen. [No docs/conventions/discovery.yaml; the explore_output userConfig option substitutes to auto.]",
+      "expected_output": "explore_output is auto at the default level, but the invocation comes from another skill's procedure, so auto picks change-prep even though the scope reads like a what-is-it question. The reply is the handoff summary, and EXPLORE.md is written as usual.",
+      "files": [],
+      "expectations": [
+        "The concrete shape is change-prep because another skill invoked explore, not explain",
+        "The reported level is the default, with the value auto",
+        "The reply is the handoff summary, not a walkthrough"
+      ]
+    },
+    {
+      "id": 23,
+      "name": "explore-output-skill-caller-passes-explain",
+      "narration": true,
+      "prompt": "[A skill body you are following tells you to run /discovery:explore and show the person how the code works.] /discovery:explore --output explain the password-reset token flow [No docs/conventions/discovery.yaml; the explore_output userConfig option substitutes to auto.]",
+      "expected_output": "The calling skill passed --output explain, which wins over every layer, so the reply is a cited walkthrough even though another skill invoked explore. The scope is the password-reset token flow, without the --output argument, and the line names the invocation argument as the level.",
+      "files": [],
+      "expectations": [
+        "The concrete shape is explain, taken from the --output argument",
+        "The scope used (and any scope_as_received) is the password-reset token flow, without --output explain in it",
+        "The reply is a walkthrough with path:line citations and names the invocation argument as the supplying level"
+      ]
+    },
+    {
+      "id": 24,
+      "name": "index-pins-commit-and-states-reference-coverage",
+      "prompt": "Explore the payments rounding module inline; I will come back to this in a fresh session next week, so the EXPLORE.md has to tell me whether its line citations still hold.",
+      "files": [],
+      "expected_output": "Writes EXPLORE.md whose frontmatter carries a repos: list with the repository's name (never an absolute path), the full HEAD sha taken before the first file read, and a dirty flag, and whose body has a Code references section listing the cited repo-relative paths grouped by area, opening with coverage: exhaustive or coverage: key-files. The index itself carries the instruction that a resuming session compares the sha with HEAD and, on a mismatch or dirty: true, diffs the cited paths and re-reads the changed ones before relying on a citation.",
+      "expectations": [
+        "The EXPLORE.md frontmatter has a repos: entry whose sha is the full 40-character output of git rev-parse HEAD, not a short sha or a branch name",
+        "The repos: entry carries a dirty flag and names the repository without an absolute machine path",
+        "The index body has a Code references section whose first line is exactly coverage: exhaustive or coverage: key-files",
+        "The EXPLORE.md index itself states the staleness check as comparing the recorded sha with HEAD and diffing the cited paths, not as re-running the whole exploration"
+      ]
+    },
+    {
+      "id": 25,
+      "name": "pass-claim-requires-ran",
+      "prompt": "Explore the payments rounding module and tell me whether its tests pass. Do not run anything that writes to the repo.",
+      "files": [],
+      "expected_output": "Reads the rounding tests and records what they assert as verified: read. Because the user ruled out commands that write, and a test runner writes caches or build output, it does not claim the tests pass; the pass/fail question becomes a numbered gap or open question. If it does run a command that writes nothing, the finding carries verified: ran with the exact command and the observed result.",
+      "expectations": [
+        "No finding says the tests pass, fail or build while carrying verified: read, grep or inferred",
+        "Any pass/fail finding carries verified: ran together with a command: and the observed result:",
+        "Tests that were only opened are recorded as verified: read and describe what they assert, not whether they pass",
+        "When the tests were not run, whether they pass is left as a numbered gap or open question rather than asserted"
+      ]
+    },
+    {
+      "id": 26,
+      "name": "abstracts-state-findings-section-names-stay-fixed",
+      "prompt": "Explore how the payments module applies rounding and write up the EXPLORE.md.",
+      "files": [],
+      "expected_output": "Each sidecar abstract, and the index abstract, asserts what was found (for example where and when rounding happens) rather than naming the area covered ('Rounding overview', 'Test coverage of payments'). Sidecar filenames and section ids keep the fixed EXPLORE-<section>.md names the section table and gate key on.",
+      "expectations": [
+        "Every abstract states a finding about the code, not a topic label for what was looked at",
+        "The index copies each sidecar abstract verbatim",
+        "Sidecar filenames stay EXPLORE-<section>.md with stable section ids rather than being renamed after their findings"
+      ]
+    }
+  ]
+}

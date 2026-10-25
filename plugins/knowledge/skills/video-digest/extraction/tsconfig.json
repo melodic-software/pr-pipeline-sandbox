@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "allowJs": true,
+    "checkJs": true,
+    "strict": false,
+    "strictNullChecks": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["**/*.js", "**/*.mjs", "**/*.ts"],
+  "exclude": ["node_modules", "vendor", "**/*.test.js", "vitest.config.ts"]
+}
