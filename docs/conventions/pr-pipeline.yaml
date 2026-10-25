@@ -651,6 +651,34 @@ models:
       # Only an experiment answers it: skip until a probe has (probe-first).
       unknown: probe-first
 
+# Sandbox: main's limits block, so a turn cap keeps agent-ready and resumes.
+limits:
+  # fix-ci runs one pr-unblock-dispatch run starts. 2 matches the
+  # review-dependency cap, so a push to main starts at most a few model runs
+  # while plan usage per run is unmeasured; the backlog drains over pushes.
+  fix-ci-per-run: 2
+  # Extra fix-ci dispatches on one head whose fix-ci run failed (an outage,
+  # a timeout). 1 retries once; a second failure on the same head is a
+  # pattern for a person, not a retry.
+  fix-ci-restarts: 1
+  # fix-docs runs one pr-unblock-dispatch run starts, matching fix-ci-per-run.
+  fix-docs-per-run: 2
+  # The issue lane's WIP cap when the lane merge rate cannot be read; the
+  # wip block below derives it otherwise.
+  wip-cap: 12
+  # Restarts after a run reaches its turn cap, per agent-ready a person adds.
+  # 1: one capped run resumes from its pushed branch before a person is asked
+  # again. Raise it further only with a security review (#7677).
+  turn-cap-restarts: 1
+  # Share of the lane's hourly merge rate admitted per hour. The queued cap
+  # (check-wip-cap) is the larger of this rate and admission-min-per-hour,
+  # times wip.merge-rate-window-hours; at it, past wip.pause-from, new
+  # agent-ready labels pause.
+  admission-factor: 0.8
+  # Admissions per hour the queued cap never falls below, so a day with no
+  # lane merges cannot hold admissions shut (owner decision 2026-10-21).
+  admission-min-per-hour: 1
+
 merge:
   # The lane auto-merges only PRs labeled `work-class: mechanical` (C2):
   # dependency bumps, lint and format fixes, syncs. The classes C1-C5 (read-only,
