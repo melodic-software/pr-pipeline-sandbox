@@ -194,11 +194,12 @@ test("intake-triage.yml: intake runs only with claude-args resolved from triage-
 
   const intake = jobs["intake-triage"];
   assert.match(intake.if, /&& needs\.born-triaged\.outputs\.claude-args != '' \}\}$/);
-  const runs = (skip, claudeArgs, event = "issues", proceed = "true") =>
+  const runs = (skip, claudeArgs, event = "issues", proceed = "true", limited = "false") =>
     evaluate(intake.if, {
       "github.event_name": event,
       "needs.born-triaged.outputs.skip": skip,
       "needs.born-triaged.outputs.claude-args": claudeArgs,
+      "needs.born-triaged.outputs.rate-limited": limited,
       "needs.kill-switch.outputs.proceed": proceed,
     });
   const args = "--model sonnet --max-turns 30 --effort medium";
@@ -211,12 +212,46 @@ test("intake-triage.yml: intake runs only with claude-args resolved from triage-
   assert.equal(runs("true", "", "workflow_dispatch"), false, "a dispatch never runs without resolved claude-args");
   assert.equal(runs("false", args, "issues", "false"), false, "the kill switch stops intake");
   assert.equal(runs("false", args, "workflow_dispatch", ""), false, "a failed kill-switch job stops intake");
+  assert.equal(runs("false", args, "issues", "true", "true"), false, "a rate limit on the gate's read stops intake");
+  assert.equal(runs("true", args, "workflow_dispatch", "true", "true"), false, "and a dispatch too");
+  assert.equal(runs("false", args, "issues", "true", ""), true, "a gate job that wrote no output still falls through");
+  assert.equal(gate.outputs["rate-limited"], "${{ steps.check.outputs.rate-limited }}");
   assert.equal(intake.with["claude-args"], "${{ needs.born-triaged.outputs.claude-args }}");
   assert.deepEqual(intake.needs, ["born-triaged", "kill-switch"]);
   const killSwitch = jobs["kill-switch"];
   assertKillSwitchJob(killSwitch);
   assert.equal(killSwitch.if, jobs["born-triaged"].if, "the kill switch runs wherever the gate runs");
   assert.equal(killSwitch.outputs.proceed, "${{ steps.kill.outputs.proceed }}");
+});
+
+test("intake-label-needs-triage.yml: the kill switch stops the born-triaged check and the label", () => {
+  const { jobs } = workflow("intake-label-needs-triage.yml");
+  assertKillSwitchJob(jobs["kill-switch"]);
+  assert.equal(jobs["kill-switch"].outputs.proceed, "${{ steps.kill.outputs.proceed }}");
+  const gate = jobs["born-triaged"];
+  assert.equal(gate.needs, "kill-switch");
+  const checks = (action, proceed) =>
+    evaluate(gate.if, { "github.event.action": action, "needs.kill-switch.outputs.proceed": proceed });
+  assert.equal(checks("opened", "true"), true);
+  assert.equal(checks("opened", "false"), false, "the kill switch stops the born-triaged API reads");
+  assert.equal(checks("opened", ""), false, "a failed kill-switch job stops them too");
+  assert.equal(checks("reopened", "true"), false);
+  const label = jobs["intake-label-needs-triage"];
+  assert.deepEqual(label.needs, ["kill-switch", "born-triaged"]);
+  const labels = (proceed, skip, limited = "false") =>
+    evaluate(label.if, {
+      "needs.kill-switch.outputs.proceed": proceed,
+      "needs.born-triaged.outputs.skip": skip,
+      "needs.born-triaged.outputs.rate-limited": limited,
+    });
+  assert.equal(labels("true", ""), true, "a skipped or failed born-triaged check still labels");
+  assert.equal(labels("true", "false"), true);
+  assert.equal(labels("true", "true"), false, "a born-triaged issue keeps no floor label");
+  assert.equal(labels("false", ""), false, "the kill switch stops the label");
+  assert.equal(labels("", ""), false, "a failed kill-switch job stops the label");
+  assert.equal(labels("true", "false", "true"), false, "a rate limit on the gate's read stops the label's calls");
+  assert.equal(labels("true", "", ""), true, "a gate job that wrote no output still labels");
+  assert.equal(gate.outputs["rate-limited"], "${{ steps.check.outputs.rate-limited }}");
 });
 
 test("intake-triage.yml: a dispatch runs only from main and passes the gate's ids", () => {
@@ -430,11 +465,12 @@ test("pr-unblock.yml: address-feedback and publish-feedback are reported neutral
   const head = "c".repeat(40);
   const { jobs } = workflow("pr-unblock.yml");
   const notRun = jobs["address-feedback-not-run"];
-  const context = (proceed, headSha, skip = "", activity = "address-feedback") => ({
+  const context = (proceed, headSha, skip = "", activity = "address-feedback", detail = "") => ({
     "inputs.activity": activity,
     "needs.address-feedback-select.outputs.proceed": proceed,
     "needs.address-feedback-select.outputs.head-sha": headSha,
     "needs.address-feedback-select.outputs.skip-reason": skip,
+    "needs.address-feedback-select.outputs.not-run-detail": detail,
   });
   assert.deepEqual([notRun.needs].flat(), ["address-feedback-select"]);
   for (const id of ["address-feedback", "publish-feedback"]) {
@@ -465,6 +501,12 @@ test("pr-unblock.yml: address-feedback and publish-feedback are reported neutral
       JSON.stringify(skip),
     );
   }
+  // A PR stopped at the round cap shows its round count on both checks.
+  const counted = await postNotRunChecks(notRun, context("false", head, "awaiting-human", "address-feedback", "round 4 of max 4"));
+  assert.deepEqual(
+    counted.map((call) => call.output.summary),
+    ["Skip reason: awaiting-human\n\nround 4 of max 4", "Skip reason: awaiting-human\n\nround 4 of max 4"],
+  );
 });
 
 // fix-ci's one retry one model rung up runs inside the same pr-unblock run,
@@ -984,10 +1026,21 @@ function needsOf(jobs, id, seen = new Set()) {
 test("work-resolve-issue.yml: every job that gets the issue lane's credential or runs the read runner needs the admission gate's proceed", () => {
   const { jobs } = workflow("work-resolve-issue.yml");
   const admit = jobs.admit;
-  assert.deepEqual(admit.permissions, { contents: "read" }, "the gate holds a read-only token");
+  assert.deepEqual(admit.permissions, { contents: "read", issues: "read" }, "the gate holds a read-only token");
   assert.equal(admit.secrets, undefined);
   assert.doesNotMatch(JSON.stringify(admit), /secrets\./, "the gate names no secret");
-  assert.equal(admit.outputs.proceed, "${{ steps.gate.outputs.proceed }}");
+  // The trusted trigger, then the blocker gate (check-blockers.mjs), which
+  // runs only after the trigger passed, from the default branch tip.
+  assert.equal(admit.outputs.proceed, "${{ steps.gate.outputs.proceed == 'true' && steps.blockers.outputs.proceed == 'true' }}");
+  const blockers = admit.steps.find((s) => s.id === "blockers");
+  assert.equal(blockers.if, "steps.gate.outputs.proceed == 'true'");
+  assert.equal(blockers.run, "node .base/.github/scripts/work-resolve-issue/check-blockers.mjs");
+  // Trusted closes and provenance are judged against the default branch's list, never the head's.
+  assert.equal(blockers.env.TRUSTED_ACTORS_PATH, ".base/.github/standards/trusted-actors/trusted-actors.json");
+  assert.equal(blockers.env.LANES_APP_ID, "${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}");
+  // work-unblock never re-fires a run that reached this step.
+  const final = admit.steps.find((s) => s.name === "Stop on untrusted provenance");
+  assert.equal(final.if, "steps.blockers.outputs.untrusted == 'true'");
   const checkout = admit.steps.find((s) => String(s.uses ?? "").startsWith("actions/checkout@"));
   assert.equal(checkout.with.ref, "${{ github.event.repository.default_branch }}");
   assert.equal(checkout.with["persist-credentials"], false);
@@ -1267,7 +1320,10 @@ function jobGates(doc, job) {
     const [, need, output] = term.match(/^needs\.([\w-]+)\.outputs\.([\w-]+) == 'true'$/) ?? [];
     if (!needs.includes(need)) continue;
     const gateJob = doc.jobs?.[need] ?? {};
-    const [, stepId] = String(gateJob.outputs?.[output] ?? "").match(/^\$\{\{\s*steps\.([\w-]+)\.outputs\.proceed\s*\}\}$/) ?? [];
+    // The gate's proceed alone, or the gate's proceed joined by && to more checks
+    // (no `||`, which could stand in for it).
+    const [, stepId] =
+      String(gateJob.outputs?.[output] ?? "").match(/^\$\{\{\s*steps\.([\w-]+)\.outputs\.proceed\s*(?:== 'true' && [^|]+)?\}\}$/) ?? [];
     if (stepId && (gateJob.steps ?? []).some((step) => step.id === stepId && step.uses === TRUSTED_TRIGGER)) gates.add("author");
     const [, selectId] = String(gateJob.outputs?.[output] ?? "").match(/^\$\{\{\s*steps\.([\w-]+)\.outputs\.refine\s*\}\}$/) ?? [];
     if (selectId && (gateJob.steps ?? []).some((step) => step.id === selectId && String(step.run ?? "").split("\n").some((line) => line.trim() === REFINE_SELECT))) gates.add("author");
@@ -1430,6 +1486,8 @@ test("the trigger-gate check names an ungated job and accepts only the lanes' ga
     "check-trusted-trigger in a needed job": [{ issues: {} }, { admit: admit(), run: { needs: ["admit"], if: "needs.admit.outputs.proceed == 'true'", steps: [launcher] } }, { "f.yml run": ["author"] }],
     "a gate job outside needs": [{ issues: {} }, { admit: admit(), run: { if: "needs.admit.outputs.proceed == 'true'", steps: [launcher] } }, { "f.yml run": [] }],
     "another action's proceed": [{ issues: {} }, { admit: admit({ id: "gate", uses: "./.base/.github/actions/check-kill-switch" }), run: { needs: "admit", if: "needs.admit.outputs.proceed == 'true'", steps: [launcher] } }, { "f.yml run": [] }],
+    "the gate's proceed && another check": [{ issues: {} }, { admit: { ...admit(), outputs: { proceed: "${{ steps.gate.outputs.proceed == 'true' && steps.more.outputs.proceed == 'true' }}" } }, run: { needs: "admit", if: "needs.admit.outputs.proceed == 'true'", steps: [launcher] } }, { "f.yml run": ["author"] }],
+    "the gate's proceed || another check": [{ issues: {} }, { admit: { ...admit(), outputs: { proceed: "${{ steps.gate.outputs.proceed == 'true' || steps.more.outputs.proceed == 'true' }}" } }, run: { needs: "admit", if: "needs.admit.outputs.proceed == 'true'", steps: [launcher] } }, { "f.yml run": [] }],
     "a gate output compared to false": [{ issues: {} }, { admit: admit(), run: { needs: "admit", if: "needs.admit.outputs.proceed != 'true'", steps: [launcher] } }, { "f.yml run": [] }],
     "the pinned intake reusable with author ids": [{ issues: {} }, { triage: intake(PINNED, "${{ needs.x.outputs.human-ids }}") }, { "f.yml triage": ["author"] }],
     "the intake reusable with no author ids": [{ issues: {} }, { triage: intake(PINNED, "") }, { "f.yml triage": [] }],
@@ -5217,6 +5275,8 @@ test("handoff-evidence.sh: job-level evidence decides through a lagging listing,
   assert.equal(empty.status, 0);
   assert.deepEqual(empty.outputs, { posted: "false", allowed: "true" });
   assert.equal(empty.calls.trim().split("\n").length, 1, "job-level evidence needs one read");
+  assert.match(empty.stdout, /^handoff evidence: posted=false allowed=true \(1 read\)$/m);
+  assert.doesNotMatch(empty.stdout, /::error::/);
   // A kill switch or refusal: broker-allowed skipped, steps empty.
   const killed = readPosted(t, read, lagging(withMarkers(jobListing([], { reportSkipped: FIX_CI_CALLS }), [])));
   assert.deepEqual(killed.outputs, { posted: "false", allowed: "false" });
@@ -5227,6 +5287,7 @@ test("handoff-evidence.sh: job-level evidence decides through a lagging listing,
   assert.equal(retried.status, 0);
   assert.deepEqual(retried.outputs, { posted: "true", allowed: "true" });
   assert.equal(retried.calls.trim().split("\n").length, 3);
+  assert.match(retried.stdout, /^handoff evidence: posted=true allowed=true \(3 reads\)$/m);
   assert.match(retried.stdout, /Read 1: missing: fix-ci \/ report step "Post the check run" has no conclusion/);
   // No broker-allowed job (a listing from before it): the broker step decides,
   // retried while null, then the handoff the subscription leg starts on.
@@ -5863,6 +5924,33 @@ test("work-resolve-issue.yml: every job after the calls takes each resolve-issue
     }
   }
   assert.ok(values >= 10, `${values} values read`);
+  // Once the subscription call ran, an output it left empty stays empty: the
+  // first call's value for it, set by its issue-fields job on a handoff, is
+  // never taken. Step conditions that read the calls are held to it too.
+  const subscriptionRan = (first) => (expression) => {
+    const context = {};
+    for (const [ref, call, rest] of String(expression).matchAll(/needs\.(resolve-issue(?:-subscription)?)\.(result|outputs\.[\w-]+)/g)) {
+      context[ref] = rest === "result" ? "success" : call === "resolve-issue" ? first : "";
+    }
+    return evaluate(expression, context);
+  };
+  let reads = 0;
+  for (const id of after) {
+    const job = jobs[id];
+    const expressions = [
+      ["if", job.if],
+      ...Object.entries(job.with ?? {}),
+      ...(job.steps ?? []).flatMap((step) => [...Object.entries(step.env ?? {}), ["if", step.if], ["continue-on-error", step["continue-on-error"]]]),
+    ];
+    for (const [name, expression] of expressions) {
+      if (!/needs\.resolve-issue/.test(String(expression ?? ""))) continue;
+      reads += 1;
+      for (const stale of ["true", "stale"]) {
+        assert.equal(subscriptionRan(stale)(expression), subscriptionRan("")(expression), `${id} ${name} takes the first call's ${stale} after the subscription call ran`);
+      }
+    }
+  }
+  assert.ok(reads > values, `${reads} reads, step conditions included`);
   // The started and reuse gates follow the call that ran too.
   const gate = (id, sub, first) =>
     evaluate(jobs[id].if, {
