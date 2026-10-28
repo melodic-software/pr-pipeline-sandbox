@@ -1,0 +1,2 @@
+layer 2 probe file for claude-code-plugins#7669
+v1
