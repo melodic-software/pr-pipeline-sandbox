@@ -64,7 +64,9 @@ jobs:
     if: ${{ !cancelled() && github.event.pull_request.draft == false && needs.kill-switch.outputs.proceed == 'true' }}
     permissions:
       actions: read # the reusable's check-key-credit job reads this workflow's
-                    # runs for the key's recent credit stop
+                    # runs for the key's recent credit stop, and its status
+                    # job reads them for cost decisions
+      checks: read # the reusable's status job reads its earlier runs' cost notices
       contents: read
       pull-requests: write # the review, its comments, the marker and the hold label
     uses: melodic-software/ci-workflows/.github/workflows/pr-review-cli.yml@4fbceb4b75ffd568dfa5db31de0d0e753c0c64e6 # v0.65.9
