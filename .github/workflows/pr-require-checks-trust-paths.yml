@@ -1,0 +1,18 @@
+name: pr-require-checks-trust-paths
+# pull_request_target runs main's caller and config; nothing from the head is checked out or run.
+on: # zizmor: ignore[dangerous-triggers]
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+permissions: {}
+jobs:
+  pr-require-checks-trust-paths:
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    uses: melodic-software/ci-workflows/.github/workflows/pr-require-checks-trust-paths.yml@4ad14b4f1b4868aa5362590299c93d9117b629f1 # v0.67.1
+    with:
+      runner: ubuntu-24.04
