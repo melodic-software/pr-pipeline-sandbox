@@ -13,7 +13,11 @@
     ".work-item-tracker.json",
     "lefthook.yml",
     ".claude/**",
-    "CLAUDE.md"
+    "*CLAUDE.md",
+    "*AGENTS.md",
+    ".mcp.json",
+    ".gitmodules",
+    ".npmrc"
   ],
   "apps": ["melodic-agent[bot]"]
 }
