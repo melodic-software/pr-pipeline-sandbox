@@ -1,0 +1,27 @@
+name: probe-g-tag
+# Temporary probe: does a tag ruleset creation rule block GITHUB_TOKEN from creating a matching tag?
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Try POST git/refs for refs/tags/probe-g-<run_id>
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set +e
+          out=$(gh api -i -X POST "repos/$REPO/git/refs" -f ref="refs/tags/probe-g-$RUN_ID" -f sha="$SHA" 2>&1)
+          rc=$?
+          echo "probe-g-exit=$rc"
+          echo "probe-g-status=$(printf '%s\n' "$out" | head -n 1)"
+          echo "probe-g-body=$(printf '%s\n' "$out" | grep -E '^\{' | tail -n 1)"
+          exit 0
