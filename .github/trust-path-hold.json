@@ -1,0 +1,23 @@
+{
+  "paths": [
+    ".github/**",
+    "docs/conventions/**",
+    "plugins/**",
+    ".claude-plugin/**",
+    "scripts/**",
+    "lib/**",
+    "package.json",
+    "package-lock.json",
+    ".node-version",
+    ".python-version",
+    ".work-item-tracker.json",
+    "lefthook.yml",
+    ".claude/**",
+    "*CLAUDE.md",
+    "*AGENTS.md",
+    ".mcp.json",
+    ".gitmodules",
+    ".npmrc"
+  ],
+  "apps": ["melodic-agent[bot]"]
+}
