@@ -1,0 +1,27 @@
+name: probe-930
+
+# Probe for ci-workflows#930: does a failure commit status named ci-status
+# block the merge while the ci-status check run passes? Waits past the
+# trust-paths success status so this failure is the latest status.
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions: {}
+
+jobs:
+  post-failure:
+    if: github.head_ref == 'probe/930-failure-status'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - name: Post a failure ci-status after the trust-paths status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          sleep 90
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state=failure -f context=ci-status -f description='probe-930 failure status'
