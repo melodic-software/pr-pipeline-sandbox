@@ -82,6 +82,8 @@ ADAPTED=(
   docs/conventions/pr-pipeline.yaml
   # Sandbox activities fix-marker and audit-env-write, with the role input,
   # and the fix-ci fallback probe (pr-unblock.yml's fix-ci jobs on this lane).
+  # Its run-name, dispatcher-run-id input and fix-docs jobs are main's on the
+  # automations role: sync them with the dispatcher, which sends that input.
   .github/workflows/pr-refine.yml
   # The synced dispatch job plus claude-code-plugins#9361's rerun-ci-status
   # job, ahead of the next full resync.
