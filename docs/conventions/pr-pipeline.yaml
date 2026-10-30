@@ -683,6 +683,14 @@ limits:
   # lane merges cannot hold admissions shut (owner decision 2026-10-21).
   admission-min-per-hour: 1
 
+# The daily branch cleanup (owner decision W-7, 2026-10-21): a branch lives as
+# long as its issue is open. maintenance-delete-stale-branches.yml deletes a
+# branch once its pull request and linked issue are closed, and never one with
+# an open issue or an open pull request.
+branch-cleanup:
+  # A run deletes at most this many; the rest wait for the next run.
+  max-deletes-per-run: 25
+
 merge:
   # The lane auto-merges only PRs labeled `work-class: mechanical` (C2):
   # dependency bumps, lint and format fixes, syncs. The classes C1-C5 (read-only,
