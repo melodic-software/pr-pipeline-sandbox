@@ -1,0 +1,2 @@
+Fixture for the workflow-deletion merge probe: this branch keeps
+.github/workflows/rate-probe.yml, which main deletes.
