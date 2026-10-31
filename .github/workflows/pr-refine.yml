@@ -25,7 +25,7 @@ on:
           fix-docs-no-key runs it with an empty key (Phase 7.1 probes).
         required: false
         type: choice
-        options: [refine, fix-ci-fallback, fix-docs, fix-docs-no-key]
+        options: [refine, fix-ci-fallback, fix-docs, fix-docs-no-key, test-workflow-delete]
         default: refine
       dispatcher-run-id:
         description: The dispatcher run that sent this dispatch; empty for a human dispatch.
@@ -87,6 +87,25 @@ jobs:
       pr-number: ${{ inputs.pr-number }}
     secrets:
       claude-code-oauth-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
+
+  # Probe: a Git Data merge that drops a workflow main deleted. Revert after.
+  test-workflow-delete:
+    if: github.event_name == 'workflow_dispatch' && inputs.activity == 'test-workflow-delete'
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      issues: write
+      id-token: write
+    concurrency:
+      group: pr-pipeline-write-${{ inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-write.yml
+    with:
+      role: automations
+      lane: pr-refine
+      activity: test-workflow-delete
+      pr-number: ${{ inputs.pr-number }}
 
   # Sandbox-only probe of fix-ci's subscription fallback (claude-code-plugins
   # Phase 5b, probe P2): pr-unblock.yml's fix-ci jobs on lane pr-refine,
