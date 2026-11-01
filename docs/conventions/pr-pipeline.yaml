@@ -107,6 +107,18 @@ activities:
     gating: advisory
     reads-untrusted: false
 
+  # Probe (claude-code-plugins resolve-conflicts workflow-staged): the lanes
+  # App token, with no Workflows permission, puts a Git Data merge of main
+  # onto a PR branch whose head keeps a workflow main deleted. Applies only to
+  # its fixture PR. Revert after the probe.
+  test-workflow-delete:
+    script: scripts/lanes/probe-workflow-delete.sh
+    effect: mutate-branch
+    gating: advisory
+    reads-untrusted: false
+    applies-when:
+      paths: ["sandbox/probe/gitdata.txt"]
+
   # P7: the audit-env skill at a write effect, so it runs in
   # pr-run-activity-write.yml, whose job holds id-token: write.
   audit-env-write:
@@ -518,6 +530,7 @@ lanes:
       - activity: fix-marker
       - activity: check-write-effect
       - activity: audit-env-write
+      - activity: test-workflow-delete
       # Sandbox-only probe of fix-ci's subscription fallback (claude-code-
       # plugins Phase 5b, probe P2): pr-refine.yml's fix-ci-fallback dispatch
       # passes an unset key. A new lane would need a lane-rules.json row, which
