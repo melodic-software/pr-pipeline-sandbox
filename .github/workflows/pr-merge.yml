@@ -94,6 +94,7 @@ jobs:
       # The review-evidence reads of the lane runs' check-run annotations,
       # on the same token.
       checks: read
+      issues: read # the verdict reader's split sub-issue read, on the same token
       id-token: write # prove to the token broker which workflow this is
     outputs:
       # `true` when the lane is live (not report-only) and either a PR merged
@@ -248,13 +249,12 @@ jobs:
         if: steps.candidates.outcome == 'success'
         env:
           GH_TOKEN: ${{ steps.lane-token.outputs.token }}
-          # The verdict reader's Actions calls and the review-evidence reads
-          # (timeline, comments, lane runs, attempts, jobs, annotations) use
-          # this, as their own GH_TOKEN (babysit_verify_evidence.py,
-          # babysit_merge.py _lane_evidence); every write keeps the lane
-          # token. The job runs main's code alone, never a PR's.
+          # The gate's reads for verdicts, review-lane evidence and timelines
+          # use this as their own GH_TOKEN; every write keeps the lane token.
+          # The job runs main's code alone, never a PR's.
           BABYSIT_VERIFY_GH_TOKEN: ${{ github.token }}
-          # Name the two tokens' rate-limit readings (babysit_gh.py).
+          # Name each token's rate-limit pool for the gate's rate guard
+          # (babysit_gh.py _limits_pool).
           API_BUDGET_TOKEN: lanes-app
           API_BUDGET_OVERRIDE_TOKEN: github-token
           REPO: ${{ github.repository }}
