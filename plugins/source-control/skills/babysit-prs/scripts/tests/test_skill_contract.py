@@ -221,11 +221,27 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("never directly to the merge gate", paragraph)
         self.assertIn("In autopilot, that worker assesses", paragraph)
         self.assertIn(
-            "a completed draft is marked ready with `/source-control:pull-request ready`",
+            "a completed draft is marked ready with `/source-control:pull-request ready --unattended`",
             paragraph,
         )
         self.assertIn("a genuinely in-progress draft stays draft", paragraph)
         self.assertIn("reported and escalated with the reason", paragraph)
+
+    def test_unattended_modifier_grants_no_tier_and_reaches_no_script(self) -> None:
+        paragraph = _paragraph_containing(
+            self.skill_text, "is neither a mode nor a scope"
+        )
+
+        self.assertIn("`--unattended`, anywhere in the string", paragraph)
+        self.assertIn("never selects or raises a tier", paragraph)
+        self.assertIn("passes it to no script or skill", paragraph)
+        self.assertIn(
+            "The bare word `unattended` and `--unattended=<value>` are not this modifier",
+            paragraph,
+        )
+        self.assertIn(
+            'argument-hint: "[worker|autopilot|help] [--unattended] ', self.skill_text
+        )
 
     def test_autopilot_merge_tier_ships_disabled_and_fail_closed(self) -> None:
         para = _paragraph_containing(self.skill_text, "config-gated escalation")
@@ -468,7 +484,7 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("`mutation_policy.branch_write_allowed`", autopilot)
         self.assertIn("`needs_worker` delta", autopilot)
         self.assertIn(
-            "mark it ready for review (`/source-control:pull-request ready`", drafts
+            "mark it ready for review (`/source-control:pull-request ready --unattended`", drafts
         )
         self.assertIn("leave it draft and report why", drafts)
 

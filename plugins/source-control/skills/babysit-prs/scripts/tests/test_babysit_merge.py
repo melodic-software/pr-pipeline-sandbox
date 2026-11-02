@@ -17,6 +17,7 @@ import contextlib
 import io
 import json
 import pathlib
+import subprocess
 import sys
 import unittest
 from typing import Any
@@ -28,7 +29,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import babysit_gh as gh
 from repo_config_fake import RepoConfigFake
 import babysit_merge as merge
+import babysit_postmerge as postmerge
 import refresh_pr_branch as refresh
+
+# Captured before setUpModule stubs `_role_label` for the rest of the module.
+REAL_ROLE_LABEL = postmerge._role_label
 
 HEAD = "a" * 40
 # The base compare the freshness hold reads for an otherwise-ready PR.
@@ -41,6 +46,35 @@ LINKED_ISSUE = 999  # distinct from the PR so the two comment fetches are separa
 LINKED_REF = f"owner/repo#{LINKED_ISSUE}"
 
 
+def role_label_stub(label: str = "needs-human") -> Any:
+    """A patcher for the tracker's role label reads: `label` for the
+    human-gated role an autonomous gate reads, each other role's default;
+    started per module so no test reads GitHub."""
+
+    def read(
+        owner: str,
+        name: str,
+        *,
+        strict: bool = False,
+        role: str = "human-gated",
+        default: str = "needs-human",
+    ) -> str:
+        return label if role == "human-gated" else default
+
+    return mock.patch.object(postmerge, "_role_label", side_effect=read)
+
+
+_role_label = role_label_stub()
+
+
+def setUpModule() -> None:
+    _role_label.start()
+
+
+def tearDownModule() -> None:
+    _role_label.stop()
+
+
 def _queue_read(
     *,
     in_queue: bool = False,
@@ -48,6 +82,7 @@ def _queue_read(
     armed: bool = False,
     state: str | None = None,
     position: int | None = None,
+    failed_ejections: int | None = 0,
 ) -> dict[str, Any]:
     """A `read_merge_queue` answer; the default is a base with no merge queue."""
     return {
@@ -58,6 +93,7 @@ def _queue_read(
         "autoMergeArmed": armed,
         "state": state,
         "position": position,
+        "failedEjections": failed_ejections,
     }
 
 
@@ -710,6 +746,20 @@ class PullRequestBodyHold(TierEvaluateHarness):
                         result["blockers"],
                     )
 
+    def test_needs_human_label_does_not_block_an_attended_merge(self) -> None:
+        # The person the label asks for may merge; autonomous runs hold on it
+        # (test_babysit_merge_unattended.NeedsHumanHoldsOnlyAutonomous).
+        result = self._evaluate(_pr(labels=[{"name": "needs-human"}]), tier=None)
+        self.assertTrue(result["ready"], result["blockers"])
+
+    def test_needs_human_label_blocks_the_autopilot_tier(self) -> None:
+        result = self._evaluate(_pr(labels=[{"name": "Needs-Human"}]), tier=TIER)
+        self.assertFalse(result["ready"])
+        self.assertTrue(
+            any("'needs-human' label" in b for b in result["blockers"]),
+            result["blockers"],
+        )
+
     def test_other_labels_do_not_block_without_the_tier(self) -> None:
         result = self._evaluate(_pr(labels=[{"name": "needs-review"}]), tier=None)
         self.assertTrue(result["ready"], result["blockers"])
@@ -992,7 +1042,9 @@ class RequiredSignaturesEnforcement(unittest.TestCase):
                 return rules
             raise AssertionError(f"unexpected gh_json call: {args}")
 
-        def commits_side_effect(repo: str, number: int) -> list[dict[str, Any]]:
+        def commits_side_effect(
+            repo: str, number: int, head: str | None = None
+        ) -> list[dict[str, Any]]:
             if commits_error:
                 raise RuntimeError("simulated commit-verification fetch failure")
             return commits or []
@@ -1685,6 +1737,475 @@ class RefreshDisarmsAutoMerge(unittest.TestCase):
             self._disarm(armed=True, disable_error=True)
 
 
+class RefreshRefusesDependencyManagerPrs(unittest.TestCase):
+    """A dependency manager's PR is never refreshed: an extra commit on its branch
+    stops the manager's own rebases."""
+
+    def _validate(self, login: str, extra: frozenset[str] = frozenset()) -> None:
+        pr = {"state": "OPEN", "author": {"login": login}}
+        policy = mock.Mock(extra_dependency_manager_logins=extra)
+        with (
+            mock.patch.object(refresh, "view_pr", return_value=pr),
+            mock.patch.object(refresh.repo_policy, "resolve", return_value=policy),
+            # The next check reads GitHub; past the author check is far enough.
+            mock.patch.object(
+                refresh,
+                "refuse_standards_sync",
+                side_effect=RuntimeError("past the author check"),
+            ),
+        ):
+            refresh.validate_current_candidate(
+                "owner/repo", PR_NUMBER, HEAD, frozenset({"owner"})
+            )
+
+    def test_configured_extra_login_is_refused(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "dependency manager"):
+            self._validate("acme-deps[bot]", frozenset({"acme-deps"}))
+
+    def test_dependabot_pr_is_refused(self) -> None:
+        # `gh pr view` reports app/dependabot; REST reports dependabot[bot].
+        for login in (
+            "dependabot",
+            "app/dependabot",
+            "dependabot[bot]",
+            "renovate[bot]",
+        ):
+            with (
+                self.subTest(login=login),
+                self.assertRaisesRegex(RuntimeError, "dependency manager"),
+            ):
+                self._validate(login)
+
+    def test_other_author_passes_the_author_check(self) -> None:
+        with self.assertRaises(RuntimeError) as caught:
+            self._validate("octocat")
+        self.assertEqual(str(caught.exception), "past the author check")
+
+
+# A Dependabot pull request's commits as `pulls/{n}/commits` lists them.
+DEPENDABOT_PARENT, BASE_PARENT = "1" * 40, "2" * 40
+STRAY_SHA, EDITED_SHA = "4" * 40, "5" * 40
+DEPENDABOT_COMMIT = {
+    "sha": DEPENDABOT_PARENT,
+    "parents": [{"sha": "3" * 40}],
+    "commit": {
+        "author": {
+            "name": "dependabot[bot]",
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+        },
+        "committer": {"name": "GitHub", "email": "noreply@github.com"},
+        "verification": {"verified": True},
+    },
+}
+# The stray update-branch shape (#9131's ad32a613): a person's merge of the
+# base that GitHub committed and signed, head parent first.
+STRAY_MERGE = {
+    "sha": STRAY_SHA,
+    "parents": [{"sha": DEPENDABOT_PARENT}, {"sha": BASE_PARENT}],
+    "commit": {
+        "author": {"name": "A Person", "email": "person@example.com"},
+        "committer": {"name": "GitHub", "email": "noreply@github.com"},
+        "verification": {"verified": True},
+    },
+}
+# A merge GitHub committed that also changes a file the base never touched.
+EDITED_MERGE = {**STRAY_MERGE, "sha": EDITED_SHA}
+# A person's one-parent fix commit.
+FIX_COMMIT = {
+    "sha": "6" * 40,
+    "parents": [{"sha": DEPENDABOT_PARENT}],
+    "commit": {
+        "author": {"name": "A Person", "email": "person@example.com"},
+        "committer": {"name": "A Person", "email": "person@example.com"},
+        "verification": {"verified": False},
+    },
+}
+_COMPARE = "repos/owner/repo/compare/"
+_BASE_FILE = {"filename": "docs/a.md", "status": "modified", "sha": "a1"}
+STRAY_MERGE_COMPARES = {
+    # The base parent is on main: main is ahead of it.
+    f"{_COMPARE}{BASE_PARENT}...main": {"status": "ahead"},
+    # The merge brings in the base's file as the base has it...
+    f"{_COMPARE}{DEPENDABOT_PARENT}...{STRAY_SHA}": {"files": [_BASE_FILE]},
+    # ...and the edited one also changes a file the base did not.
+    f"{_COMPARE}{DEPENDABOT_PARENT}...{EDITED_SHA}": {
+        "files": [
+            _BASE_FILE,
+            {"filename": "src/x.js", "status": "modified", "sha": "b2"},
+        ]
+    },
+    f"{_COMPARE}{DEPENDABOT_PARENT}...{BASE_PARENT}": {"files": [_BASE_FILE]},
+    f"{_COMPARE}{BASE_PARENT}...{DEPENDABOT_PARENT}": {
+        "files": [{"filename": "package-lock.json", "status": "modified", "sha": "c3"}]
+    },
+}
+
+
+class RefreshAsksDependabotToRebase(unittest.TestCase):
+    """A behind Dependabot head is never updated from the base: an extra commit
+    stops Dependabot's own rebases. The refresh asks for a rebase with a
+    comment instead, once per base tip, and holds the PR."""
+
+    REPO = "owner/repo"
+    TIP = "b" * 40
+    COMMENTS = f"repos/{REPO}/issues/{PR_NUMBER}/comments"
+    # The command alone on line one, the marker naming the base tip on line two.
+    BODY = f"@dependabot rebase\n<!-- babysit-dependabot-rebase base={TIP} -->"
+    RECREATE = f"@dependabot recreate\n<!-- babysit-dependabot-rebase base={TIP} -->"
+
+    def _run(
+        self,
+        *,
+        apply: bool = True,
+        head_ref: str = "dependabot/npm_and_yarn/x-1.2.3",
+        author: str = "app/dependabot",
+        comments: list[dict[str, Any]] | None = None,
+        commits: tuple[dict[str, Any], ...] = (DEPENDABOT_COMMIT,),
+        queue: bool = False,
+        mergeable: str = "MERGEABLE",
+        acting: str = "a-maintainer",
+    ) -> dict[str, object]:
+        self.writes: list[list[str]] = []
+        self.leases: list[Any] = []
+        pr = {
+            "state": "OPEN",
+            "author": {"login": author},
+            "headRefName": head_ref,
+            "headRefOid": HEAD,
+            "mergeable": mergeable,
+            "mergeStateStatus": "BEHIND",
+            "baseRefName": "main",
+        }
+
+        def gh_json(args: list[str]) -> Any:
+            if args == ["api", f"repos/{self.REPO}/git/ref/heads/main"]:
+                return {"object": {"sha": self.TIP}}
+            if args[:2] == ["api", f"repos/{self.REPO}/pulls/{PR_NUMBER}"]:
+                return {"auto_merge": None, "labels": []}
+            if args[:2] == ["api", "graphql"]:
+                return {"data": {"viewer": {"login": acting}}}
+            if args[0] == "api" and args[1] in STRAY_MERGE_COMPARES:
+                return STRAY_MERGE_COMPARES[args[1]]
+            self.writes.append(args)
+            return {}
+
+        def paginated(endpoint: str, label: str, **kwargs: Any) -> Any:
+            if endpoint == f"repos/{self.REPO}/pulls/{PR_NUMBER}/commits?per_page=100":
+                return list(commits)
+            self.assertEqual(endpoint, f"{self.COMMENTS}?per_page=100")
+            return comments or []
+
+        pr_state = {
+            "mergeable": "MERGEABLE",
+            "branch_freshness": {"state": "behind"},
+            "mutation_policy": {
+                "head_metadata_complete": True,
+                "branch_write_allowed": True,
+                "base_owner": "owner",
+                "head_owner": "owner",
+            },
+            "human_stop": {},
+            "head_ref_uniqueness": {"checked": True, "unique": True},
+        }
+        opened = (
+            self.REPO,
+            PR_NUMBER,
+            f"{self.REPO}#{PR_NUMBER}",
+            {"pr_states": {}},
+            pr_state,
+            HEAD,
+        )
+        policy = mock.Mock(extra_dependency_manager_logins=frozenset())
+        scope = {"head_metadata_complete": True, "branch_write_allowed": True}
+        with (
+            mock.patch.object(refresh, "begin_guarded_mutation", return_value=opened),
+            mock.patch.object(
+                refresh,
+                "require_worker_lease",
+                side_effect=lambda *a, **k: self.leases.append(a),
+            ),
+            mock.patch.object(refresh, "write_state"),
+            mock.patch.object(
+                refresh.repo_policy, "fallback_from_args", return_value={}
+            ),
+            mock.patch.object(refresh, "view_pr", return_value=pr),
+            mock.patch.object(refresh.repo_policy, "resolve", return_value=policy),
+            mock.patch.object(refresh, "head_repository_scope", return_value=scope),
+            mock.patch.object(refresh, "fetch_current_human_stop", return_value={}),
+            mock.patch.object(
+                refresh,
+                "find_open_prs_for_head_ref",
+                return_value=[f"{self.REPO}#{PR_NUMBER}"],
+            ),
+            mock.patch.object(refresh, "base_requires_merge_queue", return_value=queue),
+            mock.patch.object(refresh, "gh_json", side_effect=gh_json),
+            mock.patch.object(refresh, "fetch_paginated_api", side_effect=paginated),
+        ):
+            return refresh.run_locked(
+                mock.Mock(apply=apply),
+                pathlib.Path("state"),
+                pathlib.Path("state.json"),
+            )
+
+    def test_a_dependabot_head_gets_a_rebase_comment_not_an_update(self) -> None:
+        result = self._run()
+        self.assertEqual(
+            self.writes,
+            [["api", "-X", "POST", self.COMMENTS, "-f", f"body={self.BODY}"]],
+        )
+        self.assertEqual(len(self.leases), 1)
+        self.assertEqual(result["rebase"], "@dependabot rebase")
+        self.assertEqual(result["held"], "dependabot-rebase-requested")
+        self.assertIs(result["eligible"], False)
+
+    def test_a_stray_base_merge_gets_a_recreate(self) -> None:
+        result = self._run(commits=(DEPENDABOT_COMMIT, STRAY_MERGE))
+        self.assertEqual(
+            self.writes,
+            [["api", "-X", "POST", self.COMMENTS, "-f", f"body={self.RECREATE}"]],
+        )
+        self.assertEqual(result["held"], "dependabot-rebase-requested")
+
+    def test_a_real_edit_posts_nothing_and_holds_as_edited(self) -> None:
+        for commit in (FIX_COMMIT, EDITED_MERGE):
+            with self.subTest(commit=commit["sha"]):
+                result = self._run(commits=(DEPENDABOT_COMMIT, commit))
+                self.assertEqual(self.writes, [])
+                self.assertEqual(self.leases, [])
+                self.assertEqual(result["held"], "dependabot-branch-edited")
+
+    def test_the_same_base_tip_is_not_asked_twice(self) -> None:
+        for body in (self.BODY, self.RECREATE):
+            with self.subTest(body=body):
+                result = self._run(
+                    comments=[
+                        {"id": 1, "body": body, "author_association": "COLLABORATOR"}
+                    ],
+                    commits=(DEPENDABOT_COMMIT, STRAY_MERGE),
+                )
+                self.assertEqual(self.writes, [])
+                self.assertEqual(result["rebase"], "none")
+
+    def test_an_outsiders_marker_does_not_suppress_the_request(self) -> None:
+        self._run(comments=[{"id": 1, "body": self.BODY, "author_association": "NONE"}])
+        self.assertEqual(
+            self.writes,
+            [["api", "-X", "POST", self.COMMENTS, "-f", f"body={self.BODY}"]],
+        )
+
+    def test_a_live_human_stop_posts_nothing(self) -> None:
+        with (
+            mock.patch.object(
+                refresh, "human_stop_blocks_automation", side_effect=[False, True]
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "human review stop is active; refusing branch refresh"
+            ),
+        ):
+            self._run()
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.leases, [])
+
+    def test_a_dry_run_posts_nothing(self) -> None:
+        result = self._run(apply=False)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.leases, [])
+        self.assertEqual(result["rebase"], "would-request @dependabot rebase")
+
+    def test_the_lane_apps_own_request_is_not_repeated(self) -> None:
+        # An App identity's comment carries association NONE.
+        own = {
+            "id": 1,
+            "body": self.BODY,
+            "author_association": "NONE",
+            "user": {"login": "agent-lanes[bot]", "type": "Bot"},
+        }
+        result = self._run(comments=[own], acting="agent-lanes[bot]")
+        self.assertEqual(self.writes, [])
+        self.assertEqual(result["rebase"], "none")
+
+    def test_a_conflicting_dependabot_head_is_refused_as_before(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeError, "merge conflict; refusing branch refresh"
+        ):
+            self._run(mergeable="CONFLICTING")
+        self.assertEqual(self.writes, [])
+
+    def test_a_dependabot_head_passes_the_refresh_gates_first(self) -> None:
+        # Asked only where a refresh would run: behind, no merge queue.
+        with self.assertRaisesRegex(RuntimeError, "merge queue"):
+            self._run(queue=True)
+        self.assertEqual(self.writes, [])
+
+    def test_a_non_dependabot_head_is_still_updated(self) -> None:
+        self._run(head_ref="feature/x", author="octocat")
+        [update] = self.writes
+        self.assertIn(f"repos/{self.REPO}/pulls/{PR_NUMBER}/update-branch", update)
+
+
+class RefreshRefusesMergeQueueBases(unittest.TestCase):
+    """A behind head on a merge-queue base is never refreshed, even when GitHub
+    reports BEHIND; an unreadable rules answer refuses too."""
+
+    def _validate(self, queue: bool | None) -> None:
+        repo = "owner/repo"
+        pr = {
+            "state": "OPEN",
+            "author": {"login": "octocat"},
+            "headRefOid": HEAD,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "BEHIND",
+            "baseRefName": "main",
+        }
+        policy = mock.Mock(extra_dependency_manager_logins=frozenset())
+        scope = {"head_metadata_complete": True, "branch_write_allowed": True}
+        with (
+            mock.patch.object(refresh, "view_pr", return_value=pr),
+            mock.patch.object(refresh.repo_policy, "resolve", return_value=policy),
+            mock.patch.object(refresh, "head_repository_scope", return_value=scope),
+            mock.patch.object(refresh, "fetch_current_human_stop", return_value={}),
+            mock.patch.object(
+                refresh,
+                "find_open_prs_for_head_ref",
+                return_value=[f"{repo}#{PR_NUMBER}"],
+            ),
+            mock.patch.object(refresh, "base_requires_merge_queue", return_value=queue),
+            mock.patch.object(refresh, "gh_json", return_value={"labels": []}),
+        ):
+            refresh.validate_current_candidate(
+                repo, PR_NUMBER, HEAD, frozenset({"owner"})
+            )
+
+    def test_queue_base_is_refused(self) -> None:
+        for queue in (True, None):
+            with (
+                self.subTest(queue=queue),
+                self.assertRaisesRegex(RuntimeError, "merge queue"),
+            ):
+                self._validate(queue)
+
+    def test_base_without_queue_passes(self) -> None:
+        self._validate(False)
+
+
+class RefreshRefusesStandardsSyncPrs(unittest.TestCase):
+    """A PR carrying the standards-sync role label is never refreshed: the
+    sync App is its only writer, and a merge commit from the base fails the
+    managed-files guard so the sync cannot re-arm."""
+
+    REPO = "owner/repo"
+
+    def _run(self, labels: list[str], *, apply: bool = True) -> list[list[str]]:
+        self.writes: list[list[str]] = []
+        writes = self.writes
+        pr = {
+            "state": "OPEN",
+            "author": {"login": "melodic-standards-sync[bot]"},
+            "headRefOid": HEAD,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "BEHIND",
+            "baseRefName": "main",
+        }
+        pull = {"auto_merge": None, "labels": [{"name": n} for n in labels]}
+
+        def gh_json(args: list[str]) -> Any:
+            if args[:2] == ["api", f"repos/{self.REPO}/pulls/{PR_NUMBER}"]:
+                return pull
+            writes.append(args)
+            return {"message": "Updating pull request branch."}
+
+        state = {"pr_states": {}}
+        pr_state = {
+            "mergeable": "MERGEABLE",
+            "branch_freshness": {"state": "behind"},
+            "mutation_policy": {
+                "head_metadata_complete": True,
+                "branch_write_allowed": True,
+                "base_owner": "owner",
+                "head_owner": "owner",
+            },
+            "human_stop": {},
+            "head_ref_uniqueness": {"checked": True, "unique": True},
+        }
+        opened = (
+            self.REPO,
+            PR_NUMBER,
+            f"{self.REPO}#{PR_NUMBER}",
+            state,
+            pr_state,
+            HEAD,
+        )
+        policy = mock.Mock(extra_dependency_manager_logins=frozenset())
+        scope = {"head_metadata_complete": True, "branch_write_allowed": True}
+        args = mock.Mock(apply=apply)
+        with (
+            mock.patch.object(refresh, "begin_guarded_mutation", return_value=opened),
+            mock.patch.object(refresh, "require_worker_lease"),
+            mock.patch.object(refresh, "write_state"),
+            mock.patch.object(
+                refresh.repo_policy, "fallback_from_args", return_value={}
+            ),
+            mock.patch.object(refresh, "view_pr", return_value=pr),
+            mock.patch.object(refresh.repo_policy, "resolve", return_value=policy),
+            mock.patch.object(refresh, "head_repository_scope", return_value=scope),
+            mock.patch.object(refresh, "fetch_current_human_stop", return_value={}),
+            mock.patch.object(
+                refresh,
+                "find_open_prs_for_head_ref",
+                return_value=[f"{self.REPO}#{PR_NUMBER}"],
+            ),
+            mock.patch.object(refresh, "base_requires_merge_queue", return_value=False),
+            mock.patch.object(refresh, "gh_json", side_effect=gh_json),
+        ):
+            refresh.run_locked(args, pathlib.Path("state"), pathlib.Path("state.json"))
+        return writes
+
+    def test_a_standards_sync_pr_is_refused_and_never_updated(self) -> None:
+        for label in ("standards-sync", "Standards-Sync"):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    RuntimeError, "standards-sync.*refusing branch refresh"
+                ):
+                    self._run([label])
+                self.assertEqual(self.writes, [])
+
+    def test_an_unlabeled_pr_is_still_updated(self) -> None:
+        [update] = self._run(["enhancement"])
+        self.assertIn(f"repos/{self.REPO}/pulls/{PR_NUMBER}/update-branch", update)
+
+    def test_a_remapped_label_is_the_one_refused(self) -> None:
+        def read(owner: str, name: str, **kwargs: Any) -> str:
+            if kwargs.get("role") == "standards-sync":
+                return "sync-managed"
+            return "needs-human"
+
+        with mock.patch.object(postmerge, "_role_label", side_effect=read):
+            with self.assertRaisesRegex(RuntimeError, "'sync-managed'"):
+                self._run(["sync-managed"])
+            self.assertEqual(self.writes, [])
+            self.assertEqual(len(self._run(["standards-sync"])), 1)
+
+    def test_an_unreadable_label_config_refuses(self) -> None:
+        failed = postmerge.PostMergeReadError("tracker: HTTP 502")
+        with (
+            mock.patch.object(postmerge, "_role_label", side_effect=failed),
+            self.assertRaisesRegex(RuntimeError, "unreadable.*refusing branch refresh"),
+        ):
+            self._run([])
+        self.assertEqual(self.writes, [])
+
+    def test_the_bundled_default_is_standards_sync(self) -> None:
+        # No tracker config (404): the real resolver falls back to the default.
+        missing = subprocess.CompletedProcess([], 1, "", "gh: Not Found (HTTP 404)")
+        with (
+            mock.patch.object(postmerge, "_role_label", REAL_ROLE_LABEL),
+            mock.patch.object(postmerge, "gh_capture", return_value=missing),
+        ):
+            self.assertEqual(
+                postmerge.standards_sync_label("owner", "repo"), "standards-sync"
+            )
+
+
 class RepoPolicyReachesTheGate(unittest.TestCase):
     """`main` reads the target repository's policy; the flags are the fallback."""
 
@@ -1941,6 +2462,227 @@ class RepoPolicyReachesTheGate(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("squash", result["error"])
         method.assert_not_called()
+
+
+class MainReviewInputTests(unittest.TestCase):
+    """What the gate hands bind() for the main-run reviews: nothing, with no
+    read, unless the pull request changes a lane source; then each lane's
+    exact artifact name for the head's tree and the context bind() checks."""
+
+    def reviews(self, changed: list[str]) -> tuple[Any, Any, list[Any]]:
+        calls: list[Any] = []
+
+        def collect(repo, names, workflow, branch, env):
+            calls.append((repo, names, workflow, branch))
+            return [{"lane": "claude-review"}]
+
+        tree = "e" * 40
+        with (
+            mock.patch.object(merge, "repository_default_branch", return_value="main"),
+            mock.patch.object(
+                merge, "gh_json", return_value={"tree": {"sha": tree}}
+            ) as read,
+            mock.patch.object(merge, "collect_main_reviews", side_effect=collect),
+            mock.patch.object(merge, "_force_pushed_heads", return_value=["b" * 40]),
+            mock.patch.object(
+                merge,
+                "collect_main_review_counts",
+                side_effect=lambda repo, shas, names, env: (
+                    calls.append(("critical-counts", dict(shas), names))
+                    or {
+                        HEAD: {
+                            "claude-review": [(2, 0), ("stop", "too-large")],
+                            "claude-security-review": [(1, 0), None],
+                        },
+                        "b" * 40: {
+                            "claude-security-review": [(3, 1), ("stop", "binary")],
+                        },
+                    }
+                ),
+            ),
+        ):
+            reviews, context = merge._main_reviews(
+                "owner/repo",
+                5,
+                HEAD,
+                changed,
+                None,
+                None,
+                None,
+                [HEAD],
+                floor=merge.babysit_risk.floor_for(),
+            )
+        calls.extend(read.call_args_list)
+        return reviews, context, calls
+
+    def test_no_lane_source_reads_nothing(self) -> None:
+        self.assertEqual(self.reviews(["app.py"]), (None, None, []))
+
+    def test_a_lane_source_collects_by_the_heads_tree(self) -> None:
+        reviews, context, calls = self.reviews(["app.py", ".github/workflows/x.yml"])
+        tree = "e" * 40
+        self.assertEqual(reviews, [{"lane": "claude-review"}])
+        self.assertEqual(
+            context,
+            {
+                "repo": "owner/repo",
+                "pr": 5,
+                "tree": tree,
+                "branch": "main",
+                # An unreadable title counts one CRITICAL, and only readable
+                # counts on this head can match a verdict.
+                "carried_critical": {"claude-review": 0, "claude-security-review": 1},
+                "head_records": {
+                    "claude-review": [[2, 0]],
+                    "claude-security-review": [[1, 0]],
+                },
+                # A designed stop on this head, never one on another head.
+                "head_stops": {
+                    "claude-review": ["too-large"],
+                    "claude-security-review": [],
+                },
+            },
+        )
+        # The security lane on every head of the pull request, force-pushed
+        # ones included; the code lane on the head alone, the only records
+        # its binding reads.
+        self.assertEqual(
+            calls[1],
+            (
+                "critical-counts",
+                {
+                    "claude-review": [HEAD],
+                    "claude-security-review": [HEAD, HEAD, "b" * 40],
+                },
+                {
+                    "claude-review": "pr-review-main: claude-review",
+                    "claude-security-review": "pr-review-main: claude-security-review",
+                },
+            ),
+        )
+        self.assertEqual(
+            calls[0],
+            (
+                "owner/repo",
+                {
+                    "claude-review": f"pr-review-main-claude-review-5-{tree}",
+                    "claude-security-review": f"pr-review-main-claude-security-review-5-{tree}",
+                },
+                ".github/workflows/pr-review-main.yml",
+                "main",
+            ),
+        )
+
+
+class LaneRunsReadTests(unittest.TestCase):
+    """`_lane_evidence` lists a lane's pull_request runs only when `bind()`
+    can read them: a lane-source pull request binds the code lane on a
+    main-run review alone, so only the security lane's runs are listed (its
+    carried blocking count reads them)."""
+
+    def lanes_listed(self, changed: list[str]) -> list[Any]:
+        listed: list[Any] = []
+        pr = {
+            "head": {"ref": "feat", "sha": HEAD},
+            "base": {"sha": "b" * 40},
+            "user": {"login": "someone"},
+            "commits": 0,
+        }
+        with (
+            mock.patch.object(merge, "fetch_paginated_api", return_value=[]),
+            mock.patch.object(merge, "fetch_review_threads", return_value=[]),
+            mock.patch.object(
+                merge,
+                "collect_lane_runs",
+                side_effect=lambda repo, number, ref, lanes, *rest: (
+                    listed.extend(lanes) or []
+                ),
+            ),
+            mock.patch.object(merge, "_main_reviews", return_value=(None, None)),
+        ):
+            merge._lane_evidence(
+                "owner/repo",
+                5,
+                pr,
+                "agent",
+                frozenset(),
+                lambda login: "write",
+                changed,
+                merge.babysit_risk.floor_for(),
+            )
+        return listed
+
+    def test_a_lane_source_lists_only_the_security_lanes_runs(self) -> None:
+        self.assertEqual(
+            self.lanes_listed(["app.py", "AGENTS.md"]),
+            [merge.review_evidence.LANES["claude-security-review"]],
+        )
+
+    def test_any_other_pull_request_lists_every_lane(self) -> None:
+        self.assertEqual(
+            self.lanes_listed(["app.py"]),
+            list(merge.review_evidence.LANES.values()),
+        )
+
+
+class ForcePushedHeadsTests(unittest.TestCase):
+    """The heads force pushes replaced, whose recorded review counts still
+    hold, read across pages; a listing that is not whole raises."""
+
+    @staticmethod
+    def page(total: int, oids: list[Any], cursor: str | None = None) -> dict:
+        nodes = [
+            {"beforeCommit": None if oid is None else {"oid": oid}} for oid in oids
+        ]
+        info = {"hasNextPage": cursor is not None, "endCursor": cursor}
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "timelineItems": {
+                            "totalCount": total,
+                            "pageInfo": info,
+                            "nodes": nodes,
+                        }
+                    }
+                }
+            }
+        }
+
+    def heads(self, *pages: dict) -> tuple[list[str], mock.MagicMock]:
+        with mock.patch.object(
+            merge, "gh_json_graphql", side_effect=list(pages)
+        ) as read:
+            return merge._force_pushed_heads("owner/repo", 5), read
+
+    def test_names_each_replaced_head(self) -> None:
+        heads, _ = self.heads(self.page(3, ["a" * 40, None, "b" * 40]))
+        self.assertEqual(heads, ["a" * 40, "b" * 40])
+
+    def test_reads_every_page_by_its_cursor(self) -> None:
+        heads, read = self.heads(
+            self.page(101, ["a" * 40] * 100, cursor="next"),
+            self.page(101, ["b" * 40]),
+        )
+        self.assertEqual(heads, ["a" * 40] * 100 + ["b" * 40])
+        self.assertNotIn("c=next", read.call_args_list[0].args[0])
+        self.assertIn("c=next", read.call_args_list[1].args[0])
+
+    def test_a_count_the_pages_do_not_reach_raises(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self.heads(self.page(101, ["a" * 40]))
+
+    def test_a_next_page_with_no_cursor_raises(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self.heads(self.page(200, ["a" * 40], cursor=""))
+
+    def test_a_listing_past_the_page_cap_raises(self) -> None:
+        pages = [
+            self.page(9999, ["a" * 40], cursor=f"c{i}")
+            for i in range(merge._FORCE_PUSH_PAGES)
+        ]
+        with self.assertRaises(RuntimeError):
+            self.heads(*pages)
 
 
 if __name__ == "__main__":
