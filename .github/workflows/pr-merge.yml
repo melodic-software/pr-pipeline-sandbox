@@ -87,6 +87,13 @@ jobs:
     permissions:
       contents: read # check out main
       pull-requests: read # list the open PRs
+      # The gate's pr-verify verdict reads (artifact listing, run records,
+      # download) and its review-evidence reads, which stay on this token;
+      # the lane token holds no Actions permission.
+      actions: read
+      # The review-evidence reads of the lane runs' check-run annotations,
+      # on the same token.
+      checks: read
       id-token: write # prove to the token broker which workflow this is
     outputs:
       # `true` when the lane is live (not report-only) and either a PR merged
@@ -241,6 +248,15 @@ jobs:
         if: steps.candidates.outcome == 'success'
         env:
           GH_TOKEN: ${{ steps.lane-token.outputs.token }}
+          # The verdict reader's Actions calls and the review-evidence reads
+          # (timeline, comments, lane runs, attempts, jobs, annotations) use
+          # this, as their own GH_TOKEN (babysit_verify_evidence.py,
+          # babysit_merge.py _lane_evidence); every write keeps the lane
+          # token. The job runs main's code alone, never a PR's.
+          BABYSIT_VERIFY_GH_TOKEN: ${{ github.token }}
+          # Name the two tokens' rate-limit readings (babysit_gh.py).
+          API_BUDGET_TOKEN: lanes-app
+          API_BUDGET_OVERRIDE_TOKEN: github-token
           REPO: ${{ github.repository }}
           OWNER: ${{ github.repository_owner }}
           SCRIPT: ${{ steps.config.outputs.script }}
