@@ -543,10 +543,18 @@ lanes:
 # The version 1 activities' max-turns, as profiles (schema version 2).
 models:
   profiles:
-    standard: {model: default, max-turns: 75}
-    turns-10: {model: default, max-turns: 10}
-    turns-6: {model: default, max-turns: 6}
-    turns-5: {model: default, max-turns: 5}
+    standard:
+      model: default
+      max-turns: 75
+    turns-10:
+      model: default
+      max-turns: 10
+    turns-6:
+      model: default
+      max-turns: 6
+    turns-5:
+      model: default
+      max-turns: 5
     # main's fix-ci profile: a worker on code at the verifier's effort, from
     # the multi-agent role map.
     code-fix:

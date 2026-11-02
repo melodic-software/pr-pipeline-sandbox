@@ -1,11 +1,5 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/plugins/source-control/schemas/source-control.schema.json
 # Team layer of the source-control plugin's settings. Keys, values and resolution:
 # https://github.com/melodic-software/claude-code-plugins/blob/main/plugins/source-control/reference/config-resolution.md
-#
-# .claude/source-control.md carries the same two values and stays until this repository's vendored
-# merge gate (plugins/source-control/skills/babysit-prs/scripts/babysit_merge_policy.py
-# read_config_at) is synced to read this file: today it reads babysit_loop_merge only from the
-# legacy file, so deleting it would turn the pr-merge lane's rung off. Change both files while both
-# exist.
 babysit_loop_merge: c2-mechanical
 subject_pattern: '^((build|chore|ci|docs|feat|fix|perf|refactor|revert|security|style|test)(\(.+\))?!?: .+|Merge .+|Revert ".+)'

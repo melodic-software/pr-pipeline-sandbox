@@ -5,14 +5,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import quote
 
+import babysit_dependabot as dependabot
+import babysit_postmerge as postmerge
+import babysit_repo_config as repo_policy
+from babysit_classify import is_dependency_author
 from babysit_delta import compute_branch_freshness, head_repository_scope
 from babysit_feedback import fetch_current_human_stop, human_stop_blocks_automation
 from babysit_gh import (
+    base_requires_merge_queue,
+    fetch_paginated_api,
     find_open_prs_for_head_ref,
     gh_json,
     run_gh,
@@ -48,12 +57,40 @@ def allowed_owners_from_policy(policy: dict[str, Any]) -> frozenset[str]:
     return frozenset(owner for owner in owners if owner)
 
 
+class DependabotHead(RuntimeError):
+    """The PR's head is Dependabot's own branch: it is never updated from the
+    base, and its rebase is asked for instead (`request_dependabot_rebase`)."""
+
+    def __init__(self, pr: dict[str, Any]) -> None:
+        super().__init__(
+            "PR head is a Dependabot branch; refusing branch refresh (an extra "
+            "commit stops its own rebases: ask it to rebase instead)"
+        )
+        self.pr = pr
+
+
 def validate_current_candidate(
-    repo: str, number: int, expected_head_sha: str, allowed_owners: frozenset[str]
+    repo: str,
+    number: int,
+    expected_head_sha: str,
+    allowed_owners: frozenset[str],
+    fallback: Mapping[str, str | None] | None = None,
 ) -> dict[str, Any]:
     current = view_pr(repo, number)
     if str(current.get("state") or "").upper() != "OPEN":
         raise RuntimeError("PR is no longer open")
+    author = str(json_object(current.get("author")).get("login") or "")
+    # A Dependabot head passes every gate a refresh does, then is asked to
+    # rebase instead of being updated.
+    dependabot_head = dependabot.is_dependabot_head(current.get("headRefName"), author)
+    # The same repository policy the merge gate resolves; an unreadable one raises.
+    extra = repo_policy.resolve(repo, fallback or {}).extra_dependency_manager_logins
+    if not dependabot_head and is_dependency_author(author, extra):
+        raise RuntimeError(
+            f"PR is authored by dependency manager {author}; refusing branch refresh "
+            "(an extra commit stops its own rebases: ask it to rebase instead)"
+        )
+    refuse_standards_sync(repo, number)
     current_policy = head_repository_scope(current, allowed_owners)
     if (
         not current_policy["head_metadata_complete"]
@@ -66,6 +103,14 @@ def validate_current_candidate(
         raise RuntimeError("PR has a merge conflict; refusing branch refresh")
     if compute_branch_freshness(current)["state"] != "behind":
         raise RuntimeError("PR is no longer behind its base branch")
+    # Read live even when GitHub reports BEHIND; an unreadable answer (None) refuses.
+    if (
+        base_requires_merge_queue(repo, str(current.get("baseRefName") or ""))
+        is not False
+    ):
+        raise RuntimeError(
+            "base uses a merge queue or its rules are unreadable; refusing branch refresh"
+        )
     if human_stop_blocks_automation(fetch_current_human_stop(repo, number, current)):
         raise RuntimeError("human review stop is active; refusing branch refresh")
     matching_prs = find_open_prs_for_head_ref(current)
@@ -73,7 +118,23 @@ def validate_current_candidate(
         raise RuntimeError(
             "head branch is shared or its uniqueness could not be verified"
         )
+    if dependabot_head:
+        raise DependabotHead(current)
     return current
+
+
+def refuse_standards_sync(repo: str, number: int) -> None:
+    """Refuse a PR carrying the standards-sync role label: a merge commit from
+    the base fails its managed-files guard, so the sync cannot re-arm. An
+    unreadable label refuses too."""
+    owner, name = repo.split("/", 1)
+    pull = json_object(gh_json(["api", f"repos/{repo}/pulls/{number}"]))
+    try:
+        skip = postmerge.standards_sync_skip(owner, name, pull.get("labels"))
+    except postmerge.PostMergeReadError as exc:
+        skip = f"the standards-sync role label is unreadable ({exc})"
+    if skip:
+        raise RuntimeError(f"{skip}; refusing branch refresh")
 
 
 def disarm_auto_merge(repo: str, number: int) -> None:
@@ -115,6 +176,7 @@ def run_locked(
     if not uniqueness.get("checked") or not uniqueness.get("unique"):
         raise RuntimeError("snapshot does not prove that the head branch is unique")
     allowed_owners = allowed_owners_from_policy(snapshot_policy)
+    fallback = repo_policy.fallback_from_args(args)
 
     prior = json_object(pr_state.get("branch_refresh"))
     ledger = cast(dict[str, Any], state.setdefault("mutation_ledger", {}))
@@ -126,7 +188,14 @@ def run_locked(
     if prior.get("requested_source_sha") == expected_head_sha:
         raise RuntimeError("a refresh was already requested for this source SHA")
 
-    validate_current_candidate(repo, number, expected_head_sha, allowed_owners)
+    try:
+        validate_current_candidate(
+            repo, number, expected_head_sha, allowed_owners, fallback
+        )
+    except DependabotHead as head:
+        return request_dependabot_rebase(
+            args, state_dir, repo, number, key, expected_head_sha, head.pr
+        )
 
     result: dict[str, object] = {
         "key": key,
@@ -151,7 +220,9 @@ def run_locked(
     write_state(state_path, state)
 
     try:
-        validate_current_candidate(repo, number, expected_head_sha, allowed_owners)
+        validate_current_candidate(
+            repo, number, expected_head_sha, allowed_owners, fallback
+        )
         require_worker_lease(args, state_dir, repo, number, renew=True)
         disarm_auto_merge(repo, number)
         response = gh_json(
@@ -178,6 +249,88 @@ def run_locked(
     state["updated_at"] = accepted_at
     write_state(state_path, state)
     result.update({"requested": True, **record})
+    return result
+
+
+def acting_login() -> str:
+    """The login the session's gh credentials act as, so an App identity
+    (association NONE) counts its own earlier request; unreadable raises."""
+    try:
+        data = json_object(
+            gh_json(["api", "graphql", "-f", "query=query{viewer{login}}"])
+        )
+        login = json_object(json_object(data.get("data")).get("viewer")).get("login")
+    except RuntimeError:
+        # A session whose proxy refuses GraphQL reads a user token over REST.
+        login = json_object(gh_json(["api", "user"])).get("login")
+    if not isinstance(login, str) or not login:
+        raise RuntimeError(
+            "the acting login is unreadable; refusing the rebase request"
+        )
+    return login
+
+
+def request_dependabot_rebase(
+    args: argparse.Namespace,
+    state_dir: Path,
+    repo: str,
+    number: int,
+    key: str,
+    expected_head_sha: str,
+    current: dict[str, Any],
+) -> dict[str, object]:
+    """Ask Dependabot to rebase (or recreate) its behind head with a comment,
+    never `update-branch`, once per base tip (`dependabot.rebase_request`);
+    `--apply` posts it under the worker lease. The PR is held either way. An
+    unreadable base tip, comment list or commit list raises."""
+    if current.get("headRefOid") != expected_head_sha:
+        raise RuntimeError("PR head changed after the snapshot")
+    base = str(current.get("baseRefName") or "")
+    ref = json_object(
+        gh_json(["api", f"repos/{repo}/git/ref/heads/{quote(base, safe='/')}"])
+    )
+    tip = str(json_object(ref.get("object")).get("sha") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", tip):
+        raise RuntimeError(
+            f"base {base} tip is unreadable; refusing the Dependabot rebase request"
+        )
+    comments = fetch_paginated_api(
+        f"repos/{repo}/issues/{number}/comments?per_page=100", f"#{number} comments"
+    )
+    commits = fetch_paginated_api(
+        f"repos/{repo}/pulls/{number}/commits?per_page=100", f"#{number} commits"
+    )
+    hold, body, why = dependabot.rebase_request(
+        repo,
+        base,
+        tip,
+        comments,
+        commits,
+        lambda ep: gh_json(["api", ep]),
+        identities=(acting_login(),),
+    )
+    result: dict[str, object] = {
+        "key": key,
+        "expected_head_sha": expected_head_sha,
+        "apply": args.apply,
+        "eligible": False,
+        "held": hold,
+        "base_sha": tip,
+        "reason": why,
+    }
+    if body is None:
+        result["rebase"] = "none"
+        return result
+    command = body.split("\n", 1)[0]
+    if not args.apply:
+        result["rebase"] = f"would-request {command}"
+        return result
+    require_worker_lease(args, state_dir, repo, number, renew=True)
+    gh_json(
+        ["api", "-X", "POST", f"repos/{repo}/issues/{number}/comments"]
+        + ["-f", f"body={body}"]
+    )
+    result["rebase"] = command
     return result
 
 
