@@ -100,9 +100,12 @@ activities:
     reads-untrusted: false
   # Case 7a: a write activity that applies to every PR, sent to
   # pr-run-activity-read.yml, must stop with effect-not-read before the head
-  # checkout. Its script never runs.
+  # checkout. Its script never runs there. pr-refine.yml's resolve-probe
+  # dispatch runs it on the write file, resolving the review thread `args`
+  # names (claude-code-plugins#12634); with no args it fails closed.
   check-write-effect:
-    script: scripts/lanes/check-sandbox.sh
+    script: scripts/lanes/probe-resolve-thread.sh
+    args: PRRT_kwDOU7Aifs6zON4J
     effect: mutate-branch
     gating: advisory
     reads-untrusted: false
