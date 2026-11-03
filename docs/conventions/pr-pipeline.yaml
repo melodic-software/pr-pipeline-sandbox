@@ -105,6 +105,7 @@ activities:
   # names (claude-code-plugins#12634); with no args it fails closed.
   check-write-effect:
     script: scripts/lanes/probe-resolve-thread.sh
+    args: PRRT_kwDOU7Aifs6zON4J
     effect: mutate-branch
     gating: advisory
     reads-untrusted: false
