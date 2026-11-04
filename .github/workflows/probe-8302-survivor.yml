@@ -1,0 +1,118 @@
+name: probe-8302-survivor
+
+# Throwaway replica of pr-run-activity-write.yml's skill step: same action pin,
+# env, tool rules and isolation install, on a skill from this branch. It never
+# requests the lanes token. Prints process ids, namespace ids and counts only.
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - .github/workflows/probe-8302-survivor.yml
+      - probe-8302/**
+
+permissions: {}
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        scrub: ["1", ""]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Check out the PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Isolate the runner
+        uses: ./.github/actions/setup-runner-isolation
+        with:
+          install-subprocess-isolation: "true"
+
+      - name: Stage the marketplace and the tool rules
+        id: stage
+        env:
+          MARKETPLACE: ${{ runner.temp }}/base-marketplace
+          SCRATCH: ${{ runner.temp }}/lane-scratch
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          mkdir -p "$MARKETPLACE" "$SCRATCH"
+          cp -R probe-8302/plugins probe-8302/.claude-plugin "$MARKETPLACE/"
+          chmod -R a-w "$MARKETPLACE"
+          skill=survivor-probe:survivor
+          allowed="Skill($skill),Read(/$MARKETPLACE/**),Edit,Write,Agent,Grep,Glob,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,Edit(/$SCRATCH/**)"
+          denied="WebFetch,WebSearch,Edit(/$MARKETPLACE/**),Bash(git *)"
+          for c in echo printf cat head tail grep find env printenv strings od xxd diff sed awk sort cut tr base64 nl tac rev uniq fold column jq xargs more less wc; do
+            denied="$denied,Bash($c *)"
+          done
+          denied="$denied,Read(//proc/**),Read(/$WORKSPACE/.git/**)"
+          prompt="You run unattended as a CI lane activity on a pull request, and no one can answer a question. Run every step the skill instructions name. Your scratchpad directory is $SCRATCH: put every temporary or state file there."
+          {
+            echo "claude-args=--allowedTools \"$allowed\" --disallowedTools \"$denied\" --add-dir \"$SCRATCH\" --append-system-prompt \"$prompt\""
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Host baseline
+        run: |
+          mkdir -p .probe8302
+          bash probe-8302/plugins/survivor-probe/skills/survivor/scripts/check.sh host-before
+
+      # Control: a process a plain step leaves behind, read by every later check.
+      - name: Start the plain-step control process
+        run: nohup sleep 86404 >/dev/null 2>&1 </dev/null &
+
+      - name: Run the skill activity
+        id: act-skill
+        continue-on-error: true
+        uses: anthropics/claude-code-action@16f9f71ab9c490faf367f94dd294897edc25be33 # v1.0.261
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: ${{ matrix.scrub }}
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+          CLAUDE_BRANCH: ${{ github.head_ref }}
+        with:
+          claude_code_oauth_token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          use_commit_signing: true
+          plugin_marketplaces: ${{ runner.temp }}/base-marketplace
+          plugins: survivor-probe@probe8302
+          prompt: /survivor-probe:survivor
+          claude_args: >-
+            --setting-sources user
+            --permission-mode dontAsk
+            --max-turns 6
+            ${{ steps.stage.outputs.claude-args }}
+
+      - name: Host check right after the skill step
+        if: always()
+        run: bash probe-8302/plugins/survivor-probe/skills/survivor/scripts/check.sh host-t0 0 --self-control
+
+      - name: Read the skill's own lines
+        if: always()
+        env:
+          EXEC: ${{ steps.act-skill.outputs.execution_file || format('{0}/claude-execution-output.json', runner.temp) }}
+          OUTCOME: ${{ steps.act-skill.outcome }}
+        run: |
+          echo "probe8302 skill-step outcome=$OUTCOME"
+          if [ -f "$EXEC" ]; then
+            jq -c '.[] | select(.type == "result") | {subtype, is_error, num_turns, permission_denials}' "$EXEC" || true
+            jq -r '.. | strings' "$EXEC" | grep -E '^probe8302 ' | sort -u || true
+          else
+            echo "probe8302 no-execution-file"
+          fi
+          echo "--- log file written by check.sh"
+          grep -E '^probe8302 (start-call|later-call)' .probe8302/log || true
+
+      - name: Host check 60 s after
+        if: always()
+        run: bash probe-8302/plugins/survivor-probe/skills/survivor/scripts/check.sh host-t60 60
+
+      - name: Host check 180 s after
+        if: always()
+        run: bash probe-8302/plugins/survivor-probe/skills/survivor/scripts/check.sh host-t180 120

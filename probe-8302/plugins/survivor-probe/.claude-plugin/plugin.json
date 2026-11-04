@@ -1,0 +1,5 @@
+{
+  "name": "survivor-probe",
+  "version": "1.0.0",
+  "description": "Throwaway: does a process a skill starts outlive the skill step."
+}

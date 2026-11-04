@@ -1,0 +1,11 @@
+{
+  "name": "probe8302",
+  "owner": { "name": "melodic-software" },
+  "plugins": [
+    {
+      "name": "survivor-probe",
+      "source": "./plugins/survivor-probe",
+      "description": "Throwaway: does a process a skill starts outlive the skill step."
+    }
+  ]
+}
