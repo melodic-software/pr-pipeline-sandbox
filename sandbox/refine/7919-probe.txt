@@ -1,0 +1,1 @@
+Starts fix-marker in the same run as the claude-code-plugins#7919 token scan.
