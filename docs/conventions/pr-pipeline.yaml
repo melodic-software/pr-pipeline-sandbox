@@ -113,7 +113,7 @@ activities:
     # A write skill's Bash runs only base wrappers, so the scan is one.
     skill: sandbox-marker:scan-environ
     verify-scripts:
-      - scripts/lanes/scan-environ.sh
+      - scripts/scan-environ.sh
     effect: mutate-tracker
     gating: advisory
     reads-untrusted: false
