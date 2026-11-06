@@ -402,7 +402,7 @@ function ownerPr(number, { updated = 25, committed = 25, committedDate = hoursAg
 test("a listed bot's PR is adopted with no idle wait, a listed person's waits", () => {
   const RELEASE = 337859524;
   const options = { base: "main", appSenderId: APP, actionsAppId: ACTIONS, checkName: "pr-unblock / fix-ci", holdLabels: ["do-not-merge", "needs-human"], restarts: 1, adoption: { ownerIds: [OWNER, RELEASE], idleHours: 24 }, now: NOW };
-  const bot = { __typename: "Bot", login: "melodic-plugin-release", databaseId: RELEASE };
+  const bot = { __typename: "Bot", login: "melodic-release", databaseId: RELEASE };
   assert.equal(skipReason(ownerPr(1, { updated: 0, committed: 0, author: bot }), options), "");
   assert.equal(skipReason(ownerPr(2, { updated: 0, committed: 0, author: { __typename: "User", login: "kyle-sexton", databaseId: OWNER } }), options), "owner PR or its head commit active in the last 24 hour(s)");
   assert.equal(skipReason(ownerPr(3, { updated: 0, committed: 0, author: { ...bot, databaseId: 4242 } }), options), "not opened by the lanes App or an adoptable owner");
