@@ -3,7 +3,7 @@ name: pr-review-hosted
 # Sandbox caller of the org pr-review-cli reusable, lane `code`, at @main as
 # claude-code-plugins calls it, with its hold inputs. A push by the lanes App
 # bot is reviewed, any other bot's push is skipped. The job id `pr-review`
-# keeps the check `pr-review / claude-review-status`, which ci-status's
+# gives the check `pr-review / review-status`, which ci-status's
 # `Require both review lanes on this head` step reads. No resolve-model job:
 # the review runs on the reusable's default model.
 
