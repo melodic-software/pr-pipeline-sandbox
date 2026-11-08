@@ -31,6 +31,11 @@ SYNCED=(
   .github/scripts/apply-patch
   # The handoff jobs' evidence reader, checked out from the default branch tip.
   .github/scripts/lib/handoff-evidence.sh
+  .github/scripts/lib/admission-comment.mjs
+  .github/scripts/lib/admission-record.mjs
+  .github/scripts/lib/done-evidence.mjs
+  .github/scripts/lib/lane-outcome.mjs
+  .github/scripts/lib/stop-reason.mjs
   .github/scripts/merge-base
   .github/scripts/pr-unblock
   .github/scripts/read-patch
@@ -39,7 +44,13 @@ SYNCED=(
   .github/scripts/intake-triage/admit.mjs
   .github/scripts/maintenance-reconcile-lost-runs/infra-failure.mjs
   .github/scripts/pr-merge/merge-holds.mjs
+  .github/scripts/pr-merge/refire-refused.mjs
+  .github/scripts/pr-review-main/write-verdict.mjs
   .github/scripts/pr-verify/write-verdict.mjs
+  .github/scripts/recurring-schedule/file-due.mjs
+  .github/recurring-schedule.json
+  plugins/work-items/scripts/charge-words.json
+  lib/test-tmp.mjs
   .github/standards/dependabot-policy
   .github/standards/github-actions-conventions
   .github/standards/runner-policy
@@ -88,6 +99,11 @@ ADAPTED=(
   # The synced dispatch job plus claude-code-plugins#9361's rerun-ci-status
   # job, ahead of the next full resync.
   .github/workflows/pr-feedback-dispatch.yml
+  # The label-admission writer: this sandbox's work-resolve-issue.yml starts on
+  # the agent-ready label and its config has no models.issue-status, so main's
+  # admission anchor (a record or a Work status field set) finds nothing.
+  .github/scripts/work-resolve-issue/write-issue.mjs
+  .github/scripts/work-resolve-issue/write-issue.test.mjs
   # The sandbox's own scan-carrier key pair: one per repository, never shared.
   # Until the owner runs keygen here it is the placeholder line, so seal fails
   # closed.

@@ -10,46 +10,69 @@
 // It posts only for an open pull request whose current head is the one the
 // FAIL judged, and only the comments not on it yet: a verifier note at that
 // head on the same file is that comment, so a re-run after a partial post
-// posts the rest and nothing twice. On a pull request the lanes App did not open (an
-// adopted one, `merge.verify-authors: lane-or-owner`) no round starts, and the
-// notes tell its author why the pr-merge lane refuses it. Each note that starts with a path the pull
+// posts the rest and nothing twice. A note whose thread is resolved does not
+// count: a pass that superseded an earlier FAIL at the head resolved it, so a
+// later FAIL there posts again and its round has an open thread to work. Each note that starts with a path the pull
 // request changes (`path` or `path:line`, backticks allowed) goes on that
 // file; the summary and every other note go on the first such file, or on the
 // pull request's first changed file when no note names one. Model text is
-// quoted as data in a text fence, never interpolated into a command.
+// quoted as data in a text fence, wrapped to fit the page (quote), never
+// interpolated into a command.
 //
-// Environment: GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_OUTPUT, ARTIFACT_NAME
-// (pr-verify-<pr>-<sha>-fail, then the head-ref digest write-verdict.mjs
-// adds, absent on an older verdict, then optionally `-i` and the verdict's
-// issue numbers) and
-// VERDICT_FILE (its verdict.json). Writes pr-number and head-sha outputs once
-// the notes are on the pull request, posted now or by an earlier run.
+// On a pull request the lanes App did not open, a person's, the FAIL is no
+// review thread: GitHub lets only its author or a writer resolve one, which
+// the lanes App is not, and every conversation must be resolved to merge.
+// Instead the summary and notes go in one PR comment, the marker its first
+// line, updated in place on a later FAIL, and the PR gets the
+// pr-verify-failed label, which ci-status holds in the merge queue. ci-status
+// reads that label once per merge group, so a PR already queued past that read
+// would still merge: one in the queue is dequeued too. This job's GITHUB_TOKEN
+// is refused that mutation, so a refused read or dequeue warns and the label
+// stays the hold (address-feedback.mjs leaveQueueOnHold). No round starts. A
+// PASS or PASS-NOTES at its head removes the label.
+//
+// A FAIL write-verdict.mjs recorded as withheld also holds the pull request
+// for a person (holdForCredential), in any state and at any head, apart from
+// the rest: a failure there still posts the notes, then fails the job.
+//
+// On a lanes App pull request a PASS or PASS-NOTES posts nothing and resolves
+// nothing. For an open pull request still at the head it judged, it names
+// that head in the pass-head-sha output when a fail-note thread is still open
+// (address-feedback.mjs staleVerifyNotes, the passing head's own included);
+// the dispatch job then sends pr-unblock.yml, whose publish-feedback job
+// resolves those from an earlier head as the lanes App, and those at the
+// passing head only when the dispatch job's verifier read found the FAIL there
+// superseded. Resolving a thread takes more than this job's token holds.
+//
+// Environment: GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_OUTPUT, APP_SENDER_ID
+// (the lanes App's bot user id), ARTIFACT_NAME
+// (pr-verify-<pr>-<sha>-<pass|pass-notes|fail>, then the head-ref digest
+// write-verdict.mjs adds, absent on an older verdict, then on a FAIL
+// optionally `-i` and the verdict's issue numbers: write-verdict.mjs NAME) and
+// VERDICT_FILE (its verdict.json). For a FAIL, writes pr-number and head-sha
+// outputs once the notes are on a lanes App pull request, posted now or by an
+// earlier run; for a pass, pass-head-sha as above.
 
 import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-import { headRefDigest } from "../pr-verify/write-verdict.mjs";
-import { createGitHubApi, MARKER_AUTHOR_ID, need, VERIFY_NOTE_MARKER } from "./address-feedback.mjs";
+import { rateLimitLatch } from "../../actions/log-api-budget/rate-guard.mjs";
+import { personReasonLines } from "../lib/stop-reason.mjs";
+import { headRefDigest, isVerdictName, NAME } from "../pr-verify/write-verdict.mjs";
+import { createGitHubApi, humanGatedLabelFrom, leaveQueueOnHold, MARKER_AUTHOR_ID, need, quote, staleVerifyNotes, VERIFY_NOTE_MARKER } from "./address-feedback.mjs";
 
-// The name may end with `-i` and the issue numbers the verdict records,
-// ascending, each once, joined by dots (babysit_verify_evidence.NAME_RE);
-// `isFailName` checks the order.
-export const FAIL_NAME = /^pr-verify-([1-9][0-9]{0,9})-([0-9a-f]{40})-fail(?:-([0-9a-f]{16}))?(?:-i([1-9][0-9]{0,9}(?:\.[1-9][0-9]{0,9}){0,9}))?$/;
-const ascending = (named) => {
-  const numbers = named?.split(".").map(Number) ?? [];
-  return numbers.every((n, i) => i === 0 || numbers[i - 1] < n);
-};
-// The longest name FAIL_NAME allows (babysit_verify_evidence.NAME_MAX).
-export const NAME_MAX = 194;
-export const isFailName = (name) => {
-  const match = String(name).length <= NAME_MAX ? FAIL_NAME.exec(String(name)) : null;
-  return match !== null && ascending(match[4]);
-};
-// GitHub refuses a comment body over 65536 characters; leave room for the
-// framing (judgment).
-const BODY_MAX = 60000;
+// The label that holds a person's pull request after a FAIL (ci-status's
+// merge-queue label step reads the same name).
+export const FAILED_LABEL = "pr-verify-failed";
 
 const firstLine = (body) => String(body ?? "").split("\n")[0].replace(/\r$/, "");
+
+function laneAppId(appId) {
+  if (!Number.isSafeInteger(appId) || appId < 1) {
+    throw new Error("APP_SENDER_ID must name the lanes App's bot user id");
+  }
+  return appId;
+}
 
 // The changed path a note starts with, or null.
 export function notePath(note, files) {
@@ -59,13 +82,6 @@ export function notePath(note, files) {
     .replace(/[`'")\]*.,;:]+$/, "")
     .replace(/:[0-9]+(-[0-9]+)?$/, "");
   return files.includes(path) ? path : null;
-}
-
-// One fenced quote, with no fence inside it and no control character.
-function quote(lines) {
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are what it removes
-  const text = lines.join("\n").replace(/\r\n/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "?").replaceAll("```", "'''");
-  return ["```text", text.length > BODY_MAX ? `${text.slice(0, BODY_MAX)} [cut]` : text, "```"].join("\n");
 }
 
 // The comments to post, each { path, body }, in the pull request's file order.
@@ -94,6 +110,108 @@ export function noteComments({ head, summary, notes, files }) {
   });
 }
 
+// The one PR comment a person's pull request gets for a FAIL.
+export function failComment({ head, summary, notes }) {
+  return [
+    VERIFY_NOTE_MARKER,
+    `The pr-verify verifier failed head \`${head}\`. What it wrote, as data:`,
+    "",
+    quote([`Summary: ${summary}`, ...notes.map((note) => `- ${note}`)]),
+    "",
+    `This pull request leaves the merge queue, and ci-status holds it out while it carries \`${FAILED_LABEL}\`. A pr-verify pass removes the label, at a new commit or at this same head: once a trusted person edits the body, and only trusted people have edited it since the fail, this head is judged again, so a fail on the body or the issues it links needs only the body fixed, no new commit.`,
+  ].join("\n");
+}
+
+// The labels come from the pull request read the job already made, when it
+// carries them, so the check costs no call of its own.
+const hasLabel = async (api, pull, pr, name = FAILED_LABEL) => (Array.isArray(pull?.labels) ? pull.labels : await api.listLabels(pr)).some((label) => label.name === name);
+
+// Runs every step, so one failure leaves the others done, then throws the first.
+async function everyStep(log, steps) {
+  const failures = [];
+  for (const step of steps) {
+    try {
+      await step();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  for (const error of failures.slice(1)) {
+    log(`::error::${error.message}`);
+  }
+  if (failures.length > 0) {
+    throw failures[0];
+  }
+}
+
+// Called after the label, so a re-queue meets ci-status's label read.
+async function leaveQueue({ api, pr, log }) {
+  const entry = await api.readQueueEntry(pr);
+  if (!entry.queued) {
+    return;
+  }
+  try {
+    await api.dequeuePull(entry.id);
+  } catch (error) {
+    log(`::error::#${pr}: could not dequeue it (${error.message}); its queued merge was not stopped`);
+    throw error;
+  }
+  log(`#${pr}: dequeued from the merge queue`);
+}
+
+// A withheld fail may mean a live credential in the pull request's commits,
+// which a later clean commit does not rotate: it holds for a person, at
+// whatever head the pull request has moved to. The label goes on in any state,
+// so a closed pull request that reopens is still held; only an open one has a
+// queue step. The label is the hold, so it goes first; the comment, whose first line gate-source.mjs CREDENTIAL_HOLD reads,
+// keeps the clear paths off that label. It posts once per head whatever else
+// the label stands for, and names no text.
+async function holdForCredential({ api, pull, verdict: { pr, head }, humanGatedLabel, log }) {
+  await everyStep(log, [
+    async () => {
+      const label = humanGatedLabel();
+      if (!(await hasLabel(api, pull, pr, label))) {
+        await api.addLabels(pr, [label]);
+      }
+    },
+    async () => {
+      const reason = personReasonLines("pr-verify", "security");
+      const said = `pr-verify withheld its fail at head \`${head}\``;
+      const posted = (await api.listIssueComments(pr)).some((comment) => comment.user?.id === MARKER_AUTHOR_ID && firstLine(comment.body) === reason[0] && comment.body.includes(said));
+      if (!posted) {
+        await api.createIssueComment(
+          pr,
+          [...reason, "", `${said}: its text was shaped like a credential, or its step stopped on the credential scan. Check this pull request's commits for a credential and rotate any that is real; removing it from the head does not. A person removing the human-gated label lifts this hold.`].join("\n"),
+        );
+      }
+    },
+    async () => {
+      if (pull.state === "open") {
+        await leaveQueue({ api, pr, log });
+      }
+    },
+  ]);
+  log(`#${pr}: withheld fail at ${head}; held for a person`);
+}
+
+// A person's pull request at the FAIL's head: its fail comment, then the label.
+async function holdPersonPull({ api, pull, verdict, log }) {
+  const { pr, head } = verdict;
+  const body = failComment(verdict);
+  const mine = (await api.listIssueComments(pr)).filter((comment) => comment.user?.id === MARKER_AUTHOR_ID && firstLine(comment.body) === VERIFY_NOTE_MARKER);
+  const last = mine.at(-1);
+  if (last === undefined) {
+    await api.createIssueComment(pr, body);
+  } else if (last.body !== body) {
+    await api.updateIssueComment(last.id, body);
+  }
+  if (!(await hasLabel(api, pull, pr))) {
+    await api.addLabels(pr, [FAILED_LABEL]);
+  }
+  await leaveQueueOnHold({ readQueueEntry: (n) => api.readQueueEntry(n), dequeuePull: (id) => api.dequeuePull(id), pr, label: FAILED_LABEL, log });
+  log(`#${pr}: a person's pull request; the fail at ${head} is in its fail comment and the ${FAILED_LABEL} label holds it`);
+}
+
 // Whether the dot-joined numbers a name carries are the issues the verdict
 // records, as sets.
 const sameIssues = (named, recorded) => {
@@ -104,36 +222,95 @@ const sameIssues = (named, recorded) => {
 };
 
 export function readVerdict(name, text) {
-  const match = FAIL_NAME.exec(name ?? "");
-  if (!match || !isFailName(name)) {
-    throw new Error("the artifact name is not a pr-verify fail verdict");
+  const match = NAME.exec(name ?? "");
+  if (!match || !isVerdictName(name)) {
+    throw new Error("the artifact name is not a pr-verify verdict");
   }
+  const [, pr, head, kind, issues] = match;
+  const digest = /^-([0-9a-f]{16})/.exec(name.slice(`pr-verify-${pr}-${head}-${kind}`.length))?.[1];
   const verdict = JSON.parse(text);
   if (
-    verdict?.verdict !== "fail" ||
-    verdict.pr !== Number(match[1]) ||
-    verdict.head_sha !== match[2] ||
-    (match[3] !== undefined && headRefDigest(verdict.head_ref) !== match[3]) ||
-    (match[4] !== undefined && !sameIssues(match[4], verdict.linked_issues)) ||
-    typeof verdict.summary !== "string" ||
-    !Array.isArray(verdict.notes) ||
-    !verdict.notes.every((note) => typeof note === "string")
+    verdict?.verdict !== kind ||
+    verdict.pr !== Number(pr) ||
+    verdict.head_sha !== head ||
+    (digest !== undefined && headRefDigest(verdict.head_ref) !== digest) ||
+    (issues !== undefined && !sameIssues(issues, verdict.linked_issues)) ||
+    ![undefined, true].includes(verdict.withheld)
   ) {
+    throw new Error("the verdict file does not record the verdict its name names");
+  }
+  if (kind !== "fail") {
+    return { pr: verdict.pr, head: verdict.head_sha, verdict: kind };
+  }
+  if (typeof verdict.summary !== "string" || !Array.isArray(verdict.notes) || !verdict.notes.every((note) => typeof note === "string")) {
     throw new Error("the verdict file does not record the fail its name names");
   }
-  return { pr: verdict.pr, head: verdict.head_sha, summary: verdict.summary, notes: verdict.notes };
+  return { pr: verdict.pr, head: verdict.head_sha, verdict: kind, summary: verdict.summary, notes: verdict.notes, withheld: verdict.withheld === true };
 }
 
-export async function postNotes({ api, verdict, log }) {
+// For a pass: whether a lanes App pull request is open at the head it judged
+// and holds an open fail-note thread, which only reads; whether one at that
+// head may be resolved is the dispatch job's verifier read. A person's pull
+// request there loses the label instead.
+export async function findStaleNotes({ api, verdict, appId, log }) {
   const { pr, head } = verdict;
+  laneAppId(appId);
   const pull = await api.getPull(pr);
   if (pull.state !== "open" || pull.head?.sha !== head) {
     log(`skip: #${pr} is not open at head ${head}`);
     return false;
   }
+  if (pull.user?.id !== appId) {
+    if (await hasLabel(api, pull, pr)) {
+      await api.removeLabel(pr, FAILED_LABEL);
+      log(`#${pr}: the ${verdict.verdict} at ${head} removed ${FAILED_LABEL}`);
+    }
+    return false;
+  }
+  // A fail note is a review comment, so a pull request the read counts none
+  // on holds no fail-note thread; a read without the count lists the threads.
+  if (pull.review_comments === 0) {
+    log(`#${pr}: no review comment, so no open fail-note thread the ${verdict.verdict} at ${head} may supersede`);
+    return false;
+  }
+  const open = staleVerifyNotes(await api.listThreads(pr), head, { supersededHead: head });
+  log(`#${pr}: ${open.length} open fail-note thread(s) the ${verdict.verdict} at ${head} may supersede`);
+  return open.length > 0;
+}
+
+// For a fail: whether its notes are on a lanes App pull request, so a round
+// starts. A person's pull request gets its fail comment and label instead.
+// `humanGatedLabel` reads the label's name, and only the credential hold calls
+// it, so a config it cannot read stops no other fail.
+export async function postNotes({ api, verdict, appId, humanGatedLabel = () => "needs-human", log }) {
+  laneAppId(appId);
+  const pull = await api.getPull(verdict.pr);
+  let posted = false;
+  await everyStep(log, [
+    ...(verdict.withheld ? [() => holdForCredential({ api, pull, verdict, humanGatedLabel, log })] : []),
+    async () => {
+      posted = await postAtHead({ api, pull, verdict, appId, log });
+    },
+  ]);
+  return posted;
+}
+
+async function postAtHead({ api, pull, verdict, appId, log }) {
+  const { pr, head } = verdict;
+  if (pull.state !== "open" || pull.head?.sha !== head) {
+    log(`skip: #${pr} is not open at head ${head}`);
+    return false;
+  }
+  if (pull.user?.id !== appId) {
+    await holdPersonPull({ api, pull, verdict, log });
+    return false;
+  }
+  // A note in a resolved thread is not posted: a pass that superseded an
+  // earlier FAIL at this head resolved it, and this FAIL needs an open thread.
+  const resolved = new Set((await api.listThreads(pr)).filter((thread) => thread.isResolved === true).flatMap((thread) => (thread.comments?.nodes ?? []).map((comment) => comment.databaseId)));
   const posted = new Set(
     (await api.listReviewComments(pr))
-      .filter((comment) => comment.user?.id === MARKER_AUTHOR_ID && comment.commit_id === head && firstLine(comment.body) === VERIFY_NOTE_MARKER)
+      .filter((comment) => comment.user?.id === MARKER_AUTHOR_ID && comment.commit_id === head && firstLine(comment.body) === VERIFY_NOTE_MARKER && !resolved.has(comment.id))
       .map((comment) => comment.path),
   );
   const files = (await api.listPullFiles(pr)).map((file) => file.filename);
@@ -151,7 +328,8 @@ export async function postNotes({ api, verdict, log }) {
 }
 
 export async function main(env, { api, log = (line) => console.log(line) } = {}) {
-  need(env, ["GITHUB_TOKEN", "GITHUB_REPOSITORY", "GITHUB_OUTPUT", "ARTIFACT_NAME", "VERDICT_FILE"]);
+  need(env, ["GITHUB_TOKEN", "GITHUB_REPOSITORY", "GITHUB_OUTPUT", "APP_SENDER_ID", "ARTIFACT_NAME", "VERDICT_FILE"]);
+  const appId = laneAppId(Number(env.APP_SENDER_ID));
   const verdict = readVerdict(env.ARTIFACT_NAME, readFileSync(env.VERDICT_FILE, "utf8"));
   const client =
     api ??
@@ -160,8 +338,14 @@ export async function main(env, { api, log = (line) => console.log(line) } = {})
       repository: env.GITHUB_REPOSITORY,
       apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
       graphqlUrl: env.GITHUB_GRAPHQL_URL ?? "https://api.github.com/graphql",
+      // Each answer's rate-limit reading, for the job-end api-budget notice.
+      fetch: rateLimitLatch.guard(globalThis.fetch),
     });
-  if (await postNotes({ api: client, verdict, log })) {
+  if (verdict.verdict !== "fail") {
+    if (await findStaleNotes({ api: client, verdict, appId, log })) {
+      appendFileSync(env.GITHUB_OUTPUT, `pass-head-sha=${verdict.head}\n`);
+    }
+  } else if (await postNotes({ api: client, verdict, appId, humanGatedLabel: () => humanGatedLabelFrom(env.TRACKER_CONFIG || ".base/docs/conventions/work-items.yaml"), log })) {
     appendFileSync(env.GITHUB_OUTPUT, `pr-number=${verdict.pr}\nhead-sha=${verdict.head}\n`);
   }
   return 0;

@@ -543,20 +543,21 @@ lanes:
       - activity: review-gate
       - activity: audit-env
 
-# The version 1 activities' max-turns, as profiles (schema version 2).
+# The version 1 activities' max-turns, as profiles (schema version 2). The
+# schema admits no `default` model; the config reader resolved it to opus.
 models:
   profiles:
     standard:
-      model: default
+      model: opus
       max-turns: 75
     turns-10:
-      model: default
+      model: opus
       max-turns: 10
     turns-6:
-      model: default
+      model: opus
       max-turns: 6
     turns-5:
-      model: default
+      model: opus
       max-turns: 5
     # main's fix-ci profile: a worker on code at the verifier's effort, from
     # the multi-agent role map.

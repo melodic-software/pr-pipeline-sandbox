@@ -1,20 +1,22 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { after, test } from "node:test";
+import { after, describe, test } from "node:test";
 
+import { renderSplitRecord, SIZE_SPLIT_MARKER } from "../intake-triage/admit.mjs";
 import { main } from "./check-blockers.mjs";
+import { tempDir } from "../../../lib/test-tmp.mjs";
 
 const HUMAN = { id: 101, login: "person" };
 const STRANGER = { id: 202, login: "stranger" };
 const APP = { id: 303, login: "melodic-automation-lanes[bot]" };
 const UNTRUSTED = "work-class: untrusted-provenance";
-const dir = mkdtempSync(join(tmpdir(), "check-blockers-"));
+const dir = tempDir("check-blockers-");
 after(() => rmSync(dir, { recursive: true, force: true }));
 const TRUSTED = join(dir, "trusted-actors.json");
 writeFileSync(TRUSTED, JSON.stringify({ version: 1, actors: [{ kind: "human", id: HUMAN.id, login: HUMAN.login }] }));
-const ENV = { GITHUB_REPOSITORY: "o/r", ISSUE_NUMBER: "42", TRUSTED_ACTORS_PATH: TRUSTED, LANES_APP_ID: String(APP.id) };
+// BASE_PATH: the checkout whose models.issue-status the field read takes.
+const ENV = { GITHUB_REPOSITORY: "o/r", ISSUE_NUMBER: "42", TRUSTED_ACTORS_PATH: TRUSTED, LANES_APP_ID: String(APP.id), BASE_PATH: new URL("../../..", import.meta.url).pathname };
 
 const issue = (number, state, { repo = "o/r", reason = state === "closed" ? "completed" : null, closer = HUMAN } = {}) => ({
   number,
@@ -26,8 +28,25 @@ const issue = (number, state, { repo = "o/r", reason = state === "closed" ? "com
 const pull = (number, merged) => ({ ...issue(number, "closed"), pull_request: { merged_at: merged ? "2026-10-01T00:00:00Z" : null } });
 const labelEvent = (kind, actor) => ({ event: kind, label: { name: UNTRUSTED }, actor });
 
+// One GraphQL answer for both reads: no merged pull request closed a blocker
+// (timelineItems), and the issue's text a listed human wrote (specOf).
+const GRAPHQL = {
+  data: {
+    repository: {
+      issue: {
+        timelineItems: { nodes: [{ closer: null }] },
+        body: "Plain issue.",
+        lastEditedAt: null,
+        author: { __typename: "User", databaseId: HUMAN.id },
+        editor: null,
+        comments: { totalCount: 0, nodes: [] },
+      },
+    },
+  },
+};
+
 // The issue itself answers `subject`: its labels and its events. A function
-// `blockers` answers every read.
+// `blockers` answers every read, given its path and body.
 async function run(blockers, { env = ENV, subject = {} } = {}) {
   const calls = [];
   const lines = [];
@@ -35,13 +54,22 @@ async function run(blockers, { env = ENV, subject = {} } = {}) {
   const github = async (method, path, body) => {
     calls.push(`${method} ${path}`);
     if (typeof blockers === "function") {
-      return blockers(path);
+      return blockers(path, body);
     }
     if (path === "/repos/o/r/issues/42") {
       if (subject.issue instanceof Error) {
         throw subject.issue;
       }
-      return { number: 42, state: "open", labels: (subject.labels ?? []).map((name) => ({ name })) };
+      return {
+        number: 42,
+        state: "open",
+        ...("author" in subject ? subject.author !== undefined && { user: subject.author } : { user: HUMAN }),
+        labels: (subject.labels ?? []).map((name) => ({ name })),
+        ...(subject.summary && { sub_issues_summary: subject.summary }),
+      };
+    }
+    if (path.startsWith("/repos/o/r/issues/42/sub_issues")) {
+      return subject.subs ?? [];
     }
     if (path.startsWith("/repos/o/r/issues/42/events")) {
       if (subject.events instanceof Error) {
@@ -58,7 +86,7 @@ async function run(blockers, { env = ENV, subject = {} } = {}) {
     }
     if (method === "POST" && path === "/graphql") {
       // No merged pull request closed it.
-      return { data: { repository: { issue: { timelineItems: { nodes: [{ closer: null }] } } } } };
+      return GRAPHQL;
     }
     throw new Error(`unexpected ${method} ${path} ${JSON.stringify(body)}`);
   };
@@ -67,14 +95,20 @@ async function run(blockers, { env = ENV, subject = {} } = {}) {
 }
 
 const SKIP = { proceed: "false", untrusted: "false" };
-const RUN = { proceed: "true", untrusted: "false" };
+// A run that proceeds also says whether the issue is a trusted size-split
+// sub-issue (admit.mjs trustedSplitChild); a listed human wrote this one.
+const RUN = { proceed: "true", untrusted: "false", "split-child": "false" };
 const FINAL = { proceed: "false", untrusted: "true" };
+// The outside-author stop: FINAL, plus the mark report-skip reads to tell the
+// issue's author is outside the trusted list.
+const OUTSIDER = { ...FINAL, outsider: "true" };
 
 test("an open blocker skips the run with a notice naming it, and writes nothing", async () => {
   const { code, calls, lines, outputs } = await run([issue(7, "open"), issue(8, "closed"), issue(9, "open", { repo: "o/other" })]);
   assert.equal(code, 0);
   assert.deepEqual(outputs, SKIP);
-  assert.ok(calls.every((call) => call.startsWith("GET ")));
+  // The one POST is the field events read.
+  assert.ok(calls.every((call) => call.startsWith("GET ") || call === "POST /graphql"), calls.join("\n"));
   const notice = lines.find((line) => line.startsWith("::notice"));
   assert.match(notice, /#7/);
   assert.match(notice, /o\/other#9/);
@@ -123,7 +157,7 @@ test("a merged pull request blocker costs no trust read, so a read that would fa
       throw new Error("GET failed: 502");
     }
     if (path === "/repos/o/r/issues/42") {
-      return { number: 42, state: "open", labels: [] };
+      return { number: 42, state: "open", user: HUMAN, labels: [], sub_issues_summary: { total: 0, completed: 0, percent_completed: 0 } };
     }
     if (path.includes("/events")) {
       return [];
@@ -135,7 +169,7 @@ test("a merged pull request blocker costs no trust read, so a read that would fa
       return blockers[0];
     }
     if (path === "/graphql") {
-      return { data: { repository: { issue: { timelineItems: { nodes: [{ closer: null }] } } } } };
+      return GRAPHQL;
     }
     throw new Error(`unexpected ${path}`);
   });
@@ -146,19 +180,39 @@ test("a merged pull request blocker costs no trust read, so a read that would fa
   assert.ok(!calls.includes("GET /repos/o/r/issues/9"));
 });
 
-test("an untrusted-provenance label on the issue stops the run for good, with a notice, before any blocker read", async () => {
-  const { code, calls, lines, outputs } = await run([], { subject: { labels: ["agent-ready", UNTRUSTED] } });
-  assert.equal(code, 0);
-  assert.deepEqual(outputs, FINAL);
-  assert.ok(!calls.some((call) => call.includes("/dependencies/")));
-  assert.match(lines.find((line) => line.startsWith("::notice")), /untrusted-provenance/);
-});
+for (const label of [UNTRUSTED, "provenance: untrusted"]) {
+  test(`a ${label} label on the issue stops the run for good, with a notice, before any blocker read`, async () => {
+    const { code, calls, lines, outputs } = await run([], { subject: { labels: ["agent-ready", label] } });
+    assert.equal(code, 0);
+    assert.deepEqual(outputs, FINAL);
+    assert.ok(!calls.some((call) => call.includes("/dependencies/")));
+    assert.match(lines.find((line) => line.startsWith("::notice")), /`provenance: untrusted` holds the issue/);
+  });
+}
 
 test("the label removed by someone neither a listed human nor the App still stops the run; their removal does not", async () => {
   const added = labelEvent("labeled", APP);
   assert.deepEqual((await run([], { subject: { events: [added, labelEvent("unlabeled", STRANGER)] } })).outputs, FINAL);
   assert.deepEqual((await run([], { subject: { events: [added, labelEvent("unlabeled", HUMAN)] } })).outputs, RUN);
   assert.deepEqual((await run([], { subject: { events: [added, labelEvent("unlabeled", APP)] } })).outputs, RUN);
+});
+
+test("an issue neither a listed human nor the lanes App wrote stops the run for good, before its events or blockers are read, and marks it for report-skip", async () => {
+  for (const author of [STRANGER, undefined]) {
+    const { code, calls, lines, outputs } = await run([], { subject: { author } });
+    assert.equal(code, 0);
+    assert.deepEqual(outputs, OUTSIDER, JSON.stringify(author));
+    assert.deepEqual(calls, ["GET /repos/o/r/issues/42"]);
+    const notice = lines.find((line) => line.startsWith("::notice"));
+    assert.match(notice, /neither a listed human nor the lanes App/);
+    assert.match(notice, /re-file/);
+  }
+});
+
+test("an issue a listed human or the lanes App wrote still runs", async () => {
+  for (const author of [HUMAN, APP]) {
+    assert.deepEqual((await run([], { subject: { author } })).outputs, RUN, author.login);
+  }
 });
 
 test("labels or events it cannot read skip the run with a warning, not for good", async () => {
@@ -176,7 +230,7 @@ test("a blocker list it cannot read skips the run with a warning and exits 0", a
     if (path.includes("/dependencies/")) {
       throw new Error("GET failed: 502");
     }
-    return path.includes("/events") ? [] : { number: 42, labels: [] };
+    return path.includes("/events") ? [] : { number: 42, user: HUMAN, labels: [] };
   });
   assert.equal(code, 0);
   assert.deepEqual(outputs, SKIP);
@@ -191,4 +245,238 @@ test("an issue number that is not one, no trusted list, or no App id skips the r
     assert.deepEqual(outputs, SKIP);
     assert.ok(lines.some((line) => line.startsWith("::warning")));
   }
+});
+
+// Admission counts a split parent the lanes App closed once a listed human
+// closed every sub-issue (admit.mjs closedByTrusted); the run gate must too.
+test("a split parent the lanes App closed after a listed human closed every part no longer blocks; an open part keeps it blocking", async () => {
+  const record = { id: 61, user: APP, body: `${SIZE_SPLIT_MARKER}\n${renderSplitRecord({ items: "a".repeat(64), parts: [[1], [2]], order: [], filed: [50, 51] })}` };
+  const world = (partState) => (path) => {
+    if (path === "/repos/o/r/issues/42") return { number: 42, state: "open", user: HUMAN, labels: [], sub_issues_summary: { total: 0, completed: 0, percent_completed: 0 } };
+    if (path.startsWith("/repos/o/r/issues/42/events")) return [];
+    if (path.includes("/42/dependencies/blocked_by")) return [issue(7, "closed", { closer: APP })];
+    if (path === "/repos/o/r/issues/7") return issue(7, "closed", { closer: APP });
+    if (path.startsWith("/repos/o/r/issues/7/comments")) return [record];
+    if (path.startsWith("/repos/o/r/issues/7/sub_issues")) return [issue(50, "closed"), issue(51, partState)];
+    if (path === "/repos/o/r/issues/50") return issue(50, "closed");
+    if (path === "/repos/o/r/issues/51") return issue(51, partState);
+    if (path === "/graphql") return GRAPHQL;
+    throw new Error(`unexpected ${path}`);
+  };
+  assert.deepEqual((await run(world("closed"))).outputs, RUN);
+  assert.deepEqual((await run(world("open"))).outputs, SKIP);
+});
+
+// An umbrella's work is its sub-issues' (owner Q93, intake admission's wait):
+// the run gate skips it, agent-ready kept, while one is open, and never hands
+// it to a person. The issue read's sub_issues_summary decides whether the
+// sub-issues are listed at all.
+describe("an umbrella issue", () => {
+  const summary = (total, completed) => ({ total, completed, percent_completed: total ? Math.round((completed * 100) / total) : 0 });
+
+  test("with an open sub-issue skips the run, agent-ready kept, with a notice naming each open one", async () => {
+    const subs = [issue(9691, "open"), issue(9692, "closed"), issue(9693, "open")];
+    const { code, calls, lines, outputs } = await run([], { subject: { summary: summary(3, 1), subs } });
+    assert.equal(code, 0);
+    assert.deepEqual(outputs, SKIP);
+    assert.ok(calls.every((call) => call.startsWith("GET ") || call === "POST /graphql"), calls.join("\n"));
+    const notice = lines.find((line) => line.startsWith("::notice"));
+    assert.match(notice, /#9691/);
+    assert.match(notice, /#9693/);
+    assert.doesNotMatch(notice, /#9692/);
+    assert.doesNotMatch(notice, /needs-human/);
+  });
+
+  test("whose sub-issues are all closed, as completed or not planned, runs", async () => {
+    assert.deepEqual((await run([], { subject: { summary: summary(2, 2), subs: [issue(9691, "closed"), issue(9692, "closed")] } })).outputs, RUN);
+    // A close as not planned may not count as completed, so the list decides.
+    const notPlanned = [issue(9691, "closed"), issue(9692, "closed", { reason: "not_planned" })];
+    assert.deepEqual((await run([], { subject: { summary: summary(2, 1), subs: notPlanned } })).outputs, RUN);
+  });
+
+  test("costs no call past the issue read when the summary shows no sub-issue", async () => {
+    const { calls, outputs } = await run([], { subject: { summary: summary(0, 0) } });
+    assert.deepEqual(outputs, RUN);
+    assert.ok(!calls.some((call) => call.includes("/sub_issues")));
+  });
+
+  // A finished parent (admit.mjs finishedParent) runs once to verify its own
+  // done-when: Size Large does not skip it (split-child), and report-outcome
+  // gets its trusted sub-issues (verify-close).
+  // The parent (#42, no blocker) and its sub-issues, each read by number.
+  const parent = (children) => (path) => {
+    if (path === "/repos/o/r/issues/42") {
+      return { number: 42, state: "open", user: HUMAN, labels: [], sub_issues_summary: summary(children.length, children.length) };
+    }
+    if (path.includes("/sub_issues")) {
+      return children;
+    }
+    if (path === "/graphql") {
+      return GRAPHQL;
+    }
+    const child = children.find((item) => path === `/repos/o/r/issues/${item.number}`);
+    return child ?? [];
+  };
+
+  test("whose every sub-issue a listed human closed as completed runs as a finished parent", async () => {
+    const { outputs } = await run(parent([issue(9691, "closed"), issue(9692, "closed")]));
+    assert.deepEqual(outputs, { ...RUN, "split-child": "true", "verify-close": "9691,9692" });
+  });
+
+  test("with a sub-issue closed not planned, or closed by a stranger, is no finished parent", async () => {
+    for (const second of [issue(9692, "closed", { reason: "not_planned" }), issue(9692, "closed", { closer: STRANGER })]) {
+      const { outputs, lines } = await run(parent([issue(9691, "closed"), second]));
+      assert.deepEqual(outputs, RUN, JSON.stringify(lines));
+    }
+  });
+
+  test("an issue read with no summary lists the sub-issues, and an open one skips the run", async () => {
+    const { calls, outputs } = await run([], { subject: { subs: [issue(9691, "open")] } });
+    assert.deepEqual(outputs, SKIP);
+    assert.ok(calls.some((call) => call.includes("/sub_issues")));
+    assert.deepEqual((await run([], { subject: { subs: [] } })).outputs, RUN);
+  });
+
+  test("a sub-issue list it cannot read skips the run with a warning, not for good", async () => {
+    const { code, lines, outputs } = await run((path) => {
+      if (path.includes("/sub_issues")) {
+        throw new Error("GET failed: 502");
+      }
+      if (path === "/repos/o/r/issues/42") {
+        return { number: 42, state: "open", user: HUMAN, labels: [], sub_issues_summary: summary(2, 0) };
+      }
+      return [];
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(outputs, SKIP);
+    assert.ok(lines.some((line) => line.startsWith("::warning")));
+  });
+});
+
+// A blocker the lanes App closed report-delivered is no completed work (owner
+// Q9): it holds the run until a verdict or admission postdates its close
+// (admit.mjs reportCleared), and a close kind that does not read holds it.
+const reportClose = (user, at) => ({
+  user,
+  created_at: at,
+  html_url: "https://github.com/o/r/issues/7#issuecomment-1",
+  body: ["<!-- work-resolve-issue outcome=closed run=555 -->", "The work-resolve-issue lane stopped on this issue (`report-delivered`): the run posted the report.", "", "In the run's words:", "", "> the report"].join("\n"),
+});
+const reportWorld = ({ comments, readyAt, closer = APP }) => (path) => {
+  if (path === "/repos/o/r/issues/42") {
+    return { number: 42, state: "open", user: HUMAN, labels: [{ name: "agent-ready" }] };
+  }
+  if (path.startsWith("/repos/o/r/issues/42/events")) {
+    return [{ event: "labeled", label: { name: "agent-ready" }, actor: APP, created_at: readyAt }];
+  }
+  if (path.includes("/dependencies/blocked_by")) {
+    return [issue(7, "closed", { closer })];
+  }
+  if (path === "/repos/o/r/issues/7") {
+    return issue(7, "closed", { closer });
+  }
+  if (path.startsWith("/repos/o/r/issues/7/comments")) {
+    if (comments instanceof Error) {
+      throw comments;
+    }
+    return comments;
+  }
+  if (path.startsWith("/repos/o/r/issues/42/sub_issues") || path.startsWith("/repos/o/r/issues/7/sub_issues")) {
+    return [];
+  }
+  if (path === "/graphql") {
+    return GRAPHQL;
+  }
+  throw new Error(`unexpected ${path}`);
+};
+
+test("a blocker the lanes App closed report-delivered runs once agent-ready postdates the close; before that, or unread, it blocks", async () => {
+  const comments = [reportClose(APP, "2026-10-28T00:00:00Z")];
+  assert.deepEqual((await run(reportWorld({ comments, readyAt: "2026-10-29T00:00:00Z" }))).outputs, RUN);
+  assert.deepEqual((await run(reportWorld({ comments, readyAt: "2026-10-27T00:00:00Z" }))).outputs, SKIP);
+  assert.deepEqual((await run(reportWorld({ comments: [reportClose(STRANGER, "2026-10-28T00:00:00Z")], readyAt: "2026-10-29T00:00:00Z" }))).outputs, SKIP);
+  assert.deepEqual((await run(reportWorld({ comments: new Error("502"), readyAt: "2026-10-29T00:00:00Z" }))).outputs, SKIP);
+});
+
+// A verdict written only to the Work status field (`ready`, by the lanes App)
+// is the issue's history too. App field events before the config's
+// field-events-since mirrored labels, so they count for nothing.
+test("a field-only `ready` from the lanes App after the report-delivered close clears it; one from the mirror era does not", async () => {
+  const fieldWorld = (readyAt) => {
+    const world = reportWorld({ comments: [reportClose(APP, "2026-11-08T00:00:00Z")], readyAt: "2026-10-01T00:00:00Z" });
+    return (path, body) => {
+      if (path.startsWith("/repos/o/r/issues/42/events")) {
+        return [];
+      }
+      if (path === "/graphql" && body?.variables?.number === 42 && /IssueFieldAddedEvent/.test(body.query)) {
+        const actor = { __typename: "Bot", login: "melodic-automation-lanes", databaseId: APP.id };
+        const field = { fullDatabaseId: "48484079" };
+        return { data: { repository: { issue: { timelineItems: { nodes: [{ __typename: "IssueFieldAddedEvent", createdAt: readyAt, value: "ready", actor, issueField: field }] } } } } };
+      }
+      return world(path);
+    };
+  };
+  assert.deepEqual((await run(fieldWorld("2026-11-09T00:00:00Z"))).outputs, RUN);
+  assert.deepEqual((await run(fieldWorld("2026-11-07T00:00:00Z"))).outputs, SKIP);
+});
+
+test("a field events read that fails skips the run as unread", async () => {
+  const world = reportWorld({ comments: [reportClose(APP, "2026-11-08T00:00:00Z")], readyAt: "2026-11-09T00:00:00Z" });
+  const { outputs, lines } = await run((path, body) => (path === "/graphql" && /IssueFieldAddedEvent/.test(body?.query ?? "") ? { errors: [{ message: "boom" }] } : world(path)));
+  assert.deepEqual(outputs, SKIP);
+  assert.ok(lines.some((line) => line.startsWith("::warning title=admission unread::")), lines.join("\n"));
+});
+
+// The App's report comment speaks only for a close the App made: once the
+// blocker is reopened and someone else closes it, the older report clears
+// nothing.
+test("a blocker someone other than the lanes App closed blocks even with an older App report-delivered comment", async () => {
+  const comments = [reportClose(APP, "2026-10-28T00:00:00Z")];
+  assert.deepEqual((await run(reportWorld({ comments, readyAt: "2026-10-29T00:00:00Z", closer: STRANGER }))).outputs, SKIP);
+});
+
+// The read runner's in-slot re-check (RECHECK=true): a blocker added while
+// the run waited for its slot stops it as admission's blocker gate does, on
+// one blocked_by read; a list of closed blockers takes the full check.
+describe("the in-slot re-check", () => {
+  const RECHECK = { ...ENV, RECHECK: "true" };
+  const RECHECK_RUN = { proceed: "true", untrusted: "false" };
+
+  test("no blocker proceeds on the one blocked_by read", async () => {
+    const { code, calls, outputs } = await run([], { env: RECHECK });
+    assert.equal(code, 0);
+    assert.deepEqual(outputs, RECHECK_RUN);
+    assert.deepEqual(calls, ["GET /repos/o/r/issues/42/dependencies/blocked_by?per_page=100&page=1"]);
+  });
+
+  test("an open blocker added since admission stops the run as admission does, on the one read, with the same notice", async () => {
+    const admitted = await run([issue(7, "open")]);
+    const { code, calls, lines, outputs } = await run([issue(7, "open"), issue(8, "closed")], { env: RECHECK });
+    assert.equal(code, 0);
+    assert.deepEqual(outputs, SKIP);
+    assert.deepEqual(outputs, admitted.outputs);
+    assert.deepEqual(calls, ["GET /repos/o/r/issues/42/dependencies/blocked_by?per_page=100&page=1"]);
+    const notice = lines.find((line) => line.startsWith("::notice"));
+    assert.match(notice, /^::notice title=blocked::/);
+    assert.match(notice, /#7/);
+  });
+
+  test("closed blockers alone take the full check, which judges who closed them", async () => {
+    assert.deepEqual((await run([issue(8, "closed")], { env: RECHECK })).outputs, RUN);
+    const stranger = await run([issue(7, "closed", { closer: STRANGER })], { env: RECHECK });
+    assert.deepEqual(stranger.outputs, SKIP);
+    assert.ok(stranger.calls.includes("GET /repos/o/r/issues/42"), "the full check reads the issue");
+  });
+
+  test("a blocked_by read that fails stops the run with a warning, not for good", async () => {
+    const { code, lines, outputs } = await run(
+      (path) => {
+        throw new Error(`502 ${path}`);
+      },
+      { env: RECHECK },
+    );
+    assert.equal(code, 0);
+    assert.deepEqual(outputs, SKIP);
+    assert.ok(lines.some((line) => line.startsWith("::warning title=admission unread::")));
+  });
 });

@@ -1,11 +1,10 @@
 // pr-unblock-dispatch.yml's limits read through the real resolver: dispatch.mjs
-// takes `limits` from the base's pr-pipeline.yaml, so a set
+// and refine-event-dispatch.mjs take `limits` from the base's pr-pipeline.yaml, so a set
 // `limits.limit-stops-per-head` changes which heads it dispatches again, and a
 // config the resolver refuses fails the run before anything is dispatched.
 // Lives here because it needs resolve-config's dependencies.
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -13,6 +12,8 @@ import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 
 import { main } from "../../scripts/pr-unblock/dispatch.mjs";
+import { main as refineEvent } from "../../scripts/pr-unblock/refine-event-dispatch.mjs";
+import { tempDir } from "../../../lib/test-tmp.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../../..");
 const LIVE = readFileSync(join(ROOT, "docs/conventions/pr-pipeline.yaml"), "utf8");
@@ -28,7 +29,7 @@ const STOPPED = {
 };
 
 function baseWith(text) {
-  const base = mkdtempSync(join(tmpdir(), "dispatch-limits-base-"));
+  const base = tempDir("dispatch-limits-base-");
   for (const file of [
     "docs/conventions/pr-pipeline/pr-pipeline.schema.json",
     ".github/standards/github-actions-conventions/vocabulary.json",
@@ -92,7 +93,7 @@ const api = (dispatched, ciFixPulls = [], docsPulls = []) => ({
     pageInfo: { hasNextPage: false, endCursor: null },
   }),
   getPulls: async () => [],
-  listCheckRuns: async () => [STOPPED],
+  listCheckRuns: async ({ checkName }) => [STOPPED].filter((run) => run.name === checkName),
   listWorkflowRuns: async () => [],
   readRequiredRun: async () => ({ run: null, jobs: [] }),
   // No label event names the lanes App, so a human-gated label holds.
@@ -106,7 +107,7 @@ const api = (dispatched, ciFixPulls = [], docsPulls = []) => ({
 async function run(text, ciFixPulls = [], docsPulls = [], tracker = null) {
   const base = baseWith(text);
   if (tracker !== null) {
-    writeFileSync(join(base, ".work-item-tracker.json"), tracker);
+    writeFileSync(join(base, "docs/conventions/work-items.yaml"), `tracker: ${tracker}\n`);
   }
   const output = join(base, "output");
   writeFileSync(output, "");
@@ -148,7 +149,7 @@ test("the base config's adoption section lets fix-ci adopt an idle owner PR", as
   owner.author = { databaseId: 153232337 };
   owner.updatedAt = idle;
   owner.commits.nodes[0].commit.committedDate = idle;
-  assert.equal(parse(LIVE).adoption["idle-hours"], 24, "the live config adopts a trusted person after 24 hours");
+  assert.equal(parse(LIVE).adoption["idle-hours"], 2, "the live config adopts a trusted person after 2 hours");
   assert.deepEqual(await run(LIVE, [owner]), { code: 0, dispatched: ["40", "61"] });
   // Every trusted-actors.json entry is adoptable: the release App, a Bot, at once.
   const release = ciFixPull(65);
@@ -168,7 +169,7 @@ test("the base config's adoption section lets fix-ci adopt an idle owner PR", as
   assert.doesNotMatch(without, /^adoption:/m);
   assert.deepEqual(await run(without, [owner]), { code: 0, dispatched: ["40"] });
   // A section without idle-hours adopts nothing, as in pr-merge.
-  const noIdle = LIVE.replace(/^ {2}idle-hours: 24\n/m, "");
+  const noIdle = LIVE.replace(/^ {2}idle-hours: 2\n/m, "");
   assert.match(noIdle, /^adoption:\n {2}#/m);
   assert.deepEqual(await run(noIdle, [owner, release]), { code: 0, dispatched: ["40"] });
 });
@@ -197,12 +198,65 @@ test("an unreadable base tracker config holds adopted owner PRs only, and no ado
   assert.deepEqual(await run(without, [ciFixPull(63)], [], "{not json"), { code: 0, dispatched: ["40", "63"] });
 });
 
-test("the base config's limits.fix-docs-per-run caps the fix-docs dispatches", async () => {
-  const pulls = [docsPull(61), docsPull(62), docsPull(63)];
-  assert.match(LIVE, /^ {2}fix-docs-per-run: 2$/m, "the live config sets the per-run cap");
-  assert.deepEqual(await run(LIVE, [], pulls), { code: 0, dispatched: ["40", "61", "62"] });
-  const one = LIVE.replace(/^ {2}fix-docs-per-run: 2$/m, "  fix-docs-per-run: 1");
-  assert.deepEqual(await run(one, [], pulls), { code: 0, dispatched: ["40", "61"] });
+// refine-event-dispatch.mjs's main for one PR's own event, sent by the lanes
+// App on its first attempt, through the real resolver over `text`.
+async function runEvent(text, pull) {
+  const base = baseWith(text);
+  const dispatched = [];
+  try {
+    const env = {
+      GITHUB_TOKEN: "t",
+      GITHUB_REPOSITORY: "o/r",
+      GITHUB_RUN_ID: "4242",
+      RUN_IDS_FILE: join(base, "run-ids"),
+      BASE_PATH: base,
+      APP_SENDER_ID: String(LANES_APP),
+      SENDER_ID: String(LANES_APP),
+      RUN_ATTEMPT: "1",
+      PR_NUMBER: String(pull.number),
+    };
+    const one = { ...api(dispatched), readDocsFixCandidate: async () => ({ rateLimit: { cost: 1, remaining: 4999 }, pullRequests: { nodes: [pull], pageInfo: { hasNextPage: false } } }) };
+    const code = await refineEvent(env, { api: one, log: () => {} });
+    return { code, dispatched };
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+test("the base config's limits.fix-docs-per-run turns a PR event's fix-docs on or off, a work-resolve-issue PR is skipped, and the dispatcher's tick starts none", async () => {
+  // The lanes App's PRs on a lane branch: one within the live tidy cutoffs
+  // (resolve-issue's max-lines 300), tidied in its own run and skipped, and
+  // one a line over them, dispatched.
+  const lanePull = (number, lines) => ({
+    ...docsPull(number),
+    author: { __typename: "Bot", login: "melodic-automation-lanes", databaseId: LANES_APP },
+    headRefName: "work-resolve-issue/issue-12-345-1",
+    changedFiles: 1,
+    additions: lines,
+    deletions: 0,
+    // The lane run's one API commit, as GraphQL lists one.
+    commits: {
+      totalCount: 1,
+      nodes: [
+        {
+          commit: {
+            oid: docsPull(number).headRefOid,
+            signature: { isValid: true },
+            author: { user: { login: "melodic-automation-lanes[bot]" } },
+            committer: { email: "noreply@github.com" },
+            statusCheckRollup: { contexts: { nodes: [] } },
+          },
+        },
+      ],
+    },
+  });
+  assert.match(LIVE, /^ {2}fix-docs-per-run: 2$/m, "the live config turns CI fix-docs on");
+  const off = LIVE.replace(/^ {2}fix-docs-per-run: 2$/m, "  fix-docs-per-run: 0");
+  for (const [pull, expected] of [[lanePull(58, 301), ["58"]], [lanePull(60, 300), []], [docsPull(61), ["61"]]]) {
+    assert.deepEqual(await runEvent(LIVE, pull), { code: 0, dispatched: expected }, `PR ${pull.number}`);
+    assert.deepEqual(await runEvent(off, pull), { code: 0, dispatched: [] }, `PR ${pull.number} with fix-docs-per-run 0`);
+  }
+  assert.deepEqual(await run(LIVE, [], [lanePull(58, 301), docsPull(61), docsPull(62)]), { code: 0, dispatched: ["40"] }, "a push, tick or hand run starts only resolve-conflicts");
 });
 
 test("a base config the resolver refuses fails the run before any dispatch", async () => {

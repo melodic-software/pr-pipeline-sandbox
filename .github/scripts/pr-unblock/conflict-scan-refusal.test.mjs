@@ -1,15 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 
 import { main } from "./conflict-scan-refusal.mjs";
+import { tempDir } from "../../../lib/test-tmp.mjs";
 
 // The escalation-reason main writes, given the markers in a fresh directory
 // and the download's outcome; no leg output is read.
 const run = (markers, read = "success") => {
-  const dir = mkdtempSync(join(tmpdir(), "conflict-scan-refusal-"));
+  const dir = tempDir("conflict-scan-refusal-");
   const scanRefused = join(dir, "scan-refused");
   mkdirSync(scanRefused);
   for (const [name, kind] of Object.entries(markers)) {
@@ -25,6 +25,7 @@ test("the scan refusal marker alone escalates unresolved-conflict", () => {
   assert.equal(run({ "scan-refused-1.txt": "output" }), "escalation-reason=unresolved-conflict\n", "a leak-scan block");
   assert.equal(run({ "scan-refused-2.txt": "patch" }), "escalation-reason=unresolved-conflict\n", "an oversize patch");
   assert.equal(run({ "scan-refused-1-rung-up.txt": "output" }), "escalation-reason=unresolved-conflict\n");
+  assert.equal(run({ "scan-refused-1.txt": "fault" }), "escalation-reason=unresolved-conflict\n", "a scan fault");
 });
 
 test("no marker escalates nothing", () => {

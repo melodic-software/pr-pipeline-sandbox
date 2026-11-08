@@ -1,15 +1,10 @@
 // The `models` block: schema, cross-checks, resolution, the arguments and
 // settings a profile becomes, and what the live config gives every model run.
-// The live expectations are the values each run got before the block existed,
-// written by hand from the runners: no --model and 75 turns for every skill
-// activity (pr-run-activity-read.yml and pr-run-activity-write.yml inputs
-// default-model '' and default-max-turns 75, which no caller overrode), and
-// --model opus with --max-turns 60 for pr-verify.yml (merge.verifier-model
-// opus, its hard-coded --max-turns 60). No run passed --effort or a settings
-// env.
+// The live expectations are written by hand: --model opus and 75 turns for a
+// skill activity no route names, and --model opus with --max-turns 60 for
+// pr-verify.yml.
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -18,6 +13,7 @@ import { parse, stringify } from "yaml";
 
 import { main } from "./resolve-config.mjs";
 import { modelArgs, modelSettings, neededFacts, Rejection, resolve, resolveRoute } from "./resolve.mjs";
+import { tempDir } from "../../../lib/test-tmp.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "../../..");
@@ -59,10 +55,11 @@ const assertRejected = (fn, code) =>
 
 // Facts under which every live skill activity's predicate applies.
 const LIVE_FACTS = {
-  event: "labeled",
+  // resolve-issue starts on the Work status field event.
+  event: "field_added",
   changedPaths: ["docs/guide.md"],
   changedTargets: ["docs/guide.md"],
-  // resolve-issue applies only while its issue carries agent-ready.
+  // resolve-issue applies only while its issue reads agent-ready.
   labels: ["agent-ready"],
   mergeable: "conflicting",
   draft: false,
@@ -79,7 +76,7 @@ const liveSlot = (lane, activity) =>
     .selected;
 
 const DEFAULT_RUN = {
-  model: "default",
+  model: "opus",
   effort: null,
   "subagent-model": "inherit",
   "max-turns": 75,
@@ -96,7 +93,8 @@ const TUNING = {
 };
 const tunedConfig = () => {
   const doc = parse(LIVE.config);
-  doc.models["issue-dimensions"] = { fields: doc.models["issue-dimensions"].fields, ...TUNING };
+  const live = doc.models["issue-dimensions"];
+  doc.models["issue-dimensions"] = { fields: live.fields, ...(live["split-child-size"] === undefined ? {} : { "split-child-size": live["split-child-size"] }), ...TUNING };
   return stringify(doc);
 };
 const TUNED = { ...LIVE, config: tunedConfig() };
@@ -114,13 +112,13 @@ const fieldFacts = ({ size, complexity, uncertainty }, setter = LISTED) => {
     fieldSetters: Object.fromEntries(rows.map(([field]) => [field, setter])),
   };
 };
-const issueSlot = (dims, { setter, labels = [], pinnedDimensions } = {}) =>
+const issueSlot = (dims, { setter, labels = [], pinnedDimensions, splitChild } = {}) =>
   resolve(TUNED, {
     lane: "work-resolve-issue",
     activity: "resolve-issue",
     configPath: CONFIG_PATH,
     basePath: ".base",
-    facts: { ...LIVE_FACTS, labels: ["agent-ready", ...labels], ...fieldFacts(dims, setter) },
+    facts: { ...LIVE_FACTS, labels: ["agent-ready", ...labels], ...fieldFacts(dims, setter), ...(splitChild === undefined ? {} : { splitChild }) },
     pinnedDimensions,
   }).selected;
 
@@ -168,6 +166,22 @@ for (const [why, dims, options, reason] of [
     assert.equal(slot["timeout-minutes"], 7);
   });
 }
+
+// Admission takes a trusted size-split sub-issue whatever its Size (owner
+// Q93), so a Large one runs on split-child-size's budget, pinned as that size.
+test("live config: a trusted split child rated Large runs on split-child-size's budget; any other Large stays split-required", () => {
+  const large = { size: "large", complexity: "low", uncertainty: "known" };
+  const child = issueSlot(large, { splitChild: true });
+  assert.equal(child.applies, true);
+  assert.equal(child["issue-dimensions"], "medium/low/known");
+  assert.equal(child["timeout-minutes"], 9);
+  assert.equal(child.models["max-turns"], 20);
+  assert.equal(issueSlot(large, { splitChild: false })["skip-reason"], "split-required");
+  assert.equal(issueSlot({ ...large, size: "small" }, { splitChild: true })["issue-dimensions"], "small/low/known", "a child that runs keeps its own size");
+  const request = { lane: "work-resolve-issue", activity: "resolve-issue", configPath: CONFIG_PATH };
+  assert.ok(neededFacts(LIVE, request).includes("splitChild"));
+  assert.ok(!neededFacts(LIVE, { ...request, pinnedDimensions: "medium/low/known" }).includes("splitChild"));
+});
 
 test("live config: a held large issue keeps its hold reason", () => {
   const slot = issueSlot({ size: "large", complexity: "low", uncertainty: "known" }, { labels: ["needs-human"] });
@@ -363,6 +377,80 @@ for (const [why, dims, code] of [
   });
 }
 
+const STATUS = {
+  "field-id": 7,
+  options: { 71: "needs-triage", 72: "agent-ready", 73: "needs-human" },
+  labels: { "needs-triage": ["needs-triage"], "agent-ready": ["agent-ready"], "needs-human": ["needs-human", "hitl"] },
+  order: ["needs-human", "agent-ready", "needs-triage"],
+};
+const statusModels = (status, dims) => ({
+  profiles: { p: { model: "opus", "max-turns": 5 } },
+  "default-profile": "p",
+  "issue-status": status,
+  ...(dims === undefined ? {} : { "issue-dimensions": dims }),
+});
+const assertStatusRejected = (fn, code, text) =>
+  assert.throws(fn, (error) => {
+    assert.ok(error instanceof Rejection, `expected a Rejection, got ${error}`);
+    assert.equal(error.code, code, error.message);
+    assert.ok(error.message.includes(text), error.message);
+    return true;
+  });
+
+test("issue-status: a block with every state labeled and ordered once loads", () => {
+  assert.equal(fixtureSlot(withModels(statusModels(STATUS))).applies, true);
+});
+
+// DIMS with the complexity an unset field reads as, so it loads.
+const LOADING_DIMS = { ...DIMS, complexity: { low: 1, medium: 1.5 } };
+const twoStates = { "needs-triage": ["needs-triage"], "agent-ready": ["agent-ready"] };
+for (const [why, status, code, text, dims] of [
+  [
+    "a state no option maps",
+    { ...STATUS, options: { 71: "needs-triage", 72: "agent-ready" }, order: ["agent-ready", "needs-triage"] },
+    "undefined-status",
+    "names `needs-human`, which no option maps",
+  ],
+  ["two option ids for one state", { ...STATUS, options: { ...STATUS.options, 74: "agent-ready" } }, "undefined-status", "maps two options to `agent-ready`"],
+  ["a state with no label", { ...STATUS, labels: twoStates }, "undefined-status", "gives `needs-human` no label"],
+  ["a label under two states", { ...STATUS, labels: { ...STATUS.labels, "needs-human": ["Agent-Ready"] } }, "undefined-status", "lists `agent-ready` twice"],
+  ["an order missing a state", { ...STATUS, order: ["agent-ready", "needs-triage"] }, "undefined-status", "every mapped state once"],
+  ["an order naming a state twice", { ...STATUS, order: ["needs-human", "agent-ready", "agent-ready", "needs-triage"] }, "undefined-status", "every mapped state once"],
+  ["an order not ending on needs-triage", { ...STATUS, order: ["needs-human", "needs-triage", "agent-ready"] }, "undefined-status", "must end on `needs-triage`"],
+  ["a field id one dimension uses", { ...STATUS, "field-id": 2 }, "undefined-status", "is a models.issue-dimensions field", LOADING_DIMS],
+  ["a third-party bot-setter", { ...STATUS, "bot-setters": [{ id: 209825114, login: "claude[bot]" }] }, "undefined-status", "claude[bot]"],
+  ["a bot-setter with no login", { ...STATUS, "bot-setters": [{ id: 41898282 }] }, "invalid-config", "bot-setters"],
+  ["an empty label list", { ...STATUS, labels: { ...STATUS.labels, "needs-human": [] } }, "invalid-config", "labels"],
+  ["a label given as a string", { ...STATUS, labels: { ...STATUS.labels, "needs-human": "needs-human" } }, "invalid-config", "labels"],
+  ["a non-numeric option id", { ...STATUS, options: { ...STATUS.options, ready: "ready" } }, "invalid-config", "options"],
+  ["no field id", { options: STATUS.options, labels: STATUS.labels, order: STATUS.order }, "invalid-config", "field-id"],
+  ["a field-events-since with no time", { ...STATUS, "field-events-since": "2026-11-07" }, "invalid-config", "field-events-since"],
+  ["a field-events-since no calendar has", { ...STATUS, "field-events-since": "2026-13-01T00:00:00Z" }, "undefined-status", "field-events-since"],
+]) {
+  test(`issue-status: ${why} is rejected`, () => {
+    assertStatusRejected(() => fixtureSlot(withModels(statusModels(status, dims))), code, text);
+  });
+}
+
+// Whether the trusted-actor list holds a melodic- bot-setter is read per
+// issue, never a config error, so the config loads with any list or none.
+test("issue-status: a melodic- bot-setter the trusted-actor list does not hold still loads", () => {
+  const files = withModels(statusModels({ ...STATUS, "bot-setters": [{ id: 1234, login: "melodic-unlisted[bot]" }] }));
+  assert.equal(fixtureSlot({ ...files, trustedActors: LIVE.trustedActors }).applies, true);
+  assert.equal(fixtureSlot({ ...files, trustedActors: undefined }).applies, true);
+});
+
+test("issue-status: a field id no dimension uses loads beside issue-dimensions", () => {
+  assert.equal(fixtureSlot(withModels(statusModels(STATUS, LOADING_DIMS))).applies, true);
+});
+
+test("issue-status: one option id written twice is rejected", () => {
+  const files = withModels(statusModels(STATUS));
+  const config = files.config.replace(/"?72"?: agent-ready/, '"71": agent-ready');
+  assert.notEqual(config, files.config);
+  assertRejected(() => fixtureSlot({ ...files, config }), "invalid-config");
+});
+
 for (const [why, models, code] of [
   [
     "an escalate-to naming no profile",
@@ -446,18 +534,16 @@ test("live config: verify-pr keeps --model opus and 60 turns", () => {
   assert.equal(modelSettings(models), "");
 });
 
-// The review and triage routes have no caller yet. Their values are owner
-// decisions: both review lanes keep the Sonnet, effort high, 75 turns the
-// ci-workflows review callers pass today; triage moves to Sonnet at effort
-// medium with 30 turns.
+// Both review lanes run Opus at effort high, 75 turns (#11503, Model tiers
+// rules 3 and 4); triage moves to Sonnet at effort medium with 30 turns.
 for (const [route, profile, args] of [
-  ["review-code", "pr-review", "--model sonnet --max-turns 75 --effort high"],
-  ["review-security", "pr-review", "--model sonnet --max-turns 75 --effort high"],
+  ["review-code", "pr-review", "--model opus --max-turns 75 --effort high"],
+  ["review-security", "pr-review", "--model opus --max-turns 75 --effort high"],
   ["triage-issue", "triage", "--model sonnet --max-turns 30 --effort medium"],
   // Owner decision: the reuse summary is a short read-only pass at a low turn budget.
   ["summarize-reuse", "summary", "--model sonnet --max-turns 10 --effort medium"],
   // Owner decision 2026-10-24: the adjudicator of a disputed finding is at
-  // least as strong as the review lanes (Sonnet at effort high): Opus.
+  // least as strong as the review lanes: Opus.
   ["adjudicate-feedback", "review", "--model opus --max-turns 60"],
 ]) {
   test(`live config: ${route} resolves ${args}`, () => {
@@ -467,6 +553,38 @@ for (const [route, profile, args] of [
     assert.equal(modelSettings(models), "");
   });
 }
+
+// #13657 (owner decision Q1): the merge-risk rater's model and effort, and its
+// checker's model through subagent-model, come from the route.
+test("live config: merge-risk resolves the rater's model and effort and the checker's model", () => {
+  const models = resolveRoute(LIVE, { route: "merge-risk", configPath: CONFIG_PATH });
+  assert.equal(models.profile, "merge-risk");
+  assert.equal(modelArgs(models), "--model opus --max-turns 40 --effort high");
+  assert.equal(modelSettings(models), JSON.stringify({ env: { CLAUDE_CODE_SUBAGENT_MODEL: "opus" } }));
+});
+
+// docs/plugin-philosophy.md, Model tiers, rules 3 and 4: the review lanes'
+// verdict is chosen before any test lane reports on the head, so no objective
+// signal backs it, and its model is never weaker than any route that writes
+// the code it reviews.
+test("live config: the review lanes' model is never weaker than a code-writing route", () => {
+  const rank = { haiku: 0, sonnet: 1, opus: 2 };
+  const modelOf = (route) => {
+    const doc = parse(LIVE.config);
+    if (!Object.hasOwn(doc.activities, route)) return resolveRoute(LIVE, { route, configPath: CONFIG_PATH }).model;
+    const lane = Object.keys(doc.lanes).find((name) => (doc.lanes[name].slots ?? []).some((slot) => slot.activity === route));
+    return liveSlot(lane, route).models.model;
+  };
+  const writers = ["resolve-issue", "fix-ci", "address-feedback", "resolve-conflicts"];
+  for (const reviewer of ["review-code", "review-security"]) {
+    for (const writer of writers) {
+      assert.ok(
+        rank[modelOf(reviewer)] >= rank[modelOf(writer)],
+        `${reviewer} (${modelOf(reviewer)}) is weaker than ${writer} (${modelOf(writer)})`,
+      );
+    }
+  }
+});
 
 // Role profiles. Expected values read by hand from the role map
 // (plugins/multi-agent/reference/defaults.yaml): worker's model is inherit and
@@ -636,10 +754,10 @@ test("a models block with no routes sends every skill activity to default-profil
   assert.equal(fixtureSlot(files, "pr-run-checks", "measure-coverage").models.profile, "light");
 });
 
-test("a config with no models block takes the built-in standard profile: no --model, 75 turns", () => {
+test("a config with no models block takes the built-in standard profile: opus, 75 turns", () => {
   const { models } = fixtureSlot(withModels(null));
   assert.deepEqual(models, { profile: "standard", ...DEFAULT_RUN });
-  assert.equal(modelArgs(models), "--max-turns 75");
+  assert.equal(modelArgs(models), "--model opus --max-turns 75");
 });
 
 test("a profile becomes --model, --max-turns and --effort, and its subagent model becomes settings env", () => {
@@ -657,12 +775,48 @@ for (const [why, models] of [
   ["a zero max-turns", { profiles: { p: { model: "opus", "max-turns": 0 } }, "default-profile": "p" }],
   ["a subagent model ID", { profiles: { p: { model: "opus", "subagent-model": "claude-sonnet-5", "max-turns": 5 } }, "default-profile": "p" }],
   ["an unknown profile key", { profiles: { p: { model: "opus", "max-turns": 5, advisor: "fable" } }, "default-profile": "p" }],
+  // Fable stays off until the owner sets a Fable allowance for the lanes.
+  ["a model of fable", { profiles: { p: { model: "fable", "max-turns": 5 } }, "default-profile": "p" }],
+  ["a model of best", { profiles: { p: { model: "best", "max-turns": 5 } }, "default-profile": "p" }],
+  ["a subagent model of fable", { profiles: { p: { model: "opus", "subagent-model": "fable", "max-turns": 5 } }, "default-profile": "p" }],
+  ["a subagent model of best", { profiles: { p: { model: "opus", "subagent-model": "best", "max-turns": 5 } }, "default-profile": "p" }],
+  // run-claude-cli cannot pass `default`, which sets no --model.
+  ["a model of default", { profiles: { p: { model: "default", "max-turns": 5 } }, "default-profile": "p" }],
   ["no default-profile", { profiles: { p: { model: "opus", "max-turns": 5 } } }],
   ["no profiles", { profiles: {}, "default-profile": "p" }],
   ["an unknown models key", { profiles: { p: { model: "opus", "max-turns": 5 } }, "default-profile": "p", sizes: ["S"] }],
 ]) {
   test(`the schema rejects ${why}`, () => {
     assertRejected(() => fixtureSlot(withModels(models)), "invalid-config");
+  });
+}
+
+test("the schema still admits opus and sonnet as a model, and every subagent model", () => {
+  for (const model of ["opus", "sonnet"]) {
+    for (const subagent of ["inherit", "opus", "sonnet"]) {
+      const profiles = { p: { model, "subagent-model": subagent, "max-turns": 5 } };
+      const slot = fixtureSlot(withModels({ profiles, "default-profile": "p" })).models;
+      assert.equal(slot["subagent-model"], subagent, `${model}/${subagent}`);
+    }
+  }
+});
+
+// Files whose schema admits any model and subagent model, so a value the
+// schema refuses still reaches the resolver.
+const uncheckedModels = (files) => {
+  const schema = structuredClone(files.schema);
+  delete schema.$defs.profile.properties.model.enum;
+  delete schema.$defs.profile.properties["subagent-model"].enum;
+  return { ...files, schema };
+};
+
+for (const model of ["fable", "best", "default"]) {
+  test(`with the schema check bypassed, a model profile naming ${model} resolves to opus, as a role profile does`, () => {
+    const profiles = { p: { model, "subagent-model": model, "max-turns": 5 } };
+    const { models } = fixtureSlot(uncheckedModels(withModels({ profiles, "default-profile": "p" })));
+    assert.equal(models.model, "opus");
+    assert.equal(models["subagent-model"], "opus");
+    assert.equal(modelArgs(models), "--model opus --max-turns 5");
   });
 }
 
@@ -703,6 +857,13 @@ test("a route naming a script activity or nothing known is undefined-route", () 
   assertRejected(() => resolveRoute(LIVE, { route: "fix-docs", configPath: CONFIG_PATH }), "undefined-route");
 });
 
+test("the upkeep and release intake model jobs resolve resolve-issue's profile", () => {
+  const models = resolveRoute(LIVE, { route: "resolve-issue", configPath: CONFIG_PATH });
+  assert.equal(models.profile, "code-fix");
+  assert.equal(typeof models.model, "string");
+  assert.ok(models.model.length > 0);
+});
+
 test("a run route that is not one of the five is undefined-route, as a model-route and as a config route", () => {
   assertRejected(() => resolveRoute(LIVE, { route: "review-docs", configPath: CONFIG_PATH }), "undefined-route");
   const profiles = { p: { model: "opus", "max-turns": 5 } };
@@ -713,7 +874,7 @@ test("a run route that is not one of the five is undefined-route, as a model-rou
 });
 
 // main() with model-route against a base holding the live config.
-const scratch = mkdtempSync(join(tmpdir(), "resolve-models-"));
+const scratch = tempDir("resolve-models-");
 after(() => rmSync(scratch, { recursive: true, force: true }));
 
 function readOutputs(path) {
@@ -774,19 +935,15 @@ test("main with model-route triage-issue writes the triage profile's outputs", a
   });
 });
 
-// A launcher caller (run-claude-cli) takes model and effort as inputs. A
-// `default` model passes no --model, which the launcher cannot express, so its
-// model output is empty and the caller fails on it.
-test("main gives a default model and an unset effort as empty model and effort outputs", async () => {
+// A launcher caller (run-claude-cli) takes model as an input, and cannot pass
+// `default`, which sets no --model, so the base's schema refuses it.
+test("main refuses a profile whose model is default", async () => {
   const env = routeEnv();
   const doc = parse(readFileSync(join(env.BASE_PATH, CONFIG_PATH), "utf8"));
   doc.models.profiles.review.model = "default";
   writeFileSync(join(env.BASE_PATH, CONFIG_PATH), stringify(doc));
-  assert.equal(await main({ env }), 0);
-  const outputs = readOutputs(env.GITHUB_OUTPUT);
-  assert.equal(outputs.model, "");
-  assert.equal(outputs.effort, "");
-  assert.equal(outputs["claude-args"], "--max-turns 60");
+  assert.equal(await main({ env }), 1);
+  assert.equal(readFileSync(env.GITHUB_OUTPUT, "utf8"), "");
 });
 
 // fix-ci on pr-unblock, on a labeled event; its labels-absent predicate reads
@@ -862,7 +1019,8 @@ const fieldEvent = (type, field, actor) => ({
   actor: { databaseId: actor },
   issueField: { fullDatabaseId: String(field) },
 });
-async function mainOnIssue(events) {
+const FIELD_ROWS = [fieldRow(15462270, 27053567), fieldRow(48625720, 85127653), fieldRow(48625721, 85127654)];
+async function mainOnIssue(events, splitChild = "false", fieldValues = FIELD_ROWS, labels = ["agent-ready"]) {
   const env = routeEnv({
     MODEL_ROUTE: "",
     LANE: "work-resolve-issue",
@@ -878,19 +1036,30 @@ async function mainOnIssue(events) {
   const github = async (method, path, body, headers) => {
     calls.push({ method, path, headers });
     if (path === "/repos/o/r/issues/7/issue-field-values") {
-      return [fieldRow(15462270, 27053567), fieldRow(48625720, 85127653), fieldRow(48625721, 85127654)];
+      return fieldValues;
     }
     if (path === "/graphql") {
       assert.deepEqual(body.variables, { owner: "o", name: "r", number: 7 });
       return { data: { repository: { issue: { timelineItems: { nodes: events } } } } };
     }
     assert.equal(`${method} ${path}`, "GET /repos/o/r/issues/7");
-    return { labels: [{ name: "agent-ready" }] };
+    return { labels: labels.map((name) => ({ name })) };
   };
-  writeFileSync(join(env.BASE_PATH, "event.json"), JSON.stringify({ action: "labeled", issue }));
-  const code = await main({ env: { ...env, EVENT_PATH: join(env.BASE_PATH, "event.json") }, github });
+  writeFileSync(join(env.BASE_PATH, "event.json"), JSON.stringify({ action: "field_added", issue }));
+  const code = await main({ env: { ...env, SPLIT_CHILD: splitChild, EVENT_PATH: join(env.BASE_PATH, "event.json") }, github });
   return { code, outputs: readOutputs(env.GITHUB_OUTPUT), calls };
 }
+
+// The caller reads whether the issue is a trusted split child (check-blockers.mjs)
+// and passes it; a resolve that reads the dimensions without it fails rather
+// than rating a trusted Large child split-required.
+test("main on an issue fails when split-child is neither true nor false", async () => {
+  for (const value of ["", "yes"]) {
+    const { code } = await mainOnIssue([], value);
+    assert.equal(code, 1, JSON.stringify(value));
+  }
+  assert.equal((await mainOnIssue([], "true")).code, 0);
+});
 
 test("main on an issue set Medium, High, Known writes its turn cap, dimensions and timeout", async () => {
   const { code, outputs, calls } = await mainOnIssue([
@@ -904,6 +1073,24 @@ test("main on an issue set Medium, High, Known writes its turn cap, dimensions a
   assert.equal(outputs["timeout-minutes"], "9");
   const read = calls.find((call) => call.path.endsWith("/issue-field-values"));
   assert.equal(read.headers["X-GitHub-Api-Version"], "2026-03-10");
+});
+
+// The trusted Work status folds into the labels (read-status.mjs statusLabels):
+// agent-ready a listed human set admits with no label, one an unlisted account
+// set does not, and a field hold holds a labeled issue.
+test("main on an issue reads its trusted Work status as its status label", async () => {
+  const DIMS_SET = [fieldEvent("IssueFieldAddedEvent", 15462270, LISTED), fieldEvent("IssueFieldAddedEvent", 48625720, LISTED), fieldEvent("IssueFieldAddedEvent", 48625721, LISTED)];
+  const status = (value, actor) => ({ ...fieldEvent("IssueFieldAddedEvent", 48484079, actor), value });
+  const rows = (option) => [...FIELD_ROWS, fieldRow(48484079, option)];
+  const fieldOnly = await mainOnIssue([...DIMS_SET, status("agent-ready", LISTED)], "false", rows(84879220), []);
+  assert.equal(fieldOnly.code, 0);
+  assert.equal(fieldOnly.outputs.applies, "true");
+  const untrusted = await mainOnIssue([...DIMS_SET, status("agent-ready", UNLISTED)], "false", rows(84879220), []);
+  assert.equal(untrusted.outputs.applies, "false");
+  assert.equal(untrusted.outputs["skip-reason"], "not-applicable");
+  const held = await mainOnIssue([...DIMS_SET, status("needs-human", LISTED)], "false", rows(86380005), ["agent-ready"]);
+  assert.equal(held.outputs.applies, "false");
+  assert.equal(held.outputs["skip-reason"], "awaiting-human");
 });
 
 test("main reads a Size an unlisted account set last as small", async () => {
@@ -923,6 +1110,75 @@ test("main fails when the field events answer with GraphQL errors", async () => 
   const { fieldSetters } = await import("./resolve-config.mjs");
   const github = async () => ({ errors: [{ message: "Resource not accessible by integration" }] });
   await assert.rejects(() => fieldSetters(github, "o/r", 7), /field events could not be read: Resource not accessible/);
+});
+
+test("main fails when the field values answer is not a list", async () => {
+  for (const answer of [{ message: "Not Found" }, null]) {
+    const { code, outputs } = await mainOnIssue([], "false", answer);
+    assert.equal(code, 1, JSON.stringify(answer));
+    assert.equal(outputs["issue-dimensions"], undefined, JSON.stringify(answer));
+  }
+});
+
+test("fieldSetters fails on an answer with no data and no errors, or a null issue", async () => {
+  const { fieldSetters } = await import("./resolve-config.mjs");
+  for (const answer of [{}, null, { data: null }, { data: { repository: null } }, { data: { repository: { issue: null } } }]) {
+    const github = async () => answer;
+    await assert.rejects(() => fieldSetters(github, "o/r", 7), /field events answer named no issue/, JSON.stringify(answer));
+  }
+});
+
+test("fieldSetters fails on an issue with no event list", async () => {
+  const { fieldSetters } = await import("./resolve-config.mjs");
+  for (const issue of [{}, { timelineItems: null }, { timelineItems: { nodes: null } }]) {
+    const github = async () => ({ data: { repository: { issue } } });
+    await assert.rejects(() => fieldSetters(github, "o/r", 7), /field events answer holds no event list/, JSON.stringify(issue));
+  }
+});
+
+// The shapes as GraphQL answered them on 2026-11-06: option names
+// as values, a bot's login without `[bot]`, and a removal with no value.
+test("fieldEvents reads each event's field, actor, time and values, oldest first", async () => {
+  const { fieldEvents, fieldSetters } = await import("./resolve-config.mjs");
+  const bot = { __typename: "Bot", login: "melodic-automation-lanes", databaseId: 337595936 };
+  const person = { __typename: "User", login: "kyle-sexton", databaseId: LISTED };
+  const nodes = [
+    { __typename: "IssueFieldAddedEvent", createdAt: "2026-11-05T09:11:45Z", value: "ready", actor: bot, issueField: { fullDatabaseId: "48484079" } },
+    { __typename: "IssueFieldAddedEvent", createdAt: "2026-11-05T09:11:46Z", value: "Medium", actor: bot, issueField: { fullDatabaseId: "15462270" } },
+    { __typename: "IssueFieldChangedEvent", createdAt: "2026-11-05T09:11:51Z", previousValue: "ready", newValue: "needs-human", actor: bot, issueField: { fullDatabaseId: "48484079" } },
+    { __typename: "IssueFieldRemovedEvent", createdAt: "2026-11-06T10:00:00Z", actor: person, issueField: { fullDatabaseId: "48484079" } },
+    { __typename: "IssueFieldAddedEvent", createdAt: "2026-11-06T10:00:01Z", value: "x", actor: person, issueField: {} },
+    { __typename: "IssueFieldAddedEvent", createdAt: "2026-11-06T11:00:00Z", value: "needs-triage", actor: { __typename: "Bot", login: "ghost" }, issueField: { fullDatabaseId: "48484079" } },
+  ];
+  const github = async (method, path, body) => {
+    assert.equal(`${method} ${path}`, "POST /graphql");
+    assert.deepEqual(body.variables, { owner: "o", name: "r", number: 7 });
+    for (const selection of ["createdAt value", "previousValue newValue", "__typename login"]) assert.ok(body.query.includes(selection), selection);
+    return { data: { repository: { issue: { timelineItems: { nodes } } } } };
+  };
+  const at = (time, rest) => ({ removed: false, at: time, ...rest });
+  assert.deepEqual(await fieldEvents(github, "o/r", 7), [
+    at("2026-11-05T09:11:45Z", { field: "48484079", actorId: 337595936, actorLogin: "melodic-automation-lanes", actorType: "Bot", from: null, to: "ready" }),
+    at("2026-11-05T09:11:46Z", { field: "15462270", actorId: 337595936, actorLogin: "melodic-automation-lanes", actorType: "Bot", from: null, to: "Medium" }),
+    at("2026-11-05T09:11:51Z", { field: "48484079", actorId: 337595936, actorLogin: "melodic-automation-lanes", actorType: "Bot", from: "ready", to: "needs-human" }),
+    { field: "48484079", removed: true, actorId: LISTED, actorLogin: "kyle-sexton", actorType: "User", at: "2026-11-06T10:00:00Z", from: "needs-human", to: null },
+    at("2026-11-06T11:00:00Z", { field: "48484079", actorId: null, actorLogin: "ghost", actorType: "Bot", from: null, to: "needs-triage" }),
+  ]);
+  // fieldSetters folds the same events: the newest actor per field, null for one with no id.
+  assert.deepEqual({ ...(await fieldSetters(github, "o/r", 7)) }, { 48484079: null, 15462270: 337595936 });
+});
+
+test("fieldEvents fails as fieldSetters does on GraphQL errors and malformed answers", async () => {
+  const { fieldEvents } = await import("./resolve-config.mjs");
+  await assert.rejects(() => fieldEvents(async () => ({ errors: [{ message: "nope" }] }), "o/r", 7), /field events could not be read: nope/);
+  await assert.rejects(() => fieldEvents(async () => ({ data: { repository: { issue: null } } }), "o/r", 7), /named no issue/);
+  await assert.rejects(() => fieldEvents(async () => ({ data: { repository: { issue: {} } } }), "o/r", 7), /holds no event list/);
+});
+
+test("fieldSetters reads an empty event list as no setters", async () => {
+  const { fieldSetters } = await import("./resolve-config.mjs");
+  const github = async () => ({ data: { repository: { issue: { timelineItems: { nodes: [] } } } } });
+  assert.deepEqual({ ...(await fieldSetters(github, "o/r", 7)) }, {});
 });
 
 test("main reads a field removed after it was set as unset", async () => {

@@ -4,18 +4,17 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { issueLaneWebHostsFromBase, main, resolveFromBase } from "./resolve-config.mjs";
+import { tempDir } from "../../../lib/test-tmp.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = join(HERE, "resolve-config.mjs");
@@ -29,7 +28,7 @@ const SCHEMA_PATH = "docs/conventions/pr-pipeline/pr-pipeline.schema.json";
 const VOCABULARY_PATH =
   ".github/standards/github-actions-conventions/vocabulary.json";
 
-const scratch = mkdtempSync(join(tmpdir(), "resolve-config-"));
+const scratch = tempDir("resolve-config-");
 after(() => rmSync(scratch, { recursive: true, force: true }));
 let counter = 0;
 
@@ -204,6 +203,7 @@ test("a valid config writes ResolvedConfig and the selected activity's outputs",
     issues: "read",
     actions: "",
     "can-commit": "false",
+    checkout: "head",
   });
 });
 
@@ -249,6 +249,37 @@ for (const mode of ["bypassPermissions", "acceptEdits", "default", "plan"]) {
     await assertFailsRed(t, withPermissionMode(mode), /permission-mode/);
   });
 }
+
+// A script's write-runner checkout: head unless the leaf sets base; a skill
+// has none, and setting one on a skill or to another value fails the schema.
+// The key is inserted after `after`, a line of the leaf.
+const withCheckout = (checkout, { activity = "run-tests", after = "    script: scripts/run-tests.sh\n" } = {}) => {
+  const { env } = workspace();
+  env.ACTIVITY = activity;
+  if (activity === "fix-prose") {
+    env.LANE = "pr-refine";
+  }
+  const path = join(env.BASE_PATH, CONFIG_PATH);
+  const config = readFileSync(path, "utf8");
+  const set = config.replace(after, (line) => `${line}    checkout: ${checkout}\n`);
+  assert.notEqual(set, config);
+  writeFileSync(path, set);
+  return env;
+};
+
+test("a script's checkout output is head unless the leaf sets base; a skill has none", async () => {
+  const env = withCheckout("base");
+  assert.equal(await main({ env, github: srcChanged() }), 0);
+  assert.equal(readOutputs(env.GITHUB_OUTPUT).checkout, "base");
+  const skill = withPermissionMode(undefined);
+  assert.equal(await main({ env: skill, github: noApi }), 0);
+  assert.equal(Object.hasOwn(readOutputs(skill.GITHUB_OUTPUT), "checkout"), false);
+});
+
+test("checkout fails the schema on a skill or with a value other than head or base", async (t) => {
+  await assertFailsRed(t, withCheckout("pr"), /checkout/);
+  await assertFailsRed(t, withCheckout("base", { activity: "fix-prose", after: /    reads-untrusted: false\n(?=lanes:)/ }), /checkout|script/);
+});
 
 test("without an activity only enabled and slots are output", async () => {
   const { env } = workspace();

@@ -1,0 +1,117 @@
+{
+  "items": [
+    {
+      "id": "frontier-release-instruction-ablation",
+      "title": "Model release: run audit-instructions (any release) + unhobble (frontier only) over this repo",
+      "cadence": "quarterly",
+      "area": [],
+      "category": "general",
+      "triggers": ["claude-model-release"],
+      "precondition": {
+        "id": "frontier-release-since-last-checked",
+        "prompt": "Read the official Claude release notes as raw markdown (https://platform.claude.com/docs/en/release-notes/overview.md), taking each launch's date from the `###` date heading above it, for a Claude model release of any class (frontier, Opus, Sonnet or Haiku) after last_checked. audit-instructions runs on any release; unhobble runs only when the release is a frontier model. If no release has occurred, run nothing and recheck: cite the page and its newest model entry in the recheck, set last_checked to the date you read it, and advance next_due by the cadence. If the page cannot be read, run nothing and leave the issue open.",
+        "requires_operator_confirmation": false
+      },
+      "last_checked": "2026-11-07",
+      "next_due": "2027-02-05",
+      "notes": "On each Claude model release (primary trigger), re-test which standing instructions the new model still needs over this repository's session surfaces (CLAUDE.md, AGENTS.md, .claude/rules, local hooks and settings), never the shipped plugin components. /harness-config:audit-instructions runs report-only on any release (frontier, Opus, Sonnet or Haiku). On a frontier release only, /harness-config:unhobble follows on the survivors: strip candidate instructions on an experiment branch, exercise the affected workflows, restore only what observed failures justify, and run /overengineering:delta as a step of that pass, so each frontier release re-checks whether the enforcement surface (guards, hooks, gates) still earns its keep. Record the audit's findings summary and, for unhobble, what was removed, what was restored with the evidence for each, and what the delta moved, in the body of the pull request that advances last_checked (/work-items:track recheck). Shipped-component findings go to their own issues. The id names only the frontier case; the precondition prompt sets the release class. No automation observes the release event: the daily recurring filer files this row once next_due arrives, so the quarterly cadence is a backstop that catches a release nobody noticed (docs/plugin-philosophy.md, Instruction economy), and an operator or agent who notices a release runs it sooner. 2026-10-10: Claude Haiku 5.5 (not a frontier release) got the audit-instructions pass only; its findings are on #2019.",
+      "close_previous": true
+    },
+    {
+      "id": "listing-budget-watch",
+      "title": "Listing-budget watch: report the shared aggregate and drift",
+      "cadence": "quarterly",
+      "area": [],
+      "category": "general",
+      "triggers": [],
+      "last_checked": "2026-11-06",
+      "next_due": "2027-02-04",
+      "notes": "Report-only self-maintenance routine (digest menu #9 pilot). Run skill-quality's check-listing-budget.sh pooled over plugins/*/skills from a current main checkout; record aggregate, skill count, delta vs prior cycle, and top-10 contributors on the open recurring issue (#2023 is the first instance). Baseline and the pending target decision live in #2022. Never edits descriptions — findings route to issues.",
+      "close_previous": true
+    },
+    {
+      "id": "stale-doc-drift-watch",
+      "title": "Stale-doc drift watch: report doc references that no longer hold",
+      "cadence": "quarterly",
+      "area": [],
+      "category": "general",
+      "triggers": [],
+      "last_checked": "2026-11-06",
+      "next_due": "2027-02-04",
+      "notes": "Report-only self-maintenance routine (digest menu #9 pilot). Sweep docs/ and top-level repo docs for references to files/checks/skills that no longer exist, stale version claims, and moved official-docs.md pages (review:doc-drift-detector or docs-hygiene audits); verify generated CATALOG/skill-cheat-sheet freshness on a scratch branch. File one issue per confirmed drift cluster or comment no-drift on the open recurring issue (#2024 is the first instance). Never edits docs directly from the routine.",
+      "close_previous": true
+    },
+    {
+      "id": "agents-md-cutover-check",
+      "title": "Run /instruction-placement:migrate cutover-check",
+      "cadence": "monthly",
+      "area": [],
+      "category": "general",
+      "triggers": ["claude-code-release-agents-md"],
+      "last_checked": "2026-10-31",
+      "next_due": "2026-11-30",
+      "notes": "Run /instruction-placement:migrate cutover-check across the ten in-scope repositories; it reports each of the four cutover conditions as met, unmet or unreachable, with evidence (plugins/instruction-placement/skills/migrate/scripts/cutover-check.sh). Also run it, independent of cadence, whenever /harness-ops:changelog reports a Claude Code release that touches AGENTS.md handling or instruction-file loading. Record each run's per-condition table in the body of the pull request that advances last_checked (/work-items:track recheck). Condition 4 (no repository locates a path by the existence of CLAUDE.md) regresses silently: a pull request that adds such a mention in a code file, test teardown included, adds its row to that repository's .claude/cutover-pathdet-ack.txt in the same pull request. Shims stay until the official docs name AGENTS.md for cloud sessions and claude-code-action (owner decision 2026-10-31; ADR 0036). When they do and every condition is met, grade shim-droppable.md per repository, then run /instruction-placement:migrate remove-shims per repository, each with the operator's named confirmation in that conversation, medley last, canaries after; remove-shims refuses below its installed-plugin floors (remove-shims.sh). Never remove a shim from a partial grade. 2026-10-31: all four conditions met on all ten repositories; the per-condition table is on #4281.",
+      "close_previous": true
+    },
+    {
+      "id": "actionlint-self-repository-watch",
+      "title": "Check actionlint for a release that parses uses: $/...",
+      "cadence": "monthly",
+      "area": [],
+      "category": "general",
+      "triggers": [],
+      "last_checked": "2026-10-24",
+      "next_due": "2026-11-24",
+      "notes": "Check rhysd/actionlint releases after v1.7.12 (and actionlint issues #711/#732) for one that parses uses: $/... . None: comment unmet on the recurring issue, change nothing. One: file an issue to repin the ci-workflows actionlint action (pr-require-checks.yml), re-count the zizmor: ignore[self-repository] sites (137 on 2026-10-24), run zizmor --fix=safe --persona=regular -- ., delete every zizmor: ignore[self-repository] and the comment above the Run zizmor step in pr-require-checks.yml; accept when zizmor and actionlint both exit 0, never a repo-wide disable. Spec: #4130.",
+      "close_previous": true
+    },
+    {
+      "id": "model-fallback-targets-watch",
+      "title": "Check the model-config fallback targets against the model-adaptation chapters",
+      "cadence": "monthly",
+      "area": [],
+      "category": "general",
+      "triggers": [],
+      "last_checked": "2026-10-24",
+      "next_due": "2026-11-24",
+      "notes": "Re-read https://code.claude.com/docs/en/model-config#automatic-model-fallback. If it still names Opus 5, Opus 4.8 and Sonnet 5, change nothing. For each model no longer named, file an issue: remove plugins/playbooks/reference/model-adaptation/<model>.md, update fable-5 meta-rule 3 with the new read date, fable-5 evals, playbooks CHANGELOG and version, then sweep stale references (spec: #4349). Retire the row when the opus-5, opus-4-8 and sonnet-5 chapters are gone.",
+      "close_previous": true
+    },
+    {
+      "id": "ci-perf-target-watch",
+      "title": "Measure CI performance against the p50 and p95 targets",
+      "cadence": "monthly",
+      "area": [],
+      "category": "general",
+      "triggers": [],
+      "last_checked": "2026-10-24",
+      "next_due": "2026-11-24",
+      "notes": "Run github-iac eng/ci-perf snapshot.sh capture/compare read-only with --raw-root under .work/; append the scored rows to github-iac eng/ci-perf/GOAL.md's Run log; file an issue per row over target (targets p50 5 min, p95 12 min). Spec: #3932.",
+      "close_previous": true
+    },
+    {
+      "id": "pr-verify-denial-watch",
+      "title": "Check pr-verify verdicts lost to permission denials",
+      "cadence": "monthly",
+      "area": [],
+      "category": "general",
+      "triggers": [],
+      "last_checked": "2026-10-26",
+      "next_due": "2026-11-26",
+      "notes": "Run gh run list -R melodic-software/claude-code-plugins --workflow pr-verify.yml --branch main --status failure -L 50 and read each failed run's log for ::error::no verdict: the run hit N permission denial(s) or ::error::no verdict: the run's legs hit N permission denial(s) (write-verdict.mjs); list the lane PRs the merge lane refused verify:missing behind those heads. A person decides, per denial, whether it was a benign read (the model reaching for a path outside pr-verify-data) or injected PR text. Injected PR text: the refusal worked; keep it and change nothing. Benign reads recurring (2 or more lane PRs refused verify:missing from benign-read denials in 30 days): file a fix issue, trying first an automatic pr-require-checks rerun on the stalled head, since it leaves the injection refusal intact, then a tighter prompt. Below that: comment the counts on the recurring issue and change nothing. Rejected for now (#8432): a fail verdict with the reason, which refuses that head verify:fail, holds the PR's later heads verify:earlier-fail until a later pass on a different change clears them, and counts toward the verify:repeated-fail cap; and ignoring denials, which lets an injected read still be judged. Spec: #8432.",
+      "close_previous": true
+    },
+    {
+      "id": "userconfig-fallback-removal-watch",
+      "title": "Remove the userConfig fallback for six migrated babysit keys",
+      "cadence": "annual",
+      "area": [],
+      "category": "general",
+      "triggers": [],
+      "last_checked": "2026-10-25",
+      "next_due": "2026-12-27",
+      "notes": "One-off; retire this row when the removal lands (cadence annual is only the schema's required value). Owner decision on #5653, 2026-10-26: closed not planned, reopen on or after 2026-12-27, the date the branch_issue_pattern entry under The config files in plugins/source-control/reference/config-resolution.md keeps the fallback until. next_due is that reopen date; the removal itself must not land before 2026-12-29, the date #5653 gates it on, and its CHANGELOG Removed entry is dated on or after 2026-12-29 (fix the reference's 12-27 line when it lands). Scope: remove the userConfig fallback and its deprecation note for the six migrated keys and the deprecated branch_issue_pattern userConfig twin, in the same minor release under one CHANGELOG Removed entry. The review pair (babysit_review_bot_logins, babysit_review_settle_minutes) stays userConfig-only. Spec: #5653.",
+      "close_previous": true
+    }
+  ]
+}

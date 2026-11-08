@@ -10,7 +10,7 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 
 import { writeOutputs } from "../check-kill-switch/check-kill-switch.mjs";
-import { rateLimitLatch } from "../log-api-budget/rate-guard.mjs";
+import { rateLimitLatch, refusedForLimit, RESEND, SERVER_RETRY_BUDGET_MS } from "../log-api-budget/rate-guard.mjs";
 
 const ACTOR_KEYS = ["id", "kind", "login"];
 const KINDS = new Set(["human", "bot"]);
@@ -26,6 +26,8 @@ const ACTIONS_BOT_ID = 41898282;
 // A workflow_dispatch dispatcher must come from a listed human; push and
 // schedule name none.
 const DISPATCHER_EVENTS = new Set(["push", "schedule", "workflow_dispatch"]);
+// The one event a run-dispatcher-relay upstream runs on.
+const RELAY_EVENT = "pull_request_review_comment";
 // The dispatcher dispatches within seconds of starting; a longer run must not
 // keep its window open.
 const WINDOW_MS = 10 * 60 * 1000;
@@ -36,6 +38,12 @@ const RECORD_PREFIX = "pr-unblock-dispatched-";
 // A workflow_run dispatcher sends one dispatch per run and names its record
 // with the upstream run that started it, then the run it dispatched.
 const RUN_RECORD_NAME = /^pr-feedback-dispatched-([1-9][0-9]{0,14})-([1-9][0-9]{0,14})$/;
+// A pull_request_target dispatcher sends one dispatch, of this workflow only,
+// and names its record with the default-branch commit it ran, then the run it
+// dispatched.
+const TARGET_EVENT = "pull_request_target";
+const TARGET_DISPATCHED = ".github/workflows/pr-refine.yml";
+const TARGET_RECORD_NAME = /^pr-unblock-target-dispatched-([0-9a-f]{40})-([1-9][0-9]{0,14})$/;
 // The record can land after this run's gate starts: re-read every 5 s while
 // the dispatcher run is still going, for at most 2 min (judgment).
 const RECORD_WAIT_MS = 5000;
@@ -45,14 +53,18 @@ const RECORD_MAX_PAGES = 10;
 // predictable name, so each forged one costs a run read (judgment).
 const RECORD_MAX_CANDIDATES = 20;
 const RECORD_MAX_SLEEPS = 24;
-// The lost-run reconciler re-runs a lane run once, on its first attempt, so
-// the attempt it starts is always the second.
+// The first re-run attempt. The lost-run reconciler re-runs most runs once,
+// on their first attempt, so the attempt it starts is the second.
 const RERUN_ATTEMPT = 2;
+// The highest attempt the reconciler records: it re-runs a passed checks run
+// whose spec changed again after its last recorded re-run (owner decision
+// Q-RERUN3), so it may record attempts 2 to this one.
+export const RECONCILER_ATTEMPT_CAP = 3;
 const RECONCILER_EVENTS = new Set(["schedule", "workflow_dispatch"]);
 
-// The artifact the reconciler run uploads before it re-runs a lane run: the
-// run, the attempt the re-run starts, and the run's head SHA.
-export const rerunRecordName = (runId, headSha) => `reconcile-rerun-${runId}-${RERUN_ATTEMPT}-${headSha}`;
+// The artifact the reconciler run uploads before it re-runs a run: the run,
+// the attempt the re-run starts, and the run's head SHA.
+export const rerunRecordName = (runId, attempt, headSha) => `reconcile-rerun-${runId}-${attempt}-${headSha}`;
 
 // The artifact pr-feedback-dispatch.yml's rerun-ci-status job uploads just
 // before it re-runs a ci-status job: the run, the attempt the re-run starts,
@@ -65,8 +77,8 @@ export const ciStatusRerunRecordName = (runId, attempt, headSha) => `rerun-ci-st
 // may poll for minutes first, so its window runs from the record's upload.
 const reconcilerRecorder = (workflow) => ({
   workflow,
-  attempts: (attempt) => attempt === RERUN_ATTEMPT,
-  name: (runId, _attempt, headSha) => rerunRecordName(runId, headSha),
+  attempts: (attempt) => attempt >= RERUN_ATTEMPT && attempt <= RECONCILER_ATTEMPT_CAP,
+  name: rerunRecordName,
   started: (run, isListedHuman) => RECONCILER_EVENTS.has(run.event) && (run.event === "schedule" || isListedHuman(run.actor)),
   fromRecord: false,
 });
@@ -81,37 +93,115 @@ const ciStatusRerunRecorder = (workflow) => ({
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// detail is responseDetail's line for the answer, kept out of the message so
+// a caller that logs only the message logs what it did before.
 export class GitHubError extends Error {
-  constructor(status, what) {
+  constructor(status, what, detail = "") {
     super(`${what} failed with status ${status}`);
     this.name = "GitHubError";
     this.status = status;
+    this.detail = detail;
   }
 }
 
-// Wraps a fetch so a GET attempt is aborted after attemptTimeoutMs, and a GET
-// that GitHub answers 5xx, answers 200 with an empty body or with JSON that
-// does not parse, or that fails on the network (a timeout, "fetch failed", an
-// error with a cause code) is sent again after 2 s, 4 s and 8 s, each with
-// equal jitter (half fixed, half random). The time failed attempts took plus
-// the waits, summed over every call through one wrapper, is capped at 60 s: a
-// wait past the cap is not taken. With 20 s attempts, retrying adds at most
-// about 80 s to a client, inside the shortest step that runs one (3 minutes,
+// Why GitHub refused a call, from the answer already in hand, so it costs no
+// request: the status, the x-ratelimit-remaining, -reset and -resource
+// headers ("none" when absent), retry-after when sent, and the body's first
+// 200 characters. x-ratelimit-resource names "the rate limit resource that the
+// request counted against", and a secondary limit's 403 or 429 carries "an
+// error message that indicates that you exceeded a secondary rate limit"
+// (https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api);
+// retry-after, x-ratelimit-remaining and x-ratelimit-reset say when to call
+// again (https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#handle-rate-limit-errors-appropriately).
+// The body is JSON-quoted and % escaped, so it cannot end or re-encode the
+// annotation line it goes in. A body already read is "".
+export async function responseDetail(response) {
+  const header = (name) => response.headers?.get?.(name) ?? null;
+  let text = "";
+  try {
+    text = await response.clone().text();
+  } catch {
+    text = "";
+  }
+  const fields = [
+    `status=${response.status}`,
+    ...["remaining", "reset", "resource"].map((key) => `x-ratelimit-${key}=${header(`x-ratelimit-${key}`) ?? "none"}`),
+    ...(header("retry-after") === null ? [] : [`retry-after=${header("retry-after")}`]),
+    `body=${JSON.stringify(text.slice(0, 200))}`,
+  ];
+  return fields.join(" ").replaceAll("%", "%25");
+}
+
+// The annotation suffix for a thrown error's responseDetail, or "".
+export const detailSuffix = (error) => (typeof error?.detail === "string" && error.detail ? ` [${error.detail}]` : "");
+
+// Wraps a fetch so an idempotent request (a GET, or a GraphQL query) has each
+// attempt aborted after attemptTimeoutMs, and is sent again, at most 3
+// attempts in all, after a full-jitter wait (a random share of 2 s, then of
+// 4 s), when GitHub answers it 5xx, answers a GET 200 with an empty body or
+// with JSON that does not parse, or it fails on the network (a timeout, "fetch
+// failed", an error with a cause code). The time failed attempts took plus the
+// waits, summed over every call through one wrapper, is capped at 60 s: a wait
+// past the cap is not taken, though a call's first attempt always goes out.
+// With 20 s attempts, retrying adds at most about 46 s to one call, inside the
+// shortest step that runs one (3 minutes,
 // pr-merge.yml's gate-check and clear-escalations). The last answer is
-// returned, or the last error thrown. Only GETs are idempotent; a 4xx is the
-// caller's to handle, a rate limit is the rate guard's (rate-guard.mjs), whose
-// latch refuses any attempt while its pool is stopped, and any other
-// thrown error is raised at once. A retry line names an error's name and cause
-// code only: undici puts a whole header value, the token included, in some
-// messages. createGitHub and budgetedFetch both use it.
-const SERVER_RETRY_DELAYS_MS = [2000, 4000, 8000];
-const SERVER_RETRY_BUDGET_MS = 60_000;
+// returned, or the last error thrown. Any other request, a mutation among
+// them, is sent once and never timed out; a 4xx is the caller's to handle, a
+// rate limit is the rate guard's (rate-guard.mjs), whose latch waits out a
+// stop that fits its budget (with sleep) and refuses any attempt past it, and
+// any other thrown error is raised at once. With resendLimited, an idempotent
+// request whose answer stopped its pool for no longer than the latch would
+// wait is sent again, inside the same 3 attempts, once the reset passes. A
+// retry line names an error's name and cause code only: undici puts a
+// whole header value, the token included, in some messages. createGitHub and
+// budgetedFetch both use it, with resendLimited.
+//
+// A write whose caller marks it [RESEND_ONCE] (createGitHub's resendOnce) is
+// one that leaves the same state when GitHub applies it twice; the caller
+// says why at the call. It is sent again once, WRITE_RETRY_DELAY_MS later,
+// when GitHub answers it 5xx or it fails on the network; it is still never
+// timed out, and a 403, 429 or any other 4xx is returned at once, so a rate
+// limit is never sent again.
+export const RESEND_ONCE = Symbol("resend a write once");
+const WRITE_RETRY_DELAY_MS = 3000;
+const SERVER_RETRY_DELAYS_MS = [2000, 4000];
 const ATTEMPT_TIMEOUT_MS = 20_000;
-const networkFailure = (error) =>
+// A GraphQL query: a POST to /graphql whose document starts with `query` or
+// `{` past any `#` comments, holds no `mutation` or `subscription` word
+// anywhere in the raw text (so a `#` inside a string hides none), and whose
+// request names no operationName. A document can hold several operations and the
+// request pick one by name, so anything less than all three may run a mutation.
+export const graphqlQuery = (url, init) => {
+  if (!String(url).endsWith("/graphql") || typeof init.body !== "string") {
+    return false;
+  }
+  try {
+    const request = JSON.parse(init.body);
+    const query = request?.query;
+    return (
+      typeof query === "string" &&
+      request.operationName === undefined &&
+      /^(query\b|\{)/.test(query.replace(/#[^\n]*/g, "").trim()) &&
+      !/\b(mutation|subscription)\b/.test(query)
+    );
+  } catch {
+    return false;
+  }
+};
+export const networkFailure = (error) =>
   error?.name === "TimeoutError" ||
   error?.name === "AbortError" ||
   (error?.name === "TypeError" && error.message === "fetch failed") ||
   typeof error?.cause?.code === "string";
+// A GitHub fault: a 5xx or 429, a call the rate guard refused (RateLimitStop),
+// or a request that got no answer. What the call did is unknown, not wrong, so
+// a lane holds on it (outage posture element 2). Any other 4xx (a lost
+// permission, a missing label) is not one, since a retry meets it again.
+export const isFault = (error) =>
+  (error?.name === "GitHubError" && (error.status >= 500 || error.status === 429)) ||
+  error?.name === "RateLimitStop" ||
+  networkFailure(error);
 // An error's name and cause code, never its message.
 export const errorLabel = (error) =>
   [error?.name ?? "Error", typeof error?.cause?.code === "string" ? error.cause.code : null].filter(Boolean).join(" ");
@@ -144,57 +234,84 @@ export function retryServerErrors(
     now = () => Date.now(),
     attemptTimeoutMs = ATTEMPT_TIMEOUT_MS,
     latch = rateLimitLatch,
+    resendLimited = false,
   } = {},
 ) {
-  // Every attempt, a retry included, goes through the rate guard's latch.
-  fetchImpl = latch.guard(fetchImpl);
+  // Every attempt, a retry included, goes through the rate guard's latch,
+  // which waits out a short stop with this client's sleep.
+  fetchImpl = latch.guard(fetchImpl, { sleep });
   let spent = 0;
   return async function send(url, init = {}) {
     const method = init.method ?? "GET";
+    const idempotent = method === "GET" || (method === "POST" && graphqlQuery(url, init));
     for (let attempt = 0; ; attempt += 1) {
-      // Only a GET is timed out: a write GitHub accepted slowly must not look
-      // failed, so writes keep only the caller's signal.
-      const timeout = method === "GET" ? AbortSignal.timeout(attemptTimeoutMs) : undefined;
+      // The latch's wait comes before the attempt's timeout and clock start, so
+      // it neither aborts the attempt nor counts against the retry budget.
+      await latch.waitOut(url, method, sleep);
+      // Only an idempotent request is timed out: a write GitHub accepted slowly
+      // must not look failed, so writes keep only the caller's signal.
+      const timeout = idempotent ? AbortSignal.timeout(attemptTimeoutMs) : undefined;
       const signal = timeout && init.signal ? AbortSignal.any([init.signal, timeout]) : (timeout ?? init.signal);
       const started = now();
+      // Whether a rate-limit refusal of this attempt is sent again, which the
+      // guard reads (RESEND) so it fails nothing for it.
+      const resend = resendLimited && idempotent && SERVER_RETRY_DELAYS_MS[attempt] !== undefined && spent <= SERVER_RETRY_BUDGET_MS;
       let response;
       let error;
       let broken = false;
       try {
-        response = await fetchImpl(url, { ...init, signal });
+        response = await fetchImpl(url, { ...init, signal, [RESEND]: resend });
         broken = method === "GET" && (await brokenBody(response));
       } catch (thrown) {
         error = thrown;
       }
-      const failed = error !== undefined ? networkFailure(error) && !init.signal?.aborted : response.status >= 500 || broken;
-      spent += failed ? now() - started : 0;
+      // The latch waits out the reset before the resend, on its own budget.
+      const limited = resend && error === undefined && latch.waits(url) && (await refusedForLimit(response));
+      const failed = error !== undefined ? networkFailure(error) && !init.signal?.aborted : response.status >= 500 || broken || limited;
+      spent += failed && !limited ? now() - started : 0;
       const delay = SERVER_RETRY_DELAYS_MS[attempt];
-      const wait = delay === undefined ? 0 : Math.round(delay / 2 + (random() * delay) / 2);
-      if (!failed || method !== "GET" || delay === undefined || spent + wait > SERVER_RETRY_BUDGET_MS) {
+      const wait = delay === undefined || limited ? 0 : Math.round(random() * delay);
+      if (failed && !idempotent && init[RESEND_ONCE] === true && attempt === 0) {
+        await response?.body?.cancel().catch(() => {});
+        const what = error !== undefined ? `failed (${errorLabel(error)})` : `answered ${response.status}`;
+        log(`::warning::${method} ${url} ${what}; sending it again in ${WRITE_RETRY_DELAY_MS} ms (it is safe to send twice; retry 1 of 1)`);
+        await sleep(WRITE_RETRY_DELAY_MS);
+        continue;
+      }
+      if (!failed || !idempotent || delay === undefined || spent + wait > SERVER_RETRY_BUDGET_MS) {
         if (error !== undefined) {
           throw error;
         }
         return response;
       }
       await response?.body?.cancel().catch(() => {});
+      if (limited) {
+        continue;
+      }
       const what =
         error !== undefined
           ? `failed (${errorLabel(error)})`
           : broken
             ? `answered ${response.status} with an empty or unparsable body`
             : `answered ${response.status}`;
-      log(`::warning::GET ${url} ${what}; sending it again in ${wait} ms (retry ${attempt + 1} of ${SERVER_RETRY_DELAYS_MS.length})`);
+      log(`::warning::${method} ${url} ${what}; sending it again in ${wait} ms (retry ${attempt + 1} of ${SERVER_RETRY_DELAYS_MS.length})`);
       spent += wait;
       await sleep(wait);
     }
   };
 }
 
+// The key createGitHub keeps an answer's ETag under.
+export const ETAG = Symbol.for("github.etag");
+
 // One function every API read and write goes through; tests replace it.
 // keepGraphQLErrors returns a GraphQL answer with its errors for the caller to
-// judge, instead of raising on any. A GET answered 5xx is sent again
-// (retryServerErrors). A call while the rate guard's latch holds its pool
-// throws RateLimitStop without a request.
+// judge, instead of raising on any. A read answered 5xx is sent again
+// (retryServerErrors), and so is a read a rate limit refused once the latch
+// waits out its reset. A call while the rate guard's latch holds its pool past
+// the wait budget throws RateLimitStop without a request. A write the caller
+// passes `resendOnce: true` for is sent again once on a 5xx or a network
+// failure (RESEND_ONCE); pass it only for a write that is safe to send twice.
 export function createGitHub({
   token,
   apiUrl = "https://api.github.com",
@@ -208,9 +325,10 @@ export function createGitHub({
   attemptTimeoutMs,
   latch,
 }) {
-  const send = retryServerErrors(fetchImpl, { sleep, random, log, now, attemptTimeoutMs, latch });
-  return async function github(method, apiPath, body, headers = {}, { signal } = {}) {
+  const send = retryServerErrors(fetchImpl, { sleep, random, log, now, attemptTimeoutMs, latch, resendLimited: true });
+  return async function github(method, apiPath, body, headers = {}, { signal, resendOnce = false } = {}) {
     const response = await send(`${apiUrl}${apiPath}`, {
+      [RESEND_ONCE]: resendOnce,
       method,
       headers: {
         Accept: "application/vnd.github+json",
@@ -224,7 +342,7 @@ export function createGitHub({
     });
     onResponse?.(response);
     if (!response.ok) {
-      throw new GitHubError(response.status, `${method} ${apiPath}`);
+      throw new GitHubError(response.status, `${method} ${apiPath}`, await responseDetail(response));
     }
     // A success can carry no body: 204, or the 201 a workflow re-run answers.
     const text = await response.text();
@@ -234,6 +352,17 @@ export function createGitHub({
     const json = JSON.parse(text);
     if (!keepGraphQLErrors && Array.isArray(json?.errors) && json.errors.length > 0) {
       throw new GitHubError(response.status, `${method} ${apiPath} (GraphQL errors)`);
+    }
+    // A list keeps its Link header for a reader that pages by cursor
+    // (merge-holds.mjs branchActivity).
+    if (Array.isArray(json)) {
+      Object.defineProperty(json, Symbol.for("github.link"), { value: response.headers.get("link") });
+    }
+    // An answer keeps its ETag for a reader that reads it again conditionally
+    // (verifyRecordedRerun's listing). A 304 still throws GitHubError.
+    const etag = response.headers.get("etag");
+    if (etag && json !== null && typeof json === "object") {
+      Object.defineProperty(json, ETAG, { value: etag });
     }
     return json;
   };
@@ -252,7 +381,7 @@ export const COMMIT_PULLS_QUERY = `query($owner: String!, $name: String!, $oid: 
         associatedPullRequests(first: 100) {
           pageInfo { hasNextPage }
           nodes {
-            number state isDraft headRefName headRefOid baseRefName baseRefOid
+            number state isDraft mergedAt headRefName headRefOid baseRefName baseRefOid
             headRepository { nameWithOwner }
             author { __typename login ... on User { databaseId } ... on Bot { databaseId } }
             labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
@@ -270,12 +399,17 @@ export function commitPullsFromGraphQL(data) {
     list.pageInfo?.hasNextPage !== false ||
     list.nodes.some((node) => !Array.isArray(node?.labels?.nodes) || node.labels.pageInfo?.hasNextPage !== false)
   ) {
-    throw new Error("the commit's pull requests could not be read through GraphQL");
+    // A list missing from the answer is `incomplete`, which a lane may hold on
+    // (resolve-pr.mjs closing), since a re-read can return it; another page
+    // means more than the query reads, which every re-read meets again.
+    const pastPage = list?.pageInfo?.hasNextPage === true || (Array.isArray(list?.nodes) && list.nodes.some((node) => node?.labels?.pageInfo?.hasNextPage === true));
+    throw Object.assign(new Error("the commit's pull requests could not be read through GraphQL"), pastPage ? {} : { incomplete: true });
   }
   return list.nodes.map((node) => ({
     number: node.number,
     state: node.state === "OPEN" ? "open" : "closed",
     draft: node.isDraft,
+    merged_at: node.mergedAt ?? null,
     // REST spells an App's login `app[bot]`; GraphQL spells it `app`.
     user: node.author
       ? {
@@ -328,9 +462,9 @@ export const graphQLReader = (github) => async (query, variables, signal) =>
 // merge in this repository closed it: the `closer` GraphQL gives the issue's
 // last ClosedEvent is a merged pull request or a commit here, whoever merged
 // it. The REST close event carries no link to the pull request, so GraphQL
-// is the read. Any
-// other close, such as a workflow's GITHUB_TOKEN or an outside author closing
-// their own issue, counts for nothing.
+// is the read; or (c) below. Any other close, such as a workflow's
+// GITHUB_TOKEN or an outside author closing their own issue, counts for
+// nothing.
 const CLOSER_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
@@ -344,7 +478,9 @@ const CLOSER_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
     }
   }
 }`;
-export async function isTrustedClose(github, repo, closedIssue, humans) {
+// (c) The lanes App's close, when the caller names the App with `isApp`,
+// counts only as appDoneClose allows.
+export async function isTrustedClose(github, repo, closedIssue, humans, isApp = () => false) {
   const closer = closedIssue?.closed_by;
   if (humans.has(closer?.id)) {
     return true;
@@ -359,7 +495,50 @@ export async function isTrustedClose(github, repo, closedIssue, humans) {
   });
   const by = answer?.data?.repository?.issue?.timelineItems?.nodes?.at(-1)?.closer;
   const here = String(by?.repository?.nameWithOwner ?? "").toLowerCase() === repo.toLowerCase();
-  return here && (by.__typename === "Commit" || (by.__typename === "PullRequest" && by.merged === true));
+  if (here && (by.__typename === "Commit" || (by.__typename === "PullRequest" && by.merged === true))) {
+    return true;
+  }
+  return isApp(closer) && appDoneClose(github, repo, Number(closedIssue.number), humans, isApp);
+}
+
+// Whether the lanes App's close of issue `number` is an already-done close
+// whose evidence still holds (owner Q9, 2026-10-29): the App's last close
+// comment names already-done, and doneEvidence re-reads that the pull request
+// or commit it cites is on the default branch with a commit message that
+// closes the issue. A verified-done close counts when parentDone re-reads that
+// every sub-issue is closed as completed by a close this function trusts. A
+// report-delivered close, or any read that fails, counts for nothing.
+async function appDoneClose(github, repo, number, humans, isApp) {
+  try {
+    const close = await appCloseKind(github, repo, number, isApp);
+    const { doneEvidence, parentDone } = await import(new URL("../../scripts/lib/done-evidence.mjs", import.meta.url).href);
+    if (close?.stop === "verified-done") {
+      const trusted = async (child) => isTrustedClose(github, repo, await github("GET", `/repos/${repo}/issues/${child}`), humans, isApp);
+      return (await parentDone(github, `/repos/${repo}`, number, trusted)) === true;
+    }
+    return close?.stop === "already-done" && (await doneEvidence(github, `/repos/${repo}`, close.reason, number)) === true;
+  } catch {
+    return false;
+  }
+}
+
+// The lanes App's last close comment on issue `number` (report-outcome's,
+// read back by closeStop): {stop, reason, url, at}, or null when none parses
+// or a read fails. It says what kind of close the App made, never that the
+// work is done. The module loads here, not at the top, so a job that checks
+// out this action alone still runs it.
+export async function appCloseKind(github, repo, number, isApp) {
+  try {
+    const { closeStop } = await import(new URL("../../scripts/lib/done-evidence.mjs", import.meta.url).href);
+    const comments = await paginate(github, `/repos/${repo}/issues/${number}/comments`);
+    const found = comments
+      .filter((comment) => isApp(comment?.user))
+      .map((comment) => ({ comment, close: closeStop(comment.body) }))
+      .findLast(({ close }) => Boolean(close));
+    return found ? { ...found.close, url: found.comment.html_url ?? null, at: found.comment.created_at ?? null } : null;
+  } catch {
+    return null;
+  }
 }
 
 // Reads every page of a list endpoint (100 per page).
@@ -430,12 +609,22 @@ export function parseDeniedIds(value = "") {
 
 export const isListed = (ids, user) => Number.isInteger(user?.id) && ids.has(user.id);
 
+// `fault` marks a stop a read GitHub failed to answer caused (isFault): the
+// reason is the one a refusal at that read gives, and with fault-reason on
+// (FAULT_REASON) main writes FAULT_REASON in its place.
 class Stop extends Error {
-  constructor(reason) {
+  constructor(reason, fault = false) {
     super(reason);
     this.reason = reason;
+    this.fault = fault;
   }
 }
+
+// The reason a stop that a read fault caused writes when the caller sets
+// fault-reason (FAULT_REASON=true): proceed stays false, so it accepts nothing
+// a refusal stops, and the caller can mark the run held (pr-verify.yml's
+// `Note the hold`). A refusal on an answer GitHub gave keeps its own reason.
+export const FAULT_REASON = "read-fault";
 
 export const REPOSITORY = /^[A-Za-z0-9-]+\/(?!\.\.?$)[A-Za-z0-9_.-]+$/;
 // GET /pulls can lag a push by minutes, so the PR is re-read until its head
@@ -487,8 +676,8 @@ async function fetchPull(github, repository, number, sleep) {
   let read;
   try {
     read = await readPull(github, `/repos/${repository}`, number, sleep, sameRepo);
-  } catch {
-    throw new Stop("no-pr");
+  } catch (error) {
+    throw new Stop("no-pr", isFault(error));
   }
   if (!read.headConfirmed && sameRepo(read.pull)) {
     throw new Stop("head-lag");
@@ -511,8 +700,8 @@ async function resolveRunPull(github, repository, run, attemptTimeoutMs) {
       readGraphQL: graphQLReader(github),
       timeoutMs: attemptTimeoutMs,
     });
-  } catch {
-    throw new Stop("no-pr");
+  } catch (error) {
+    throw new Stop("no-pr", isFault(error));
   }
   const matches = pulls.filter(
     (pull) =>
@@ -532,8 +721,8 @@ async function readOrRefuse(github, apiPath, reason = "untrusted-actor") {
   let body;
   try {
     body = await github("GET", apiPath);
-  } catch {
-    throw new Stop(reason);
+  } catch (error) {
+    throw new Stop(reason, isFault(error));
   }
   if (!isPlainObject(body)) {
     throw new Stop(reason);
@@ -546,7 +735,7 @@ async function readOrRefuse(github, apiPath, reason = "untrusted-actor") {
 // re-run keeps the event, so a stop here could otherwise turn an earlier red
 // check on the same SHA neutral: untrusted-rerunner has no skip mapping, and
 // a failed or malformed read stops with it too.
-async function readRerunner(github, repository, runId, runAttempt) {
+export async function readRerunner(github, repository, runId, runAttempt) {
   const refuse = "untrusted-rerunner";
   if (!RUN_ID.test(runId) || !RUN_ATTEMPT.test(runAttempt)) {
     throw new Stop(refuse);
@@ -566,37 +755,53 @@ async function checkRerunner({ github, repository, runId, runAttempt, pool, deni
   }
 }
 
-// The run at headSha ran the default branch's own code: no tag shares the
-// branch's name (a run on that tag would report the same head_branch; only a
-// 404 proves it absent), and headSha is the branch tip or behind it.
-async function requireOnDefaultBranch(github, repository, defaultBranch, headSha, reason) {
+// The default branch's tip, read only while no tag shares the branch's name
+// (a run on that tag would report the same head_branch; only a 404 proves it
+// absent).
+export async function readDefaultBranchTip(github, repository, defaultBranch, reason) {
   let tagAbsent = false;
+  let fault = false;
   try {
     await github("GET", `/repos/${repository}/git/ref/tags/${defaultBranch}`);
   } catch (error) {
     tagAbsent = error instanceof GitHubError && error.status === 404;
+    fault = isFault(error);
   }
   if (!tagAbsent) {
-    throw new Stop(reason);
+    throw new Stop(reason, fault);
   }
   const tip = await readOrRefuse(github, `/repos/${repository}/git/ref/heads/${defaultBranch}`, reason);
   if (tip.ref !== `refs/heads/${defaultBranch}` || !SHA.test(tip.object?.sha ?? "")) {
     throw new Stop(reason);
   }
-  const comparison = await readOrRefuse(github, `/repos/${repository}/compare/${headSha}...${tip.object.sha}`, reason);
+  return tip.object.sha;
+}
+
+// headSha is the tip `tipSha` or behind it.
+export async function requireBehindTip(github, repository, headSha, tipSha, reason) {
+  const comparison = await readOrRefuse(github, `/repos/${repository}/compare/${headSha}...${tipSha}`, reason);
   if (comparison.status !== "ahead" && comparison.status !== "identical") {
     throw new Stop(reason);
   }
 }
 
+// The run at headSha ran the default branch's own code: no tag shares the
+// branch's name, and headSha is the branch tip or behind it.
+async function requireOnDefaultBranch(github, repository, defaultBranch, headSha, reason) {
+  const tip = await readDefaultBranchTip(github, repository, defaultBranch, reason);
+  await requireBehindTip(github, repository, headSha, tip, reason);
+}
+
 // What a record name says about this run: null when it does not list it,
-// otherwise true, or for a workflow_run dispatcher's record the upstream run id.
-function readRecordName(name, runId, viaRun) {
+// otherwise true, or for a workflow_run or pull_request_target dispatcher's
+// record the upstream run id or the commit it ran. Each kind reads only its
+// own name.
+function readRecordName(name, runId, kind) {
   if (typeof name !== "string") {
     return null;
   }
-  if (viaRun) {
-    const match = RUN_RECORD_NAME.exec(name);
+  if (kind !== "push") {
+    const match = (kind === "run" ? RUN_RECORD_NAME : TARGET_RECORD_NAME).exec(name);
     return match !== null && match[2] === runId ? match[1] : null;
   }
   return RECORD_NAME.test(name) && name.slice(RECORD_PREFIX.length).split("-").includes(runId)
@@ -606,7 +811,7 @@ function readRecordName(name, runId, viaRun) {
 
 // The dispatcher run's unexpired record of its own that lists this run's id,
 // read by readRecordName, or null. A failed or malformed read refuses.
-async function findRecord(github, runPath, dispatcherRunId, runId, viaRun) {
+async function findRecord(github, runPath, dispatcherRunId, runId, kind) {
   const body = await readOrRefuse(github, `${runPath}/artifacts?per_page=100`);
   if (!Array.isArray(body.artifacts)) {
     throw new Stop("untrusted-actor");
@@ -618,7 +823,7 @@ async function findRecord(github, runPath, dispatcherRunId, runId, viaRun) {
       Number.isSafeInteger(artifact.workflow_run?.id) &&
       String(artifact.workflow_run.id) === dispatcherRunId
     ) {
-      const found = readRecordName(artifact.name, runId, viaRun);
+      const found = readRecordName(artifact.name, runId, kind);
       if (found !== null) {
         return found;
       }
@@ -636,11 +841,11 @@ async function findRecord(github, runPath, dispatcherRunId, runId, viaRun) {
 // the run and its artifact list, and then the gate refuses. That wait counts
 // toward the cap, so the whole wait stays within 2 min. Returns what the
 // record names (readRecordName).
-async function requireRecorded({ github, repository, dispatcherRunId, runId, viaRun, sleep }) {
+async function requireRecorded({ github, repository, dispatcherRunId, runId, kind, sleep }) {
   const runPath = `/repos/${repository}/actions/runs/${dispatcherRunId}`;
   for (let sleeps = 0; ; sleeps += 1) {
     const { status } = await readOrRefuse(github, runPath);
-    const found = await findRecord(github, runPath, dispatcherRunId, runId, viaRun);
+    const found = await findRecord(github, runPath, dispatcherRunId, runId, kind);
     if (found !== null) {
       return found;
     }
@@ -652,7 +857,7 @@ async function requireRecorded({ github, repository, dispatcherRunId, runId, via
     );
     await sleep(RECORD_WAIT_MS);
     if (status === "completed") {
-      const late = await findRecord(github, runPath, dispatcherRunId, runId, viaRun);
+      const late = await findRecord(github, runPath, dispatcherRunId, runId, kind);
       if (late !== null) {
         return late;
       }
@@ -672,7 +877,17 @@ async function requireRecorded({ github, repository, dispatcherRunId, runId, via
 // run its record names must be one of runDispatcherUpstreams, run on
 // pull_request in this repository, started (and any re-run) by the lanes App
 // or a listed human, at the PR's current head or at expectedUpstreamHead
-// (upstreamHeadHolds). Returns this run's own record.
+// with the PR at it or at pushedCommit (upstreamHeadHolds). An upstream of
+// runDispatcherRelay instead must have run on pull_request_review_comment,
+// name the PR among its pull_requests, and be started (and any re-run) by a
+// listed human, never the lanes App: a review comment relayed by path, event
+// and actor (ADR 0088). A dispatcher started by pull_request_target vouches
+// for a pr-refine.yml run only: its head repository is this one, one
+// pull_requests entry names this PR on the default branch with base and head
+// in this repository and the run's head_branch as head ref, its actor and
+// triggering actor are the lanes App or a listed human, and the ancestry
+// check reads the commit its record names in place of head_sha (ADR 0090).
+// Returns this run's own record.
 async function verifyDispatcher({
   github,
   repository,
@@ -684,7 +899,9 @@ async function verifyDispatcher({
   dispatcherWorkflow,
   runDispatcherWorkflow,
   runDispatcherUpstreams,
+  runDispatcherRelay = "",
   expectedUpstreamHead,
+  pushedCommit,
   lanesAppId,
   dispatchedWorkflow,
   runId,
@@ -714,7 +931,27 @@ async function verifyDispatcher({
   // A workflow_run run reports the default branch and its tip as head_branch
   // and head_sha, so the branch and ancestry checks below hold for it too.
   const viaRun = dispatcher.event === "workflow_run";
+  const viaTarget = dispatcher.event === TARGET_EVENT;
   const expectedPath = viaRun ? runDispatcherWorkflow : dispatcherWorkflow;
+  // The lanes App or a listed human.
+  const vouches = (user) =>
+    Number.isInteger(user?.id) && (user.id === lanesAppId || isListedHuman(user));
+  // A pull_request_target run reports the PR's branch and head as head_branch
+  // and head_sha. One pull_requests entry must bind every term; an empty or
+  // missing list refuses. Entries carry repository ids, not names.
+  const repositoryId = event.repository?.id;
+  const onThisPull = () =>
+    Number.isInteger(repositoryId) &&
+    typeof dispatcher.head_branch === "string" &&
+    Array.isArray(dispatcher.pull_requests) &&
+    dispatcher.pull_requests.some(
+      (entry) =>
+        entry?.number === pull.number &&
+        entry.base?.ref === defaultBranch &&
+        entry.base?.repo?.id === repositoryId &&
+        entry.head?.repo?.id === repositoryId &&
+        entry.head?.ref === dispatcher.head_branch,
+    );
   // Comparisons with NaN are false, so a missing or unparsable time refuses.
   const trusted =
     own.path === dispatchedWorkflow &&
@@ -722,8 +959,15 @@ async function verifyDispatcher({
     dispatcher.repository?.full_name === repository &&
     expectedPath !== "" &&
     dispatcher.path === expectedPath &&
-    dispatcher.head_branch === defaultBranch &&
+    (viaTarget
+      ? own.path === TARGET_DISPATCHED &&
+        dispatcher.head_repository?.full_name === repository &&
+        onThisPull() &&
+        vouches(dispatcher.actor) &&
+        vouches(dispatcher.triggering_actor)
+      : dispatcher.head_branch === defaultBranch) &&
     (viaRun ||
+      viaTarget ||
       (DISPATCHER_EVENTS.has(dispatcher.event) &&
         (dispatcher.event !== "workflow_dispatch" || isListedHuman(dispatcher.actor)))) &&
     SHA.test(dispatcher.head_sha ?? "") &&
@@ -735,26 +979,44 @@ async function verifyDispatcher({
   if (!trusted) {
     throw new Stop("untrusted-actor");
   }
-  await requireOnDefaultBranch(github, repository, defaultBranch, dispatcher.head_sha, "untrusted-actor");
-  if (expectedUpstreamHead !== "" && (!viaRun || !SHA.test(expectedUpstreamHead))) {
+  if (!viaTarget) {
+    await requireOnDefaultBranch(github, repository, defaultBranch, dispatcher.head_sha, "untrusted-actor");
+  }
+  if (
+    (expectedUpstreamHead !== "" && (!viaRun || !SHA.test(expectedUpstreamHead))) ||
+    (pushedCommit !== "" && (expectedUpstreamHead === "" || !SHA.test(pushedCommit)))
+  ) {
     throw new Stop("untrusted-actor");
   }
-  const found = await requireRecorded({ github, repository, dispatcherRunId, runId, viaRun, sleep });
+  const kind = viaRun ? "run" : viaTarget ? "target" : "push";
+  const found = await requireRecorded({ github, repository, dispatcherRunId, runId, kind, sleep });
+  if (viaTarget) {
+    // Since 2025-12-08 a pull_request_target run takes its workflow file and
+    // checkout from the default branch, so only that branch's dispatcher
+    // writes this record, and the commit it names is what must be on it.
+    await requireOnDefaultBranch(github, repository, defaultBranch, found, "untrusted-actor");
+  }
   if (viaRun) {
     const upstream = await readOrRefuse(github, `/repos/${repository}/actions/runs/${found}`);
-    // The run the review reacted to was started, and any re-run triggered, by
-    // the lanes App or a listed human.
-    const vouches = (user) =>
-      Number.isInteger(user?.id) && (user.id === lanesAppId || isListedHuman(user));
+    // A relayed review comment: only a listed human vouches, never the lanes
+    // App, and the run must name the PR.
+    const relayed = runDispatcherRelay !== "" && upstream.path === runDispatcherRelay;
+    const startedBy = relayed
+      ? upstream.event === RELAY_EVENT &&
+        Array.isArray(upstream.pull_requests) &&
+        upstream.pull_requests.some((entry) => entry?.number === pull.number) &&
+        isListedHuman(upstream.actor) &&
+        isListedHuman(upstream.triggering_actor)
+      : runDispatcherUpstreams.includes(upstream.path) &&
+        upstream.event === "pull_request" &&
+        vouches(upstream.actor) &&
+        vouches(upstream.triggering_actor);
     const reviewed =
       String(upstream.id) === found &&
-      runDispatcherUpstreams.includes(upstream.path) &&
-      upstream.event === "pull_request" &&
+      startedBy &&
       upstream.repository?.full_name === repository &&
       upstream.head_repository?.full_name === repository &&
-      vouches(upstream.actor) &&
-      vouches(upstream.triggering_actor) &&
-      (await upstreamHeadHolds({ github, repository, upstreamSha: upstream.head_sha, pullSha: pull.head.sha, expectedUpstreamHead, lanesAppId, runCreated: created }));
+      upstreamHeadHolds({ upstreamSha: upstream.head_sha, pullSha: pull.head.sha, expectedUpstreamHead, pushedCommit });
     if (!reviewed) {
       throw new Stop("untrusted-actor");
     }
@@ -762,48 +1024,18 @@ async function verifyDispatcher({
   return own;
 }
 
-// A job after pr-unblock's model job passes the head that job was gated on:
-// the review must be of it, and every commit from it to the PR's current head
-// one GitHub signed for the lanes App (author the App, committer web-flow,
-// signature valid) during this workflow run. That proves an App-token commit
-// made after this run was created, not which lane made it. A human, foreign,
-// unsigned, older or truncated range refuses. Without one, the review must be
-// of the PR's current head.
-//
-// web-flow, the committer GitHub records on commits it signs (seen on the
-// lanes App's commits of #7493, #7494, #7496, #7520 and #7522).
-const WEB_FLOW_ID = 19864447;
-
-async function upstreamHeadHolds({ github, repository, upstreamSha, pullSha, expectedUpstreamHead, lanesAppId, runCreated }) {
+// A job after pr-unblock's model job passes the head that job was gated on,
+// and the commit apply-feedback-patch pushed onto it (empty when it pushed
+// none): the review must be of the gated head, and the PR must be at it or
+// at that pushed commit. Any other head refuses, a verified lanes App commit
+// of another job or run included: a signature proves an App token made it,
+// not this run's push job. Without a gated head, the review must be of the
+// PR's current head.
+function upstreamHeadHolds({ upstreamSha, pullSha, expectedUpstreamHead, pushedCommit }) {
   if (expectedUpstreamHead === "") {
     return upstreamSha === pullSha;
   }
-  if (upstreamSha !== expectedUpstreamHead) {
-    return false;
-  }
-  if (expectedUpstreamHead === pullSha) {
-    return true;
-  }
-  const range = await readOrRefuse(github, `/repos/${repository}/compare/${expectedUpstreamHead}...${pullSha}`);
-  const commits = Array.isArray(range.commits) ? range.commits : [];
-  return (
-    range.status === "ahead" &&
-    commits.length > 0 &&
-    range.total_commits === commits.length &&
-    commits.every(
-      (commit) =>
-        Number.isInteger(commit?.author?.id) &&
-        commit.author.id === lanesAppId &&
-        // GitHub signed it (web-flow): an API commit made with the App's
-        // token. A local commit claiming the App as author is committed
-        // and signed by whoever pushed it.
-        commit.committer?.id === WEB_FLOW_ID &&
-        commit?.commit?.verification?.verified === true &&
-        commit.commit.verification.reason === "valid" &&
-        // Committed during this workflow run, not by an earlier lane.
-        timeOf(commit.commit.committer?.date) >= runCreated,
-    )
-  );
+  return upstreamSha === expectedUpstreamHead && (pullSha === expectedUpstreamHead || (pushedCommit !== "" && pullSha === pushedCommit));
 }
 
 // The re-runner of a dispatched run, read by id from this run's own record:
@@ -821,14 +1053,15 @@ function checkDispatchedRerunner({ ids }, deniedIds, own) {
 
 // A re-run github-actions[bot] started names no human, so it is trusted only
 // as the lost-run reconciler's re-run of runId, this run or the upstream run a
-// workflow_run event names: its attempt RERUN_ATTEMPT, started by
-// github-actions[bot], and an unexpired
-// rerunRecordName artifact, created no later than that attempt started, of a
+// workflow_run event names: its attempt RERUN_ATTEMPT to
+// RECONCILER_ATTEMPT_CAP, started by github-actions[bot], and an unexpired
+// rerunRecordName artifact naming that attempt, created no later than that attempt started, of a
 // reconcilerWorkflow run in this repository on the default branch, started by
 // its schedule or a listed human's dispatch, any re-run of it by a listed
 // human, its head SHA the default branch tip or behind it, and this attempt
 // started between that run's start and WINDOW_MS after it. A run id names one
-// run and its second attempt starts once, so a record vouches for one attempt.
+// run, each of its attempts starts once, and the record names the attempt, so
+// a record vouches for one attempt.
 // The reconciler uploads the record before it re-runs; one more read follows
 // RECORD_WAIT_MS for any lag in the artifact list. Every refusal is refuse:
 // untrusted-rerunner for this run, as for an unlisted re-runner, and
@@ -866,6 +1099,30 @@ async function verifyRecordedRerun({ github, repository, event, list, deniedIds,
   }
   const isListedHuman = (user) =>
     Number.isInteger(user?.id) && list.humans.has(user.id) && !deniedIds.has(user.id);
+  // Each listing page's ETag and the body it came with. The re-read sends the
+  // ETag (If-None-Match), and a 304, which GitHub does not count against the
+  // rate limit, gives back that body, judged again as it was (outage posture
+  // element 6). A page that came with no ETag is read again unconditionally.
+  const pagesSeen = new Map();
+  const readListing = async (apiPath) => {
+    const cached = pagesSeen.get(apiPath);
+    let body;
+    try {
+      body = await (cached ? github("GET", apiPath, undefined, { "If-None-Match": cached.etag }) : github("GET", apiPath));
+    } catch (error) {
+      if (cached && error instanceof GitHubError && error.status === 304) {
+        return cached.body;
+      }
+      throw new Stop(refuse, isFault(error));
+    }
+    if (!isPlainObject(body)) {
+      throw new Stop(refuse);
+    }
+    if (typeof body[ETAG] === "string") {
+      pagesSeen.set(apiPath, { etag: body[ETAG], body });
+    }
+    return body;
+  };
   // Anyone's run can upload an artifact of this name, so each candidate's run
   // is read and judged, at most RECORD_MAX_CANDIDATES of them per record name;
   // one that cannot be read does not vouch. A name past its cap returns null:
@@ -922,7 +1179,7 @@ async function verifyRecordedRerun({ github, repository, event, list, deniedIds,
       const name = recorder.name(runId, attempt, own.head_sha);
       const listingPath = `/repos/${repository}/actions/artifacts?name=${name}&per_page=100`;
       pages: for (let page = 1; page <= RECORD_MAX_PAGES; page += 1) {
-        const body = await readOrRefuse(github, `${listingPath}&page=${page}`, refuse);
+        const body = await readListing(`${listingPath}&page=${page}`);
         if (!Array.isArray(body.artifacts)) {
           throw new Stop(refuse);
         }
@@ -947,17 +1204,67 @@ async function verifyRecordedRerun({ github, repository, event, list, deniedIds,
   throw new Stop(refuse);
 }
 
-// app-label: the lanes App applying exactly that label to an issue starts the
-// lane; the label alone admits the issue. Any other App event stops. The
-// re-runner is the App itself, listed, or a listed human.
-async function checkAppLabel({ github, repository, event, list, deniedIds, lanesAppId, appLabel, runId, runAttempt }) {
-  if (event.action !== "labeled" || event.label?.name !== appLabel) {
+// Whether the lost-run reconciler's record vouches for its re-run of runId,
+// read at attempt RERUN_ATTEMPT by verifyRecordedRerun with the reconciler as
+// the only recorder: the rules the trigger check applies, unchanged. Only
+// attempt 2: the reconciler re-runs a hosted review once, as the merge gate
+// binds only that attempt. For a workflow that records an attempt the
+// reconciler's re-run causes
+// (pr-feedback-dispatch.yml rerun-ci-status, through reconciler-record.mjs).
+// Any refusal is false; an unexpected error throws.
+export async function reconcilerRecordVouches({ github, repository, defaultBranch, list, deniedIds, reconcilerWorkflow, runId, sleep = defaultSleep }) {
+  if (reconcilerWorkflow === "") {
+    return false;
+  }
+  try {
+    await verifyRecordedRerun({
+      github,
+      repository,
+      event: { repository: { default_branch: defaultBranch } },
+      list,
+      deniedIds,
+      recorders: [reconcilerRecorder(reconcilerWorkflow)],
+      runId: String(runId),
+      runAttempt: String(RERUN_ATTEMPT),
+      sleep,
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof Stop) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+// The lanes App starts the lane on an issue only by applying app-label, or by
+// setting the field app-field-id to the option app-field-option; that event
+// alone admits the issue. Any other App event stops. The re-runner is the App
+// itself, listed, or a listed human.
+function appTrigger(event, appLabel, appField) {
+  if (appLabel !== "" && event.action === "labeled" && event.label?.name === appLabel) {
+    return appLabel;
+  }
+  if (
+    appField !== null &&
+    event.action === "field_added" &&
+    String(event.issue_field?.id ?? "") === appField.id &&
+    String(event.issue_field_value?.option?.id ?? "") === appField.option
+  ) {
+    return `field ${appField.id} option ${appField.option}`;
+  }
+  return null;
+}
+
+async function checkAppLabel({ github, repository, event, list, deniedIds, lanesAppId, appLabel, appField, runId, runAttempt }) {
+  const trigger = appTrigger(event, appLabel, appField);
+  if (trigger === null) {
     throw new Stop("bot-actor");
   }
   if (!PR_NUMBER.test(String(event.issue?.number ?? ""))) {
     throw new Stop("untrusted-actor");
   }
-  console.log(`check-trusted-trigger: ${appLabel} from the lanes App`);
+  console.log(`check-trusted-trigger: ${trigger} from the lanes App`);
   const rerunnerId = await readRerunner(github, repository, runId, runAttempt);
   const isApp = rerunnerId === lanesAppId && list.ids.has(rerunnerId);
   if (!isApp && (!list.humans.has(rerunnerId) || deniedIds.has(rerunnerId))) {
@@ -970,18 +1277,18 @@ async function checkAppLabel({ github, repository, event, list, deniedIds, lanes
 // (on issues, the account that applied the label) and the triggering actor, a
 // push only the triggering actor; no PR is read. require-kind human narrows
 // both to actors listed as human.
-async function evaluateActors({ github, repository, eventName, event, list, deniedIds, requireKind, lanesAppId, appLabel, runId, runAttempt }) {
+async function evaluateActors({ github, repository, eventName, event, list, deniedIds, requireKind, lanesAppId, appLabel, appField, runId, runAttempt }) {
   if (eventName !== "workflow_dispatch" && eventName !== "issues" && eventName !== "push") {
     throw new Stop("no-pr");
   }
   if (
     eventName === "issues" &&
     requireKind === "human" &&
-    appLabel !== "" &&
+    (appLabel !== "" || appField !== null) &&
     lanesAppId !== null &&
     event.sender?.id === lanesAppId
   ) {
-    return checkAppLabel({ github, repository, event, list, deniedIds, lanesAppId, appLabel, runId, runAttempt });
+    return checkAppLabel({ github, repository, event, list, deniedIds, lanesAppId, appLabel, appField, runId, runAttempt });
   }
   const pool = requireKind === "human" ? list.humans : list.ids;
   if (eventName !== "push") {
@@ -1008,11 +1315,14 @@ export async function evaluateTrigger({
   dispatcherWorkflow = "",
   runDispatcherWorkflow = "",
   runDispatcherUpstreams = [],
+  runDispatcherRelay = "",
   expectedUpstreamHead = "",
+  pushedCommit = "",
   lanesAppId = null,
   requirePr = "true",
   requireKind = "",
   appLabel = "",
+  appField = null,
   runId = "",
   runAttempt = "",
   reconcilerWorkflow = "",
@@ -1030,7 +1340,7 @@ export async function evaluateTrigger({
     throw new Stop("no-pr");
   }
   if (requirePr === "false") {
-    return evaluateActors({ github, repository, eventName, event, list, deniedIds, requireKind, lanesAppId, appLabel, runId, runAttempt });
+    return evaluateActors({ github, repository, eventName, event, list, deniedIds, requireKind, lanesAppId, appLabel, appField, runId, runAttempt });
   }
   if (requirePr !== "true") {
     throw new Stop("no-pr");
@@ -1092,14 +1402,16 @@ export async function evaluateTrigger({
       dispatcherWorkflow,
       runDispatcherWorkflow,
       runDispatcherUpstreams,
+      runDispatcherRelay,
       expectedUpstreamHead,
+      pushedCommit,
       lanesAppId,
       dispatchedWorkflow,
       runId,
       sleep,
     });
     checkDispatchedRerunner(list, deniedIds, own);
-  } else if (expectedUpstreamHead !== "") {
+  } else if (expectedUpstreamHead !== "" || pushedCommit !== "") {
     throw new Stop("untrusted-actor");
   } else {
     // A CI run the reconciler or rerun-ci-status re-ran is started by
@@ -1192,11 +1504,18 @@ export async function main({ env = process.env, github, sleep = defaultSleep, at
       dispatcherWorkflow: env.DISPATCHER_WORKFLOW ?? "",
       runDispatcherWorkflow: env.RUN_DISPATCHER_WORKFLOW ?? "",
       runDispatcherUpstreams: (env.RUN_DISPATCHER_UPSTREAMS ?? "").split(/\s+/).filter(Boolean),
+      runDispatcherRelay: env.RUN_DISPATCHER_RELAY ?? "",
       expectedUpstreamHead: env.EXPECTED_UPSTREAM_HEAD ?? "",
+      pushedCommit: env.PUSHED_COMMIT ?? "",
       lanesAppId: /^[1-9][0-9]{0,14}$/.test(env.LANES_APP_ID ?? "") ? Number(env.LANES_APP_ID) : null,
       requirePr: env.REQUIRE_PR ?? "true",
       requireKind: env.REQUIRE_KIND ?? "",
       appLabel: env.APP_LABEL ?? "",
+      // Both ids or neither: a half-set pair keeps every App field event stopped.
+      appField:
+        /^[1-9][0-9]{0,14}$/.test(env.APP_FIELD_ID ?? "") && /^[1-9][0-9]{0,14}$/.test(env.APP_FIELD_OPTION ?? "")
+          ? { id: env.APP_FIELD_ID, option: env.APP_FIELD_OPTION }
+          : null,
       dispatchedWorkflow: env.DISPATCHED_WORKFLOW ?? "",
       runId: env.GITHUB_RUN_ID ?? "",
       runAttempt: env.GITHUB_RUN_ATTEMPT ?? "",
@@ -1210,7 +1529,8 @@ export async function main({ env = process.env, github, sleep = defaultSleep, at
     if (!(error instanceof Stop)) {
       console.log(`check-trusted-trigger: unexpected ${error?.name ?? "error"}; stopping`);
     }
-    result = stopped(error instanceof Stop ? error.reason : "no-pr");
+    const fault = error instanceof Stop ? error.fault : isFault(error);
+    result = stopped(env.FAULT_REASON === "true" && fault ? FAULT_REASON : error instanceof Stop ? error.reason : "no-pr");
   }
   try {
     writeOutputs(result, env.GITHUB_OUTPUT);

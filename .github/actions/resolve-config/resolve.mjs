@@ -7,21 +7,23 @@ import { posix } from "node:path";
 import Ajv2020 from "ajv/dist/2020.js";
 import { parseDocument } from "yaml";
 
-import { checkDimensions, dimensionBudget, issueDimensions, parsePin } from "./dimensions.mjs";
-import { MissingFact, appliesAll, factsFor } from "./predicate.mjs";
+import { checkDimensions, dimensionBudget, issueDimensions, parsePin, splitChildDims } from "./dimensions.mjs";
+import { checkStatus } from "./issue-status.mjs";
+import { MissingFact, appliesAll, factsFor, matchedPaths } from "./predicate.mjs";
 import { checkActivityName, checkLaneName } from "./vocabulary.mjs";
 
 const CONFIG_BASENAME = "pr-pipeline.yaml";
 // Runner job names: `<lane> / run` would collide with pr-run-activity's own checks.
 const RESERVED_ACTIVITIES = new Set(["run", "report"]);
-const TRUSTED_ACTORS_PATH =
-  ".github/standards/trusted-actors/trusted-actors.json";
-// Model routes that are no activity: pr-verify.yml's judgment, the code and
+// Model routes that are no activity: pr-verify.yml's judgment, pr-rate-merge-risk.yml's rating, the code and
 // security review lanes, and intake triage.
-const RUN_ROUTES = new Set(["verify-pr", "review-code", "review-security", "triage-issue", "summarize-reuse", "adjudicate-feedback"]);
+const RUN_ROUTES = new Set(["verify-pr", "merge-risk", "review-code", "review-security", "triage-issue", "summarize-reuse", "adjudicate-feedback"]);
+// What model-route accepts: the run routes, and resolve-issue for a model job that takes the issue
+// lane's code-change profile (the upkeep batch and the release intake lane).
+const MODEL_ROUTES = new Set([...RUN_ROUTES, "resolve-issue"]);
 // The profile every run takes in a config with no `models` block.
 const BUILTIN_MODELS = Object.freeze({
-  profiles: { standard: { model: "default", "max-turns": 75 } },
+  profiles: { standard: { model: "opus", "max-turns": 75 } },
   "default-profile": "standard",
 });
 
@@ -335,6 +337,9 @@ function checkModels(models, activities) {
       );
     }
   }
+  if (models["issue-status"] !== undefined) {
+    checkStatus(models["issue-status"], models["issue-dimensions"]);
+  }
 }
 
 // Whether a skill activity takes its budget from its issue's dimensions.
@@ -495,7 +500,9 @@ function expand(doc, slots, parent) {
 }
 
 // Each leaf of the lane, with its activity, predicates and enabled flag.
-function laneSlots(doc, lane) {
+// pr-refine's plan job (plan-passes.mjs) reads them too, so a pass is planned
+// from the predicates its runner applies.
+export function laneSlots(doc, lane) {
   const section = laneSection(doc, lane);
   return expand(doc, section.slots ?? [], {
     ...ROOT,
@@ -550,6 +557,9 @@ export function neededFacts(files, { lane, activity, configPath, pinnedDimension
       if (dimensionedBy(definition, doc.models) && !pinnedDimensions) {
         needed.add("fieldValues");
         needed.add("fieldSetters");
+        if (doc.models["issue-dimensions"]?.["split-child-size"] !== undefined) {
+          needed.add("splitChild");
+        }
       }
     }
   });
@@ -604,7 +614,7 @@ function codeownersGlobs(text) {
 // what it is asked to fix. Sorted, without duplicates.
 export function changedPathTargets({
   paths,
-  predicatePaths,
+  predicate,
   edits,
   codeowners,
 }) {
@@ -615,12 +625,8 @@ export function changedPathTargets({
       posix.matchesGlob(path.toLowerCase(), glob),
     ) ||
       owned.some((glob) => posix.matchesGlob(path, glob)));
-  const kept = paths.filter(
-    (path) =>
-      isSafePath(path) &&
-      (predicatePaths === undefined ||
-        predicatePaths.some((glob) => posix.matchesGlob(path, glob))) &&
-      !notTargeted(path),
+  const kept = matchedPaths(predicate, paths).filter(
+    (path) => isSafePath(path) && !notTargeted(path),
   );
   return [...new Set(kept)].sort();
 }
@@ -680,13 +686,15 @@ function grantFor(effectGrants, effect, extra = {}) {
   return Object.freeze({ ...row, ...extra });
 }
 
-// The owner's model for a role route that resolves to no alias: CI has no
-// session, so `inherit`, a missing role map or role, and any value that is not
-// an alias (`default`, a model ID) all run on it. The frontier tier (`fable`,
-// and `best`, which may resolve to it) never routes automatically, so it runs
-// on it too.
+// The owner's model for any profile whose model resolves to no alias: CI has
+// no session, so `inherit`, a missing role map or role, and any value that is
+// not an alias (`default`, a model ID) all run on it. The frontier tier
+// (`fable`, and `best`, which may resolve to it) never routes automatically,
+// so it runs on it too. The schema refuses those values on a model profile;
+// this holds when a config reaches the resolver without that check.
 const FALLBACK_MODEL = "opus";
 const ROUTED_ALIASES = new Set(["haiku", "opus", "sonnet"]);
+const routedModel = (model) => (ROUTED_ALIASES.has(model) ? model : FALLBACK_MODEL);
 const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 // The multi-agent role map (plugins/multi-agent/reference/defaults.yaml) as
@@ -727,7 +735,7 @@ function roleModels(values, roleMapText) {
   return {
     role: values.role,
     ...(values.workload === undefined ? {} : { workload: values.workload }),
-    model: ROUTED_ALIASES.has(model) ? model : FALLBACK_MODEL,
+    model: routedModel(model),
     effort: EFFORTS.has(effort) ? effort : null,
   };
 }
@@ -742,7 +750,8 @@ const routeProfile = (models, route) => {
 // A profile's resolved values, at `rung` 1 its escalate-to profile's: one
 // rung at most, never the escalate-to's own, and a profile with no rung above
 // is refused, so a retry never reruns the same model. A role profile takes
-// its model and effort from the role map.
+// its model and effort from the role map. Every model and subagent model but
+// `inherit` resolves to a routed alias, as a role profile's does.
 function profileModels(models, start, roleMapText, rung = 0) {
   const climbed = rung === 1 ? models.profiles[start]["escalate-to"] : undefined;
   if (rung === 1 && climbed === undefined) {
@@ -750,22 +759,24 @@ function profileModels(models, start, roleMapText, rung = 0) {
   }
   const profile = climbed ?? start;
   const values = models.profiles[profile];
+  const subagentModel = values["subagent-model"] ?? "inherit";
   return {
     profile,
     ...(values.role === undefined
-      ? { model: values.model, effort: values.effort ?? null }
+      ? { model: routedModel(values.model), effort: values.effort ?? null }
       : roleModels(values, roleMapText)),
-    "subagent-model": values["subagent-model"] ?? "inherit",
+    "subagent-model": subagentModel === "inherit" ? subagentModel : routedModel(subagentModel),
     "max-turns": values["max-turns"],
   };
 }
 
-// The Claude Code arguments a resolved profile sets: `--model` unless the
-// model is `default`, `--max-turns`, and `--effort` only when the profile sets
-// one. Every value is a schema enum or integer, never free text.
+// The Claude Code arguments a resolved profile sets: `--model`, `--max-turns`,
+// and `--effort` only when the profile sets one. Every value is a routed
+// alias, a schema enum or an integer, never free text.
 export function modelArgs(models) {
   return [
-    ...(models.model === "default" ? [] : ["--model", models.model]),
+    "--model",
+    models.model,
     "--max-turns",
     String(models["max-turns"]),
     ...(models.effort === null ? [] : ["--effort", models.effort]),
@@ -791,16 +802,30 @@ function checkRung(rung) {
   return rung ?? 0;
 }
 
-// The resolved profile of a run that is no lane activity (RUN_ROUTES), after
+// The resolved profile of a run that is no lane activity (MODEL_ROUTES), after
 // the same file checks as resolve().
 export function resolveRoute(files, { route, configPath }) {
-  if (!RUN_ROUTES.has(route)) {
+  if (!MODEL_ROUTES.has(route)) {
     throw new Rejection(
       "undefined-route",
-      `\`${route}\` is not a run route; one of ${[...RUN_ROUTES].join(", ")} is required`,
+      `\`${route}\` is not a run route; one of ${[...MODEL_ROUTES].join(", ")} is required`,
     );
   }
   return routeModels(loadConfig(files, { configPath }).models, route, files.roleMap);
+}
+
+// The changed paths a laneSlots entry with the changed-paths input is asked
+// to work on: those its ancestors' and its own predicates let through, less
+// what changedPathTargets keeps from it. pr-refine's plan job reads it too.
+export function slotTargets({ activity, predicate, predicates }, changedTargets, codeowners) {
+  // A composite's paths predicate narrows its leaves' targets too.
+  const ancestors = predicate === undefined ? predicates : predicates.slice(0, -1);
+  return changedPathTargets({
+    paths: ancestors.reduce((kept, outer) => matchedPaths(outer, kept), changedTargets),
+    predicate,
+    edits: activity.effect !== "read" || activity["applied-by"]?.patch !== undefined,
+    codeowners,
+  });
 }
 
 function resolveSlot(
@@ -825,21 +850,7 @@ function resolveSlot(
     if (facts.changedTargets === undefined) {
       throw new MissingFact("changedTargets");
     }
-    // A composite's paths predicate narrows its leaves' targets too.
-    const ancestors =
-      predicate === undefined ? predicates : predicates.slice(0, -1);
-    targets = changedPathTargets({
-      paths: facts.changedTargets.filter((path) =>
-        ancestors.every(
-          (outer) =>
-            outer.paths === undefined ||
-            outer.paths.some((glob) => posix.matchesGlob(path, glob)),
-        ),
-      ),
-      predicatePaths: predicate?.paths,
-      edits: activity.effect !== "read" || activity["applied-by"]?.patch !== undefined,
-      codeowners,
-    });
+    targets = slotTargets({ activity, predicate, predicates }, facts.changedTargets, codeowners);
     if (targets.length === 0) {
       outcome = { applies: false, skipReason: "not-applicable-paths" };
     }
@@ -860,7 +871,7 @@ function resolveSlot(
           throw new MissingFact(fact);
         }
       }
-      dims = issueDimensions(facts, config, trustedActors);
+      dims = splitChildDims(issueDimensions(facts, config, trustedActors), config, facts.splitChild);
     } else {
       dims = parsePin("not-assessed", config);
     }
@@ -888,7 +899,9 @@ function resolveSlot(
     ...(activity["self-checks"] === undefined ? {} : { "self-checks": activity["self-checks"] }),
     ...(activity["verify-scripts"] === undefined ? {} : { "verify-scripts": activity["verify-scripts"] }),
     ...(activity["web-access"] === undefined ? {} : { "web-access": activity["web-access"] }),
+    ...(activity.tidy === undefined ? {} : { tidy: activity.tidy }),
     ...(activity["permission-mode"] === undefined ? {} : { "permission-mode": activity["permission-mode"] }),
+    ...(activity.checkout === undefined ? {} : { checkout: activity.checkout }),
     ...(activity["applied-by"] === undefined ? {} : { "applied-by": activity["applied-by"] }),
     effect: activity.effect,
     gating: activity.gating,
@@ -935,20 +948,14 @@ export function resolveGrant(files, { lane, activity, configPath }) {
   };
 }
 
-function resolveMerge(merge = {}, configPath) {
+function resolveMerge(merge = {}) {
   const diffCheck = merge["diff-check"] ?? {};
-  const denied = [
-    ...new Set([
-      ...(diffCheck["denied-paths"] ?? []),
-      configPath,
-      TRUSTED_ACTORS_PATH,
-    ]),
-  ];
   return {
     rung: merge.rung ?? "off",
-    "diff-check": { ...diffCheck, "denied-paths": denied },
+    "diff-check": { ...diffCheck, "denied-paths": [...new Set(diffCheck["denied-paths"] ?? [])] },
     "stack-landing": merge["stack-landing"] ?? "manual",
     "lane-prs": merge["lane-prs"] ?? "native",
+    "refire-skip-branches": merge["refire-skip-branches"] ?? [],
   };
 }
 
@@ -960,21 +967,33 @@ const limitsOf = (limits = {}) => ({
   "reset-clamp-min": limits["reset-clamp-min"] ?? 1,
   "reset-clamp-max": limits["reset-clamp-max"] ?? 168,
   "restarts-per-run": limits["restarts-per-run"] ?? 5,
+  "readmit-per-run": limits["readmit-per-run"] ?? 20,
+  "parent-rescan-per-run": limits["parent-rescan-per-run"] ?? 5,
   "limit-stops-per-head": limits["limit-stops-per-head"] ?? 3,
   "limit-stops-per-issue": limits["limit-stops-per-issue"] ?? 3,
   "wip-cap": limits["wip-cap"] ?? 60,
   "turn-cap-restarts": limits["turn-cap-restarts"] ?? 0,
+  "stop-retries": limits["stop-retries"] ?? 2,
   "fix-ci-per-run": limits["fix-ci-per-run"] ?? 2,
   "fix-ci-restarts": limits["fix-ci-restarts"] ?? 1,
   "fix-docs-per-run": limits["fix-docs-per-run"] ?? 2,
   "admission-factor": limits["admission-factor"] ?? 0.8,
   "admission-min-per-hour": limits["admission-min-per-hour"] ?? 1,
-  // As set: rate-guard.mjs fills it from the schema's defaults.
+  "stranded-backoff-hours": {
+    "no-run": 3,
+    "no-report": 3,
+    "failed-again": 3,
+    "failed-mint": 3,
+    "kill-switch": 3,
+    ...limits["stranded-backoff-hours"],
+  },
+  // As set: rate-guard.mjs fills it from rate-limits.json beside it.
   api: limits.api ?? {},
 });
 
 const loopOf = (loop = {}) => ({
   "review-rounds": loop["review-rounds"] ?? 2,
+  "findings-after-first-review": loop["findings-after-first-review"] ?? "blocking-only",
   "no-progress": loop["no-progress"] ?? 3,
   "dependency-review-rounds": loop["dependency-review-rounds"] ?? 2,
   "fix-ci-rounds": loop["fix-ci-rounds"] ?? 3,
@@ -1033,8 +1052,9 @@ export function resolve(
     },
     selected: index < 0 ? null : slots[index],
     loop: loopOf(doc.loop),
+    "review-threads": { "reviewer-ids": doc["review-threads"]?.["reviewer-ids"] ?? [] },
     limits: limitsOf(doc.limits),
     wip: doc.wip ?? {},
-    merge: resolveMerge(doc.merge, configPath),
+    merge: resolveMerge(doc.merge),
   };
 }

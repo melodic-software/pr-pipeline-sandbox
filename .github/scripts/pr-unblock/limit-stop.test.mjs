@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { anyHandles, limitResetsAt, permanentlyHandles } from "./limit-stop.mjs";
+import { anyHandles, cappedAt, HEAD_LAG_STOP, headLagStop, KILL_SWITCH_STOP, killSwitchStop, limitResetsAt, pendingStop, permanentlyHandles, releasedBy, releasesHead, stopRelease } from "./limit-stop.mjs";
 
 const HOUR = 3_600_000;
 const ENDED = "2026-10-17T10:00:00Z";
@@ -32,6 +32,36 @@ test("a record ending in the models and profile tokens is still read", () => {
 test("a stated reset is held between one hour and seven days after the run ended", () => {
   assert.equal(limitResetsAt(posted(`${LIMIT} resets=2026-10-01T00:00:00Z`)), ended + HOUR);
   assert.equal(limitResetsAt(posted(`${LIMIT} resets=2027-01-01T00:00:00Z`)), ended + 7 * 24 * HOUR);
+});
+
+// A 401 fails every run on that credential until a person re-sets it, so it
+// waits like a usage limit that states no reset, and counts toward the cap.
+test("a refused credential (class auth) is a limit stop that resets fallback-reset hours after the run ended", () => {
+  const AUTH = "lane=pr-unblock activity=resolve-conflicts class=auth turns=1";
+  assert.equal(limitResetsAt(posted(AUTH)), ended + 5 * HOUR);
+  const stops = [1, 2, 3].map((id) => posted(AUTH, { id }));
+  assert.equal(anyHandles(stops.slice(0, 1), { now: ended + 5 * HOUR - 1, failuresRetry: true }), true);
+  assert.equal(anyHandles(stops.slice(0, 2), { now: ended + 5 * HOUR, failuresRetry: true }), false);
+  assert.equal(anyHandles(stops, { now: ended + 5 * HOUR, failuresRetry: true }), true);
+});
+
+test("pendingStop names the unreset stop that resets last, and nothing once all have reset", () => {
+  const auth = posted("lane=pr-unblock activity=resolve-conflicts class=auth", { id: 1 });
+  const limit = posted(LIMIT_LINE, { id: 2 });
+  assert.deepEqual(pendingStop([limit, auth], { now: ended }), { failureClass: "auth", resetsAt: ended + 5 * HOUR });
+  assert.deepEqual(pendingStop([limit, auth], { now: ended + 4 * HOUR }), { failureClass: "auth", resetsAt: ended + 5 * HOUR });
+  assert.equal(pendingStop([limit, auth], { now: ended + 5 * HOUR }), null);
+  assert.equal(pendingStop([run()], { now: ended }), null);
+});
+
+// A key out of credit does not recover when a usage window resets, so a credit
+// stop is no limit stop: its failed run handles the head, and no reset waits.
+test("a credit stop is no limit stop: no reset, nothing pending, and the head is handled", () => {
+  const credit = posted("lane=pr-unblock activity=resolve-conflicts class=credit-stop turns=1");
+  assert.equal(limitResetsAt(credit), null);
+  assert.equal(pendingStop([credit], { now: ended }), null);
+  assert.equal(anyHandles([credit], { now: ended + 5 * HOUR }), true);
+  assert.equal(permanentlyHandles([credit]), true);
 });
 
 test("another class, or a failed run with no summary record, is no limit stop", () => {
@@ -128,6 +158,34 @@ test("with failures retried, failed runs stop handling the head until three of t
   assert.equal(permanentlyHandles([run(1), run(2), run(3)], { failuresRetry: true }), true);
 });
 
+// A class whose run never started the model (ci-workflows lane-outcome.md:
+// install-failed, sandbox-unavailable) is a fault: it holds, counts toward no
+// cap, and the next tick dispatches the head again. A class that persists or
+// that a model turn may have run under (no-credential, max-turns) still counts.
+test("a fault stop holds without counting toward the cap; a max-turns failure still counts", () => {
+  const now = ended + HOUR;
+  const fault = (cls, id) => posted(`lane=pr-unblock activity=resolve-conflicts class=${cls}`, { id });
+  const record = (cls, id) => ({ ...run(id), name: "pr-unblock / resolve-conflicts", output: { title: "Failed", text: `lane-outcome {"v":1,"lane":"pr-unblock","activity":"resolve-conflicts","outcome":"failure","class":"${cls}","credential":{"secret":"CLAUDE_CODE_OAUTH_TOKEN","kind":"oauth-token"}}` } });
+  for (const faults of [
+    [1, 2, 3, 4].map((id) => fault("install-failed", id)),
+    [1, 2, 3, 4].map((id) => record("sandbox-unavailable", id)),
+  ]) {
+    for (const opt of [{}, { failuresRetry: true }, { failuresRetry: true, heldSkipsRelease: true, lagStopsRelease: true }]) {
+      assert.equal(anyHandles(faults, { now, ...opt }), false);
+      assert.equal(permanentlyHandles(faults, opt), false);
+      assert.equal(cappedAt(faults, opt), 0);
+    }
+  }
+  const turns = [1, 2, 3].map((id) => fault("max-turns", id));
+  assert.equal(anyHandles(turns, { now, failuresRetry: true }), true);
+  assert.equal(cappedAt(turns, { failuresRetry: true }), 3);
+  assert.equal(anyHandles([turns[0], fault("install-failed", 9), turns[1]], { now, failuresRetry: true }), false, "two counted failures of three");
+  assert.equal(anyHandles([run(1)], { now }), true, "a red run with no record still handles the head");
+  const noCred = [1, 2, 3].map((id) => record("no-credential", id));
+  assert.equal(anyHandles(noCred, { now, failuresRetry: true }), true, "a missing credential fails every tick, so it still caps the head");
+  assert.equal(cappedAt(noCred, { failuresRetry: true }), 3);
+});
+
 test("with failures retried, an unreset limit stop or any run that did not fail still handles the head", () => {
   const options = { now: ended + HOUR, failuresRetry: true };
   assert.equal(anyHandles([posted(LIMIT, { id: 1 })], options), true);
@@ -152,4 +210,133 @@ test("with held skips released, an awaiting-human skip does not handle the head"
   assert.equal(anyHandles(three, { now, heldSkipsRelease: true }), true);
   assert.equal(permanentlyHandles(three, { heldSkipsRelease: true }), true);
   assert.equal(anyHandles([heldSkip, run(1), run(2)], { now, heldSkipsRelease: true, failuresRetry: true }), true, "held skips and failures share the cap");
+});
+
+test("with lag stops released, a head-lag stop does not handle the head until the cap; by default it does", () => {
+  const now = ended + HOUR;
+  const lagged = (id) => ({ ...heldSkip, id, output: { title: HEAD_LAG_STOP } });
+  assert.equal(HEAD_LAG_STOP, "Skipped: superseded-sha");
+  assert.equal(headLagStop(lagged(1)), true);
+  assert.equal(headLagStop({ ...lagged(1), conclusion: "failure" }), false);
+  assert.equal(anyHandles([lagged(1)], { now }), true, "by default it handles the head");
+  assert.equal(anyHandles([lagged(1)], { now, lagStopsRelease: true }), false);
+  assert.equal(permanentlyHandles([lagged(1)], { lagStopsRelease: true }), false);
+  assert.equal(anyHandles([lagged(1), { ...lagged(2), status: "in_progress", conclusion: null }], { now, lagStopsRelease: true }), true, "a newer run going handles it");
+  assert.equal(anyHandles([lagged(1), { ...lagged(2), conclusion: "success", output: { title: "Passed" } }], { now, lagStopsRelease: true }), true, "a newer run that acted handles it");
+  const three = [lagged(1), lagged(2), lagged(3)];
+  assert.equal(anyHandles(three, { now, lagStopsRelease: true }), true, "the cap ends it");
+  assert.equal(cappedAt(three, { lagStopsRelease: true }), 3);
+});
+
+// A run the lanes kill switch stopped did no work: its own kill-switch step,
+// or a broker refusal of its mint (request-lane-token kill-switch-ok), posts
+// neutral kill-switch (decide.mjs: "Skipped: <reason>").
+const killed = (id = 20, started = "2026-10-17T09:00:00Z") => ({
+  id,
+  status: "completed",
+  conclusion: "neutral",
+  started_at: started,
+  completed_at: ENDED,
+  output: { title: KILL_SWITCH_STOP },
+});
+
+test("a kill-switch stop never handles a head, with or without the opt-ins, until three stops stand on it", () => {
+  const now = ended + HOUR;
+  assert.equal(KILL_SWITCH_STOP, "Skipped: kill-switch");
+  assert.equal(killSwitchStop(killed()), true);
+  assert.equal(killSwitchStop({ ...killed(), conclusion: "failure" }), false, "a red kill-switch denial is no such stop");
+  assert.equal(killSwitchStop({ ...killed(), output: { title: "Skipped: prerequisite-missing" } }), false);
+  for (const options of [{}, { heldSkipsRelease: true, failuresRetry: true }]) {
+    assert.equal(anyHandles([killed()], { now, ...options }), false);
+    assert.equal(permanentlyHandles([killed()], options), false);
+    const three = [killed(20), killed(21), killed(22)];
+    assert.equal(anyHandles(three, { now, ...options }), true, "a switch that keeps flipping mid-run ends the head at the cap");
+  }
+  assert.equal(anyHandles([killed(), run(1), run(2)], { now, failuresRetry: true }), true, "kill-switch stops and failures share the cap");
+  assert.equal(anyHandles([killed(), { ...killed(30), conclusion: "success", output: { title: "Passed" } }], { now }), true, "another run still handles the head");
+});
+
+test("an emitter check's kill-switch stop releases the head's earlier activity checks, like a lane stop", () => {
+  const activity = { ...killed(1, "2026-10-17T08:00:00Z"), conclusion: "success", output: { title: "Passed" } };
+  const stop = killed(2, "2026-10-17T08:30:00Z");
+  assert.equal(releasesHead(stop), true);
+  const { cut, stops } = stopRelease([stop], 3);
+  assert.equal(cut, Date.parse("2026-10-17T08:30:00Z"));
+  assert.equal(stops, 1);
+  assert.deepEqual(releasedBy([activity], cut), []);
+  const capped = stopRelease([killed(2), killed(3), killed(4)], 3);
+  assert.equal(capped.cut, null, "the dispatcher's per-head cap ends the retries");
+  assert.equal(stopRelease([{ ...stop, output: { title: "Passed" } }], 3).cut, null, "a push that acted releases nothing");
+});
+
+// The lane-outcome record report-check-run writes into output.text, built by
+// hand from docs/lane-outcome.md's rate-limit example plus the hub's activity.
+const RECORD = {
+  v: 1,
+  lane: "pr-unblock",
+  activity: "resolve-conflicts",
+  outcome: "failure",
+  class: "rate-limit",
+  credential: { secret: "CLAUDE_CODE_OAUTH_TOKEN", kind: "oauth-token" },
+  resets: { at: "2026-10-17T14:00:00Z", window: "five_hour" },
+  turns: 4,
+};
+const withText = (record, line = "", extra = {}) =>
+  posted(line, { output: { title: "Failed", summary: `${line}\n\nThe activity step failed.`, text: `lane-outcome ${JSON.stringify(record)} trailing free text }` }, ...extra });
+
+test("the lane-outcome record in output.text is read before the legacy summary line", () => {
+  assert.equal(limitResetsAt(withText(RECORD, LIMIT_LINE)), Date.parse("2026-10-17T14:00:00Z"));
+  assert.equal(limitResetsAt(withText({ ...RECORD, class: "auth", resets: undefined })), ended + 5 * HOUR);
+});
+
+test("an auth stop waits fallback-reset even when its record states a reset, as the legacy line does", () => {
+  assert.equal(limitResetsAt(withText({ ...RECORD, class: "auth" })), ended + 5 * HOUR);
+});
+
+test("a record's Claude model ids, with the [1m] suffix, are read", () => {
+  const models = { ...RECORD, models: ["claude-opus-5-5", "claude-haiku-5-5[1m]"] };
+  assert.equal(limitResetsAt(withText(models, LIMIT_LINE)), Date.parse("2026-10-17T14:00:00Z"));
+});
+
+test("an impossible stated reset (month 13) is no stated reset: it resets five hours after the run ended", () => {
+  assert.equal(limitResetsAt(withText({ ...RECORD, resets: { at: "2026-13-01T00:00:00Z", window: "five_hour" } })), ended + 5 * HOUR);
+  assert.equal(limitResetsAt(posted(`${LIMIT} resets=2026-13-01T00:00:00Z`)), ended + 5 * HOUR);
+});
+
+test("a key the reader does not know, top level or nested, is ignored and the record still read", () => {
+  const extra = { ...RECORD, laterField: { note: "a } in a string" }, resets: { ...RECORD.resets, laterNested: 1 } };
+  assert.equal(limitResetsAt(withText(extra, LIMIT_LINE)), Date.parse("2026-10-17T14:00:00Z"));
+});
+
+test("with no record, or an unreadable one, the legacy summary line is read", () => {
+  assert.equal(limitResetsAt(posted(LIMIT_LINE)), Date.parse("2026-10-17T13:00:00Z"));
+  for (const [label, record] of [
+    ["another v", { ...RECORD, v: 2 }],
+    ["a malformed known key", { ...RECORD, turns: "4" }],
+    ["a malformed nested key", { ...RECORD, resets: { at: "tomorrow" } }],
+    ["a value-shaped secret", { ...RECORD, credential: { secret: "sk-ant-abc", kind: "api-key" } }],
+    ["a kind that disagrees with the secret", { ...RECORD, credential: { secret: "CLAUDE_CODE_OAUTH_TOKEN", kind: "api-key" } }],
+    ["a class outside the enum", { ...RECORD, class: "rate limited" }],
+    ["a failure with no class", { ...RECORD, class: undefined }],
+    ["a handoff leg", { ...RECORD, handoff: true }],
+    ["an email as a model", { ...RECORD, models: ["kyle.sexton@example.com"] }],
+    ["a host:port as a model", { ...RECORD, models: ["runner-7.corp.internal:443"] }],
+    ["a key prefix as a model", { ...RECORD, models: ["sk-ant-api03-abcdef"] }],
+  ]) {
+    assert.equal(limitResetsAt(withText(record, LIMIT_LINE)), Date.parse("2026-10-17T13:00:00Z"), label);
+  }
+});
+
+test("a record naming another check run is ignored: the legacy line wins, and with none there is no stop", () => {
+  const other = { ...RECORD, activity: "address-feedback" };
+  assert.equal(limitResetsAt(withText(other, LIMIT_LINE)), Date.parse("2026-10-17T13:00:00Z"));
+  assert.equal(limitResetsAt(withText(other, "The activity step failed.")), null);
+  assert.equal(limitResetsAt(withText({ ...RECORD, lane: "pr-review" }, "The activity step failed.")), null);
+});
+
+test("a credit stop is no limit stop on the record or the legacy line", () => {
+  const credit = { ...RECORD, class: "credit-stop", resets: undefined, credential: { secret: "LANES_CLAUDE_API_KEY", kind: "api-key", role: "LANES" } };
+  assert.equal(limitResetsAt(withText(credit)), null);
+  assert.equal(limitResetsAt(withText(credit, LIMIT_LINE)), null, "a readable record wins over the legacy line");
+  assert.equal(limitResetsAt(posted("lane=pr-unblock activity=resolve-conflicts class=credit-stop")), null);
 });

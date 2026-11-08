@@ -8,9 +8,11 @@ import { inThreadScope } from "../pr-unblock/thread-scope.mjs";
 
 export const PREDICATES = {
   any: () => () => true,
+  // A markdown file: a path ending in .md, in that case.
+  markdown: () => (path) => path.endsWith(".md"),
   // A kept thread's path, or a file thread-scope.mjs places in its scope,
-  // its named_paths and the PR's own files the patch does not add included:
-  // `keptThreads` is { paths, threads, prPaths }.
+  // its named_paths and the PR's own files and shared copies the patch does
+  // not add included: `keptThreads` is { paths, threads, prPaths, copyPaths }.
   "kept-threads": ({ keptThreads }) => {
     if (!(keptThreads?.paths instanceof Set) || keptThreads.paths.size === 0 || !Array.isArray(keptThreads.threads)) {
       throw new Error("allow kept-threads needs the run's kept thread paths");
@@ -18,6 +20,7 @@ export const PREDICATES = {
     return (path, entry) =>
       inThreadScope(path, keptThreads.paths, keptThreads.threads, {
         prPaths: keptThreads.prPaths ?? new Set(),
+        copyPaths: keptThreads.copyPaths ?? new Set(),
         added: entry === undefined || entry.status?.[0] === "A",
       });
   },
@@ -29,6 +32,14 @@ export const PREDICATES = {
       throw new Error("allow dependency-manifests needs the base dependabot.yml's [ecosystem, directory] pairs");
     }
     return (path) => inFixScope(path, dependabotConfig);
+  },
+  // A copy the base-tip scripts/shared-copies.txt registers, which
+  // apply-patch.mjs reads from the trusted base copy (sharedCopiesFrom).
+  "shared-copies": ({ sharedCopies }) => {
+    if (!(sharedCopies instanceof Set) || sharedCopies.size === 0) {
+      throw new Error("allow shared-copies needs the base registry's copies");
+    }
+    return (path) => sharedCopies.has(path);
   },
   // A path the base merge left conflicted, which the patch resolves; the
   // merge's own changes from the base side never face the predicates.

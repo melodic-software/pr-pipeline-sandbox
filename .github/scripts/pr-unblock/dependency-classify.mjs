@@ -2,7 +2,8 @@
 // the rules the pr-merge lane applies: a line-for-line port of
 // plugins/source-control/skills/babysit-prs/scripts/babysit_dependabot.py
 // (`classify`, `parse_metadata`, `parse_title`, `is_major`, `commit_refusal`,
-// `commits_refusal`, `parse_config`, `glob_regex`, `content_refusal`, and the
+// `commits_refusal`, `parse_config`, `glob_regex`, `content_refusal`,
+// `push_refusal`, and the
 // fix rule `in_fix_scope`, `is_fix_file`, `is_semver_range`,
 // `fix_content_refusal` and `fix_refusal`) and its
 // caller's commit and content steps (`dependabot_eligibility` and
@@ -25,8 +26,8 @@
 // <b>`) or a group's body `Updates` lines at the start of a line otherwise
 // (release notes are quoted, so they never start one); when both read they
 // must name the same dependencies and agree on which are major. A commit the
-// pr-merge lane refuses (not GitHub-verified, not committed by GitHub, or
-// neither Dependabot's nor the version-bump commit) is a review reason here,
+// pr-merge lane refuses (not GitHub-verified, not committed by GitHub, or not
+// Dependabot's) is a review reason here,
 // so the AI review owns the pull request; it never sorts `auto`.
 
 export const DEPENDABOT_LOGIN = "dependabot[bot]";
@@ -34,11 +35,8 @@ export const DEPENDABOT_LOGIN = "dependabot[bot]";
 // "dependabot[bot]", so a GraphQL listing matches it by id.
 export const DEPENDABOT_ID = 49699333;
 export const DEPENDABOT_AUTHOR = Object.freeze(["dependabot[bot]", "49699333+dependabot[bot]@users.noreply.github.com"]);
-export const ACTIONS_AUTHOR = Object.freeze(["github-actions[bot]", "41898282+github-actions[bot]@users.noreply.github.com"]);
 export const ACTIONS_PUBLISHERS = Object.freeze(["actions", "github", "anthropics"]);
 export const GITHUB_COMMITTER_EMAIL = "noreply@github.com";
-export const SKIP_MARKER = "[dependabot skip]";
-const BUMP_PATH = /^plugins\/[A-Za-z0-9._-]+\/(\.claude-plugin\/plugin\.json|CHANGELOG\.md)$/;
 export const RED = new Set(["failure", "cancelled", "timed_out", "action_required", "startup_failure"]);
 
 const PREFIX = /^[a-z]+(\([^)]*\))?!?:\s*/i;
@@ -140,16 +138,12 @@ export function parseTitle(title, body) {
 const signed = (item) => [item?.commit?.author?.name, item?.commit?.author?.email];
 const isAuthor = (item, author) => signed(item)[0] === author[0] && signed(item)[1] === author[1];
 export const isDependabotCommit = (item) => isAuthor(item, DEPENDABOT_AUTHOR);
-export const isActionsCommit = (item) => isAuthor(item, ACTIONS_AUTHOR);
 
 // Why one REST pull-request commit may not merge, or null: it is
-// GitHub-verified, committed by GitHub, and Dependabot's or the repository's
-// `[dependabot skip]` version-bump commit (github-actions[bot], touching only a
-// plugin's plugin.json or CHANGELOG.md). `files(sha)` lists a commit's paths,
-// or null when unreadable. The pr-merge lane's lanes App admission is left
-// out: a lanes App fix commit keeps the pull request `review`, which pr-merge
-// merges only on a round marker.
-export function commitRefusal(item, files) {
+// GitHub-verified, committed by GitHub, and Dependabot's. The pr-merge lane's
+// lanes App admission is left out: a lanes App fix commit keeps the pull
+// request `review`, which pr-merge merges only on a round marker.
+export function commitRefusal(item) {
   const commit = item?.commit ?? {};
   const sha = String(item?.sha || "?").slice(0, 12);
   if (commit.verification?.verified !== true) {
@@ -158,26 +152,16 @@ export function commitRefusal(item, files) {
   if (commit.committer?.email !== GITHUB_COMMITTER_EMAIL) {
     return `commit-not-committed-by-github:${sha}`;
   }
-  if (isDependabotCommit(item)) {
-    return null;
-  }
-  if (!isActionsCommit(item) || !String(commit.message ?? "").includes(SKIP_MARKER)) {
-    return `commit-not-dependabot:${sha}`;
-  }
-  const paths = files(String(item?.sha ?? ""));
-  if (!paths?.length || paths.some((path) => !BUMP_PATH.test(path))) {
-    return `commit-not-version-bump:${sha}`;
-  }
-  return null;
+  return isDependabotCommit(item) ? null : `commit-not-dependabot:${sha}`;
 }
 
 // The first commit that may not merge, or `commits-missing`.
-export function commitsRefusal(commits, files) {
+export function commitsRefusal(commits) {
   if (!commits.length) {
     return "commits-missing";
   }
   for (const item of commits) {
-    const refusal = commitRefusal(item, files);
+    const refusal = commitRefusal(item);
     if (refusal) return refusal;
   }
   return null;
@@ -345,6 +329,59 @@ export const isDependabotSigned = (item) =>
   item?.commit?.verification?.verified === true &&
   item.commit.verification.reason === "valid";
 
+const PUSH_TYPES = Object.freeze(["push", "force_push", "branch_creation"]);
+
+// `sha` and its ancestors among the pull request's commits `bySha`.
+function ancestry(sha, bySha) {
+  const found = new Set();
+  const todo = [String(sha)];
+  while (todo.length) {
+    const current = todo.pop();
+    if (found.has(current) || !bySha.has(current)) continue;
+    found.add(current);
+    const parents = bySha.get(current)?.parents;
+    if (Array.isArray(parents)) todo.push(...parents.map((parent) => String(parent?.sha)));
+  }
+  return found;
+}
+
+// Whose push must bring a pull-request commit: Dependabot's or the lanes App's
+// (author id `appId`); null for any other commit.
+const commitPusher = (item, appId) => (isDependabotCommit(item) ? "dependabot" : Number.isInteger(appId) && item?.author?.id === appId ? "lane" : null);
+
+// Why the head branch's push history does not bind it to Dependabot, or null.
+// `activities` is the repository activity API for the branch, newest first.
+// Reading back to Dependabot's newest branch creation or force push (which
+// rewrites the branch), every push must be by dependabot[bot], or by the lanes
+// App (actor id `appId`) when it pushed a commit of the pull request. Every commit a push brought (its `after` and the
+// ancestors its `before` lacks) must be its pusher's own (commitPusher), every
+// commit of the pull request must arrive in one of those pushes, and the newest
+// push must have pushed `head`. The pr-merge lane's twin is `push_refusal` in
+// babysit_dependabot.py.
+export function pushRefusal(activities, head, commits, appId) {
+  const pushes = (Array.isArray(activities) ? activities : []).filter((activity) => PUSH_TYPES.includes(activity?.activity_type));
+  if (pushes.length === 0 || pushes[0].after !== head) return "push-history-incomplete";
+  const bySha = new Map((Array.isArray(commits) ? commits : []).map((item) => [String(item?.sha), item]));
+  const unattributed = new Set(bySha.keys());
+  for (const push of pushes) {
+    const login = String(push.actor?.login ?? "").toLowerCase();
+    const after = String(push.after);
+    const before = ancestry(push.before, bySha);
+    const brought = [...ancestry(after, bySha)].filter((sha) => !before.has(sha));
+    for (const sha of brought) unattributed.delete(sha);
+    const pusher =
+      login === DEPENDABOT_LOGIN && push.actor?.type === "Bot" ? "dependabot" : Number.isInteger(appId) && push.actor?.id === appId ? "lane" : null;
+    if (pusher === null || (pusher !== "dependabot" && !bySha.has(after)) || brought.some((sha) => commitPusher(bySha.get(sha), appId) !== pusher)) {
+      return `pushed-by:${login || "unknown"}`;
+    }
+    if (pusher === "dependabot" && ["force_push", "branch_creation"].includes(push.activity_type)) {
+      return unattributed.size ? "push-history-incomplete" : null;
+    }
+  }
+  // No Dependabot branch creation or force push in reach: the history is cut.
+  return "push-history-incomplete";
+}
+
 // A fix changes only regular, non-executable files: no symbolic link
 // (120000), submodule (160000) or executable (100755). `entry` is the GraphQL
 // tree entry at the fix's tip.
@@ -398,16 +435,67 @@ const canonical = (value) =>
           .join(",")}}`
       : JSON.stringify(value);
 
+// The packages whose install script package.json's `allowScripts` approves
+// for one exact version, which a fix may move to the version the manifest
+// pins (the owner's decision on claude-code-plugins#12807).
+export const INSTALL_SCRIPT_PINS = Object.freeze(["@anthropic-ai/claude-code"]);
+const EXACT_VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$/;
+
+// The exact version `manifest` pins `name` to in a dependency section, or null
+// for a range, an absent name, or two sections that disagree.
+export function pinnedVersion(manifest, name) {
+  const specs = new Set(DEPENDENCY_SECTIONS.map((key) => manifest?.[key]).filter(isObject).filter((section) => Object.hasOwn(section, name)).map((section) => section[name]));
+  const [spec] = specs;
+  return specs.size === 1 && typeof spec === "string" && EXACT_VERSION.test(spec) ? spec : null;
+}
+
+// Why an `allowScripts` change is not exactly one install-script pin moved,
+// or null: one INSTALL_SCRIPT_PINS key `<name>@<old>` becomes `<name>@<new>`
+// with the same value, `<new>` is the exact version the manifest pins the
+// package to on both sides (the version Dependabot set), and every other key
+// stays.
+export function allowScriptsRefusal(old, now) {
+  const was = old?.allowScripts;
+  const is = now?.allowScripts;
+  if (!isObject(was) || !isObject(is)) return "allow-scripts-shape";
+  const gone = Object.keys(was).filter((key) => !Object.hasOwn(is, key));
+  const added = Object.keys(is).filter((key) => !Object.hasOwn(was, key));
+  if (gone.length !== 1 || added.length !== 1) return "allow-scripts-not-one-pin";
+  const kept = Object.keys(was).filter((key) => key !== gone[0]);
+  if (kept.some((key) => canonical(was[key]) !== canonical(is[key]))) return "allow-scripts-other-key";
+  const name = INSTALL_SCRIPT_PINS.find((pin) => gone[0].startsWith(`${pin}@`) && added[0].startsWith(`${pin}@`));
+  if (!name) return "allow-scripts-package";
+  if (canonical(was[gone[0]]) !== canonical(is[added[0]])) return "allow-scripts-value";
+  // The version the commit before the fix (Dependabot's) pins, unchanged by
+  // the fix, so a fix cannot move the manifest and the pin together, to a
+  // downgrade or anything else.
+  const version = pinnedVersion(old, name);
+  if (version === null || pinnedVersion(now, name) !== version || added[0] !== `${name}@${version}`) return "allow-scripts-version";
+  return null;
+}
+
+// Why a package.json change is not one install-script pin move and nothing
+// else, or null: the rule apply-patch.mjs's install-script-pin row holds the
+// select job's pin patch to.
+export function installScriptPinRefusal(before, after) {
+  const old = parseJson(before);
+  const now = parseJson(after);
+  if (!old || !now) return "package-json-unreadable";
+  const other = [...new Set([...Object.keys(old), ...Object.keys(now)])].sort().find((key) => key !== "allowScripts" && canonical(old[key]) !== canonical(now[key]));
+  return other ? `package-json-key:${other}` : allowScriptsRefusal(old, now);
+}
+
 // package.json: only the version range of a dependency already listed in a
 // dependency section changes, to a plain semver range. Any other key
-// (scripts, overrides, resolutions, bin, ...) stays as it was.
+// (scripts, overrides, resolutions, bin, ...) stays as it was, except an
+// install-script pin moved to the pinned version (allowScriptsRefusal).
 export function packageJsonRefusal(before, after) {
   const old = parseJson(before);
   const now = parseJson(after);
   if (!old || !now) return "package-json-unreadable";
   for (const key of [...new Set([...Object.keys(old), ...Object.keys(now)])].sort()) {
     if (!DEPENDENCY_SECTIONS.includes(key)) {
-      if (canonical(old[key]) !== canonical(now[key])) return `package-json-key:${key}`;
+      if (canonical(old[key]) !== canonical(now[key]) && (key !== "allowScripts" || allowScriptsRefusal(old, now))) return `package-json-key:${key}`;
       continue;
     }
     const was = old[key];
@@ -538,36 +626,6 @@ export async function fixRefusal(files, config, { entry, text }) {
   return null;
 }
 
-// The version-bump commit's plugin.json: only `version` changes, to a
-// plain version; every other key stays as it was.
-export function pluginJsonRefusal(before, after) {
-  const old = parseJson(before);
-  const now = parseJson(after);
-  if (!old || !now) return "plugin-json-unreadable";
-  if (typeof now.version !== "string" || !LOCK_VERSION.test(now.version)) return "plugin-json-version";
-  const rest = ({ version, ...other }) => canonical(other);
-  return rest(old) === rest(now) ? null : "plugin-json-key";
-}
-
-// The first reason the repository's version-bump commit (its files, as in
-// fixRefusal) is more than a version bump, or null: each file a plugin's
-// plugin.json or CHANGELOG.md, modified in place as a regular file, and a
-// plugin.json changing only its `version`. CHANGELOG.md is text.
-export async function bumpRefusal(files, { entry, text }) {
-  if (!files.length) return "bump-empty";
-  for (const file of files) {
-    const path = String(file?.filename ?? "");
-    if (file?.status !== "modified" || file.previous_filename) return `bump-status:${path}`;
-    if (!BUMP_PATH.test(path)) return `bump-path:${path}`;
-    if (!isFixFile(await entry(path))) return `bump-mode:${path}`;
-    if (path.endsWith("/plugin.json")) {
-      const why = pluginJsonRefusal(await text("before", path), await text("after", path));
-      if (why) return `bump-content:${path}:${why}`;
-    }
-  }
-  return null;
-}
-
 function actionsFile(path, config) {
   return config.some(([eco, folder]) => {
     if (eco !== "github-actions") return false;
@@ -588,7 +646,7 @@ export function usesOnly(patch) {
 
 // `dependabot-content:<path>` for the first changed path (either side of a
 // rename, sorted per file) the rule does not cover and `extra` (the paths the
-// version-bump and lanes App fix commits touched) does not hold, else null.
+// lanes App fix commits touched) does not hold, else null.
 // `files` is the REST pull-request files listing with patches.
 export function contentReason(files, config, extra = new Set()) {
   const pairs = config ?? [];
@@ -609,9 +667,9 @@ export function contentReason(files, config, extra = new Set()) {
 }
 
 // The content step, as the pr-merge lane's _dependabot_content: the paths
-// every non-Dependabot commit touched count as checked, a non-version-bump
-// commit (a lanes App fix) touching .github/ or a commit whose files cannot be
-// read whole is a reason (the pr-merge lane refuses those), an unreadable
+// every non-Dependabot commit (a lanes App fix) touched count as checked, such
+// a commit touching .github/ or a commit whose files cannot be read whole is a
+// reason (the pr-merge lane refuses those), an unreadable
 // config is dependabot-config-unreadable, and a files listing shorter than
 // the PR's changed-file count is dependabot-content:files-incomplete.
 // `commitFiles(sha)` returns a commit's paths, or null when unreadable.
@@ -626,11 +684,9 @@ export function contentStep({ commits = [], commitFiles = () => null, files, con
     if (!Array.isArray(touched)) {
       return `dependabot-commit-files-unreadable:${sha.slice(0, 12)}`;
     }
-    if (!isActionsCommit(item)) {
-      const gated = touched.find((p) => p === ".github" || p.startsWith(".github/"));
-      if (gated) {
-        return `dependabot-fix-content:${gated}`;
-      }
+    const gated = touched.find((p) => p === ".github" || p.startsWith(".github/"));
+    if (gated) {
+      return `dependabot-fix-content:${gated}`;
     }
     for (const path of touched) extra.add(path);
   }
@@ -754,7 +810,7 @@ export function classify(pr) {
     if (!Number.isInteger(pr.totalCommits) || pr.totalCommits !== listed) {
       reasons.push(`commits-listed:${listed}-of:${pr.totalCommits}`);
     }
-    const refusal = commitsRefusal(pr.commits ?? [], pr.commitFiles ?? (() => null));
+    const refusal = commitsRefusal(pr.commits ?? []);
     if (refusal) reasons.push(refusal);
     const content = contentStep(pr);
     if (content) reasons.push(content);

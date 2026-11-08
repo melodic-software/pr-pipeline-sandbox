@@ -15,10 +15,13 @@ inputs:
   model-route:
     description: >
       A run that is no lane activity (verify-pr for pr-verify.yml,
+      merge-risk for pr-rate-merge-risk.yml,
       review-code for pr-review-hosted.yml, review-security for
       pr-review-security-hosted.yml, triage-issue for intake-triage.yml,
       summarize-reuse for work-resolve-issue's summary pass,
-      adjudicate-feedback for pr-unblock.yml's adjudicate-feedback job):
+      adjudicate-feedback for pr-unblock.yml's adjudicate-feedback job,
+      resolve-issue for the model jobs of maintenance-tidy-code-upkeep.yml and
+      upstream-apply-changelog.yml):
       resolve only its model profile, for the profile, claude-args,
       settings-json, max-turns, model and effort outputs. Set it or lane, not both.
     required: false
@@ -64,6 +67,15 @@ inputs:
       The dimensions an earlier resolve of this run read (its issue-dimensions
       output), for a run whose job timeout they already set: the run takes
       them instead of reading the issue's fields again.
+    required: false
+    default: ""
+  split-child:
+    description: >
+      `true` or `false`: whether the issue is a trusted size-split sub-issue
+      (admit.mjs trustedSplitChild) or a finished parent (admit.mjs
+      finishedParent), as work-resolve-issue's admit job reads it. Required
+      when the run reads the issue's dimensions; a Large one then takes
+      models.issue-dimensions.split-child-size.
     required: false
     default: ""
   model-rung:
@@ -121,9 +133,9 @@ outputs:
     value: ${{ steps.resolve.outputs.profile }}
   claude-args:
     description: >
-      The profile's Claude Code arguments: `--model <alias>` unless the model
-      is `default`, `--max-turns <n>`, and `--effort <level>` when the profile
-      sets one. Empty for a script.
+      The profile's Claude Code arguments: `--model <alias>`, `--max-turns
+      <n>`, and `--effort <level>` when the profile sets one. Empty for a
+      script.
     value: ${{ steps.resolve.outputs.claude-args }}
   settings-json:
     description: >
@@ -135,12 +147,11 @@ outputs:
     value: ${{ steps.resolve.outputs.max-turns }}
   model:
     description: >
-      The profile's model alias, for run-claude-cli's `model` input. A role
-      profile takes its role's model from the base's
+      The profile's model alias, for run-claude-cli's `model` input: `haiku`,
+      `sonnet` or `opus`, and `opus` for any other value. A role profile
+      takes its role's model from the base's
       plugins/multi-agent/reference/defaults.yaml, and `opus` when that
-      gives `inherit` or no alias. Empty when the model is `default`, which
-      the launcher cannot pass, so a launcher caller must fail on it; empty
-      for a script.
+      gives `inherit` or no alias. Empty for a script.
     value: ${{ steps.resolve.outputs.model }}
   effort:
     description: >
@@ -178,6 +189,9 @@ outputs:
   prepare:
     description: "The leaf's prepare mode (`merge-base`), empty when it sets none."
     value: ${{ steps.resolve.outputs.prepare }}
+  checkout:
+    description: "A script activity's checkout in the write runner: `head` (the default) or `base` (no head checkout); empty for a skill."
+    value: ${{ steps.resolve.outputs.checkout }}
   contents:
     description: The App grant's `contents` permission for the activity's effect.
     value: ${{ steps.resolve.outputs.contents }}
@@ -215,8 +229,10 @@ runs:
         APPLIED_BY_SUPPORTED: ${{ inputs.applied-by-supported }}
         ISSUE_DIMENSIONS: ${{ inputs.issue-dimensions }}
         MODEL_RUNG: ${{ inputs.model-rung }}
+        SPLIT_CHILD: ${{ inputs.split-child }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         REPOSITORY: ${{ github.repository }}
       run: |
-        npm ci --ignore-scripts --omit=dev --no-audit --no-fund --prefix "$GITHUB_ACTION_PATH"
+        # A composite step takes no timeout-minutes, so `timeout` bounds the install.
+        timeout 2m npm ci --ignore-scripts --omit=dev --no-audit --no-fund --prefix "$GITHUB_ACTION_PATH"
         node "$GITHUB_ACTION_PATH/resolve-config.mjs"

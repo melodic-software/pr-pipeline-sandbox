@@ -1,9 +1,10 @@
 {
   "type": "object",
   "properties": {
-    "verdict": { "type": "string", "enum": ["lane", "reviewer", "human"] },
-    "question": { "type": "string", "enum": ["none", "intent", "design", "security"] }
+    "verdict": { "type": "string", "enum": ["lane", "reviewer", "human", "tests-only"] },
+    "question": { "type": "string", "enum": ["none", "intent", "design", "security"] },
+    "quote": { "type": "string", "maxLength": 2000 }
   },
-  "required": ["verdict", "question"],
+  "required": ["verdict", "question", "quote"],
   "additionalProperties": false
 }

@@ -5,13 +5,11 @@ import { test } from "node:test";
 import { parse, stringify } from "yaml";
 
 import { Rejection, resolve } from "./resolve.mjs";
-import { FORCED_DENIED_PATHS } from "../../scripts/pr-merge/merge-holds.mjs";
 
 const read = (relative) =>
   readFileSync(new URL(relative, import.meta.url), "utf8");
 const json = (relative) => JSON.parse(read(relative));
 const CONFIG_PATH = "docs/conventions/pr-pipeline.yaml";
-const TRUSTED_ACTORS = ".github/standards/trusted-actors/trusted-actors.json";
 const IDENTITY = "example-lanes[bot]";
 
 const run = (config) =>
@@ -52,13 +50,14 @@ const rejectedFor = (config, pattern) =>
   );
 
 // The merge section valid.yaml resolves to: no merge section, so rung off,
-// manual landing, lane pull requests on native auto-merge, and only the
-// forced denied paths.
+// manual landing, lane pull requests on native auto-merge, and no denied
+// path.
 const VALID_MERGE = {
   rung: "off",
-  "diff-check": { "denied-paths": [CONFIG_PATH, TRUSTED_ACTORS] },
+  "diff-check": { "denied-paths": [] },
   "stack-landing": "manual",
   "lane-prs": "native",
+  "refire-skip-branches": [],
 };
 
 test("authority local-babysit without agent-identity fails the schema on the missing identity", () => {
@@ -198,6 +197,24 @@ test("rung C2 with authority local-babysit fails on both the missing diff-check 
   );
 });
 
+// Each rung above off has a name and a code kept as its alias; both spellings
+// carry the same conditional requirements.
+for (const rung of ["merge", "merge-reviewed", "C2", "C3"]) {
+  test(`rung ${rung} validates and carries the requirements of a rung above off`, () => {
+    assert.doesNotThrow(() => run(withMerge({ rung })));
+    assert.doesNotThrow(() => run(withMerge({ ...LANE, rung, "require-verifier-verdict": true })));
+    rejectedFor(withMerge({ ...LANE, rung }), /require-verifier-verdict/);
+    rejectedFor(
+      withMerge({ rung, authority: "local-babysit", "agent-identity": IDENTITY }),
+      /required property 'diff-check'/,
+    );
+  });
+}
+
+test("a rung outside off, its names and its codes fails the schema", () => {
+  rejectedFor(withMerge({ rung: "C4" }), /\/merge\/rung must be equal to one of the allowed values/);
+});
+
 test("an agent-identity without the [bot] suffix fails the schema: it must be a GitHub App", () => {
   rejectedFor(
     withMerge({ authority: "local-babysit", "agent-identity": "some-user" }),
@@ -213,14 +230,6 @@ test("a GitHub App [bot] login validates as agent-identity", () => {
 
 test("resolveMerge output for valid.yaml is unchanged", () => {
   assert.deepEqual(run(read("./fixtures/valid.yaml")).merge, VALID_MERGE);
-});
-
-// ci-status adds this floor to the base config's denied paths itself.
-test("merge-holds.mjs's FORCED_DENIED_PATHS are the denied paths resolveMerge forces", () => {
-  assert.deepEqual(
-    [...run(read("./fixtures/valid.yaml")).merge["diff-check"]["denied-paths"]].sort(),
-    [...FORCED_DENIED_PATHS].sort(),
-  );
 });
 
 test("resolveMerge does not carry authority or agent-identity into the output", () => {
@@ -259,6 +268,14 @@ test("merge.lane-prs takes native or gate, and the schema's default is the resol
   rejectedFor(withMerge({ "lane-prs": "off" }), /must be equal to one of the allowed values/);
   const schema = json("../../../docs/conventions/pr-pipeline/pr-pipeline.schema.json");
   assert.equal(schema.$defs.merge.properties["lane-prs"].default, run(withMerge({})).merge["lane-prs"]);
+});
+
+test("merge.refire-skip-branches takes a list of branch names, and the schema's default is the resolver's", () => {
+  assert.deepEqual(run(withMerge({ "refire-skip-branches": ["release/plugins", "release/other"] })).merge["refire-skip-branches"], ["release/plugins", "release/other"]);
+  rejectedFor(withMerge({ "refire-skip-branches": "release/plugins" }), /must be array/);
+  rejectedFor(withMerge({ "refire-skip-branches": ["release plugins"] }), /must match pattern/);
+  const schema = json("../../../docs/conventions/pr-pipeline/pr-pipeline.schema.json");
+  assert.deepEqual(schema.$defs.merge.properties["refire-skip-branches"].default, run(withMerge({})).merge["refire-skip-branches"]);
 });
 
 test("merge.dependabot.majors takes hold or review", () => {

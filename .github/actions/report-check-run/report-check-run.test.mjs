@@ -2,18 +2,18 @@ import assert from "node:assert/strict";
 import {
   cpSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { createRateLimitLatch } from "../log-api-budget/rate-guard.mjs";
 import { anyHandles, limitResetsAt } from "../../scripts/pr-unblock/limit-stop.mjs";
 import { main } from "./report-check-run.mjs";
+import { tempDir } from "../../../lib/test-tmp.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA_REL = "docs/conventions/pr-pipeline/pr-pipeline.schema.json";
@@ -25,7 +25,7 @@ const FALLBACK = "f".repeat(40);
 let dir;
 let basePath;
 beforeEach(() => {
-  dir = mkdtempSync(path.join(tmpdir(), "report-check-run-"));
+  dir = tempDir("report-check-run-");
   basePath = path.join(dir, "base");
   mkdirSync(path.dirname(path.join(basePath, SCHEMA_REL)), { recursive: true });
   cpSync(LIVE_SCHEMA, path.join(basePath, SCHEMA_REL));
@@ -94,6 +94,7 @@ test("a valid verdict POSTs one completed check run with the contract body", asy
   assert.deepEqual(Object.keys(call.body).sort(), [
     "conclusion",
     "details_url",
+    "external_id",
     "head_sha",
     "name",
     "output",
@@ -165,13 +166,81 @@ test("a malformed run attempt posts the record without an external_id", async ()
   assert.match(calls[0].body.output.summary, /^lane=pr-refine activity=simplify class=rate-limit /);
 });
 
-test("no lane record POSTs no annotations, text, external_id or record line", async () => {
+// A record shaped as docs/lane-outcome.md's rate-limit example, for the lane
+// this harness posts (pr-refine / simplify).
+const OUTCOME = {
+  v: 1,
+  lane: "pr-refine",
+  outcome: "failure",
+  class: "rate-limit",
+  credential: { secret: "CLAUDE_CODE_OAUTH_TOKEN", kind: "oauth-token" },
+  resets: { at: "2026-10-17T16:00:00Z", window: "five_hour" },
+  turns: 3,
+};
+
+test("a valid lane-outcome record opens output.text with activity added, ahead of the legacy record", async () => {
+  const { calls } = await run({ ...LIMIT, LANE_OUTCOME: JSON.stringify(OUTCOME) });
+  const [first, blank, ...rest] = calls[0].body.output.text.split("\n");
+  assert.equal(first.startsWith("lane-outcome {"), true);
+  assert.deepEqual(JSON.parse(first.slice("lane-outcome ".length)), { ...OUTCOME, activity: "simplify" });
+  assert.equal(blank, "");
+  assert.match(rest.join("\n"), /^```json\n\{"lane":"pr-refine"/);
+  assert.match(calls[0].body.output.summary, /^lane=pr-refine activity=simplify class=rate-limit /);
+  const posted = { ...calls[0].body, id: 1, completed_at: "2026-10-17T12:00:00Z" };
+  assert.equal(limitResetsAt(posted), Date.parse("2026-10-17T16:00:00Z"), "limit-stop reads the record's reset, not the summary's");
+});
+
+test("the record line is written with no legacy record, and drops keys it does not know", async () => {
+  const { calls } = await run({ ACT_OUTCOME: "failure", LANE_OUTCOME: JSON.stringify({ ...OUTCOME, host: "runner-7", resets: { ...OUTCOME.resets, path: "/var/tmp/x" } }) });
+  const { output } = calls[0].body;
+  assert.equal(output.text.startsWith("lane-outcome {"), true);
+  assert.deepEqual(JSON.parse(output.text.slice("lane-outcome ".length)), { ...OUTCOME, activity: "simplify" });
+  assert.doesNotMatch(output.summary, /lane=/);
+});
+
+test("a record out of shape, of another lane, or not JSON writes no record line", async () => {
+  for (const [label, raw] of [
+    ["a value-shaped secret", JSON.stringify({ ...OUTCOME, credential: { secret: "sk-ant-x", kind: "api-key" } })],
+    ["a class outside the enum", JSON.stringify({ ...OUTCOME, class: "free text" })],
+    ["another lane", JSON.stringify({ ...OUTCOME, lane: "pr-unblock" })],
+    ["not JSON", "lane-outcome {"],
+    ["an array", "[]"],
+  ]) {
+    const { calls } = await run({ ...LIMIT, LANE_OUTCOME: raw });
+    assert.match(calls[0].body.output.text, /^```json\n/, label);
+    assert.doesNotMatch(calls[0].body.output.text, /lane-outcome /, label);
+  }
+});
+
+test("no lane record POSTs no annotations, text or record line, and still names its run in external_id", async () => {
   const { calls } = await run();
   const { output } = calls[0].body;
   assert.equal(output.annotations, undefined);
   assert.equal(output.text, undefined);
-  assert.equal("external_id" in calls[0].body, false);
+  assert.equal(calls[0].body.external_id, "pr-refine:simplify:123:1");
   assert.doesNotMatch(output.summary, /lane=/);
+});
+
+// The check run 122864732692 on #10583 posted: a run job the broker refused,
+// with no lane record. Its run is what refire-refused.mjs links back to.
+test("a run job that failed before the skill names its run in external_id", async () => {
+  const { calls } = await run({
+    LANE: "pr-unblock",
+    ACTIVITY: "apply-feedback-patch",
+    RUN_RESULT: "failure",
+    ACT_OUTCOME: "skipped",
+    VERDICT_PATH: path.join(dir, "missing.json"),
+    GITHUB_RUN_ID: "40700900804",
+  });
+  assert.equal(calls[0].body.conclusion, "failure");
+  assert.equal(calls[0].body.external_id, "pr-unblock:apply-feedback-patch:40700900804:1");
+});
+
+test("a malformed run id or attempt posts no external_id", async () => {
+  for (const env of [{ GITHUB_RUN_ID: "1/../../x" }, { GITHUB_RUN_ATTEMPT: "0" }]) {
+    const { calls } = await run(env);
+    assert.equal("external_id" in calls[0].body, false, JSON.stringify(env));
+  }
 });
 
 test("an absent verdict file POSTs failure on the env head", async () => {
@@ -325,6 +394,24 @@ test("a workflow-modified skip from a run job that succeeded POSTs neutral", asy
   assert.equal(calls[0].body.output.summary, "Skip reason: workflow-modified");
 });
 
+test("a stop-resolved skip POSTs neutral under the schema's enum", async () => {
+  const verdict = { ...JSON.parse(readFileSync(fixture("verdict-skipped.json"), "utf8")), "skip-reason": "stop-resolved", outcome: "skipped" };
+  const verdictPath = path.join(dir, "verdict.json");
+  writeFileSync(verdictPath, JSON.stringify(verdict));
+  const { calls } = await run({ VERDICT_PATH: verdictPath, ACT_OUTCOME: "skipped" });
+  assert.equal(calls[0].body.conclusion, "neutral");
+  assert.equal(calls[0].body.output.title, "Skipped: stop-resolved");
+});
+
+test("an awaiting-session skip POSTs neutral under the schema's enum", async () => {
+  const verdict = { ...JSON.parse(readFileSync(fixture("verdict-skipped.json"), "utf8")), "skip-reason": "awaiting-session", outcome: "skipped" };
+  const verdictPath = path.join(dir, "verdict.json");
+  writeFileSync(verdictPath, JSON.stringify(verdict));
+  const { calls } = await run({ VERDICT_PATH: verdictPath, ACT_OUTCOME: "skipped" });
+  assert.equal(calls[0].body.conclusion, "neutral");
+  assert.equal(calls[0].body.output.title, "Skipped: awaiting-session");
+});
+
 test("the enum is read from base-path: a base schema without the reason POSTs failure", async () => {
   const schemaPath = path.join(basePath, SCHEMA_REL);
   const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
@@ -374,6 +461,47 @@ test("an API error exits non-zero", async () => {
   const { code, calls } = await run({}, 403);
   assert.equal(code, 1);
   assert.equal(calls.length, 1);
+});
+
+// A bad token's 403, with every header the annotation reads. retry-after
+// latches the rate guard, so the test hands main a latch of its own.
+const REFUSED_BODY = JSON.stringify({ message: "Bad credentials", documentation_url: "https://docs.github.com/rest", pad: "x".repeat(300) });
+const REFUSED_HEADERS = {
+  "x-ratelimit-remaining": "4321",
+  "x-ratelimit-reset": "1760767020",
+  "x-ratelimit-resource": "core",
+  "retry-after": "60",
+};
+const quietLatch = () => createRateLimitLatch({ log: () => {}, fail: () => {}, stopFile: null, limits: () => ({}) });
+
+test("a refused POST's annotation carries the status, the rate-limit headers and the body prefix", async () => {
+  const lines = [];
+  const code = await main({
+    env: { LANE: "pr-refine", ACTIVITY: "simplify", RUN_RESULT: "success", ACT_OUTCOME: "success", CAN_COMMIT: "false", HEAD_SHA: HEAD, HEAD_SHA_FALLBACK: FALLBACK, VERDICT_PATH: fixture("verdict-success.json"), BASE_PATH: basePath, GITHUB_REPOSITORY: REPOSITORY, GITHUB_TOKEN: "bad-token", GITHUB_API_URL: "https://api.example.test" },
+    fetchImpl: async () => new Response(REFUSED_BODY, { status: 403, headers: REFUSED_HEADERS }),
+    log: (line) => lines.push(line),
+    latch: quietLatch(),
+  });
+  assert.equal(code, 1);
+  const annotation = lines.find((line) => line.startsWith("::error::report-check-run: could not post"));
+  assert.ok(annotation, lines.join("\n"));
+  for (const field of ["status=403", "x-ratelimit-remaining=4321", "x-ratelimit-reset=1760767020", "x-ratelimit-resource=core", "retry-after=60", `body=${JSON.stringify(REFUSED_BODY.slice(0, 200))}`]) {
+    assert.ok(annotation.includes(field), `${field} in ${annotation}`);
+  }
+});
+
+test("a refused answer's body cannot end or re-encode its annotation line", async () => {
+  const lines = [];
+  await main({
+    env: { LANE: "pr-refine", ACTIVITY: "simplify", RUN_RESULT: "success", ACT_OUTCOME: "success", CAN_COMMIT: "false", HEAD_SHA: HEAD, HEAD_SHA_FALLBACK: FALLBACK, VERDICT_PATH: fixture("verdict-success.json"), BASE_PATH: basePath, GITHUB_REPOSITORY: REPOSITORY, GITHUB_TOKEN: "t", GITHUB_API_URL: "https://api.example.test" },
+    fetchImpl: async () => new Response("oops\n::warning::injected %0A", { status: 404 }),
+    log: (line) => lines.push(line),
+    latch: quietLatch(),
+  });
+  const annotation = lines.find((line) => line.startsWith("::error::report-check-run: could not post"));
+  assert.ok(!annotation.includes("\n"));
+  assert.ok(annotation.includes(String.raw`body="oops\n::warning::injected %250A"`), annotation);
+  assert.ok(annotation.includes("x-ratelimit-remaining=none") && !annotation.includes("retry-after="), annotation);
 });
 
 test("a malformed repository exits non-zero with no API call", async () => {
