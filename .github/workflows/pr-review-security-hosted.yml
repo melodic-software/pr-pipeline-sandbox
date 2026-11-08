@@ -1,4 +1,4 @@
-name: pr-review-security-hosted
+name: PR Review Security Hosted
 
 # Sandbox caller of the org pr-review-cli reusable, lane `security`, at the
 # pin claude-code-plugins#9910 uses and its hold inputs. The job id

@@ -1,4 +1,4 @@
-name: pr-review-hosted
+name: PR Review Hosted
 
 # Sandbox caller of the org pr-review-cli reusable, lane `code`, at @main as
 # claude-code-plugins calls it, with its hold inputs. A push by the lanes App

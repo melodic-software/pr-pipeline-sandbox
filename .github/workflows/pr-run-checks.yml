@@ -1,4 +1,4 @@
-name: pr-run-checks
+name: PR Run Checks
 
 # Lane caller for pr-run-checks: its file stem is the lane, so the lanes token
 # broker's check endpoint accepts its read activity (a caller whose stem

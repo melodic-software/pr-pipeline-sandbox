@@ -1,4 +1,4 @@
-name: pr-require-checks
+name: PR Require Checks
 
 # Emits the `ci-status` check the merge-queue and ci-gate rulesets require.
 # The fleet's pr-require-checks.yml has the same shape: gate jobs, then one

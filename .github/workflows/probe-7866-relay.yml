@@ -1,4 +1,4 @@
-name: probe-7866-relay
+name: Probe 7866 Relay
 
 # Probe for melodic-software/claude-code-plugins#7866, the shape of that
 # repository's pr-review-comment-relay.yml: an unprivileged run on a new review

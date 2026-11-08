@@ -1,4 +1,4 @@
-name: pr-check-managed-files
+name: PR Check Managed Files
 
 # Sandbox probe of the check-managed-files action's merge-group mode
 # (ci-workflows#825): a merge_group run maps the group to its pull requests and
