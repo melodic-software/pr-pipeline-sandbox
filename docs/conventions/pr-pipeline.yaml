@@ -838,10 +838,7 @@ merge:
   report-only: false
   # Sandbox: the merge job lists, scores and enqueues the lanes App's pull
   # requests too (gate), as this repository's lane did before the upstream
-  # pr-merge.yml sync; main's native auto-merge path also relies on main's
-  # ci-status reading the pr-verify verdict in the merge queue, which this
-  # repository's pr-require-checks.yml does not. The enable-auto-merge job
-  # still arms them in both modes.
+  # pr-merge.yml sync. The enable-auto-merge job still arms them in both modes.
   lane-prs: gate
   require-verifier-verdict: true
   diff-check:
