@@ -86,6 +86,9 @@ SYNCED=(
   plugins/work-items/skills/triage/scripts/yaml-subset.awk
   plugins/work-items/schemas/work-items.schema.json
   plugins/work-items/skills/onboard-adapter/scripts
+  # The issue lane's skill and the reference its CI mode links.
+  plugins/work-items/skills/work
+  plugins/work-items/reference/item-content-trust.md
   scripts/setup-env.sh
   # The read runner's caller-secret gate, and the shadow check the owner runs
   # after the scan-carrier keygen.
@@ -103,6 +106,9 @@ SYNCED=(
 # fixtures hold a fake AWS key the secret scan refuses; no workflow reads them.
 LEFT_OUT=(
   .github/scripts/pr-verify/probe
+  # These read SKILL.md files of plugins this sandbox does not carry.
+  plugins/work-items/skills/work/unattended-callers.test.mjs
+  plugins/work-items/skills/work/unattended-callers.test.sh
 )
 
 # The sandbox's own versions of files claude-code-plugins also has.
