@@ -13,8 +13,9 @@ non-human `mergedBy` (`babysit_merge_policy.derive_auto_merge`, which
 `in_flight` shares); a queue-bypassing merge by a human is reported as the
 warning `unqueued-merge`. It is verified when a green
 dispatch run by the identity on a SHA containing the merge, a green canary
-run on such a SHA, and a matching read-back all exist, and no red full run or
-canary run counted against it first. Only an enqueue by the identity has a
+run on such a SHA (unless the repository has no canary workflow), and a
+matching read-back all exist, and no red full run or canary run counted
+against it first. Only an enqueue by the identity has a
 pinned SHA to read back; any other enqueue, and the identity's own native
 auto-merge (`native_auto_merge`, an immediate enqueue on arm included),
 verifies on the dispatch and canary runs alone. A red full run is attributed after one `rerun-failed-jobs` the
@@ -49,6 +50,8 @@ babysit-merge-settled sha=<merge commit> -->` comment on its pull request. A
 later check counts a merge carrying that marker, unedited and by the
 identity, verified without reading its runs or the pr-merge-dispatched
 artifact, so a settled merge no longer depends on that artifact's retention.
+Only the lane's floor anchor reads a settled merge's runs again, and only to
+pass it (`advance_anchor`); that read never changes the verdict.
 
 Exit codes: 0 no failure and every auto-merge verified, 1 a failure, 2 usage
 or a refused identity (not a dedicated App login, or `--remediate` under
@@ -60,19 +63,22 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import json
 import os
 import re
 import sys
 import tempfile
+import zipfile
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 import babysit_merge_policy as policy
+import babysit_run_cache as run_cache
 import babysit_tracker_binding as tracker_binding
 from babysit_gh import (
     RUN_SEARCH_CAP,
@@ -93,11 +99,13 @@ from babysit_util import (
 
 FULL_RUN_WORKFLOW = "pr-require-checks.yml"
 CANARY_WORKFLOW = "post-merge-detect-silent-revert.yml"
+CANARY_PATH = f".github/workflows/{CANARY_WORKFLOW}"
 # The pr-merge lane dispatches the full run with its own GITHUB_TOKEN (the
 # lanes App holds no actions: write) and records the dispatched run's id in an
 # artifact named with this prefix; `_Context.lane_dispatched` reads it. The
-# artifact expires (pr-merge.yml's retention-days), but a settled merge is not
-# judged on its runs again, so only a merge not yet settled reads it.
+# artifact expires (pr-merge.yml's retention-days), but the verdict never
+# judges a settled merge on its runs again, so only a merge not yet settled
+# depends on it.
 LANE_DISPATCH_WORKFLOW = ".github/workflows/pr-merge.yml"
 LANE_DISPATCH_ARTIFACT = "pr-merge-dispatched-"
 LANE_DISPATCH_ACTOR = "github-actions[bot]"
@@ -135,6 +143,9 @@ _LANE_RECORD_NAME = re.compile(
 # file, and every attempt is read as before.
 ATTEMPTS_ENV = "BABYSIT_POSTMERGE_ATTEMPTS"
 ATTEMPTS_VERSION = 1
+# The run cache section holding compare answers between two full SHAs
+# (`_Context._compare`). A branch tip is never kept there: it moves.
+COMPARE_SECTION = "postmerge-compare"
 _ATTEMPT_KEY = re.compile(r"[1-9][0-9]{0,15}:[1-9][0-9]{0,2}")
 # With `--lane-merges-only`, a red attempt 1 of a lane-dispatched full run
 # created within red-main.confirm-wait-minutes plus this, with a newly failing
@@ -352,6 +363,9 @@ class MergeState:
     # Judged verified with no red full run or running canary in its window
     # and no empty record listing behind it: a marker may settle it.
     settleable: bool = False
+    # A settled merge the lane's anchor needed, judged again from its runs
+    # and found settleable (`check`'s `rejudge`); the verdict ignores it.
+    final_by_runs: bool = False
 
 
 @dataclass(frozen=True)
@@ -382,6 +396,11 @@ class PostMergeVerdict:
     # it can still turn red and fail a merge judged verified, so a later tick
     # lists runs back to it before it reuses the report (`idle_refusal`).
     outstanding_since: datetime | None = None
+    # Each full and canary run the verdict's run listing read as completed,
+    # by id, at the `updated_at` it read: a later tick counts such a run as
+    # moved only when it reads another `updated_at` (`_verifying_runs_unchanged`).
+    # None when no runs were listed; the report then leaves the field out.
+    judged_runs: Mapping[int, str] | None = None
 
     @property
     def ok(self) -> bool:
@@ -405,6 +424,13 @@ class PostMergeVerdict:
         )
 
     def report(self) -> dict[str, Any]:
+        judged = (
+            {}
+            if self.judged_runs is None
+            else {
+                "judgedRuns": {str(n): at for n, at in sorted(self.judged_runs.items())}
+            }
+        )
         return {
             "ok": self.ok,
             "readable": self.readable,
@@ -463,6 +489,7 @@ class PostMergeVerdict:
             "outstandingSince": (
                 self.outstanding_since.isoformat() if self.outstanding_since else None
             ),
+            **judged,
         }
 
 
@@ -511,9 +538,14 @@ def _time(value: Any) -> datetime:
     return parsed
 
 
-def _call(args: list[str], label: str, error: type[RuntimeError]) -> Any:
+def _call(
+    args: list[str],
+    label: str,
+    error: type[RuntimeError],
+    env: Mapping[str, str] | None = None,
+) -> Any:
     try:
-        proc = gh_capture(args)
+        proc = gh_capture(args, env_overrides=env) if env else gh_capture(args)
     except (RuntimeError, ValueError, OSError) as exc:
         raise error(f"{label}: {exc}") from exc
     if proc.returncode != 0:
@@ -524,8 +556,8 @@ def _call(args: list[str], label: str, error: type[RuntimeError]) -> Any:
         raise error(f"{label}: {exc}") from exc
 
 
-def _read(args: list[str], label: str) -> Any:
-    return _call(args, label, PostMergeReadError)
+def _read(args: list[str], label: str, env: Mapping[str, str] | None = None) -> Any:
+    return _call(args, label, PostMergeReadError, env)
 
 
 def _write(args: list[str], label: str) -> Any:
@@ -749,17 +781,16 @@ def _merged_since(
     """Pull requests merged into `branch` at or after `since`. A merge updates
     the PR, so reading newest-updated first can stop at the first PR last
     updated before the floor. A PR updated mid-read jumps to page 1 and can
-    slip past the walk, so page 1 is read again afterwards: any merge there
-    the walk missed makes the history unreadable."""
+    slip past the walk, so page 1 is read again afterwards and any merge
+    there the walk missed is added: pages follow the update time, so a PR
+    the walk skipped can only have moved to the front."""
     found = _walk_merged(owner, name, branch, since)
     numbers = {pr.get("number") for pr in found}
     for pr in _merged_page(owner, name, branch, None)[0]:
         if _time(pr.get("updatedAt")) < since:
             break
         if _time(pr.get("mergedAt")) >= since and pr.get("number") not in numbers:
-            raise PostMergeReadError(
-                "merged pull requests: the history changed while it was read"
-            )
+            found.append(pr)
     return found
 
 
@@ -814,6 +845,9 @@ class Run:
     url: str
     actor: str
     triggering_actor: str
+    # The listing's `updated_at` as read, or None when the payload has none;
+    # left out of equality so two reads of one run still compare equal.
+    updated_at: str | None = field(default=None, compare=False)
 
     @classmethod
     def from_api(cls, payload: Any) -> Run:
@@ -840,6 +874,9 @@ class Run:
             triggering_actor=_login_key(
                 json_object(item.get("triggering_actor")).get("login")
             ),
+            updated_at=updated
+            if isinstance(updated := item.get("updated_at"), str)
+            else None,
         )
 
 
@@ -1297,6 +1334,9 @@ class _Context:
     # The full runs the check already listed, which `superseded` reads
     # instead of a listing of its own.
     held_full_runs: dict[int, tuple[str, Run]] = field(default_factory=dict)
+    # The verdict's first run listing's completed runs, by id, at the
+    # `updated_at` read (`_listed_runs` with `record`); None until listed.
+    judged_runs: dict[int, str] | None = None
     settle_compares_left: int = SETTLE_COMPARE_BUDGET
     compare_reads: int = 0
     # `red-main.confirm-wait-minutes` plus FULL_RUN_ALLOWANCE (None: read at
@@ -1778,7 +1818,7 @@ class _Context:
         if self.quarantine_issues is None:
             found: dict[str, dict[str, Any]] = {}
             for issue in _demotion_issues(
-                self.owner, self.name, (self.identity, *DEMOTION_FILERS)
+                self.owner, self.name, (self.identity, *DEMOTION_FILERS), state="open"
             ):
                 suite = _quarantined_suite(issue.get("body"))
                 if suite is None or issue.get("state") != "open":
@@ -2194,13 +2234,26 @@ class _Context:
         return self.contains_cache[key]
 
     def _compare(self, ancestor: str, sha: str) -> bool:
-        """The compare API's answer to `contains`; a failed read raises."""
+        """The compare API's answer to `contains`; a failed read raises.
+        Between two full SHAs the answer, yes or no, never changes, so the
+        run's gate processes share it (`run_cache`, `COMPARE_SECTION`). A
+        shared answer still counts in `compare_reads`, so every compare
+        budget spends exactly as it would on a read."""
         self.compare_reads += 1
+        key = None
+        if _FULL_SHA.fullmatch(ancestor) and _FULL_SHA.fullmatch(sha):
+            key = f"{self.owner}/{self.name}|{ancestor}...{sha}"
+            shared = run_cache.get(COMPARE_SECTION, key, None)
+            if isinstance(shared, bool):
+                return shared
         compare = _read(
             ["api", f"repos/{self.owner}/{self.name}/compare/{ancestor}...{sha}"],
             f"compare {ancestor[:12]}...{sha[:12]}",
         )
-        return json_object(compare).get("status") in ("ahead", "identical")
+        answer = json_object(compare).get("status") in ("ahead", "identical")
+        if key is not None:
+            run_cache.put(COMPARE_SECTION, key, answer)
+        return answer
 
     def _tip_bridge(self, tip: str) -> str | None:
         """The first full-history clone's copy of the branch, read from
@@ -2445,12 +2498,14 @@ def _judge(
     ctx: _Context,
     *,
     full_runs: list[tuple[str, Run]],
-    canary_runs: list[Run],
+    canary_runs: list[Run] | None,
     pinned: str | None,
     now: datetime,
     tally: _Tally,
     pin_required: bool,
 ) -> MergeState:
+    """`merge`'s state from its runs. `canary_runs` None: the repository has
+    no canary, so no canary run is required to verify it."""
     pending: list[str] = []
     failures: list[Failure] = []
     if not merge.merge_commit or not merge.merged_at:
@@ -2463,7 +2518,7 @@ def _judge(
         return run.created_at >= merged_at and ctx.contains(commit, run.head_sha)
 
     fulls = [(signal, run) for signal, run in full_runs if relevant(run)]
-    canaries = [run for run in canary_runs if relevant(run)]
+    canaries = [run for run in canary_runs or () if relevant(run)]
     own = [
         run
         for signal, run in fulls
@@ -2508,14 +2563,15 @@ def _judge(
         )
 
     verified_at = None
-    if green_dispatch and green_canary:
+    if green_dispatch and (green_canary or canary_runs is None):
         verified_at = max(
-            min(r.created_at for r in green_dispatch),
-            min(r.created_at for r in green_canary),
+            min(r.created_at for r in runs)
+            for runs in (green_dispatch, green_canary)
+            if runs
         )
     if not green_dispatch:
         pending.append("dispatch-run-pending")
-    if not green_canary:
+    if not green_canary and canary_runs is not None:
         pending.append("canary-run-pending")
     in_window = (
         (lambda run: run.created_at <= verified_at)
@@ -2718,6 +2774,113 @@ def _lane_reruns(
     return []
 
 
+def _listed_runs(
+    ctx: _Context, floor: datetime, now: datetime, *, record: bool = False
+) -> tuple[list[tuple[str, Run]], list[Run] | None]:
+    """The full runs (by signal) and canary runs on the branch since `floor`,
+    oldest first, the canary runs None when the repository has no canary
+    (`_canary_absent`); the full runs are held for `_Context.superseded`. With
+    `record`, each listed run that had completed is kept in
+    `_Context.judged_runs` at the `updated_at` read."""
+    owner, name, branch = ctx.owner, ctx.name, ctx.branch
+    listed = [
+        (SIGNAL_SCHEDULE, r)
+        for r in _runs(owner, name, FULL_RUN_WORKFLOW, "schedule", branch, floor, now)
+    ] + [
+        (SIGNAL_DISPATCH, r)
+        for r in _runs(
+            owner, name, FULL_RUN_WORKFLOW, "workflow_dispatch", branch, floor, now
+        )
+    ]
+    # A listing filtered by branch name also returns runs on a tag named
+    # like the branch, whose red would be charged to the merge. A run the
+    # concurrency group replaced before it started is no signal.
+    full_runs = sorted(
+        (
+            item
+            for item in listed
+            if ctx.on_branch(item[1]) and not ctx.replaced(item[1])
+        ),
+        key=lambda item: item[1].created_at,
+    )
+    ctx.held_full_runs.update((r.id, (signal, r)) for signal, r in full_runs)
+    canaries: list[Run] | None
+    try:
+        canaries = _runs(owner, name, CANARY_WORKFLOW, "push", branch, floor, now)
+    except PostMergeReadError as exc:
+        if not _canary_absent(owner, name, exc):
+            raise
+        canaries = None
+    if record:
+        ctx.judged_runs = {
+            r.id: r.updated_at
+            for r in [r for _, r in listed] + (canaries or [])
+            if r.status == "completed" and r.updated_at is not None
+        }
+    if canaries is None:
+        return full_runs, None
+    canary_runs = sorted(
+        (r for r in canaries if ctx.on_branch(r)),
+        key=lambda r: r.created_at,
+    )
+    return full_runs, canary_runs
+
+
+def _canary_absent(owner: str, name: str, exc: PostMergeReadError) -> bool:
+    """Whether `exc`, a failed CANARY_WORKFLOW run listing, means the
+    repository has no canary: the listing answered 404 and the workflow file
+    is absent on the default branch. A 404 with the file present is a failed
+    read, and so is a failed file read (it raises `PostMergeReadError`)."""
+    return (
+        not isinstance(exc, _RunSearchCapped)
+        and gh_http_status(str(exc)) == 404
+        and _default_branch_text(owner, name, CANARY_PATH) is None
+    )
+
+
+def _final_by_runs(
+    ctx: _Context,
+    merges: list[AutoMerge],
+    *,
+    pins: Mapping[int, str | None],
+    pin_required: Collection[int],
+    now: datetime,
+) -> frozenset[int]:
+    """The settled `merges` (oldest first) whose runs judge them settleable,
+    as `_judge` would an unsettled one, up to the first that is not. It runs
+    after the verdict's own judging, under
+    the check's read caps, on its own listing and tally: a failed read, a hold
+    or a failure leaves a merge out, and the verdict is unchanged."""
+    final: set[int] = set()
+    saved = dict(ctx.quarantines), ctx.excuses_expire_at
+    try:
+        full_runs, canary_runs = _listed_runs(
+            ctx, min(_time(m.merged_at) for m in merges), now
+        )
+        for merge in merges:
+            state = None
+            with contextlib.suppress(PostMergeReadError, policy.PolicyReadError):
+                state = _judge(
+                    merge,
+                    ctx,
+                    full_runs=full_runs,
+                    canary_runs=canary_runs,
+                    pinned=pins.get(merge.number),
+                    pin_required=merge.number in pin_required,
+                    now=now,
+                    tally=_Tally(),
+                )
+            if state is None or not state.settleable:
+                # The anchor stops at this merge, so later ones are not read.
+                break
+            final.add(merge.number)
+    except (PostMergeReadError, policy.PolicyReadError, ValueError) as exc:
+        print(f"settled merges not judged from their runs: {exc}", file=sys.stderr)
+    finally:
+        ctx.quarantines, ctx.excuses_expire_at = saved
+    return frozenset(final)
+
+
 def check(
     repo: str,
     *,
@@ -2730,6 +2893,7 @@ def check(
     lane_merges_only: bool = False,
     quarantine_days: int | None = None,
     settled: Callable[[AutoMerge], bool] | None = None,
+    rejudge: Callable[[AutoMerge], bool] | None = None,
 ) -> PostMergeVerdict:
     """Judge every auto-merge into `branch` since `merged_since`; with no
     `branch`, the repository's default branch, read once from the repos API.
@@ -2743,7 +2907,9 @@ def check(
     whose pin or settled marker is read (`PinReader`). `settled` says whether
     the identity's settled marker stands for one of the identity's merges
     (`PinReader.settled`); such a merge is verified with none of its runs
-    read. Any read failure makes the verdict unreadable, which is never ok."""
+    read. `rejudge` names the settled merges whose runs are read anyway, for
+    `MergeState.final_by_runs` alone (`_final_by_runs`, `anchor_needs`).
+    Any read failure makes the verdict unreadable, which is never ok."""
     if not agent_identity:
         return PostMergeVerdict(False, "agent-identity-unconfigured")
     if merged_since is None:
@@ -2815,12 +2981,25 @@ def check(
         )
         tally = _Tally()
         judged = [m for m in merges if m.number not in done]
+        targets = [m for m in merges if m.number in done and rejudge and rejudge(m)]
+
+        def rejudged(states: tuple[MergeState, ...]) -> tuple[MergeState, ...]:
+            if not targets:
+                return states
+            final = _final_by_runs(
+                ctx, targets, pins=pins, pin_required=pinned_merges, now=now
+            )
+            return tuple(
+                replace(s, final_by_runs=True) if s.merge.number in final else s
+                for s in states
+            )
+
         if not judged:
             if lane_merges_only:
                 warnings += _lane_reruns(ctx, now, tally, list_schedule=bool(done))
             return PostMergeVerdict(
                 True,
-                merges=tuple(_settled_state(m) for m in merges),
+                merges=rejudged(tuple(_settled_state(m) for m in merges)),
                 reruns=tuple(tally.reruns.values()),
                 warnings=tuple(warnings),
                 branch=branch,
@@ -2833,43 +3012,7 @@ def check(
             if any(m.merged_at for m in judged)
             else merged_since
         )
-        full_runs = [
-            (SIGNAL_SCHEDULE, r)
-            for r in _runs(
-                owner, name, FULL_RUN_WORKFLOW, "schedule", branch, floor, now
-            )
-        ] + [
-            (SIGNAL_DISPATCH, r)
-            for r in _runs(
-                owner,
-                name,
-                FULL_RUN_WORKFLOW,
-                "workflow_dispatch",
-                branch,
-                floor,
-                now,
-            )
-        ]
-        # A listing filtered by branch name also returns runs on a tag named
-        # like the branch, whose red would be charged to the merge. A run the
-        # concurrency group replaced before it started is no signal.
-        full_runs = sorted(
-            (
-                item
-                for item in full_runs
-                if ctx.on_branch(item[1]) and not ctx.replaced(item[1])
-            ),
-            key=lambda item: item[1].created_at,
-        )
-        ctx.held_full_runs.update((r.id, (signal, r)) for signal, r in full_runs)
-        canary_runs = sorted(
-            (
-                r
-                for r in _runs(owner, name, CANARY_WORKFLOW, "push", branch, floor, now)
-                if ctx.on_branch(r)
-            ),
-            key=lambda r: r.created_at,
-        )
+        full_runs, canary_runs = _listed_runs(ctx, floor, now, record=True)
         states = tuple(
             _settled_state(merge)
             if merge.number in done
@@ -2887,6 +3030,7 @@ def check(
         )
         if lane_merges_only:
             warnings += _lane_reruns(ctx, now, tally)
+        states = rejudged(states)
     except (PostMergeReadError, policy.PolicyReadError) as exc:
         held = exc if isinstance(exc, UnlistedRecordHold) else None
         return PostMergeVerdict(
@@ -2912,6 +3056,7 @@ def check(
         excuses_expire_at=ctx.excuses_expire_at,
         pins=pins,
         outstanding_since=min(tally.outstanding, default=None),
+        judged_runs=ctx.judged_runs,
     )
 
 
@@ -3175,8 +3320,12 @@ def disarm_identity_pulls(
 
 # The pinned-head record: an identity-authored comment the wrapper posts on the
 # pull request immediately before it enqueues, so the read-back has a source no
-# host stores.
-PIN_RE = re.compile(r"^<!-- babysit-merge-pin sha=([0-9a-f]{40}) -->$")
+# host stores. It names the effective rung the gate enqueued under, which the
+# promotion-evidence publisher credits; an older pin names none.
+PIN_RUNGS = ("C2", "C3")
+PIN_RE = re.compile(
+    r"^<!-- babysit-merge-pin sha=([0-9a-f]{40})(?: rung=(C2|C3))? -->$"
+)
 PIN_QUERY = (
     "query PostMergePin($o:String!,$r:String!,$n:Int!,$c:String){repository(owner:$o,name:$r){"
     "pullRequest(number:$n){reviews(last:1){nodes{author{__typename login} submittedAt}} "
@@ -3195,9 +3344,12 @@ PIN_COMMENTS = (
 )
 
 
-def pin_comment(sha: str) -> str:
+def pin_comment(sha: str, rung: str | None = None) -> str:
+    if rung is not None and rung not in PIN_RUNGS:
+        raise ValueError(f"pin rung {rung!r} is not one of {PIN_RUNGS}")
+    named = f" rung={rung}" if rung else ""
     return (
-        f"<!-- babysit-merge-pin sha={sha} -->\n"
+        f"<!-- babysit-merge-pin sha={sha}{named} -->\n"
         f"The unattended merge path enqueued this pull request at head `{sha}`."
     )
 
@@ -3474,11 +3626,14 @@ pin_reader = PinReader
 
 
 def _demotion_issues(
-    owner: str, name: str, filers: Iterable[str]
+    owner: str, name: str, filers: Iterable[str], *, state: str
 ) -> list[dict[str, Any]]:
+    """Every issue (no pull request) one of `filers` opened in `state`:
+    `open` for a reader that keeps only open issues, `all` for one that
+    reopens a closed record."""
     issues: list[dict[str, Any]] = []
     for filer in dict.fromkeys(filers):
-        endpoint = f"repos/{owner}/{name}/issues?state=all&creator={quote(filer, safe='')}&per_page=100"
+        endpoint = f"repos/{owner}/{name}/issues?state={state}&creator={quote(filer, safe='')}&per_page=100"
         issues += [
             i
             for i in _paginated(endpoint, f"issues by {filer}")
@@ -3526,8 +3681,18 @@ def _issue_body(failure: Failure, also: Iterable[AutoMerge] = ()) -> str:
                 ]
                 if failure.signal in SELF_CLEARING_SIGNALS
                 else [
-                    "Only a person's direct close (not through a pull request's closing keyword)",
-                    "clears it.",
+                    "It lifts once the pull request below reads back after all, or once a pull",
+                    "request that references this record merges into main and reads back itself",
+                    "(babysit_merge_policy.py `_lift`); a lane then closes it and removes its label.",
+                    "A person's direct close also clears it.",
+                ]
+                if failure.signal == SIGNAL_READ_BACK
+                else [
+                    "post-merge-demotion-alert.yml comments the content the canary found deleted;",
+                    "the record lifts once that content is back on main, or once a pull request that",
+                    "references it merges into main with that content (babysit_merge_policy.py",
+                    "`_lift`), and a lane then closes it. Without that comment only a person's",
+                    "direct close (not through a pull request's closing keyword) clears it.",
                 ]
             ),
             "A new sighting of the same failure reopens it.",
@@ -3629,7 +3794,7 @@ def file_quarantines(
     filers = (agent_identity, *DEMOTION_FILERS)
     keys = {_login_key(f) for f in filers}
     open_issues: dict[str, dict[str, Any]] = {}
-    for issue in _demotion_issues(owner, name, filers):
+    for issue in _demotion_issues(owner, name, filers, state="open"):
         suite = _quarantined_suite(issue.get("body"))
         if suite is not None and issue.get("state") == "open":
             open_issues.setdefault(suite, issue)
@@ -3688,6 +3853,86 @@ def file_quarantines(
         )
         report["comments"].append(number)
         issue["notes"].append(note)
+
+
+_UNREAD = object()
+# The Work status state a demotion record is filed at.
+NEEDS_HUMAN_STATE = "needs-human"
+
+
+def _issue_status(owner: str, name: str) -> policy.IssueStatusConfig | None:
+    """The default branch's `models.issue-status`, or None when it sets none,
+    sets a malformed one, or cannot be read: the record then carries the
+    human-gated label, which holds it as the field would."""
+    try:
+        text = _default_branch_text(owner, name, policy.CONFIG_PATH)
+        status = policy._issue_status_config(text) if text is not None else None
+    except PostMergeReadError:
+        return None
+    return status if status is not None and not status.error else None
+
+
+def set_issue_status(
+    repo: str, number: int, status: policy.IssueStatusConfig, state: str
+) -> None:
+    """Set issue `number`'s Work status field to `state` with one POST
+    (write-status.mjs writeState). Raise `PostMergeWriteError` when `status`
+    maps no option to `state`, the write fails, or GitHub keeps another
+    option; no label stands in for a field that did not land."""
+    option = next((o for o, s in status.options if s == state), None)
+    try:
+        if option is None:
+            raise PostMergeWriteError(f"maps no option to {state}")
+        rows = _write(
+            policy.issue_status_write(repo, number, status.field_id, state),
+            f"#{number} Work status",
+        )
+        kept = next(
+            (
+                json_object(r.get("single_select_option")).get("id")
+                for r in map(json_object, json_array(rows))
+                if r.get("issue_field_id") == status.field_id
+            ),
+            None,
+        )
+        if str(kept) != option:
+            raise PostMergeWriteError(
+                f"GitHub kept option {kept} for {state}, not {option}"
+            )
+    except PostMergeWriteError as exc:
+        raise PostMergeWriteError(
+            f"#{number} Work status not set to {state} ({exc})"
+        ) from exc
+
+
+def _hold_record(
+    owner: str, name: str, number: int, status: policy.IssueStatusConfig
+) -> None:
+    """Set record `number`'s Work status field to `NEEDS_HUMAN_STATE`
+    (`set_issue_status`), as post-merge-demotion-alert.yml does: a failed
+    write raises and is reported, with no label added in its place."""
+    set_issue_status(f"{owner}/{name}", number, status, NEEDS_HUMAN_STATE)
+
+
+def _status_unset(
+    owner: str, name: str, number: int, status: policy.IssueStatusConfig
+) -> bool:
+    """Whether record `number` holds no Work status value, whoever set one.
+    `policy.issue_status` is not used: it also reads None for a value an
+    uncounted account set, which a hold must not overwrite. Raises
+    `PolicyReadError` when the read fails or a full page may hide the value."""
+    data = policy._graphql(
+        policy.ISSUE_STATUS_QUERY, f"#{number} Work status", o=owner, r=name, n=number
+    )
+    issue = json_object(json_object(data.get("repository")).get("issue"))
+    values = json_object(issue.get("issueFieldValues")).get("nodes")
+    if not is_json_array(values) or len(values) >= policy.FIELD_VALUE_PAGE:
+        raise policy.PolicyReadError(f"#{number} Work status: no complete value list")
+    field_id = str(status.field_id)
+    return not any(
+        json_object(json_object(v).get("field")).get("fullDatabaseId") == field_id
+        for v in values
+    )
 
 
 def remediate(
@@ -3759,9 +4004,13 @@ def remediate(
         report["errors"].append(f"dequeue: {exc}")
 
     created = 0
+    # `models.issue-status`, read when the first record is filed or matched open.
+    status: Any = _UNREAD
     try:
         filers = {_login_key(f) for f in (agent_identity, *DEMOTION_FILERS)}
-        existing = _demotion_issues(owner, name, (agent_identity, *DEMOTION_FILERS))
+        existing = _demotion_issues(
+            owner, name, (agent_identity, *DEMOTION_FILERS), state="all"
+        )
         role_label = label or _role_label(owner, name)
         # One record per marker (signal, SHA); every distinct sighting under it
         # is checked against that record, so a second red run on a closed
@@ -3793,6 +4042,8 @@ def remediate(
                     and f.merge.number != failure.merge.number
                 ]
                 body = _issue_body(failure, {m.number: m for m in also}.values())
+                if status is _UNREAD:
+                    status = _issue_status(owner, name)
                 issue = _write(
                     [
                         "api",
@@ -3804,11 +4055,13 @@ def remediate(
                         "-f",
                         f"body={body}",
                         # The lanes App's issue starts intake triage on its
-                        # own; the human-gated label keeps admission off it
-                        # (admit.mjs STOP_HOLDS), so it never becomes lane
-                        # work.
-                        "-f",
-                        f"labels[]={role_label}",
+                        # own; the human-gated label, or the Work status
+                        # field set to needs-human below and retried on a
+                        # later pass while unset (which admission reads as
+                        # that label, read-status.mjs statusLabels), keeps
+                        # admission off it (admit.mjs STOP_HOLDS), so it
+                        # never becomes lane work.
+                        *(() if status else ("-f", f"labels[]={role_label}")),
                     ],
                     "file the demotion issue",
                 )
@@ -3826,10 +4079,28 @@ def remediate(
                 # later pass would.
                 existing.append(records[failure.marker])
                 notes_by_issue[filed] = []
+                if status:
+                    # A failed hold is reported and fails the run; the next
+                    # record is still filed.
+                    try:
+                        _hold_record(owner, name, filed, status)
+                    except PostMergeWriteError as exc:
+                        report["errors"].append(f"demotion issue: {exc}")
                 continue
             records[failure.marker] = match
             number = match.get("number")
             if number not in notes_by_issue:
+                if match.get("state") == "open" and isinstance(number, int):
+                    if status is _UNREAD:
+                        status = _issue_status(owner, name)
+                    # A hold whose write failed on an earlier pass is retried
+                    # while the field holds no value; a value set since stands.
+                    if status:
+                        try:
+                            if _status_unset(owner, name, number, status):
+                                _hold_record(owner, name, number, status)
+                        except (policy.PolicyReadError, PostMergeWriteError) as exc:
+                            report["errors"].append(f"demotion issue: {exc}")
                 comments = _paginated(
                     f"repos/{owner}/{name}/issues/{number}/comments?per_page=100",
                     f"#{number} comments",
@@ -3940,6 +4211,247 @@ def verdict_exit(verdict: PostMergeVerdict) -> int:
     return 0
 
 
+# The lane check's floor anchor. The policy floor moves only on a config
+# commit or a demotion clear, so at the lane's merge rate the merged walk
+# reaches MERGED_PAGE_LIMIT and every lane check reads unreadable. The anchor
+# moves the lane's floor past merges a trusted run judged final.
+# post-merge-dispatch's check writes it to the file ANCHOR_ENV names, and
+# that job alone uploads it as ANCHOR_ARTIFACT; the next lane check reads it
+# back over REST (`read_anchor`). It is rebuilt and re-checked on every run
+# from GitHub state only main's pr-merge.yml can produce: an unexpired
+# artifact whose uploading run passes `_Context._lane_sender` for that job's
+# events, with a matching key. No file, comment or label the lane identity
+# can write feeds it, and anything else is no anchor: the policy floor.
+ANCHOR_ARTIFACT = "pr-merge-post-merge-anchor"
+ANCHOR_FILE = "anchor.json"
+ANCHOR_ENV = "BABYSIT_POSTMERGE_ANCHOR"
+ANCHOR_VERSION = 1
+ANCHOR_EVENTS = LANE_RERUN_EVENTS
+ANCHOR_LISTING_PAGES = 2
+ANCHOR_READ_LIMIT = 8
+# The reads one `_lane_sender` can spend: the branch tip and two compares.
+_SENDER_READS = 3
+
+
+@dataclass(frozen=True)
+class Anchor:
+    """The floor a trusted run advanced the lane check to, and the merges
+    after it that run (or one before it) judged final from their runs."""
+
+    at: datetime
+    passed: frozenset[int] = frozenset()
+
+
+def _anchor_key(repo: str, branch: str, identity: str) -> dict[str, Any]:
+    return {
+        "version": ANCHOR_VERSION,
+        "repo": repo,
+        "branch": branch,
+        "identity": _login_key(identity),
+        "laneMergesOnly": True,
+    }
+
+
+def _positive_id(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _anchor_from(raw: bytes, key: Mapping[str, Any]) -> Anchor | None:
+    """The anchor in an artifact's zip, or None for any other shape or key."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            data = json_object(json.loads(archive.read(ANCHOR_FILE).decode("utf-8")))
+        passed = json_array(data.get("passed"))
+        if any(data.get(k) != v for k, v in key.items()) or not all(
+            map(_positive_id, passed)
+        ):
+            return None
+        return Anchor(_time(data.get("anchor")), frozenset(passed))
+    except Exception:  # noqa: BLE001  (any unreadable artifact is no anchor)
+        return None
+
+
+_anchor_cache: dict[tuple[str, str, str], Anchor | None] = {}
+
+
+def read_anchor(
+    repo: str, identity: str, *, branch: str | None = None, now: datetime | None = None
+) -> Anchor | None:
+    """The newest unexpired ANCHOR_ARTIFACT whose uploading run passes
+    `_lane_sender` for post-merge-dispatch's events, keyed to this repository,
+    branch (default: the default branch) and identity, read once per process.
+    At most ANCHOR_LISTING_PAGES listing pages and ANCHOR_READ_LIMIT REST
+    reads; a read past them, a failed read, a refused or expired artifact and
+    a key mismatch are all None, so the caller keeps the policy floor.
+    The Actions reads (listing, run record, download) use
+    `policy.ACTIONS_TOKEN_ENV`'s token when set: in pr-merge's gate steps
+    GH_TOKEN is the lane token, which holds no Actions permission."""
+    now = now or datetime.now(UTC)
+    token = os.environ.get(policy.ACTIONS_TOKEN_ENV)
+    actions_env = {"GH_TOKEN": token} if token else None
+    reads = 0
+    try:
+        owner, name = _split_repo(repo)
+        if branch is None:
+            reads += 1
+            branch = _default_branch(owner, name)
+        cached = (repo, branch, _login_key(identity))
+        if cached in _anchor_cache:
+            return _anchor_cache[cached]
+        ctx = _Context(owner, name, _login_key(identity), branch=branch, now=now)
+
+        def used() -> int:
+            return reads + ctx.compare_reads + (ctx.branch_tip is not None)
+
+        anchor = None
+        for page in range(1, ANCHOR_LISTING_PAGES + 1):
+            if used() >= ANCHOR_READ_LIMIT:
+                return None
+            reads += 1
+            listing = json_object(
+                _read(
+                    [
+                        "api",
+                        f"repos/{repo}/actions/artifacts?name={ANCHOR_ARTIFACT}"
+                        f"&per_page=100&page={page}",
+                    ],
+                    "anchor artifacts",
+                    actions_env,
+                )
+            )
+            items = list(map(json_object, json_array(listing.get("artifacts"))))
+            # Newest first by id: the listing follows created_at, which can skew.
+            for item in sorted(items, key=lambda a: -int(a.get("id") or 0)):
+                run_id = json_object(item.get("workflow_run")).get("id")
+                if not (
+                    item.get("name") == ANCHOR_ARTIFACT
+                    and item.get("expired") is False
+                    and _positive_id(item.get("id"))
+                    and _positive_id(run_id)
+                    and _time(item.get("expires_at")) > now
+                ):
+                    continue
+                if used() + 1 + _SENDER_READS + 1 > ANCHOR_READ_LIMIT:
+                    return None
+                reads += 1
+                record = json_object(
+                    _read(
+                        ["api", f"repos/{repo}/actions/runs/{run_id}"],
+                        f"run {run_id}",
+                        actions_env,
+                    )
+                )
+                if not ctx._lane_sender(record, ANCHOR_EVENTS):
+                    continue
+                reads += 1
+                proc = gh_capture(
+                    ["api", f"repos/{repo}/actions/artifacts/{item['id']}/zip"],
+                    binary=True,
+                    env_overrides=actions_env,
+                )
+                if proc.returncode == 0:
+                    anchor = _anchor_from(
+                        proc.stdout, _anchor_key(repo, branch, identity)
+                    )
+                _anchor_cache[cached] = anchor
+                return anchor
+            if len(items) < 100:
+                break
+        _anchor_cache[cached] = None
+    except (PostMergeReadError, RuntimeError, ValueError, OSError) as exc:
+        print(f"post-merge anchor not used: {exc}", file=sys.stderr)
+    return None
+
+
+def lane_floor(
+    repo: str, identity: str, floor: datetime, *, branch: str | None = None
+) -> tuple[datetime, Anchor | None]:
+    """The lane check's floor: the later of the policy `floor` and an accepted
+    anchor (`read_anchor`), and that anchor."""
+    anchor = read_anchor(repo, identity, branch=branch)
+    return (max(floor, anchor.at) if anchor else floor), anchor
+
+
+def advance_anchor(verdict: PostMergeVerdict, previous: Anchor | None) -> Anchor | None:
+    """The anchor after a lane check from the policy floor or `previous`.
+
+    A merge passes when it merged at or before the previous anchor (it was
+    passed then), when this check judged it final from its runs
+    (`MergeState.settleable`, or for a settled merge
+    `MergeState.final_by_runs`), or when the previous anchor carried it as
+    such. A settled marker alone never passes a merge: that marker is a
+    comment the identity writes. A settled merge whose runs could not be read
+    within the check's caps, or do not show it final, holds the anchor. The
+    anchor moves to the
+    newest `mergedAt` at which every merge from the floor on passed; a tie
+    moves it only when every merge at that second passed, so the at-or-before
+    rule never covers an unpassed one. It carries the passed merges after
+    it, so a merge settled since does not hold it. An unreadable verdict, a
+    failure, or a merge with no time leaves `previous` as it was."""
+    if not verdict.readable or verdict.failures:
+        return previous
+    at = previous.at if previous else None
+    carried = previous.passed if previous else frozenset()
+    seconds: dict[datetime, list[bool]] = {}
+    numbers: dict[datetime, list[int]] = {}
+    for state in verdict.merges:
+        if not state.merge.merged_at:
+            return previous
+        when = _time(state.merge.merged_at)
+        passed = (
+            (at is not None and when <= at)
+            or (state.final_by_runs if state.settled else state.settleable)
+            or state.merge.number in carried
+        )
+        seconds.setdefault(when, []).append(passed)
+        if passed:
+            numbers.setdefault(when, []).append(state.merge.number)
+    new = at
+    for when in sorted(seconds):
+        if not all(seconds[when]):
+            break
+        new = when if new is None else max(new, when)
+    if new is None:
+        return None
+    return Anchor(
+        new,
+        frozenset(n for when, ns in numbers.items() if when > new for n in ns),
+    )
+
+
+def anchor_needs(anchor: Anchor | None) -> Callable[[AutoMerge], bool]:
+    """`check`'s `rejudge` for the lane check from `anchor`: a settled merge
+    passes it only from its runs when merged after it and not carried; with
+    no anchor, every settled merge. A merge with an unreadable time is
+    judged, so it holds the anchor as `advance_anchor` would."""
+
+    def needs(merge: AutoMerge) -> bool:
+        if anchor is None:
+            return True
+        if merge.number in anchor.passed:
+            return False
+        try:
+            return _time(merge.merged_at) > anchor.at
+        except PostMergeReadError:
+            return True
+
+    return needs
+
+
+def write_anchor(
+    path: str, anchor: Anchor, repo: str, branch: str, identity: str
+) -> bool:
+    """Write `anchor` for post-merge-dispatch to upload."""
+    return _replace_json(
+        path,
+        {
+            **_anchor_key(repo, branch, identity),
+            "anchor": anchor.at.astimezone(UTC).isoformat(),
+            "passed": sorted(anchor.passed),
+        },
+    )
+
+
 def default_floor(
     repo: str, identity: str, self_logins: Collection[str]
 ) -> tuple[datetime, dict[str, Any]]:
@@ -3984,8 +4496,15 @@ def gate_from_report(report: dict[str, Any]) -> policy.PostMergeGate:
         for m in map(json_object, json_array(report.get("autoMerges")))
         if ok and m.get("verified") is True
     )
+    try:
+        floor = policy._time(report["since"]) if report.get("since") else None
+    except policy.PolicyReadError:
+        floor = None
     return policy.PostMergeGate(
-        refusal, report, lambda merge: getattr(merge, "number", None) in verified
+        refusal,
+        report,
+        lambda merge: getattr(merge, "number", None) in verified,
+        floor,
     )
 
 
@@ -3993,9 +4512,12 @@ def gate_reader(
     repo: str, self_logins: Collection[str], *, lane_merges_only: bool
 ) -> Callable[[datetime, str], policy.PostMergeGate]:
     """The merge gate's `post_merge(floor, identity)`: this check from
-    `floor`, as `gate_from_report` reads it."""
+    `floor`, or for the lane from `lane_floor`, as `gate_from_report` reads
+    it; the gate's `floor` is the one the check used."""
 
     def post_merge(floor: datetime, identity: str) -> policy.PostMergeGate:
+        if lane_merges_only:
+            floor = lane_floor(repo, identity, floor)[0]
         verdict = check(
             repo,
             agent_identity=identity,
@@ -4005,7 +4527,7 @@ def gate_reader(
             lane_merges_only=lane_merges_only,
             settled=reader.settled,
         )
-        return gate_from_report(verdict.report())
+        return gate_from_report({**verdict.report(), "since": floor.isoformat()})
 
     return post_merge
 
@@ -4016,40 +4538,77 @@ VERIFYING_WORKFLOWS = frozenset(
 
 
 def _verifying_runs_unchanged(
-    repo: str, branch: str, *, created: datetime, since: datetime
+    repo: str,
+    branch: str,
+    *,
+    created: datetime,
+    since: datetime,
+    judged: Mapping[int, datetime] | None = None,
 ) -> bool:
     """Whether no full or canary run on `branch` created at or after
     `created` completed, or was re-run, at or after `since`, from one listing
     per verifying workflow: every workflow's runs on a busy branch fill more
     than one page in an hour or two. A run started since and still running
-    changes nothing yet. A listing that is not whole raises
-    `PostMergeReadError`."""
+    changes nothing yet. A completed run `judged` holds at the `updated_at`
+    it reads now (`_judged_runs`) is one the check already read finished, so
+    it counts for nothing; a re-run moves its `updated_at`. A repository with
+    no canary (`_canary_absent`) has no canary runs to move. A listing that is
+    not whole raises `PostMergeReadError`."""
+
+    def moved(run: dict[str, Any]) -> bool:
+        if run.get("path") not in VERIFYING_WORKFLOWS:
+            return False
+        if run.get("status") != "completed":
+            return False
+        updated = _time(run.get("updated_at"))
+        if updated < since:
+            return False
+        run_id = run.get("id")
+        return not (
+            judged is not None
+            and isinstance(run_id, int)
+            and judged.get(run_id) == updated
+        )
+
     owner, name = _split_repo(repo)
     floor = quote(
         f">={created.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')}", safe=""
     )
     for workflow in (FULL_RUN_WORKFLOW, CANARY_WORKFLOW):
-        payload = json_object(
-            _read(
-                [
-                    "api",
-                    f"repos/{owner}/{name}/actions/workflows/{workflow}/runs"
-                    f"?branch={quote(branch, safe='')}&created={floor}&per_page=100",
-                ],
-                f"{workflow} runs",
+        try:
+            payload = json_object(
+                _read(
+                    [
+                        "api",
+                        f"repos/{owner}/{name}/actions/workflows/{workflow}/runs"
+                        f"?branch={quote(branch, safe='')}&created={floor}&per_page=100",
+                    ],
+                    f"{workflow} runs",
+                )
             )
-        )
+        except PostMergeReadError as exc:
+            if workflow != CANARY_WORKFLOW or not _canary_absent(owner, name, exc):
+                raise
+            continue
         runs = json_array(payload.get("workflow_runs"))
         if payload.get("total_count") != len(runs):
             raise PostMergeReadError(f"{workflow} runs: the listing is not whole")
-        if any(
-            run.get("path") in VERIFYING_WORKFLOWS
-            and run.get("status") == "completed"
-            and _time(run.get("updated_at")) >= since
-            for run in map(json_object, runs)
-        ):
+        if any(moved(run) for run in map(json_object, runs)):
             return False
     return True
+
+
+def _judged_runs(report: Mapping[str, Any]) -> dict[int, datetime] | None:
+    """The report's `judgedRuns` by run id, or None when it has none or one
+    that does not parse: such a report counts every run completed since as
+    moved."""
+    record = report.get("judgedRuns")
+    if not is_json_object(record):
+        return None
+    try:
+        return {int(n): _time(at) for n, at in record.items()}
+    except (ValueError, PostMergeReadError):
+        return None
 
 
 def _pending_merges(report: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -4071,8 +4630,9 @@ def pending_runs_unchanged(
     canary run on `branch` created since the earliest of them, verified or
     not (`_judge` reads a verified merge's runs from its `mergedAt`, and a
     re-run keeps its creation time), completed or was re-run since
-    `computed_at` (less `policy.SINCE_CLOCK_MARGIN`;
-    `_verifying_runs_unchanged`), no unverified merge has passed
+    `computed_at` (less `policy.SINCE_CLOCK_MARGIN`), other than one the
+    check read finished (`judgedRuns`; `_verifying_runs_unchanged`), no
+    unverified merge has passed
     `DISPATCH_DEADLINE`, after which a missing dispatch or pin is a
     failure, and no quarantine that excused a failing suite has expired
     (`excusesExpireAt`; an answer without the field is False). Those are
@@ -4105,6 +4665,7 @@ def pending_runs_unchanged(
             if outstanding is None
             else min(created, _time(outstanding)),
             since=shared.computed_at - policy.SINCE_CLOCK_MARGIN,
+            judged=_judged_runs(report),
         )
     except PostMergeReadError:
         return False
@@ -4164,7 +4725,8 @@ def idle_refusal(
       `computedAt` of the check that made it, never re-stamped;
     - an unverified merge past `DISPATCH_DEADLINE`;
     - verifying runs: none completed since `computedAt` (less
-      `SINCE_CLOCK_MARGIN`) among those created since the earliest unverified
+      `SINCE_CLOCK_MARGIN`), other than one the check read finished at the
+      same `updated_at` (`judgedRuns`), among those created since the earliest unverified
       merge, the earliest canary still running in a merge's window
       (`outstandingSince`), or the `_lane_reruns` lookback
       (`red-main.confirm-wait-minutes` plus `FULL_RUN_ALLOWANCE`, once more
@@ -4249,7 +4811,13 @@ def idle_runs_refusal(
         if report["outstandingSince"] is not None:
             created = min(created, _time(report["outstandingSince"]))
         since = shared.computed_at - policy.SINCE_CLOCK_MARGIN
-        if not _verifying_runs_unchanged(repo, branch, created=created, since=since):
+        if not _verifying_runs_unchanged(
+            repo,
+            branch,
+            created=created,
+            since=since,
+            judged=_judged_runs(report),
+        ):
             return "runs-changed"
     except (PostMergeReadError, ValueError, KeyError) as exc:
         return f"unreadable: {exc}"
@@ -4322,6 +4890,11 @@ def read_shared(path: str) -> policy.SharedPostMerge | None:
             demotion=demotion,
             floor=policy._time(payload.get("since")),
             gate=gate_from_report(report),
+            policy_floor=(
+                policy._time(shared["policyFloor"])
+                if shared.get("policyFloor")
+                else None
+            ),
         )
     except (OSError, ValueError, policy.PolicyReadError):
         return None
@@ -4351,6 +4924,9 @@ def write_shared(path: str, shared: policy.SharedPostMerge) -> bool:
                 "clearedAt": cleared,
             },
             "identity": shared.identity,
+            "policyFloor": (
+                shared.policy_floor.isoformat() if shared.policy_floor else None
+            ),
             "selfLogins": sorted(shared.self_logins),
             "laneMergesOnly": shared.lane_merges_only,
             "computedAt": shared.computed_at.isoformat(),
@@ -4408,7 +4984,8 @@ def _unreadable_at(
     shared = json_object(payload.get("shared"))
     job = {
         "mainSha": shared.get("mainSha"),
-        "since": payload.get("since"),
+        # The gate passes the policy floor, which an anchored report keeps here.
+        "since": shared.get("policyFloor") or payload.get("since"),
         "identity": shared.get("identity"),
         "laneMergesOnly": shared.get("laneMergesOnly"),
         "computedAt": shared.get("computedAt"),
@@ -4609,6 +5186,35 @@ def _judge_run(args: argparse.Namespace) -> int:
     return code
 
 
+def anchor_covered(
+    repo: str, identity: str, report: Mapping[str, Any]
+) -> list[Any]:
+    """The report's `settle` entries the current anchor already passed: merged
+    at or before it, or carried in its `passed`. A marker never moves the
+    anchor by itself (`advance_anchor`), so a merge is marked only once an
+    anchor has passed it from its runs. No anchor settles none."""
+    anchor = read_anchor(repo, identity)
+    if anchor is None:
+        return []
+    merged = {
+        m.get("number"): m.get("mergedAt")
+        for m in map(json_object, json_array(report.get("autoMerges")))
+    }
+
+    def covered(number: Any) -> bool:
+        try:
+            at = merged.get(number)
+            return number in anchor.passed or (bool(at) and _time(at) <= anchor.at)
+        except PostMergeReadError:
+            return False
+
+    return [
+        e
+        for e in json_array(report.get("settle"))
+        if covered(json_object(e).get("number"))
+    ]
+
+
 def _settle_from(repo: str, path: str, identity: str) -> int:
     """`--settle-from`: mark settled each merge a readable check report lists
     in `settle`. Nothing here changes that check's verdict, so every outcome
@@ -4619,7 +5225,7 @@ def _settle_from(repo: str, path: str, identity: str) -> int:
     except (OSError, ValueError) as exc:
         report = {"error": f"{type(exc).__name__}: {exc}"}
     if report.get("readable") is True:
-        posted, warnings = settle(repo, report.get("settle"), identity)
+        posted, warnings = settle(repo, anchor_covered(repo, identity, report), identity)
     else:
         posted, warnings = [], [f"settle-unposted: no readable report at {path}"]
     json.dump({"settled": posted, "warnings": warnings}, sys.stdout, indent=2)
@@ -4770,6 +5376,7 @@ def main(argv: list[str] | None = None) -> int:
     is_human = _default_is_human(args.repo, args.agent_identity, args.self_login)
     since = args.since
     shared: dict[str, Any] | None = None
+    anchored, anchor = False, None
     if since is None:
         computed_at = datetime.now(UTC)
         try:
@@ -4785,11 +5392,19 @@ def main(argv: list[str] | None = None) -> int:
                     "selfLogins": list(args.self_login),
                     "laneMergesOnly": args.lane_merges_only,
                     "computedAt": computed_at.isoformat(),
+                    # `since` may be anchored (`lane_floor`); reuse binds to this.
+                    "policyFloor": since.isoformat(),
                 }
         except policy.PolicyReadError as exc:
             json.dump({"ok": False, "error": f"floor unreadable: {exc}"}, sys.stdout)
             sys.stdout.write("\n")
             return EXIT_UNREADABLE
+        # Only the lane's own check on the default branch reads the anchor;
+        # a full check, an explicit --since and --judge-run never do.
+        anchored = args.lane_merges_only and args.branch is None
+        if anchored:
+            since, anchor = lane_floor(args.repo, args.agent_identity, since)
+    out = os.environ.get(ANCHOR_ENV)
     verdict = check(
         args.repo,
         agent_identity=args.agent_identity,
@@ -4799,11 +5414,18 @@ def main(argv: list[str] | None = None) -> int:
         pinned_sha=(reader := pin_reader(args.repo, args.agent_identity)),
         lane_merges_only=args.lane_merges_only,
         settled=reader.settled,
+        # Only the check that writes the anchor reads settled merges' runs.
+        rejudge=anchor_needs(anchor) if anchored and out else None,
     )
     report = verdict.report()
     report["since"] = since.isoformat()
     if shared is not None:
         report["shared"] = shared
+    if anchored and out and verdict.branch:
+        advanced = advance_anchor(verdict, anchor)
+        if advanced is not None:
+            write_anchor(out, advanced, args.repo, verdict.branch, args.agent_identity)
+            report["anchor"] = advanced.at.isoformat()
     code = verdict_exit(verdict)
     branch = verdict.branch
     if verdict.readable and not branch:

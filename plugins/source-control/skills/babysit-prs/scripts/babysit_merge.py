@@ -74,8 +74,7 @@ Contract enforced here (encoded as code, not convention):
   merge-ready list. Absent the flag the gate is byte-for-byte its prior self.
 - The merge method, dependency-manager logins, and block labels are resolved for
   the PR's own repository from its default-branch
-  `docs/conventions/source-control.yaml`, then `.claude/source-control.md` for a
-  key the YAML lacks (`babysit_repo_config`); the matching flags are the deprecated `userConfig`
+  `docs/conventions/source-control.yaml` (`babysit_repo_config`); the matching flags are the deprecated `userConfig`
   fallback. The review-settle pair stays `userConfig`-only: a repository
   declaration of either key is ignored. A repository config that cannot be read
   refuses the run at exit 2.
@@ -126,7 +125,8 @@ Contract enforced here (encoded as code, not convention):
 
 Readiness is gated on GitHub's own `mergeStateStatus == CLEAN` (which integrates
 required checks, approvals, conversation resolution, and up-to-date where the
-base requires it) plus
+base requires it), or on `UNSTABLE` when pr-merge's own failing
+`pr-merge/unarmed` status is the only failing check, plus
 explicit cross-checks so the *reason* for a block is always reported: the
 effective branch rules (`rules/branches`), the review decision, unresolved
 review threads, and the status-check rollup.
@@ -158,6 +158,7 @@ import babysit_dependabot as dependabot
 import babysit_merge_policy as merge_policy
 import babysit_postmerge as postmerge
 import babysit_review_evidence as review_evidence
+import babysit_evidence_comment as evidence_comment
 import babysit_risk
 import babysit_run_cache as run_cache
 import babysit_verify_evidence as verify_evidence
@@ -284,6 +285,22 @@ EXPECTED_HEAD_RE = re.compile(rf"^[0-9a-fA-F]{{{MIN_HEAD_SHA_PREFIX_LENGTH},64}}
 # pre-receive hooks (GHES) -- GitHub returns one OR the other, so both are ready.
 READY_MERGE_STATES = {"CLEAN", "HAS_HOOKS"}
 
+# The commit status pr-merge posts on a head it left unarmed
+# (.github/scripts/pr-merge/enable-auto-merge.mjs UNARMED_CONTEXT). It reports
+# an earlier refusal and is no input to this one: counted, it fails the gate's
+# failing-checks rule and holds `mergeStateStatus` at UNSTABLE, so the PR stays
+# refused after the refusal's cause clears and the run that would post the
+# passing status never arms it.
+UNARMED_STATUS_CONTEXT = "pr-merge/unarmed"
+
+
+def is_unarmed_status(check: dict[str, Any]) -> bool:
+    return (
+        check.get("type") == "StatusContext"
+        and check.get("name") == UNARMED_STATUS_CONTEXT
+    )
+
+
 # The two AI review lanes `--auto` waits for. `ci-status` is the only required
 # check and does not wait on these separate workflows, so auto-merge armed
 # before both pass on the live head could merge ahead of their review. Each
@@ -291,17 +308,19 @@ READY_MERGE_STATES = {"CLEAN", "HAS_HOOKS"}
 # claude-review-status`). A name holding ` / ` must match the whole check
 # name: the security job is named `security-review`, generic enough that
 # another workflow's job could carry it, so it counts only under its own
-# caller prefix. `pr-review-security / security-review` is the current caller,
-# `security-review / security-review` the previous one, and
-# `claude-security-review-status` the job of a pin that predates the fold. Old
-# and new callers run side by side while repos migrate. Every matching check
-# must succeed.
+# caller prefix, as does pr-review-cli.yml's `review-status`, which both lanes
+# share. `pr-review-security / security-review` is the current caller of
+# pr-review-security.yml, `security-review / security-review` the previous one,
+# and `claude-security-review-status` the job of a pin that predates the fold.
+# Old and new callers run side by side while repos migrate. Every matching
+# check must succeed.
 AI_REVIEW_CHECKS = {
-    "claude-review-status": ("claude-review-status",),
+    "claude-review-status": ("claude-review-status", "pr-review / review-status"),
     "claude-security-review-status": (
         "claude-security-review-status",
         "security-review / security-review",
         "pr-review-security / security-review",
+        "pr-review-security / review-status",
     ),
 }
 
@@ -420,15 +439,7 @@ def rerun_rate_limited_review(
     except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
         report["reason"] = f"could not read the job: {type(exc).__name__}: {exc}"
         return report
-    segment = str(job.get("name") or "").rsplit(" / ", 1)[-1]
-    lane = next(
-        (
-            lane
-            for lane, (_, suffix) in review_evidence.LANES.items()
-            if suffix == segment
-        ),
-        "",
-    )
+    lane = review_evidence.lane_of_job(job.get("name"))
     if lost:
         classes = frozenset({review_evidence.LOST})
         if not lane:
@@ -1675,7 +1686,15 @@ def evaluate(
     pr, graphql_available = view_pr_fields(repo, number, view_fields, run_json=gh_json)
     threads = unresolved_threads(repo, number)
     checks = classify_checks(pr.get("statusCheckRollup"))
-    failing = checks["failing"]
+    failing = [
+        check["name"]
+        for check in checks["checks"]
+        if check["category"] == "failing" and not is_unarmed_status(check)
+    ]
+    unarmed_failing = any(
+        check["category"] == "failing" and is_unarmed_status(check)
+        for check in checks["checks"]
+    )
     pending = checks["pending"]
     checks_by_key: dict[tuple[str, str, str], dict[str, Any]] = {
         check_identity_key(check): check for check in checks["checks"]
@@ -1782,7 +1801,16 @@ def evaluate(
         blockers.append(
             f"mergeable={pr.get('mergeable')} (conflict or still computing)"
         )
-    if pr.get("mergeStateStatus") not in READY_MERGE_STATES:
+    # UNSTABLE is a non-required check not passing. When the only failing check
+    # is the unarmed status, that status is the cause, so the state counts as
+    # ready; a running check still holds through the pending-checks rule.
+    unstable_from_unarmed_only = (
+        pr.get("mergeStateStatus") == "UNSTABLE" and unarmed_failing and not failing
+    )
+    if (
+        pr.get("mergeStateStatus") not in READY_MERGE_STATES
+        and not unstable_from_unarmed_only
+    ):
         blockers.append(
             f"mergeStateStatus={pr.get('mergeStateStatus')} "
             + "(need CLEAN/HAS_HOOKS: integrates required checks, up-to-date, "
@@ -4012,7 +4040,8 @@ def close_capped(
     """`verify_evidence.capped_close` for the gate's pull request at its
     head, under `merge.verify-cap-attempts`; do-not-merge and the human-gated
     label hold it open, and the issue's hold labels
-    (`merge_policy.issue_hold_labels`) keep it so. Any hold the gate reads on
+    (`merge_policy.issue_hold_labels`) or Work status
+    (`config.issue_status`) keep it so. Any hold the gate reads on
     a queued entry (`merge_policy.entry_hold`: a hold label, a body hold, a
     member's veto; an unreadable one holds) keeps it open first,
     as enable-auto-merge.mjs decide() does. An unreadable human-gated label
@@ -4042,6 +4071,7 @@ def close_capped(
         attempts=config.verify_cap_attempts,
         holds=("do-not-merge", label),
         issue_holds=merge_policy.issue_hold_labels(config, label),
+        **({"issue_status": config.issue_status} if config.issue_status else {}),
     )
 
 
@@ -4316,7 +4346,9 @@ def unattended_writes(
         else:
             queued, _ = postmerge.identity_queue(repo, branch, identity)
             # In the pr-merge lane a queued entry also leaves without a
-            # passing verifier verdict at its head now.
+            # passing verifier verdict at its head now; a lanes App entry
+            # whose verdict cannot be read stays for the merge queue's own
+            # reader (`verify_evidence.QUEUE_READS`).
             config = inputs.get("config")
             verifier = inputs.get("verify_reader") or (
                 verify_evidence.Reader(
@@ -4350,6 +4382,11 @@ def unattended_writes(
                         if verifier is not None and n != number
                         else None
                     )
+                if hold == verify_evidence.QUEUE_READS:
+                    # A lanes App entry whose verdict this run could not read:
+                    # the merge queue's own reader refuses it fail-closed, so
+                    # it stays, neither dequeued nor counted as kept.
+                    return None
                 kept_at[n] = min([began, *taken])
                 return hold
 
@@ -4388,8 +4425,13 @@ def unattended_writes(
     except (postmerge.PostMergeReadError, postmerge.PostMergeWriteError) as exc:
         report["errors"].append(f"dequeue: {exc}")
     # A stopped path (demoted, capped off, switched off) merges nothing, so a
-    # reasons comment would only say so on every pull request.
-    if not stopped and risk is not None and babysit_risk.holds(risk):
+    # reasons comment would only say so on every pull request. Nor does one
+    # whose author App merges it itself (`adoption.self-merging-apps`): the
+    # score holds only this lane's merge, so a comment or label is noise.
+    config = inputs.get("config")
+    author = json_object(json_object(inputs.get("pr")).get("user")).get("id")
+    quiet = stopped or (config is not None and author in config.self_merging_apps)
+    if not quiet and risk is not None and babysit_risk.holds(risk):
         head = str(json_object(inputs["pr"].get("head")).get("sha"))
         body = risk_comment_body(risk, head)
         try:
@@ -4402,7 +4444,6 @@ def unattended_writes(
             # An earlier run's reasons comment saying the same thing at this
             # head for long enough means the refusal persisted: escalate it.
             # A shorter stand may be a review still running at the head.
-            config = inputs.get("config")
             minutes = (
                 config.risk_escalation_minutes
                 if config is not None
@@ -4455,7 +4496,7 @@ def unattended_writes(
     # A score that no longer holds ends the refusal at this head: the identity's refusal
     # comment naming it says so once, from comments already read. An
     # escalated one stays beside the label it explains.
-    elif not stopped and risk is not None and inputs.get("comments") is not None:
+    elif not quiet and risk is not None and inputs.get("comments") is not None:
         head = str(json_object(inputs["pr"].get("head")).get("sha"))
         prior = _newest_marker_comment(inputs["comments"], identity, RISK_MARKER)
         text = _normalized((prior or {}).get("body"))
@@ -4492,7 +4533,6 @@ def unattended_writes(
     # A lanes App pull request the verifier refuses for good closes for a
     # fresh attempt at its issue (`verify_evidence.capped_close`, which judges
     # it again and leaves a held one alone); no person's label.
-    config = inputs.get("config")
     if (
         not stopped
         and verify.get("refusal") in verify_evidence.VERIFY_FINAL
@@ -4696,8 +4736,10 @@ def unattended_enqueue(
 
     Only a merge-queue base; an armed auto-merge is disarmed and refused; the
     kill switch and the opt-in label are read again; the pin comment is
-    posted before the enqueue and the enqueue goes nowhere without it; after
-    the enqueue the queue is
+    posted before the enqueue and the enqueue goes nowhere without it; under
+    a passing verifier verdict the evidence comment follows the pin when the
+    head has a capture artifact (`babysit_evidence_comment`); after the
+    enqueue the queue is
     re-read and, when the identity entries enqueued earlier and the unverified
     lane merges already fill `merge.max-in-flight`, this one dequeues itself.
     In the pr-merge lane the kill switch "read again" is the value the
@@ -4793,11 +4835,13 @@ def unattended_enqueue(
             main_sha=main_sha,
         ).reason
     elif inputs.get("authority") == merge_policy.PR_MERGE:
+        work_status = inputs.get("issue_status")
         opt_in = merge_policy.recheck_lane_issue(
             repo,
             number,
             issue=getattr(eligible, "issue", None),
             holds=inputs.get("issue_holds") or (),
+            **({"status": work_status} if work_status else {}),
         )
     else:
         opt_in = merge_policy.recheck_opt_in(
@@ -4934,13 +4978,38 @@ def unattended_enqueue(
                 "is not enqueued"
             )
         inputs_read["updated"] = False
+    # The effective rung the gate enqueued under, which the promotion-evidence
+    # publisher credits; no merge rung leaves the pin without one.
+    rung = inputs.get("rung")
+    pin_rung = rung if rung in postmerge.PIN_RUNGS else None
     proc = gh_capture(
         ["api", "-X", "POST", f"repos/{repo}/issues/{number}/comments"]
-        + ["-f", f"body={postmerge.pin_comment(pin)}"]
+        + ["-f", f"body={postmerge.pin_comment(pin, pin_rung)}"]
     )
     if proc.returncode != 0:
         return hold(f"the pin comment could not be posted ({proc.stderr.strip()})")
     step["pinned"] = True
+    # The verifier passed this head: its evidence comment goes up before the
+    # enqueue. No capture, or a failed read or write, posts nothing and the
+    # enqueue goes on, since the verdict is the gate and the comment its record.
+    reader = inputs.get("verify_reader")
+    if reader is not None:
+        token = reader.actions_token
+        step["evidenceComment"] = evidence_comment.post(
+            repo,
+            number,
+            pin,
+            (lambda args: gh_json(args, {"GH_TOKEN": token})) if token else gh_json,
+            lambda body: upsert_marker_comment(
+                repo,
+                number,
+                identity,
+                body,
+                inputs.get("comments"),
+                marker=evidence_comment.MARKER,
+            ),
+            os.environ.get("GITHUB_SERVER_URL") or "https://github.com",
+        )
     result["action"] = "enqueue"
     record = async_merge(repo, number, sha=pin, merge_action="merge_queue", method=None)
     result["merge"] = record

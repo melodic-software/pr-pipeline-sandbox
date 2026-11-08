@@ -115,15 +115,23 @@ class Recheck:
 
 
 def run(
-    workflow: str, *, status: str, updated: datetime, created: datetime = FLOOR
+    workflow: str,
+    *,
+    status: str,
+    updated: datetime,
+    created: datetime = FLOOR,
+    run_id: int | None = None,
 ) -> dict[str, object]:
     """One row of the actions runs listing."""
-    return {
+    row: dict[str, object] = {
         "path": f".github/workflows/{workflow}",
         "status": status,
         "created_at": created.isoformat(),
         "updated_at": updated.isoformat(),
     }
+    if run_id is not None:
+        row["id"] = run_id
+    return row
 
 
 class LaneRoom(unittest.TestCase):
@@ -865,6 +873,59 @@ class PendingRunsUnchanged(unittest.TestCase):
             ]
         )
 
+    def canary_fails(self, stderr: str, *, file_present: bool = False) -> bool:
+        """The answer when the canary listing fails with `stderr` and the full
+        listing holds nothing; the canary file read on the default branch
+        answers when `file_present`, else 404 (#14059)."""
+
+        def read(args: list[str], label: str) -> dict[str, object]:
+            if "post-merge-detect-silent-revert.yml" in args[1]:
+                raise pm.PostMergeReadError(f"{label}: {stderr}")
+            return {"total_count": 0, "workflow_runs": []}
+
+        contents = (
+            subprocess.CompletedProcess(["gh"], 0, "on: push\n", "")
+            if file_present
+            else subprocess.CompletedProcess(["gh"], 1, "", "gh: Not Found (HTTP 404)")
+        )
+        with (
+            mock.patch.object(pm, "_read", side_effect=read),
+            mock.patch.object(pm, "gh_capture", return_value=contents),
+        ):
+            return pm.pending_runs_unchanged(
+                REPO, shared(report=PENDING), "main", now=STALE_NOW
+            )
+
+    def test_a_repository_without_the_canary_workflow_holds(self) -> None:
+        self.assertTrue(self.canary_fails("gh: Not Found (HTTP 404)"))
+
+    def test_a_canary_404_with_the_workflow_file_present_moves_it(self) -> None:
+        self.assertFalse(
+            self.canary_fails("gh: Not Found (HTTP 404)", file_present=True)
+        )
+
+    def test_any_other_canary_read_failure_moves_it(self) -> None:
+        for stderr in ("gh: Forbidden (HTTP 403)", "gh: Server Error (HTTP 502)"):
+            with self.subTest(stderr=stderr):
+                self.assertFalse(self.canary_fails(stderr))
+
+    def test_a_full_run_404_moves_it(self) -> None:
+        def read(args: list[str], label: str) -> dict[str, object]:
+            raise pm.PostMergeReadError(f"{label}: gh: Not Found (HTTP 404)")
+
+        contents = subprocess.CompletedProcess(
+            ["gh"], 1, "", "gh: Not Found (HTTP 404)"
+        )
+        with (
+            mock.patch.object(pm, "_read", side_effect=read),
+            mock.patch.object(pm, "gh_capture", return_value=contents),
+        ):
+            self.assertFalse(
+                pm.pending_runs_unchanged(
+                    REPO, shared(report=PENDING), "main", now=STALE_NOW
+                )
+            )
+
     def test_a_canary_still_queued_in_a_verified_window_is_listed(self) -> None:
         # A verified merge's canary queued before the unverified merge can
         # still turn red and fail it, so the listing reaches back to it; an
@@ -878,6 +939,51 @@ class PendingRunsUnchanged(unittest.TestCase):
             self.assertIn("created=%3E%3D2026-09-30T23%3A00%3A00Z", call[1])
         unsaid = {k: v for k, v in PENDING.items() if k != "outstandingSince"}
         self.assertEqual(self.unchanged([], report=unsaid), (False, []))
+
+
+class JudgedRuns(unittest.TestCase):
+    """`judgedRuns`: a completed run the check that made the report already
+    read finished, at the same `updated_at`, is not a move. The case is pr-merge
+    sweep 41831769667: canary 41831560079 completed 53 s before the report's
+    computedAt, inside the 60 s clock margin, and the merge job ran the whole
+    check again for it. `2026-09-30T23:59:07Z` is FLOOR less 53 s, written
+    in the API's `Z` form while the rows carry `+00:00`."""
+
+    CANARY = 41831560079
+    FINISHED = FLOOR - timedelta(seconds=53)
+    RECORDED = {**PENDING, "judgedRuns": {str(CANARY): "2026-09-30T23:59:07Z"}}
+
+    unchanged = PendingRunsUnchanged.unchanged
+
+    def canary(
+        self, updated: datetime = FINISHED, run_id: int = CANARY
+    ) -> dict[str, object]:
+        return run(
+            "post-merge-detect-silent-revert.yml",
+            status="completed",
+            updated=updated,
+            run_id=run_id,
+        )
+
+    def test_a_run_recorded_at_the_same_updated_at_is_not_moved(self) -> None:
+        self.assertTrue(self.unchanged([self.canary()], report=self.RECORDED)[0])
+
+    def test_the_same_run_re_run_since_is_moved(self) -> None:
+        rerun = self.canary(updated=FLOOR + timedelta(minutes=1))
+        self.assertFalse(self.unchanged([rerun], report=self.RECORDED)[0])
+
+    def test_a_completed_run_the_record_lacks_is_moved(self) -> None:
+        other = self.canary(run_id=self.CANARY + 1)
+        self.assertFalse(self.unchanged([other], report=self.RECORDED)[0])
+
+    def test_a_report_without_a_readable_record_moves_as_before(self) -> None:
+        # The measured instance with no record: in the margin, so moved.
+        self.assertFalse(self.unchanged([self.canary()])[0])
+        malformed = {**PENDING, "judgedRuns": {str(self.CANARY): "not a time"}}
+        self.assertFalse(self.unchanged([self.canary()], report=malformed)[0])
+        self.assertFalse(
+            self.unchanged([self.canary()], report={**PENDING, "judgedRuns": []})[0]
+        )
 
 
 class SettleShared(unittest.TestCase):
@@ -1227,6 +1333,30 @@ class IdleRefusal(unittest.TestCase):
         ]
         self.assertIsNone(self.refusal(runs=quiet))
         self.assertTrue(self.refusal(runs_total=101).startswith("unreadable"))
+
+    def test_a_run_the_report_judged_finished_moves_nothing(self) -> None:
+        # Updated 30 s before the report, inside the 60 s clock margin.
+        def done(updated: datetime) -> dict[str, object]:
+            return run(
+                "pr-require-checks.yml", status="completed", updated=updated, run_id=77
+            )
+
+        judged = FLOOR - timedelta(seconds=30)
+        self.assertEqual(
+            self.refusal(runs=[done(judged)]),
+            "runs-changed",
+            "with no judgedRuns record the run in the margin counts as moved",
+        )
+        recorded = {**SETTLED, "judgedRuns": {"77": "2026-09-30T23:59:30Z"}}
+        self.assertIsNone(
+            self.refusal(recorded, runs=[done(judged)]),
+            "a run the report judged at the same updated_at counts for nothing",
+        )
+        self.assertEqual(
+            self.refusal(recorded, runs=[done(NOW)]),
+            "runs-changed",
+            "the same run re-run since has a later updated_at and counts",
+        )
 
     def test_an_unverified_merge_lists_runs_from_its_merge_and_ends_at_the_deadline(
         self,
@@ -1717,6 +1847,84 @@ class SettleCommand(unittest.TestCase):
         )
         settle.assert_not_called()
 
+    def canary_settle(self, *flags: str) -> tuple[int, str | None, mock.Mock]:
+        """`settle` with `flags` on a fully verified report whose canary,
+        queued before it, completed after its computedAt, the run listings
+        read for real: its exit code, reason and the `settle_shared` mock."""
+        queued = FLOOR - timedelta(hours=4)
+        report = shared(report={**SETTLED, "outstandingSince": queued.isoformat()})
+        red = run(
+            "post-merge-detect-silent-revert.yml",
+            status="completed",
+            updated=NOW,
+            created=queued,
+        )
+
+        def read(args: list[str], label: str) -> object:
+            if "/actions/workflows/" in args[1]:
+                # Only runs created at or after the listing's floor, which
+                # outstandingSince moves back to the canary's queue time.
+                floor = datetime.fromisoformat(
+                    unquote(args[1].split("&created=")[1].split("&")[0])[2:]
+                )
+                listed = [
+                    r
+                    for r in [red]
+                    if datetime.fromisoformat(str(r["created_at"])) >= floor
+                ]
+                return {"total_count": len(listed), "workflow_runs": listed}
+            return []
+
+        out = io.StringIO()
+        with (
+            mock.patch.object(ve.postmerge, "read_shared", return_value=report),
+            mock.patch.object(policy, "check_code_unchanged", return_value=True),
+            # The report's own checks are the clock's; this case is the runs'.
+            mock.patch.object(ve.postmerge, "idle_report_refusal", return_value=None),
+            mock.patch.object(ve.postmerge, "idle_marks_refusal", return_value=None),
+            mock.patch.object(policy, "_default_branch", return_value="main"),
+            mock.patch.object(policy, "_default_branch_config", return_value=config()),
+            mock.patch.object(pm, "_read", side_effect=read),
+            mock.patch.object(
+                policy, "settle_shared", return_value=("answer", None)
+            ) as settle,
+            contextlib.redirect_stdout(out),
+        ):
+            code = ve.main(
+                [
+                    "settle",
+                    *flags,
+                    "--repo",
+                    REPO,
+                    "--postmerge-result",
+                    "/tmp/x.json",
+                    "--code-sha",
+                    MAIN,
+                ]
+            )
+        return code, json.loads(out.getvalue())["reason"], settle
+
+    def test_a_fresh_report_stands_though_a_canary_finished_as_it_ran(
+        self,
+    ) -> None:
+        # The same report as the wake's own check just made it: the canary
+        # that finished as the check ran is in the report, not a move since.
+        code, reason, settle = self.canary_settle("--idle-tick", "--fresh")
+        self.assertEqual((code, reason), (0, None))
+        settle.assert_called_once()
+
+    def test_a_canary_finished_since_a_verified_report_refuses_its_reuse(
+        self,
+    ) -> None:
+        # pr-merge's PR-scoped wake reuses the last sweep's report through
+        # this call (pr-merge.yml "Keep the last sweep's report only while
+        # nothing it read has moved"): a fully verified report whose canary,
+        # queued before it, completed after its computedAt is refused before
+        # the lane room's rule runs, and with no report nothing arms.
+        code, reason, settle = self.canary_settle("--idle-tick")
+        self.assertEqual((code, reason), (1, "idle tick runs-changed"))
+        settle.assert_not_called()
+
     def test_changed_verifying_runs_refuse_before_the_lane_rooms_reads(self) -> None:
         # 41345813084: `runs-changed` after settle_shared's 22 calls. The two
         # run listings now come first.
@@ -1735,6 +1943,52 @@ class SettleCommand(unittest.TestCase):
         )
         self.assertEqual((code, out["reason"]), (1, "idle tick stale-soon"))
         self.assertEqual(self.order, ["report", "runs", "settle", "marks", "report"])
+
+    def test_a_fresh_report_skips_the_runs_its_own_check_just_read(self) -> None:
+        # 41737390591: the wake's fresh report, computed seconds earlier, was
+        # refused `runs-changed`. With --fresh the verifying runs are not
+        # read; the report checks and the quarantine and pin reads still are.
+        fresh = ("--idle-tick", "--fresh")
+        code, out, _ = self.main(
+            ("answer", None), extra=fresh, idle_runs="runs-changed"
+        )
+        self.assertEqual(
+            (code, out), (0, {"reuse": True, "reason": None, "outcome": None})
+        )
+        self.idle_runs.assert_not_called()
+        self.assertEqual(self.order, ["report", "settle", "marks", "report"])
+        # The wake's no full run, no re-run, no hold contract still holds.
+        code, out, _ = self.main(
+            ("answer", None), extra=fresh, idle_report="needs-dispatch"
+        )
+        self.assertEqual((code, out["reason"]), (1, "idle tick needs-dispatch"))
+        self.assertEqual(self.order, ["report"])
+        code, out, _ = self.main(("answer", None), extra=fresh, idle="pins-changed")
+        self.assertEqual((code, out["reason"]), (1, "idle tick pins-changed"))
+        code, out, _ = self.main(
+            (None, "post-merge answer stale"), extra=fresh, idle_runs="runs-changed"
+        )
+        self.assertEqual((code, out["reason"]), (1, "post-merge answer stale"))
+        self.idle.assert_not_called()
+
+    def test_fresh_needs_the_idle_tick(self) -> None:
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as stop,
+        ):
+            ve.main(
+                [
+                    "settle",
+                    "--fresh",
+                    "--repo",
+                    REPO,
+                    "--postmerge-result",
+                    "/tmp/x.json",
+                    "--code-sha",
+                    MAIN,
+                ]
+            )
+        self.assertEqual(stop.exception.code, 2)
 
 
 class LaneRoomCommand(unittest.TestCase):

@@ -43,6 +43,7 @@ LEDGER_CLI = "skills/babysit-prs/scripts/manage_feedback_ledger.py"
 PRUNE_CLI = "skills/babysit-prs/scripts/prune_babysit_worktrees.py"
 REFRESH_CLI = "skills/babysit-prs/scripts/refresh_pr_branch.py"
 POSTMERGE_CLI = "skills/babysit-prs/scripts/babysit_postmerge.py"
+LIFT_CLI = "skills/babysit-prs/scripts/babysit_lift.py"
 REVIEW_CLI = "skills/babysit-prs/scripts/request_review.py"
 SNAPSHOT_CLI = "skills/babysit-prs/scripts/pr_queue_snapshot.py"
 FINDINGS_CLI = "skills/babysit-prs/scripts/babysit_findings.py"
@@ -50,6 +51,7 @@ PREFILTER_CLI = "skills/babysit-prs/scripts/babysit_merge_prefilter.py"
 SKIP_CLI = "skills/babysit-prs/scripts/babysit_merge_skip.py"
 VERIFY_EVIDENCE_CLI = "skills/babysit-prs/scripts/babysit_verify_evidence.py"
 WHOLE_REVIEW_CLI = "skills/babysit-prs/scripts/babysit_whole_review.py"
+EVIDENCE_COMMENT_CLI = "skills/babysit-prs/scripts/babysit_evidence_comment.py"
 THREADS_CLI = "skills/babysit-prs/scripts/pr_review_threads.py"
 REPO_CONFIG_CLI = "skills/babysit-prs/scripts/babysit_repo_config.py"
 READINESS_GATE = "scripts/babysit-readiness-gate.sh"
@@ -1352,6 +1354,15 @@ MECHANISMS: tuple[Mechanism, ...] = (
         must_contain=("convertPullRequestToDraft", "markPullRequestReadyForReview"),
     ),
     Mechanism(
+        id="evidence-comment.upserts-a-comment",
+        claim=(
+            "babysit_evidence_comment.py post performs a GitHub write: it posts or "
+            "rewrites the lane identity's one evidence-verification comment."
+        ),
+        entry_point=EVIDENCE_COMMENT_CLI,
+        must_contain=("upsert_marker_comment", "<!-- evidence-verification -->"),
+    ),
+    Mechanism(
         id="review.posts-a-comment",
         claim=(
             "request_review.py --apply performs a GitHub write: it POSTs an issue comment "
@@ -1459,6 +1470,36 @@ MECHANISMS: tuple[Mechanism, ...] = (
         ),
         entry_point=POSTMERGE_CLI,
         must_contain=("allow_abbrev=False",),
+    ),
+    Mechanism(
+        id="lift.close-is-the-only-github-write",
+        claim=(
+            "babysit_lift.py writes to GitHub only in its `close` subcommand, which "
+            "comments on, removes the human-gated label from and closes each canary, "
+            "revert or read-back demotion record that has lifted by the merge gate's "
+            "rule (babysit_merge_policy.py `_lift`). `canary-block` and `revert-block` "
+            "read git and run the silent-revert canary in the named checkout, and "
+            "print a lift block; they make no GitHub call."
+        ),
+        entry_point=LIFT_CLI,
+        must_contain=(
+            'if args.action == "close":',
+            '"state=closed",',
+        ),
+    ),
+    Mechanism(
+        id="lift.parsers-refuse-abbreviation",
+        claim=(
+            "babysit_lift.py sets allow_abbrev=False on its top-level parser and on "
+            "each subcommand parser, so a rule written against an exact flag "
+            "spelling also covers every prefix of it."
+        ),
+        entry_point=LIFT_CLI,
+        must_contain=(
+            'argparse.ArgumentParser(prog="babysit_lift.py", allow_abbrev=False)',
+            "sub.add_parser(action, allow_abbrev=False)",
+            'sub.add_parser("close", allow_abbrev=False)',
+        ),
     ),
 )
 
@@ -1592,6 +1633,24 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        path=LIFT_CLI,
+        wrapper=None,
+        mutation=CONDITIONAL,
+        mutates_what=(
+            "comments on, removes the human-gated label from, and closes each open "
+            "canary, revert or read-back demotion record that has lifted"
+        ),
+        gate="the `close` subcommand (`canary-block` and `revert-block` write nothing)",
+        claim=(
+            "No GitHub write outside `close`; the block subcommands read the local "
+            "checkout and print one line."
+        ),
+        backed_by=(
+            "lift.close-is-the-only-github-write",
+            "lift.parsers-refuse-abbreviation",
+        ),
+    ),
+    EntryPoint(
         path=REFRESH_CLI,
         wrapper=None,
         mutation=CONDITIONAL,
@@ -1648,6 +1707,23 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
             "held, printed on stdout; no write of any kind and no GitHub call."
         ),
         backed_by=(),
+    ),
+    EntryPoint(
+        path=EVIDENCE_COMMENT_CLI,
+        wrapper=None,
+        mutation=MUTATING,
+        mutates_what="a pull request's evidence-verification comment",
+        gate=(
+            "enable-auto-merge.mjs runs `post` with the lane token before it "
+            "arms a pull request, live mode only"
+        ),
+        claim=(
+            "`post` reads the head's pr-capture artifact and its run under "
+            "BABYSIT_VERIFY_GH_TOKEN and, when a pr-verify-capture run on main "
+            "uploaded it, posts or rewrites the lane identity's one "
+            "evidence-verification comment linking it."
+        ),
+        backed_by=("evidence-comment.upserts-a-comment",),
     ),
     EntryPoint(
         path=WHOLE_REVIEW_CLI,
@@ -1720,8 +1796,8 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         mutates_what="nothing",
         gate="n/a",
         claim=(
-            "`loop-keys <owner/repo>` reads docs/conventions/source-control.yaml and "
-            ".claude/source-control.md from the target's default branch through the "
+            "`loop-keys <owner/repo>` reads docs/conventions/source-control.yaml "
+            "from the target's default branch through the "
             "contents API and prints the four babysit_loop_* values as JSON; it performs "
             "no GitHub write and writes only a temporary file for the shared YAML reader."
         ),

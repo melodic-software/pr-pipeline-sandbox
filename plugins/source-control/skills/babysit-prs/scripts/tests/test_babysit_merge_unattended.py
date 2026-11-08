@@ -842,6 +842,8 @@ class Unattended(unittest.TestCase):
         self.hold_hook: Any = lambda kwargs: None
         self.prior: dict[str, Any] | None = None
         self.log: list[str] = []
+        self.pin_lines: list[str] = []
+        self.evidence_bodies: list[str] = []
         self.rules = QUEUE_RULES
         # -1: the queue re-read is whole; any other count truncates it.
         self.entries_total: int | None = -1
@@ -993,7 +995,7 @@ class Unattended(unittest.TestCase):
         self.in_flight = mock.Mock(return_value=self.flight)
         self.read_cap = mock.Mock(return_value=self.cap)
 
-        def gh_json(args: list[str]) -> Any:
+        def gh_json(args: list[str], env: Any = None) -> Any:
             if args[:2] == ["pr", "view"]:
                 return self.pr_view
             if args[:2] == ["api", "graphql"]:
@@ -1171,8 +1173,14 @@ class Unattended(unittest.TestCase):
         joined = " ".join(args)
         if "babysit-merge-pin" in joined:
             self.log.append("pin")
+            body = next(a for a in args if a.startswith("body="))
+            self.pin_lines.append(body.removeprefix("body=").split("\n", 1)[0])
         elif "babysit-merge-risk" in joined:
             self.log.append("risk-comment:" + args[2])
+        elif "<!-- evidence-verification -->" in joined:
+            self.log.append("evidence-comment:" + args[2])
+            body = next(a for a in args if a.startswith("body="))
+            self.evidence_bodies.append(body.removeprefix("body="))
         elif "disablePullRequestAutoMerge" in joined:
             self.log.append("disarm")
         elif "dequeuePullRequest" in joined:
@@ -1473,6 +1481,148 @@ class LaneMode(Unattended):
             out["unattended"]["enqueue"]["killSwitch"],
             {"proceed": True, "reason": "proceed"},
         )
+
+    def capture_artifact(self, run: dict[str, Any] | None = None) -> None:
+        """A `pr-capture-<pr>-<head>` artifact whose run is `run`, by default
+        the capture workflow's on main for this head."""
+        name = f"pr-capture-{PR}-{HEAD}"
+        listing = f"repos/owner/repo/actions/artifacts?name={name}&per_page=100"
+        self.compare_answers[listing] = {
+            "total_count": 1,
+            "artifacts": [
+                {
+                    "id": 5001,
+                    "name": name,
+                    "expired": False,
+                    "expires_at": "2026-12-06T10:00:00Z",
+                    "workflow_run": {"id": 900},
+                }
+            ],
+        }
+        self.compare_answers["repos/owner/repo/actions/runs/900"] = run or {
+            "id": 900,
+            "path": ".github/workflows/pr-verify-capture.yml",
+            "event": "workflow_run",
+            "head_branch": "main",
+            "repository": {"full_name": "owner/repo"},
+            "conclusion": "success",
+            "display_title": f"pr-verify-capture 812 {HEAD}",
+        }
+
+    def test_merge_pr_path_a_pass_and_a_capture_post_one_evidence_comment_then_enqueue(
+        self,
+    ) -> None:
+        self.capture_artifact()
+        code, out = self.lane()
+        self.assertEqual(code, 0, out["blockers"])
+        self.assertEqual(
+            self.log,
+            ["pin", "evidence-comment:POST", f"enqueue:{HEAD}:merge_queue"],
+        )
+        self.assertEqual(out["unattended"]["enqueue"]["evidenceComment"], "created")
+        (body,) = self.evidence_bodies
+        self.assertTrue(body.startswith("<!-- evidence-verification -->\n"))
+        self.assertIn(f"Verification evidence for {HEAD}", body)
+        self.assertIn(
+            f"[pr-capture-{PR}-{HEAD}](https://github.com/owner/repo/actions/runs/"
+            "900/artifacts/5001), expires on 2026-12-06.",
+            body,
+        )
+
+    def test_merge_pr_path_an_earlier_evidence_comment_is_updated_in_place(
+        self,
+    ) -> None:
+        self.capture_artifact()
+        self.comments = [
+            {
+                "id": 77,
+                "user": {"login": IDENTITY, "type": "Bot"},
+                "body": "<!-- evidence-verification -->\n### Verification evidence for "
+                + "e" * 40,
+                "created_at": "2026-11-01T00:00:00Z",
+            }
+        ]
+        code, out = self.lane()
+        self.assertEqual(code, 0, out["blockers"])
+        self.assertEqual(
+            self.log,
+            ["pin", "evidence-comment:PATCH", f"enqueue:{HEAD}:merge_queue"],
+        )
+
+    def test_merge_pr_path_no_capture_artifact_posts_nothing_and_enqueues(
+        self,
+    ) -> None:
+        code, out = self.lane()
+        self.assertEqual(code, 0, out["blockers"])
+        self.assertEqual(self.log, ["pin", f"enqueue:{HEAD}:merge_queue"])
+        self.assertEqual(
+            out["unattended"]["enqueue"]["evidenceComment"], "no-capture"
+        )
+
+    def test_merge_pr_path_an_artifact_from_another_workflow_is_not_linked(
+        self,
+    ) -> None:
+        # A pull request's own workflow can upload an artifact by the same name.
+        self.capture_artifact(
+            {
+                "id": 900,
+                "path": ".github/workflows/ci.yml",
+                "event": "pull_request",
+                "head_branch": "feat",
+                "repository": {"full_name": "owner/repo"},
+                "conclusion": "success",
+                "display_title": f"pr-verify-capture 812 {HEAD}",
+            }
+        )
+        code, out = self.lane()
+        self.assertEqual(code, 0, out["blockers"])
+        self.assertEqual(self.log, ["pin", f"enqueue:{HEAD}:merge_queue"])
+
+    def test_merge_pr_path_a_failed_evidence_write_still_enqueues(self) -> None:
+        self.capture_artifact()
+        real = self._capture
+
+        def failing(args: list[str]) -> Any:
+            if "<!-- evidence-verification -->" in " ".join(args):
+                self.log.append("evidence-comment:failed")
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 502")
+            return real(args)
+
+        self._capture = failing  # type: ignore[method-assign]
+        code, out = self.lane()
+        self.assertEqual(code, 0, out["blockers"])
+        self.assertEqual(
+            self.log,
+            ["pin", "evidence-comment:failed", f"enqueue:{HEAD}:merge_queue"],
+        )
+        self.assertEqual(
+            out["unattended"]["enqueue"]["evidenceComment"], "error: HTTP 502"
+        )
+
+    def test_the_pin_names_the_rung_the_lane_enqueued_under(self) -> None:
+        # The publisher credits a merge to its rung's cells, read
+        # from the pin. merge.rung C2 under c2-mechanical is rung C2; merge.rung
+        # C3 under c3-autonomous or full-autonomy is C3, and a C2 cap lowers it.
+        for config_rung, loop, cap, expected in (
+            ("C2", "c2-mechanical", "", "C2"),
+            ("C3", "c3-autonomous", "", "C3"),
+            ("C3", "full-autonomy", "", "C3"),
+            ("C3", "full-autonomy", "C2", "C2"),
+        ):
+            with self.subTest(config_rung=config_rung, loop=loop, cap=cap):
+                self.config = dataclasses.replace(
+                    self.config, rung=config_rung, loop_merge=loop
+                )
+                self.log, self.pin_lines = [], []
+                code, out = self.run_main(
+                    "--authority", "pr-merge", "--lane-kill-switch", "proceed",
+                    "--lane-rung-cap", cap,
+                )  # fmt: skip
+                self.assertEqual(code, 0, out["blockers"])
+                self.assertEqual(
+                    self.pin_lines,
+                    [f"<!-- babysit-merge-pin sha={HEAD} rung={expected} -->"],
+                )
 
     def test_a_human_do_not_merge_comment_holds_the_enqueue(self) -> None:
         self.comments = [
@@ -3681,6 +3831,53 @@ class ReasonsComment(Unattended):
             {"label": "added", "comment": "created"},
         )
 
+    def self_merging(self, listed: bool) -> None:
+        """The pull request's author App, listed or not as merging its own."""
+        self.pr_user = {**self.pr_user, "id": 337859524}
+        self.config = dataclasses.replace(
+            self.config, self_merging_apps=(337859524,) if listed else (5,)
+        )
+
+    def test_a_self_merging_author_gets_no_comment_or_label(self) -> None:
+        # The App merges its own pull request, so the reasons comment and its
+        # escalation are writes no one acts on; the score still holds.
+        body = self.body()
+        self.setUp()
+        self.earlier_sweep(body)
+        self.now = self.WRITTEN + timedelta(minutes=61)
+        self.lanes = PERSON_HELD
+        self.self_merging(listed=True)
+        code, out = self.run_main()
+        self.assert_no_merge(code)
+        self.assertNotEqual(out["unattended"]["risk"]["score"], "LOW")
+        self.assertEqual(self.log, [])
+        self.assertNotIn("riskComment", out["unattended"]["writes"])
+        self.assertNotIn("riskEscalation", out["unattended"]["writes"])
+
+    def test_an_unlisted_author_keeps_its_comment_and_label(self) -> None:
+        body = self.body()
+        self.setUp()
+        self.earlier_sweep(body)
+        self.now = self.WRITTEN + timedelta(minutes=61)
+        self.lanes = PERSON_HELD
+        self.self_merging(listed=False)
+        _, out = self.run_main()
+        self.assertEqual(self.log, ["risk-comment:POST", self.LABEL])
+        self.assertEqual(
+            out["unattended"]["writes"]["riskEscalation"],
+            {"label": "added", "comment": "created"},
+        )
+
+    def test_a_self_merging_author_gets_no_cleared_comment(self) -> None:
+        body = self.body()
+        self.setUp()
+        self.earlier_sweep(body)
+        self.self_merging(listed=True)
+        _, out = self.run_main()
+        self.assertEqual(out["unattended"]["risk"]["score"], "LOW")
+        self.assertEqual(self.comment_writes(), [])
+        self.assertNotIn("riskComment", out["unattended"]["writes"])
+
     def patched_body(self) -> str:
         """The body this run's PATCH of the reasons comment wrote."""
         patches = [
@@ -4816,14 +5013,8 @@ class LaneEvidenceReadToken(unittest.TestCase):
         if endpoint == f"{runs}/attempts/1":
             return {"id": self.RUN, "run_attempt": 1}
         if endpoint == f"{runs}/attempts/1/jobs?per_page=100":
-            suffixes = [s for _, s in merge.review_evidence.LANES.values()]
-            return [
-                {
-                    "jobs": [
-                        {"id": self.JOB, "name": f"pr-review / {n}"} for n in suffixes
-                    ]
-                }
-            ]
+            names = [jobs[0] for _, jobs in merge.review_evidence.LANES.values()]
+            return [{"jobs": [{"id": self.JOB, "name": n} for n in names]}]
         if endpoint.endswith(("/timeline?per_page=100", "/comments?per_page=100")):
             return [[]]
         if endpoint.endswith("/annotations?per_page=100"):
@@ -4937,7 +5128,7 @@ class LaneEvidenceReadTokenOutage(unittest.TestCase):
                     for i, lane in enumerate(merge.review_evidence.LANES)
                 ]
             ]
-        for lane, (path, suffix) in merge.review_evidence.LANES.items():
+        for lane, (path, names) in merge.review_evidence.LANES.items():
             run, job = self.ids[lane]
             done = {"status": "completed", "conclusion": "success", "head_sha": HEAD}
             if f"/actions/workflows/{path.rsplit('/', 1)[-1]}/" in endpoint:
@@ -4964,7 +5155,7 @@ class LaneEvidenceReadTokenOutage(unittest.TestCase):
                                 "id": job,
                                 "run_id": run,
                                 "run_attempt": 1,
-                                "name": f"pr-review / {suffix}",
+                                "name": names[0],
                                 "started_at": "2026-10-22T01:00:00Z",
                                 "completed_at": "2026-10-22T01:30:00Z",
                                 **done,
@@ -5509,6 +5700,62 @@ def setUpModule() -> None:
 
 def tearDownModule() -> None:
     _role_label.stop()
+
+
+class AnUnreadableVerdictKeepsAQueuedEntry(unittest.TestCase):
+    """The queued-entry sweep dequeues an entry its verdict holds, but keeps
+    a lanes App entry whose verdict it could not read (`QUEUE_READS`): the
+    merge queue's own reader refuses that fail-closed. Any other unreadable
+    entry still leaves, since the queue reads no verdict for it. Run
+    41496022715 dequeued #12432 and #12435 on an unreadable listing while
+    enable-auto-merge re-armed them on a pass."""
+
+    REPO = "owner/repo"
+
+    def test_only_a_read_hold_dequeues(self) -> None:
+        holds = {
+            5: "verify:fail",
+            6: merge.verify_evidence.QUEUE_READS,
+            8: None,
+            9: merge.verify_evidence.UNREADABLE,
+        }
+        reader = mock.Mock()
+        reader.queued_hold.side_effect = holds.get
+        dequeued: list[set[int] | None] = []
+        kept: list[str] = []
+        with (
+            mock.patch.object(
+                postmerge, "identity_queue", return_value=([5, 6, 8, 9], 0)
+            ),
+            mock.patch.object(
+                postmerge,
+                "dequeue_identity_entries",
+                side_effect=lambda *a, numbers, **k: dequeued.append(numbers) or 0,
+            ),
+            mock.patch.object(policy, "entry_hold", return_value=None),
+            mock.patch.object(
+                run_cache, "put", side_effect=lambda ns, key, at: kept.append(key)
+            ),
+        ):
+            out = merge.unattended_writes(
+                self.REPO,
+                7,
+                policy.UnattendedPolicy(
+                    "ineligible:x",
+                    "agent-lanes[bot]",
+                    {},
+                    inputs={
+                        "identity": "agent-lanes[bot]",
+                        "branch": "main",
+                        "verify_reader": reader,
+                    },
+                ),
+            )
+        self.assertEqual(
+            out["holds"], {5: "verify:fail", 9: merge.verify_evidence.UNREADABLE}
+        )
+        self.assertEqual(dequeued, [{5, 9}])
+        self.assertEqual([k.rsplit("|", 1)[1] for k in kept], ["8"])
 
 
 class DependabotMajorEscalation(unittest.TestCase):

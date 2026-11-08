@@ -548,6 +548,22 @@ class AffectedSet(AffectedBase):
         verdict = self.check()
         self.assertEqual(verdict.failures, ())
         self.assertEqual(self.remediate(verdict)["quarantine"]["issues"], [9001])
+        listings = [
+            a for c in self.gh.calls for a in c if a.startswith(f"repos/{REPO}/issues?")
+        ]
+        self.assertTrue(listings, "the check and the filer list quarantine issues")
+        self.assertTrue(
+            all("state=open" in a for a in listings),
+            f"only open quarantine issues count, so no closed one is listed: {listings}",
+        )
+
+    def test_an_open_quarantine_issue_takes_the_new_sighting(self) -> None:
+        self.quarantine_issue(FLAKY, "2026-10-12T09:00:00Z")
+        self.red_dispatch(bash_log((FLAKY, False)))
+        verdict = self.check()
+        self.assertEqual(verdict.failures, ())
+        report = self.remediate(verdict)["quarantine"]
+        self.assertEqual((report["issues"], report["comments"]), ([], [501]))
 
     def test_a_quarantine_issue_someone_else_opened_counts_for_nothing(self) -> None:
         # An outsider's expired issue would demote, and an open one would take
@@ -831,18 +847,18 @@ class LaneRerunOutsideAWindow(AffectedBase):
         )
 
     def test_a_red_just_inside_the_lookback_is_marked(self) -> None:
-        # The default lookback: confirm-wait-minutes (40) plus 50.
-        self.lane_red(bash_log((TOUCHED, False)), created_at=self.created(89))
+        # The default lookback: confirm-wait-minutes (55) plus 50.
+        self.lane_red(bash_log((TOUCHED, False)), created_at=self.created(104))
         self.assertEqual(self.lane_reruns(self.lane_check()), [(11, True)])
 
     def test_a_red_just_outside_the_lookback_gets_no_rerun(self) -> None:
-        self.lane_red(bash_log((TOUCHED, False)), created_at=self.created(91))
+        self.lane_red(bash_log((TOUCHED, False)), created_at=self.created(106))
         self.assertEqual(self.lane_reruns(self.lane_check()), [])
 
     def test_the_lookback_follows_a_raised_confirm_wait(self) -> None:
-        # At 45 the lookback is 95 minutes, so a 91-minute-old red is marked.
-        self.read_config.return_value.confirm_wait_minutes = 45
-        self.lane_red(bash_log((TOUCHED, False)), created_at=self.created(91))
+        # At 60 the lookback is 110 minutes, so a 106-minute-old red is marked.
+        self.read_config.return_value.confirm_wait_minutes = 60
+        self.lane_red(bash_log((TOUCHED, False)), created_at=self.created(106))
         self.assertEqual(self.lane_reruns(self.lane_check()), [(11, True)])
 
     def test_the_lookback_follows_a_lowered_confirm_wait(self) -> None:
@@ -1140,19 +1156,19 @@ class ConfirmWaitConfig(unittest.TestCase):
             file_at=lambda path, sha: text if path == policy.CONFIG_PATH else None,
         )
 
-    def test_confirm_wait_minutes_is_read_and_defaults_to_40(self) -> None:
+    def test_confirm_wait_minutes_is_read_and_defaults_to_55(self) -> None:
         base = "version: 2\nmerge:\n  rung: C2\n"
         read = lambda line: self.config(f"{base}red-main:\n{line}")  # noqa: E731
         self.assertEqual(read("  confirm-wait-minutes: 0\n").confirm_wait_minutes, 0)
-        self.assertEqual(read("  confirm-wait-minutes: 45\n").confirm_wait_minutes, 45)
-        self.assertEqual(self.config(base).confirm_wait_minutes, 40)
-        for bad in ("46", "x", "-1", "07", "4000000"):
+        self.assertEqual(read("  confirm-wait-minutes: 60\n").confirm_wait_minutes, 60)
+        self.assertEqual(self.config(base).confirm_wait_minutes, 55)
+        for bad in ("61", "x", "-1", "07", "4000000"):
             with self.subTest(bad):
                 config = read(f"  confirm-wait-minutes: {bad}\n")
-                self.assertEqual(config.confirm_wait_minutes, 40)
+                self.assertEqual(config.confirm_wait_minutes, 55)
                 self.assertTrue(any("confirm-wait-minutes" in n for n in config.notes))
 
-    def test_the_tracked_config_gives_a_90_minute_lane_rerun_lookback(
+    def test_the_tracked_config_gives_a_105_minute_lane_rerun_lookback(
         self,
     ) -> None:
         root = pathlib.Path(__file__).resolve().parents[6]
@@ -1161,7 +1177,7 @@ class ConfirmWaitConfig(unittest.TestCase):
         with mock.patch.object(
             pm.policy, "read_config_at", return_value=self.config(text)
         ):
-            self.assertEqual(ctx.lane_rerun_lookback(), timedelta(minutes=90))
+            self.assertEqual(ctx.lane_rerun_lookback(), timedelta(minutes=105))
 
 
 if __name__ == "__main__":
