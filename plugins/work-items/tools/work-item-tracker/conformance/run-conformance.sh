@@ -75,11 +75,11 @@ CB_REPO=""
 # shellcheck source=/dev/null
 source "$BINDING_FILE_SH"
 cb_setup
-# Re-home the binding into a run-private dir: the overlay lands BESIDE it under a fixed
-# name, so two runs sharing $TMPDIR would clobber each other's overlay.
+# Re-home the binding into a run-private dir: the personal override lands BESIDE it under
+# a fixed name, so two runs sharing $TMPDIR would clobber each other's personal override.
 BINDING_DIR="$(mktemp -d)"
-cp "$WORK_ITEM_TRACKER_BINDING" "$BINDING_DIR/.work-item-tracker.json"
-export WORK_ITEM_TRACKER_BINDING="$BINDING_DIR/.work-item-tracker.json"
+cp "$WORK_ITEM_TRACKER_BINDING" "$BINDING_DIR/binding.json"
+export WORK_ITEM_TRACKER_BINDING="$BINDING_DIR/binding.json"
 trap 'cb_teardown; rm -rf "$BINDING_DIR"' EXIT
 
 repo_args=()
@@ -135,17 +135,18 @@ wit_case "unknown verb → usage" 2 definitely-not-a-verb
 WIT_OUT="$(WORK_ITEM_TRACKER_BINDING="/nonexistent-$$.json" bash "$TRACKER" capabilities 2>/dev/null)"
 assert_eq "missing binding → exit 3" "3" "$?"
 
-# --- binding overlay (CONTRACT.md "Setup (binding file)") ---
-# Seam-level overlay behavior through the CLI; merge semantics are unit-tested in
-# lib/binding.test.sh. A non-allowlisted key exits 3; removing the overlay restores the team view.
-OVERLAY_PATH="$BINDING_DIR/.work-item-tracker.local.json"
-printf '%s\n' '{"config":{"lease_ttl_hours":1}}' >"$OVERLAY_PATH"
-wit_case "allowlisted overlay key merges; verbs still dispatch" 0 capabilities
-printf '%s\n' '{"provider":"someone-elses-provider"}' >"$OVERLAY_PATH"
+# --- binding personal override (CONTRACT.md "Setup (binding file)") ---
+# Seam-level personal override behavior through the CLI; merge semantics are unit-tested in
+# lib/binding.test.sh. A non-allowlisted key exits 3; removing the personal override restores
+# the team view.
+OVERRIDE_PATH="$(wit_override_path "$WORK_ITEM_TRACKER_BINDING")"
+printf '%s\n' '{"config":{"lease_ttl_hours":1}}' >"$OVERRIDE_PATH"
+wit_case "allowlisted personal override key merges; verbs still dispatch" 0 capabilities
+printf '%s\n' '{"provider":"someone-elses-provider"}' >"$OVERRIDE_PATH"
 WIT_OUT="$(bash "$TRACKER" capabilities 2>/dev/null)"
-assert_eq "non-overlayable overlay key → exit 3" "3" "$?"
-rm -f "$OVERLAY_PATH"
-wit_case "overlay removal restores the team binding" 0 capabilities
+assert_eq "non-overridable personal override key → exit 3" "3" "$?"
+rm -f "$OVERRIDE_PATH"
+wit_case "personal override removal restores the team binding" 0 capabilities
 
 # --- contract-version handshake (CONTRACT.md "Contract-version handshake") ---
 # Skew is asserted against a synthetic shadow of the SAME provider via WIT_ADAPTERS_DIR:
@@ -203,12 +204,31 @@ wit_case_if_unsupported reclaim "$FAKE_ID"
 wit_case_if_unsupported link-blocks "$FAKE_ID" --blocked-by "$FAKE_ID"
 wit_case_if_unsupported add-sub-item "$FAKE_ID" --parent "$FAKE_ID"
 wit_case_if_unsupported label-provenance "$FAKE_ID" --label agent-ready
+wit_case_if_unsupported set-fields "$FAKE_ID" --field 1=2
+wit_case_if_unsupported get-field-options --field Size
+wit_case_if_unsupported get-statuses --field "Work status" "$FAKE_ID"
+wit_case_if_unsupported add-recurrence "$FAKE_ID" --source-link https://example.com/1 --note seen
 if ! verb_supported list-items; then
   wit_case "unsupported list-items gates list-frontier → exit 6" 6 list-frontier
 fi
 if ! verb_supported list-sub-items; then
   wit_case "unsupported list-sub-items → exit 6" 6 list-sub-items "$FAKE_ID"
   wit_case "unsupported list-sub-items gates list-frontier --parent → exit 6" 6 list-frontier --parent "$FAKE_ID"
+fi
+
+# --- status-storage (core-derived: answers on every adapter) ---
+
+wit_case "status-storage" 0 status-storage "${repo_args[@]+"${repo_args[@]}"}"
+assert_schema_version "status-storage"
+assert_eq "status-storage names field or labels" "ok" "$(jq -r 'if (.storage == "field" and .field == "Work status")
+  or (.storage == "labels" and .field == null) then "ok" else "bad" end' <<<"$WIT_OUT")"
+if ! verb_supported get-field-options; then
+  assert_eq "status-storage without get-field-options → labels" "labels" "$(jq -r '.storage' <<<"$WIT_OUT")"
+else
+  wit_case "get-field-options absent field" 0 get-field-options --field "conformance-absent-field" "${repo_args[@]+"${repo_args[@]}"}"
+  assert_schema_version "get-field-options"
+  assert_eq "get-field-options absent field → null field_id, empty options" "null|[]" \
+    "$(jq -r '"\(.field_id)|\(.options | tojson)"' <<<"$WIT_OUT")"
 fi
 
 # --- create-item ---
@@ -318,6 +338,14 @@ if verb_supported list-items && [[ -n "$ITEM_A_ID" && -n "$ITEM_B_ID" ]]; then
   assert_contains "frontier holds unblocked A" "$frontier_ids" "$ITEM_A_ID"
   assert_not_contains "frontier drops blocked B" "$frontier_ids" "$ITEM_B_ID"
 
+  # Under field storage each candidate carries its Work status, a name or null; under
+  # labels none does. A freshly created A carries no hold either way.
+  wit_case "list-frontier --autonomous" 0 list-frontier --autonomous "${repo_args[@]+"${repo_args[@]}"}"
+  assert_schema_version "list-frontier --autonomous"
+  assert_contains "autonomous frontier holds unblocked A" "$(jq -c '[.items[].id]' <<<"$WIT_OUT")" "$ITEM_A_ID"
+  assert_eq "autonomous frontier statuses are names or null" "true" \
+    "$(jq '[.items[] | select(has("status")) | .status | (type == "string" or type == "null")] | all' <<<"$WIT_OUT")"
+
   wit_case "list-items" 0 list-items "${repo_args[@]+"${repo_args[@]}"}"
   assert_schema_version "list-items"
   assert_truncated_flag "list-items"
@@ -325,6 +353,8 @@ if verb_supported list-items && [[ -n "$ITEM_A_ID" && -n "$ITEM_B_ID" ]]; then
   assert_eq "list-items rows carry created_at as a UTC timestamp or null" "true" \
     "$(jq '[.items[] | has("created_at") and (.created_at == null
       or (.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")))] | all' <<<"$WIT_OUT")"
+  assert_eq "list-items rows carry milestone as a name or null" "true" \
+    "$(jq '[.items[] | .milestone == null or (.milestone | type == "string" and length > 0)] | all' <<<"$WIT_OUT")"
   wit_case "list-items --label nobody carries" 0 list-items --label "$RUN_TAG-absent" "${repo_args[@]+"${repo_args[@]}"}"
   assert_truncated_flag "list-items --label"
   assert_eq "list-items --label nobody carries holds no items" "0" "$(jq '.items | length' <<<"$WIT_OUT")"

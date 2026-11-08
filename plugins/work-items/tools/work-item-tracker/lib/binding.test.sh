@@ -166,24 +166,56 @@ assert_rejected "numeric container_label rejected" '{"schema_version":"1.0","pro
 assert_rejected "boolean container_label rejected" '{"schema_version":"1.0","provider":"github","config":{"lease_ttl_hours":24,"container_label":true}}'
 assert_rejected "object container_label rejected" '{"schema_version":"1.0","provider":"github","config":{"lease_ttl_hours":24,"container_label":{"a":1}}}'
 
-# --- overlay: .work-item-tracker.local.json beside the binding, allowlist-only ---
+# --- hold lists, wayfind prefix and the owner-decision role: defaults and remaps ---
 
-OROOT="$TEST_TMPDIR/overlay-repo"
+write_binding "$BINDING" '{"schema_version":"1.0","provider":"github","config":{"lease_ttl_hours":24}}'
+wit_read_binding "$BINDING"
+assert_eq "owner-decision label defaults when unset" "status: needs-decision" "$WIT_OWNER_DECISION_LABEL"
+assert_eq "hold labels default when unset" '["status: needs-decision","status: needs-info","needs-spec"]' "$WIT_HOLD_LABELS_JSON"
+assert_eq "hold states default when unset" '["needs-human","needs-owner-decision","needs-reporter-info","needs-spec"]' "$WIT_HOLD_STATES_JSON"
+assert_eq "hold-state labels default when unset" '["needs-human","status: needs-decision","needs-owner-decision","status: needs-info","needs-spec"]' "$WIT_HOLD_STATE_LABELS_JSON"
+assert_eq "wayfind prefix defaults when unset" "wayfind:" "$WIT_WAYFIND_PREFIX"
+
+write_binding "$BINDING" '{"schema_version":"1.0","provider":"github","config":{"lease_ttl_hours":24,"role_labels":{"owner-decision":"needs-owner-decision"}}}'
+wit_read_binding "$BINDING"
+assert_eq "an owner-decision remap reaches the hold label defaults" '["needs-owner-decision","status: needs-info","needs-spec"]' "$WIT_HOLD_LABELS_JSON"
+assert_eq "an owner-decision remap reaches the hold-state label defaults" '["needs-human","needs-owner-decision","needs-owner-decision","status: needs-info","needs-spec"]' "$WIT_HOLD_STATE_LABELS_JSON"
+
+write_binding "$BINDING" '{"schema_version":"1.0","provider":"github","config":{"lease_ttl_hours":24,"hold_labels":["on hold"],"hold_states":["parked"],"hold_state_labels":["parked"],"wayfind_label_prefix":"map:"}}'
+wit_read_binding "$BINDING"
+assert_eq "hold labels honor configured list" '["on hold"]' "$WIT_HOLD_LABELS_JSON"
+assert_eq "hold states honor configured list" '["parked"]' "$WIT_HOLD_STATES_JSON"
+assert_eq "hold-state labels honor configured list" '["parked"]' "$WIT_HOLD_STATE_LABELS_JSON"
+assert_eq "wayfind prefix honors configured value" "map:" "$WIT_WAYFIND_PREFIX"
+
+write_binding "$BINDING" '{"schema_version":"1.0","provider":"github","config":{"lease_ttl_hours":24,"hold_states":[],"wayfind_label_prefix":""}}'
+wit_read_binding "$BINDING"
+assert_eq "an empty hold-state list keeps the default" '["needs-human","needs-owner-decision","needs-reporter-info","needs-spec"]' "$WIT_HOLD_STATES_JSON"
+assert_eq "an empty wayfind prefix keeps the default" "wayfind:" "$WIT_WAYFIND_PREFIX"
+
+assert_rejected "scalar hold_labels rejected" '{"schema_version":"1.0","provider":"github","config":{"lease_ttl_hours":24,"hold_labels":"on hold"}}'
+assert_rejected "hold_states with an empty entry rejected" '{"schema_version":"1.0","provider":"github","config":{"lease_ttl_hours":24,"hold_states":["parked",""]}}'
+assert_rejected "hold_state_labels with a numeric entry rejected" '{"schema_version":"1.0","provider":"github","config":{"lease_ttl_hours":24,"hold_state_labels":[5]}}'
+assert_rejected "non-string wayfind_label_prefix rejected" '{"schema_version":"1.0","provider":"github","config":{"lease_ttl_hours":24,"wayfind_label_prefix":["map:"]}}'
+
+# --- personal override: .work-item-tracker.local.json beside the binding, allowlist-only ---
+
+OROOT="$TEST_TMPDIR/override-repo"
 mkdir -p "$OROOT"
 OBINDING="$OROOT/.work-item-tracker.json"
-OVERLAY="$OROOT/.work-item-tracker.local.json"
+PERSONAL_OVERRIDE="$OROOT/.work-item-tracker.local.json"
 
-# Overlay cases write the overlay and re-read the team binding through it. A
+# Personal override cases write the personal override and re-read the team binding through it. A
 # rejection prints a diagnostic these cases do not assert, so stderr is muted.
-assert_overlay_accepted() {
+assert_override_accepted() {
   local label="$1" content="$2"
-  write_binding "$OVERLAY" "$content"
+  write_binding "$PERSONAL_OVERRIDE" "$content"
   assert_succeeds "$label" "success" "failure" wit_read_binding "$OBINDING"
 }
 
-assert_overlay_rejected() {
+assert_override_rejected() {
   local label="$1" content="$2"
-  write_binding "$OVERLAY" "$content"
+  write_binding "$PERSONAL_OVERRIDE" "$content"
   if wit_read_binding "$OBINDING" 2>/dev/null; then
     fail "$label" "failure" "success"
   else
@@ -192,91 +224,278 @@ assert_overlay_rejected() {
 }
 
 write_binding "$OBINDING" "$VALID"
-write_binding "$OVERLAY" '{"config":{"lease_ttl_hours":2,"lease_ttl_minutes":30}}'
+write_binding "$PERSONAL_OVERRIDE" '{"config":{"lease_ttl_hours":2,"lease_ttl_minutes":30}}'
 if wit_read_binding "$OBINDING"; then
-  pass "overlay-merged binding accepted"
-  assert_eq "overlay lease_ttl_hours wins" "2" "$WIT_LEASE_TTL_HOURS"
-  assert_eq "overlay lease_ttl_minutes wins" "30" "$WIT_LEASE_TTL_MINUTES"
+  pass "override-merged binding accepted"
+  assert_eq "personal override lease_ttl_hours wins" "2" "$WIT_LEASE_TTL_HOURS"
+  assert_eq "personal override lease_ttl_minutes wins" "30" "$WIT_LEASE_TTL_MINUTES"
   assert_eq "team provider survives the merge" "github" "$WIT_PROVIDER"
 else
-  fail "overlay-merged binding accepted" "success" "failure"
+  fail "override-merged binding accepted" "success" "failure"
 fi
 
-# Keys the overlay does not mention keep their team values (per-key, never wholesale).
-write_binding "$OVERLAY" '{"config":{"lease_ttl_minutes":45}}'
+# Keys the personal override does not mention keep their team values (per-key, never wholesale).
+write_binding "$PERSONAL_OVERRIDE" '{"config":{"lease_ttl_minutes":45}}'
 wit_read_binding "$OBINDING"
 assert_eq "unmentioned team key keeps its value" "24" "$WIT_LEASE_TTL_HOURS"
-assert_eq "mentioned overlay key wins" "45" "$WIT_LEASE_TTL_MINUTES"
+assert_eq "mentioned personal override key wins" "45" "$WIT_LEASE_TTL_MINUTES"
 
-# jira auth identity is per-account and overlayable; site/project_keys are not.
+# jira auth identity is per-account and overridable; site/project_keys are not.
 write_binding "$OBINDING" '{"schema_version":"1.0","provider":"jira","config":{"lease_ttl_hours":24,"jira":{"site":"a.atlassian.net","project_keys":["AB"],"auth_email":"team@example.com","auth_env":"TEAM_TOKEN"}}}'
-write_binding "$OVERLAY" '{"config":{"jira":{"auth_email":"me@example.com","auth_env":"MY_TOKEN"}}}'
+write_binding "$PERSONAL_OVERRIDE" '{"config":{"jira":{"auth_email":"me@example.com","auth_env":"MY_TOKEN"}}}'
 EJ="$(wit_effective_binding_json "$OBINDING")"
-assert_eq "overlay jira auth_email wins" "me@example.com" "$(jq -r '.config.jira.auth_email' <<<"$EJ")"
-assert_eq "overlay jira auth_env wins" "MY_TOKEN" "$(jq -r '.config.jira.auth_env' <<<"$EJ")"
+assert_eq "personal override jira auth_email wins" "me@example.com" "$(jq -r '.config.jira.auth_email' <<<"$EJ")"
+assert_eq "personal override jira auth_env wins" "MY_TOKEN" "$(jq -r '.config.jira.auth_env' <<<"$EJ")"
 assert_eq "team jira site survives the merge" "a.atlassian.net" "$(jq -r '.config.jira.site' <<<"$EJ")"
 
 # The optional self-describing docs pointer is allowed in either layer.
-assert_overlay_accepted "docs key allowed in the overlay" '{"docs":"see CONTRACT.md"}'
+assert_override_accepted "docs key allowed in the personal override" '{"docs":"see CONTRACT.md"}'
 
 # Empty scaffolding on an allowlisted prefix is inert, not an error.
-assert_overlay_accepted "empty overlay scaffolding is inert" '{"config":{}}'
-assert_overlay_accepted "empty jira scaffolding is inert" '{"config":{"jira":{}}}'
+assert_override_accepted "empty personal override scaffolding is inert" '{"config":{}}'
+assert_override_accepted "empty jira scaffolding is inert" '{"config":{"jira":{}}}'
 
 # An explicitly null allowlisted value MERGES (presence, not non-null) and is
 # judged by normal binding validation — never a silent fallback to team values.
-write_binding "$OVERLAY" '{"config":{"jira":{"auth_email":null}}}'
+write_binding "$PERSONAL_OVERRIDE" '{"config":{"jira":{"auth_email":null}}}'
 EJ="$(wit_effective_binding_json "$OBINDING")"
-assert_eq "explicit null overlay value merges as null" "null" "$(jq -c '.config.jira.auth_email' <<<"$EJ")"
-write_binding "$OVERLAY" '{"config":{"lease_ttl_hours":null}}'
+assert_eq "explicit null personal override value merges as null" "null" "$(jq -c '.config.jira.auth_email' <<<"$EJ")"
+write_binding "$PERSONAL_OVERRIDE" '{"config":{"lease_ttl_hours":null}}'
 if wit_read_binding "$OBINDING" 2>/dev/null; then
-  fail "null lease_ttl_hours overlay fails binding validation" "failure" "success"
+  fail "null lease_ttl_hours personal override fails binding validation" "failure" "success"
 else
-  pass "null lease_ttl_hours overlay fails binding validation"
+  pass "null lease_ttl_hours personal override fails binding validation"
 fi
 
 # Deny-by-default: any key outside the allowlist is a configuration error, not a merge.
-assert_overlay_rejected "overlay provider override rejected" '{"provider":"local-markdown"}'
-assert_overlay_rejected "overlay role_labels rejected" '{"config":{"role_labels":{"human-gated":"x"}}}'
-assert_overlay_rejected "overlay container_label rejected" '{"config":{"container_label":"my-map"}}'
-assert_overlay_rejected "overlay storage_dir rejected" '{"config":{"storage_dir":"/tmp/x"}}'
-assert_overlay_rejected "overlay jira site rejected" '{"config":{"jira":{"site":"evil.example.com"}}}'
-assert_overlay_rejected "overlay jira project_keys rejected" '{"config":{"jira":{"project_keys":["ZZ"]}}}'
-assert_overlay_rejected "wrong-typed intermediate rejected" '{"config":5}'
-assert_overlay_rejected "non-JSON overlay rejected" 'not json'
+assert_override_rejected "personal override provider rejected" '{"provider":"local-markdown"}'
+assert_override_rejected "personal override role_labels rejected" '{"config":{"role_labels":{"human-gated":"x"}}}'
+assert_override_rejected "personal override container_label rejected" '{"config":{"container_label":"my-map"}}'
+assert_override_rejected "personal override storage_dir rejected" '{"config":{"storage_dir":"/tmp/x"}}'
+assert_override_rejected "personal override jira site rejected" '{"config":{"jira":{"site":"evil.example.com"}}}'
+assert_override_rejected "personal override jira project_keys rejected" '{"config":{"jira":{"project_keys":["ZZ"]}}}'
+assert_override_rejected "wrong-typed intermediate rejected" '{"config":5}'
+assert_override_rejected "non-JSON personal override rejected" 'not json'
 # Empty-object values cannot smuggle a non-allowlisted key past the leaf check.
-assert_overlay_rejected "empty-object provider rejected" '{"provider":{}}'
-assert_overlay_rejected "empty-object unknown key rejected" '{"evil":{}}'
-assert_overlay_rejected "empty-object role_labels rejected" '{"config":{"role_labels":{}}}'
+assert_override_rejected "empty-object provider rejected" '{"provider":{}}'
+assert_override_rejected "empty-object unknown key rejected" '{"evil":{}}'
+assert_override_rejected "empty-object role_labels rejected" '{"config":{"role_labels":{}}}'
 # A null at a non-leaf allowlisted prefix is a leaf, not scaffolding.
-assert_overlay_rejected "null jira subtree rejected" '{"config":{"jira":null}}'
+assert_override_rejected "null jira subtree rejected" '{"config":{"jira":null}}'
 # An allowlisted key must hold a scalar: an object or array there is rejected at
 # load with the key named, never a silent fallback to the team value.
-assert_overlay_rejected "object-valued allowlisted key rejected" '{"config":{"jira":{"auth_email":{}}}}'
-assert_overlay_rejected "populated object at allowlisted key rejected" '{"config":{"jira":{"auth_email":{"x":1}}}}'
-assert_overlay_rejected "array-valued allowlisted key rejected" '{"config":{"lease_ttl_hours":[]}}'
+assert_override_rejected "object-valued allowlisted key rejected" '{"config":{"jira":{"auth_email":{}}}}'
+assert_override_rejected "populated object at allowlisted key rejected" '{"config":{"jira":{"auth_email":{"x":1}}}}'
+assert_override_rejected "array-valued allowlisted key rejected" '{"config":{"lease_ttl_hours":[]}}'
 
 # linear and gitea auth identity is per-account for the same reason jira's is:
 # both adapters read the credential's env-var NAME from the merged view.
 write_binding "$OBINDING" '{"schema_version":"1.0","provider":"linear","config":{"lease_ttl_hours":24,"linear":{"team_keys":["ENG"],"auth_env":"TEAM_LINEAR_TOKEN"}}}'
-write_binding "$OVERLAY" '{"config":{"linear":{"auth_env":"MY_LINEAR_TOKEN"}}}'
+write_binding "$PERSONAL_OVERRIDE" '{"config":{"linear":{"auth_env":"MY_LINEAR_TOKEN"}}}'
 EL="$(wit_effective_binding_json "$OBINDING")"
-assert_eq "overlay linear auth_env wins" "MY_LINEAR_TOKEN" "$(jq -r '.config.linear.auth_env' <<<"$EL")"
+assert_eq "personal override linear auth_env wins" "MY_LINEAR_TOKEN" "$(jq -r '.config.linear.auth_env' <<<"$EL")"
 assert_eq "team linear team_keys survive the merge" "ENG" "$(jq -r '.config.linear.team_keys[0]' <<<"$EL")"
 
 write_binding "$OBINDING" '{"schema_version":"1.0","provider":"gitea","config":{"lease_ttl_hours":24,"gitea":{"base_url":"https://git.example.com","repo":"o/r","auth_env":"TEAM_GITEA_TOKEN"}}}'
-write_binding "$OVERLAY" '{"config":{"gitea":{"auth_env":"MY_GITEA_TOKEN"}}}'
+write_binding "$PERSONAL_OVERRIDE" '{"config":{"gitea":{"auth_env":"MY_GITEA_TOKEN"}}}'
 EG="$(wit_effective_binding_json "$OBINDING")"
-assert_eq "overlay gitea auth_env wins" "MY_GITEA_TOKEN" "$(jq -r '.config.gitea.auth_env' <<<"$EG")"
+assert_eq "personal override gitea auth_env wins" "MY_GITEA_TOKEN" "$(jq -r '.config.gitea.auth_env' <<<"$EG")"
 assert_eq "team gitea repo survives the merge" "o/r" "$(jq -r '.config.gitea.repo' <<<"$EG")"
 
 # Widening auth_env must not widen the rest of either subtree: everything else
 # under linear/gitea is shared coordination state, exactly as jira's site is.
-assert_overlay_rejected "overlay linear team_keys rejected" '{"config":{"linear":{"team_keys":["X"]}}}'
-assert_overlay_rejected "overlay gitea repo rejected" '{"config":{"gitea":{"repo":"other/repo"}}}'
-assert_overlay_rejected "object-valued linear auth_env rejected" '{"config":{"linear":{"auth_env":{}}}}'
-assert_overlay_rejected "object-valued gitea auth_env rejected" '{"config":{"gitea":{"auth_env":{}}}}'
+assert_override_rejected "personal override linear team_keys rejected" '{"config":{"linear":{"team_keys":["X"]}}}'
+assert_override_rejected "personal override gitea repo rejected" '{"config":{"gitea":{"repo":"other/repo"}}}'
+assert_override_rejected "object-valued linear auth_env rejected" '{"config":{"linear":{"auth_env":{}}}}'
+assert_override_rejected "object-valued gitea auth_env rejected" '{"config":{"gitea":{"auth_env":{}}}}'
 
-rm -f "$OVERLAY"
+rm -f "$PERSONAL_OVERRIDE"
+
+# --- convention home: the `tracker` mapping of <home>/work-items.yaml ---
+
+# yaml_repo <name>: a git repository with the default home, echoed.
+yaml_repo() {
+  local dir="$TEST_TMPDIR/$1"
+  mkdir -p "$dir/docs/conventions" "$dir/deep"
+  git init -q "$dir"
+  printf '%s\n' "$dir"
+}
+
+YAML_BINDING='ai_disclaimer: false
+tracker:
+  schema_version: "1.0"
+  provider: github
+  config:
+    lease_ttl_hours: 12
+    role_labels:
+      human-gated: hold'
+
+YREPO="$(yaml_repo yaml-repo)"
+write_binding "$YREPO/docs/conventions/work-items.yaml" "$YAML_BINDING"
+write_binding "$YREPO/.work-item-tracker.json" '{"schema_version":"1.0","provider":"local-markdown","config":{"lease_ttl_hours":1,"storage_dir":"x"}}'
+OUT="$(cd "$YREPO/deep" && unset WORK_ITEM_TRACKER_BINDING CLAUDE_PROJECT_DIR && wit_find_binding)"
+assert_eq "YAML binding in the default home wins over the legacy JSON" "$YREPO/docs/conventions/work-items.yaml" "$OUT"
+if wit_read_binding "$OUT" 2>"$TEST_TMPDIR/yaml.err"; then
+  pass "YAML binding accepted"
+  assert_eq "YAML provider exported" "github" "$WIT_PROVIDER"
+  assert_eq "YAML lease_ttl_hours exported" "12" "$WIT_LEASE_TTL_HOURS"
+  assert_eq "YAML role label remap exported" "hold" "$WIT_HUMAN_GATED_LABEL"
+else
+  fail "YAML binding accepted" "success" "failure"
+fi
+assert_not_contains "YAML binding prints no legacy notice" "$(<"$TEST_TMPDIR/yaml.err")" "notice"
+
+# Scalars stay strings and sequences become arrays: a jira resolution id is a
+# digit string the adapter requires as a string.
+write_binding "$TEST_TMPDIR/ids.yaml" 'tracker:
+  config:
+    jira:
+      resolutions:
+        completed: ["10000"]
+        wont_do:
+          - 10001'
+assert_eq "YAML scalars stay strings inside arrays" '{"completed":["10000"],"wont_do":["10001"]}' \
+  "$(wit_yaml_binding_json "$TEST_TMPDIR/ids.yaml" | jq -c '.config.jira.resolutions')"
+
+# An empty flow sequence stays [], as the legacy JSON writes it, where the parser
+# alone prints nothing: jira tells a present empty done_category_keys (a config
+# error) from an absent one (the default) by presence, and requires both resolutions
+# keys. A `[]` inside a quoted scalar or a comment is text, and a key with no value
+# reads as absent.
+write_binding "$TEST_TMPDIR/empty.yaml" 'tracker:
+  config:
+    jira:
+      site: a.atlassian.net # not a list: []
+      blocked_by_link_type: "[]"
+      auth_email:
+      done_category_keys: []
+      resolutions:
+        completed: ["10000"]
+        wont_do: [ ]  # none yet'
+assert_eq "an empty YAML flow sequence stays [], as in the legacy JSON" \
+  '{"site":"a.atlassian.net","blocked_by_link_type":"[]","done_category_keys":[],"resolutions":{"completed":["10000"],"wont_do":[]}}' \
+  "$(wit_yaml_binding_json "$TEST_TMPDIR/empty.yaml" | jq -c '.config.jira')"
+printf 'tracker:\r\n  config:\r\n    jira:\r\n      done_category_keys: []\r\n' >"$TEST_TMPDIR/crlf.yaml"
+assert_eq "an empty flow sequence on a CRLF line stays []" '[]' \
+  "$(wit_yaml_binding_json "$TEST_TMPDIR/crlf.yaml" | jq -c '.config.jira.done_category_keys')"
+write_binding "$TEST_TMPDIR/dup.yaml" 'tracker:
+  config:
+    jira:
+      done_category_keys: []
+      done_category_keys: ["done"]'
+ERR="$(wit_yaml_binding_json "$TEST_TMPDIR/dup.yaml" 2>&1 >/dev/null)"
+assert_contains "a parse error after an empty flow sequence names the file's own line" "$ERR" "$TEST_TMPDIR/dup.yaml: line 5"
+
+# The pointer region binds a home other than the default.
+PREPO="$(yaml_repo pointer-repo)"
+mkdir -p "$PREPO/team/conf"
+# shellcheck disable=SC2016 # the backticks are the pointer grammar, not a command substitution
+printf '%s\n' '<!-- BEGIN GENERATED: convention-home -->' 'Conventions live in `team/conf`.' '<!-- END GENERATED: convention-home -->' >"$PREPO/AGENTS.md"
+write_binding "$PREPO/team/conf/work-items.yaml" "$YAML_BINDING"
+OUT="$(unset WORK_ITEM_TRACKER_BINDING && CLAUDE_PROJECT_DIR="$PREPO" wit_find_binding)"
+assert_eq "YAML binding read from the home the pointer region binds" "$PREPO/team/conf/work-items.yaml" "$OUT"
+
+# A relative storage_dir in a YAML binding roots at the project root, not the home.
+write_binding "$PREPO/team/conf/work-items.yaml" 'tracker:
+  schema_version: "1.0"
+  provider: local-markdown
+  config:
+    lease_ttl_hours: 24
+    storage_dir: .work-items'
+OUT="$(CLAUDE_PROJECT_DIR="$PREPO" && export CLAUDE_PROJECT_DIR && wit_read_binding "$PREPO/team/conf/work-items.yaml" && printf '%s\n' "$WIT_STORAGE_DIR")"
+assert_eq "YAML relative storage_dir roots at the project root" "$PREPO/.work-items" "$OUT"
+
+# --- YAML plus the personal override work-items.local.yaml ---
+
+YOVERRIDE="$YREPO/docs/conventions/work-items.local.yaml"
+write_binding "$YOVERRIDE" 'tracker:
+  config:
+    lease_ttl_hours: 2'
+if wit_read_binding "$YREPO/docs/conventions/work-items.yaml" 2>/dev/null; then
+  assert_eq "YAML personal override lease_ttl_hours wins" "2" "$WIT_LEASE_TTL_HOURS"
+  assert_eq "team YAML provider survives the personal override" "github" "$WIT_PROVIDER"
+else
+  fail "YAML plus personal override accepted" "success" "failure"
+fi
+write_binding "$YOVERRIDE" 'tracker:
+  config:
+    lease_ttl_hours: later'
+ERR="$(wit_read_binding "$YREPO/docs/conventions/work-items.yaml" 2>&1 >/dev/null)"
+assert_contains "an invalid personal override value names the personal override file" "$ERR" "$YOVERRIDE: invalid tracker.config.lease_ttl_hours: later"
+write_binding "$YOVERRIDE" 'tracker:
+  provider: local-markdown'
+assert_fails "YAML personal override provider rejected" "failure" "success" \
+  wit_read_binding "$YREPO/docs/conventions/work-items.yaml"
+write_binding "$YOVERRIDE" 'ai_disclaimer: true'
+assert_succeeds "YAML personal override with no tracker key is inert" "success" "failure" \
+  wit_read_binding "$YREPO/docs/conventions/work-items.yaml"
+rm -f "$YOVERRIDE"
+
+# --- legacy JSON fallback, with a one-line notice, when the YAML has no binding ---
+
+JREPO="$(yaml_repo json-fallback-repo)"
+write_binding "$JREPO/docs/conventions/work-items.yaml" 'ai_disclaimer: false'
+write_binding "$JREPO/.work-item-tracker.json" "$VALID"
+OUT="$(unset WORK_ITEM_TRACKER_BINDING && CLAUDE_PROJECT_DIR="$JREPO" wit_find_binding)"
+assert_eq "legacy JSON read when the YAML has no tracker key" "$JREPO/.work-item-tracker.json" "$OUT"
+ERR="$(unset WORK_ITEM_TRACKER_BINDING && wit_read_binding "$OUT" 2>&1 >/dev/null)"
+assert_contains "legacy JSON read prints a notice" "$ERR" "notice: read the legacy binding $JREPO/.work-item-tracker.json"
+assert_eq "the notice is one line" "1" "$(printf '%s\n' "$ERR" | wc -l | tr -d ' ')"
+
+# --- neither: no YAML binding and no legacy JSON → no binding (the caller stops) ---
+
+NREPO="$(yaml_repo neither-repo)"
+write_binding "$NREPO/docs/conventions/work-items.yaml" 'ai_disclaimer: false'
+if (unset WORK_ITEM_TRACKER_BINDING && CLAUDE_PROJECT_DIR="$NREPO" wit_find_binding >/dev/null); then
+  fail "neither YAML nor JSON binding → discovery fails" "failure" "success"
+else
+  pass "neither YAML nor JSON binding → discovery fails"
+fi
+
+# --- no home applies: a root outside a git work tree reads only the legacy JSON ---
+
+LOOSE="$TEST_TMPDIR/loose-folder"
+mkdir -p "$LOOSE/docs/conventions"
+write_binding "$LOOSE/docs/conventions/work-items.yaml" "$YAML_BINDING"
+if (unset WORK_ITEM_TRACKER_BINDING && CLAUDE_PROJECT_DIR="$LOOSE" wit_find_binding >/dev/null); then
+  fail "a non-git root never reads <home>/work-items.yaml" "failure" "success"
+else
+  pass "a non-git root never reads <home>/work-items.yaml"
+fi
+write_binding "$LOOSE/.work-item-tracker.json" "$VALID"
+OUT="$(unset WORK_ITEM_TRACKER_BINDING && CLAUDE_PROJECT_DIR="$LOOSE" wit_find_binding)"
+assert_eq "a non-git root binds through the legacy JSON only" "$LOOSE/.work-item-tracker.json" "$OUT"
+
+# --- invalid YAML: the error names the file, the key and the value ---
+
+IREPO="$(yaml_repo invalid-repo)"
+IYAML="$IREPO/docs/conventions/work-items.yaml"
+write_binding "$IYAML" 'tracker:
+  schema_version: "1.0"
+  provider: github
+  config:
+    lease_ttl_hours: soon'
+OUT="$(unset WORK_ITEM_TRACKER_BINDING && CLAUDE_PROJECT_DIR="$IREPO" wit_find_binding)"
+assert_eq "an invalid YAML binding is still the binding (no JSON fallback)" "$IYAML" "$OUT"
+ERR="$(wit_read_binding "$IYAML" 2>&1 >/dev/null)"
+assert_eq "invalid YAML value rejected" "1" "$?"
+assert_contains "invalid YAML error names the file" "$ERR" "$IYAML"
+assert_contains "invalid YAML error names the key" "$ERR" "tracker.config.lease_ttl_hours"
+assert_contains "invalid YAML error names the value" "$ERR" "soon"
+
+write_binding "$IYAML" 'tracker:
+  schema_version: "1.0"
+  provider: github
+  owner: someone
+  config:
+    lease_ttl_hours: 24'
+ERR="$(wit_read_binding "$IYAML" 2>&1 >/dev/null)"
+assert_contains "a key outside the schema is named" "$ERR" "tracker.owner"
+
+write_binding "$IYAML" 'tracker:
+  provider: github
+  provider: jira'
+ERR="$(wit_read_binding "$IYAML" 2>&1 >/dev/null)"
+assert_contains "a YAML parse error names the file and line" "$ERR" "$IYAML: line 3"
 
 [[ $FAILED -eq 0 ]] || exit 1

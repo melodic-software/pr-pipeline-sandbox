@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# test-scope: .work-item-tracker.json
+# test-scope: docs/conventions/work-items.yaml
 # shellcheck disable=SC2154  # FAILED/CASE_NUM initialized by the sourced lib
 # common.sh is a sourceable contract lib — assert it sources cleanly and exposes
 # its public helpers (no --help contract; it is sourced, never invoked).
 set -uo pipefail
+# In a CI job the adapter wraps its gh calls and records into the job's
+# RUNNER_TEMP; the stubs here answer the unwrapped calls.
+unset RUNNER_TEMP
 
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
@@ -68,21 +71,21 @@ fi
 printf '%s\n' "$*" >>"${GH_STUB_DIR:?}/calls.log"
 case "$1" in
 issue)
-  if [[ "${GH_STUB_VERSION:-2.45.0}" == 2.94.0 ]]; then
-    printf '{"number":1,"title":"t","state":"OPEN","assignees":[],"labels":[],"url":"https://github.com/o/r/issues/1"}\n'
+  if [[ "${GH_STUB_VERSION:-2.45.0}" == 2.94.0 && -z "${GH_STUB_REFUSE:-}" ]]; then
+    printf '{"number":1,"title":"t","state":"OPEN","assignees":[],"labels":[],"url":"https://github.com/o/r/issues/1","milestone":{"number":1,"title":"After zero"}}\n'
     exit 0
   fi
-  printf 'HTTP 403: GitHub GraphQL is not available\n' >&2
+  printf 'HTTP 403: GitHub GraphQL is not available from Claude Code sessions\n' >&2
   exit 1
   ;;
 repo)
-  printf 'HTTP 403: GitHub GraphQL is not available\n' >&2
+  printf 'HTTP 403: GitHub GraphQL is not available from Claude Code sessions\n' >&2
   exit 1
   ;;
 api)
   case "$*" in
   *"repos/{owner}/{repo}"*) printf 'o/r\n' ;;
-  *) printf '{"number":1,"title":"t","state":"open","assignees":[{"login":"u"}],"labels":[{"name":"a"}],"type":null,"html_url":"https://github.com/o/r/issues/1","created_at":"2026-03-01T10:00:00Z"}\n' ;;
+  *) printf '{"number":1,"title":"t","state":"open","assignees":[{"login":"u"}],"labels":[{"name":"a"}],"type":null,"html_url":"https://github.com/o/r/issues/1","created_at":"2026-03-01T10:00:00Z","milestone":{"number":1,"title":"After zero"}}\n' ;;
   esac
   exit 0
   ;;
@@ -106,6 +109,7 @@ EOF
   assert_eq "wit_emit_item on gh 2.45 → blocked_by_count 0" "0" "$(jq -r '.blocked_by_count' <<<"$OUT")"
   assert_eq "wit_emit_item on gh 2.45 → created_at from created_at" "2026-03-01T10:00:00Z" \
     "$(jq -r '.created_at' <<<"$OUT")"
+  assert_eq "wit_emit_item on gh 2.45 → milestone from its title" "After zero" "$(jq -r '.milestone' <<<"$OUT")"
   assert_contains "wit_emit_item on gh 2.45 reads over REST" "$(<"$EMIT_STUB/calls.log")" \
     "api repos/o/r/issues/1"
   assert_not_contains "wit_emit_item on gh 2.45 skips issue view" "$(<"$EMIT_STUB/calls.log")" "issue view"
@@ -122,12 +126,32 @@ EOF
   rm -rf "$PR_STUB"
 
   : >"$EMIT_STUB/calls.log"
-  GH_STUB_DIR="$EMIT_STUB" GH_STUB_VERSION=2.94.0 PATH="$EMIT_STUB:$PATH" wit_emit_item o r 1 >/dev/null
+  OUT="$(GH_STUB_DIR="$EMIT_STUB" GH_STUB_VERSION=2.94.0 PATH="$EMIT_STUB:$PATH" wit_emit_item o r 1)"
   CALLS="$(<"$EMIT_STUB/calls.log")"
+  assert_eq "wit_emit_item on gh 2.94 → milestone from its title" "After zero" "$(jq -r '.milestone' <<<"$OUT")"
+  assert_contains "wit_emit_item on gh 2.94 requests milestone" "$CALLS" "milestone"
   assert_contains "wit_emit_item on gh 2.94 requests blockedBy" "$CALLS" "blockedBy"
   assert_contains "wit_emit_item on gh 2.94 requests parent" "$CALLS" "parent"
   assert_contains "wit_emit_item on gh 2.94 requests issueType" "$CALLS" "issueType"
   assert_contains "wit_emit_item on gh 2.94 requests createdAt" "$CALLS" "createdAt"
+
+  : >"$EMIT_STUB/calls.log"
+  OUT="$(CLAUDE_CODE_REMOTE=true GH_STUB_DIR="$EMIT_STUB" GH_STUB_VERSION=2.94.0 PATH="$EMIT_STUB:$PATH" wit_emit_item o r 1)"
+  assert_eq "wit_emit_item on gh 2.94 in a remote session → id" "github:o/r#1" "$(jq -r '.id' <<<"$OUT")"
+  assert_not_contains "wit_emit_item on gh 2.94 in a remote session skips issue view" \
+    "$(<"$EMIT_STUB/calls.log")" "issue view"
+
+  : >"$EMIT_STUB/calls.log"
+  OUT="$(GH_STUB_REFUSE=1 GH_STUB_DIR="$EMIT_STUB" GH_STUB_VERSION=2.94.0 PATH="$EMIT_STUB:$PATH" wit_emit_item o r 1)"
+  assert_eq "wit_emit_item on a refused gh 2.94 read falls back → id" "github:o/r#1" "$(jq -r '.id' <<<"$OUT")"
+  CALLS="$(<"$EMIT_STUB/calls.log")"
+  assert_contains "wit_emit_item on a refused gh 2.94 read tries issue view first" "$CALLS" "issue view"
+  assert_contains "wit_emit_item on a refused gh 2.94 read then reads REST" "$CALLS" "api repos/o/r/issues/1"
+
+  (CLAUDE_CODE_REMOTE=true wit_require_graphql_session "--parent" >/dev/null 2>&1)
+  assert_eq "wit_require_graphql_session exits 3 in a remote session" "3" "$?"
+  (CLAUDE_CODE_REMOTE='' wit_require_graphql_session "--parent" >/dev/null 2>&1)
+  assert_eq "wit_require_graphql_session passes in a local session" "0" "$?"
 
   : >"$EMIT_STUB/calls.log"
   REPO="$(GH_STUB_DIR="$EMIT_STUB" PATH="$EMIT_STUB:$PATH" wit_resolve_repo "")"
@@ -136,6 +160,27 @@ EOF
   assert_eq "wit_resolve_repo keeps an explicit override" "x/y" "$(wit_resolve_repo x/y)"
 
   rm -rf "$EMIT_STUB"
+
+  # In a job (RUNNER_TEMP set) sourcing common.sh wraps gh: a read goes with
+  # -i, its reading lands under github-token, and the caller sees the body alone.
+  WRAP_STUB="$(mktemp -d "$TMP_ROOT/d.XXXXXX")"
+  mkdir -p "$WRAP_STUB/runner"
+  cat >"$WRAP_STUB/gh" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "--version" ]] && { echo "gh version 2.45.0 (test)"; exit 0; }
+printf '%s\n' "$*" >>"${GH_STUB_DIR:?}/calls.log"
+[[ " $* " != *" -i "* ]] || printf 'HTTP/2.0 200 OK\r\nx-ratelimit-remaining: 4999\r\n\r\n'
+printf '{"number":1,"title":"t","state":"open","assignees":[],"labels":[],"type":null,"html_url":"https://github.com/o/r/issues/1","created_at":"2026-03-01T10:00:00Z"}\n'
+EOF
+  chmod +x "$WRAP_STUB/gh"
+  : >"$WRAP_STUB/calls.log"
+  OUT="$(RUNNER_TEMP="$WRAP_STUB/runner" GH_STUB_DIR="$WRAP_STUB" PATH="$WRAP_STUB:$PATH" \
+    bash -c 'source "$1" && wit_emit_item o r 1' _ "$SCRIPT_DIR/common.sh")"
+  assert_eq "wrapped in a job → the body alone reaches the caller" "github:o/r#1" "$(jq -r '.id' <<<"$OUT")"
+  assert_contains "wrapped in a job → the read goes with -i" "$(<"$WRAP_STUB/calls.log")" "api -i repos/o/r/issues/1"
+  assert_eq "wrapped in a job → a reading under github-token" "200 na 4999 na na na" \
+    "$(cut -d' ' -f1-6 "$WRAP_STUB/runner/api-budget/github-token" 2>/dev/null)"
+  rm -rf "$WRAP_STUB"
 fi
 
 # --- a closed blocker unblocks only when it was completed ---

@@ -111,24 +111,57 @@ as unclaimed coordination (acceptable for a publish, wrong for contended work).
 
 ## Setup (binding file)
 
-The repo binds exactly ONE active provider via `.work-item-tracker.json` at the repo root
-(tracked, since which tracker a repo uses is repo-scoped). Layering and location are locked by
-[ADR 0015](../../../../docs/adr/0015-bind-the-tracker-at-repo-root-with-an-allowlisted-personal-overlay.md):
-one team layer at the root, one gitignored personal overlay beside it, deliberately no
-user-global layer.
+The repo binds exactly ONE active provider under the `tracker` key of `<home>/work-items.yaml`
+(tracked, since which tracker a repo uses is repo-scoped), checked against
+[`work-items.schema.json`](../../schemas/work-items.schema.json). `<home>` is the convention home
+the repository binds in the pointer region of `AGENTS.md` or `CLAUDE.md`, read with the plugin's
+copy of `resolve-convention-home.sh`; `docs/conventions` when the repository binds none. Layering
+and location follow
+[ADR 0075](../../../../docs/adr/0075-resolve-plugin-settings-through-one-four-layer-cascade-and-a-bound-convention-home.md)
+fix 11, which supersedes ADR 0015: one team layer in the home, one gitignored personal override
+beside it, deliberately no user-global layer. The `tracker` mapping has the same keys as the
+legacy JSON file, so every adapter reads the same effective JSON.
 
-```json
-{
-  "schema_version": "1.0",
-  "provider": "github",
-  "docs": "Work-item tracker binding — see the work-items plugin's tools/work-item-tracker/CONTRACT.md (Setup)",
-  "config": {
-    "lease_ttl_hours": 24
-  }
-}
+```yaml
+tracker:
+  schema_version: "1.0"
+  provider: github
+  docs: Work-item tracker binding, see the work-items plugin's tools/work-item-tracker/CONTRACT.md (Setup)
+  config:
+    lease_ttl_hours: 24
 ```
 
-- Discovery: `.work-item-tracker.json` at the **repo root**, meaning `${CLAUDE_PROJECT_DIR}` when
+The seam reads the file with the plugin's copy of `yaml-subset.awk`, the repository's YAML
+subset parser. Every scalar reads as a string (the parser drops quotes, so a quoted id stays
+the id), and every reader takes a number or boolean as text. An empty flow sequence (`[]`)
+reads as an empty array, as the legacy JSON file writes it, so `done_category_keys: []` is
+present and judged like the JSON value (jira rejects an empty set) instead of taking the
+default, and `wont_do: []` keeps its key. One difference remains: a key with no value reads
+as absent, as though left out, never as a JSON `null`. A key under `tracker` that the
+schema does not declare, a document the parser rejects (named by file and line), or a rejected
+value (named by file, key and value; the personal override when it set the value) is exit `3`.
+
+- **Legacy fallback (migration).** While the migration runs, when `<home>/work-items.yaml` has
+  no `tracker` key (or the repository declined a home), the seam still reads the legacy
+  repo-root JSON binding (`WIT_LEGACY_BINDING` in `lib/binding.sh`) and prints a one-line
+  `notice:` on stderr naming it, which asks for it to move under `tracker:`. A repo
+  root where no home applies (it is `$HOME`, an ancestor of `$HOME`, or not inside a git work
+  tree: ADR 0075 fix 5) reads no `work-items.yaml` at all, not even under
+  `docs/conventions`; only the legacy JSON file binds it. The JSON file has the same keys as
+  the `tracker` mapping:
+
+  ```json
+  {
+    "schema_version": "1.0",
+    "provider": "github",
+    "config": { "lease_ttl_hours": 24 }
+  }
+  ```
+
+  A `work-items.yaml` that does not parse is still read as the binding and fails, never a
+  silent fall back to the JSON file. A broken pointer region is reported on stderr and the
+  seam falls back as if no home applied.
+- Discovery: the binding resolves from the **repo root**, meaning `${CLAUDE_PROJECT_DIR}` when
   set, else `git rev-parse --show-toplevel`. Whichever of the two resolves, that one value
   governs ALL of the seam's repo-relative resolution (binding read, consumer-local adapter
   dirs, the github adapter's bot-wrapper lookup), so a bare shell that finds the binding also
@@ -143,31 +176,34 @@ user-global layer.
   ancestor/home binding would silently capture every repo beneath it (#2941). Nested
   per-subdirectory bindings are unsupported until requested. Env override
   `WORK_ITEM_TRACKER_BINDING=<path>` (tests, conformance).
-- **Personal overlay**: an optional gitignored `.work-item-tracker.local.json` beside the
-  team binding merges **per-key over an allowlist, deny-by-default**. Overlayable keys:
+- **Personal override**: an optional gitignored file beside the team binding,
+  `<home>/work-items.local.yaml` (its `tracker` mapping) beside a YAML binding or
+  the legacy JSON override beside the legacy file (`wit_override_path` in `lib/binding.sh`),
+  merges **per-key over an allowlist, deny-by-default**. A personal override with no `tracker` key changes nothing. Overridable keys:
   `config.lease_ttl_hours`, `config.lease_ttl_minutes` (TTL travels inside each lease
   record, so a per-user value is coherent), the auth-identity keys of every credentialed
   adapter, namely `config.jira.auth_email`, `config.jira.auth_env`, `config.linear.auth_env`, and
   `config.gitea.auth_env` (auth identity is per-account, and each of those adapters reads its
   credential from the merged view), and the self-describing `docs`
   pointer. Everything else is shared coordination state and team-layer-only: `provider`,
-  `config.role_labels`, `config.container_label`, `config.storage_dir`,
+  `config.role_labels`, `config.container_label`, the hold lists (`config.hold_labels`,
+  `config.hold_states`, `config.hold_state_labels`), `config.wayfind_label_prefix`, `config.storage_dir`,
   `config.jira.site`/`project_keys`, the JQL-shaping keys, and the won't-do classifiers
-  `config.jira.resolutions` and `config.github.wont_do_labels`. An overlay value for any such key is a
+  `config.jira.resolutions` and `config.github.wont_do_labels`. A personal override value for any such key is a
   configuration error (exit `3`, naming the offending keys), never a merge, including a
   non-allowlisted key holding an empty object (only allowlisted-prefix scaffolding like
   `{"config":{}}` is inert). Allowlisted keys hold scalars: an object or array value at an
   allowlisted key is likewise a configuration error, and an explicitly `null` value merges by
   presence and is judged by normal binding validation, exactly as if the team file carried
   it, never a silent fallback to the team value either way. A personal
-  provider override is structurally foreclosed: leases, labels, and frontier state live
+  `provider` value is structurally foreclosed: leases, labels, and frontier state live
   provider-side, so a personal binding would fracture the team's coordination surface.
   There is deliberately no user-global (`~/.claude/...`) layer for the same reason. The
-  overlay's gitignore line (`.work-item-tracker.local.json`) is appended, announced, by
-  `/work-items:setup apply`, because the root-level overlay is outside the marketplace's
-  `.claude/**/*.local.*` convention line.
+  legacy personal override's gitignore line is appended, announced, by `/work-items:setup apply`,
+  because that root-level file is outside the marketplace's `.claude/**/*.local.*`
+  convention line.
 - Optional `docs` (either layer): a free-form self-describing pointer naming what the file
-  is and where its contract lives, so the root dotfile explains itself to a teammate who
+  is and where its contract lives, so the binding file explains itself to a teammate who
   finds it. `/work-items:setup` writes it by default; the seam never reads it.
 - Owner/repo are NEVER recorded in the binding. They are derived at runtime from the working
   directory's git remote (`gh api repos/{owner}/{repo}`). Verbs that need a repo
@@ -190,9 +226,9 @@ user-global layer.
 ```text
 work-item-tracker.sh create-item --title <t> [--body <b> | --body-file <path>] [--labels a,b] [--type <name>] [--parent <id>] [--blocked-by <id>[,<id>]] [--repo <o>/<r>]
 work-item-tracker.sh get-item <id>
-work-item-tracker.sh claim <id> [--ttl-hours <n>] [--ttl-minutes <n>] [--session-id <s>]
+work-item-tracker.sh claim <id> [--ttl-hours <n>] [--ttl-minutes <n>] [--session-id <s>] [--holder <h>] [--lease-only] [--phase <kind>]
 work-item-tracker.sh renew-lease <id> --lease-comment-id <n>
-work-item-tracker.sh release <id> --lease-comment-id <n>
+work-item-tracker.sh release <id> --lease-comment-id <n> [--holder <h>]
 work-item-tracker.sh reclaim <id>
 work-item-tracker.sh link-blocks <id> --blocked-by <id>
 work-item-tracker.sh add-sub-item <id> --parent <id>
@@ -200,14 +236,47 @@ work-item-tracker.sh list-sub-items <parent-id> [--state open|closed|all]
 work-item-tracker.sh list-items [--state open|closed|all] [--repo <o>/<r>] [--label <name>]
 work-item-tracker.sh list-frontier [--autonomous] [--parent <container-id>] [--repo <o>/<r>] [--label <name>]
 work-item-tracker.sh label-provenance <id> --label <name> [--label <name> ...]
+work-item-tracker.sh set-fields <id> --field <field-id>=<option-id> [--field <field-id>=<option-id> ...]
+work-item-tracker.sh get-field-options --field <name-or-id> [--repo <o>/<r>]
+work-item-tracker.sh get-statuses --field <name> <id>...
+work-item-tracker.sh status-storage [--repo <o>/<r>]
 work-item-tracker.sh change-link (<id> | --branch-ref <ref> | --branch <name>) [--repo <o>/<r>]
+work-item-tracker.sh add-recurrence <id> --source-link <url> --note <text>
 work-item-tracker.sh capabilities
 ```
+
+`add-recurrence` records that a signal was seen again on an item, keyed by the signal's source
+link, so a lane that sees one signal twice records it once. `--source-link` is an `http` or
+`https` URL with no whitespace, and `--note` is non-empty text; anything else exits `2`. The
+adapter writes one recurrence marker, `<!-- work-item-recurrence v1 {"source_link", "note",
+"recorded_at"} -->`, with every `>` in the JSON written as its unicode escape (backslash, then `u003e`) so a link or note cannot end
+the comment early. **No-op rule:** when the item already carries a marker whose `source_link`
+equals `--source-link` exactly, the verb writes nothing and exits `0` with `recorded: false`;
+otherwise it writes the marker and reports `recorded: true`. An item that does not exist exits
+`5`. GitHub posts the marker as the first line of an issue comment, the note below it, and counts
+an existing marker only from the authors a lease comment counts from ("Lease protocol"), since
+anyone can comment on a public repository. local-markdown appends the marker line to the item
+file. The check and the write are two calls with no compare-and-set, so two concurrent calls
+with one link can both write. An adapter that declares no `add-recurrence` key exits `6`.
 
 `create-item --body-file <path>` is core-side: the dispatcher reads the file and hands the adapter
 `--body <content>`, so adapters implement only `--body`. It lets a caller pass a body with no
 command substitution, a shape a worktree-isolated session refuses (#6929). `--body` together with
 `--body-file`, or a path that is not a readable, non-empty file, exits `2`.
+
+`create-item --parent <id>` creates nothing when the parent already has a child with the same
+title (exact after trimming leading and trailing whitespace from both) that is open, or
+was closed within the last 24 hours. It then exits `0`, prints that child's normalized item
+object, and names the child on stderr. A child closed earlier does not block a new create. This
+makes a retried or repeated publish of one plan file each child once. Without `--parent`, every
+call creates an item. The check is one read of the parent's children before the write, with no
+compare-and-set, so two calls that run at the same moment can still both create. GitHub reads the
+parent's sub-issues in the target repository with their `closedAt` in one GraphQL query;
+local-markdown reads each child's `closed_at` frontmatter field, which only the file edit that
+closes the item sets (see "local-markdown adapter"), and a closed child without one counts as
+closed earlier. The linear seed reads the parent's `children`, paged, with each child's
+`completedAt` and `canceledAt`, and takes the later one that is set as the close time; a closed
+child with neither counts as closed earlier. The gitea seed refuses `--parent`.
 
 `label-provenance` answers who applied each named label and whether that person may grant
 admission. For every `--label`, the adapter takes the most recent application of that label
@@ -217,18 +286,72 @@ repository permission, and marks the label `trusted` only when that permission i
 [Get repository permissions for a user](https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user),
 as of 2026-10-04, recheck trigger: the endpoint's role mapping changes). Each row carries the
 application's time as `at`. The adapter also reads when the item's body was last edited (GitHub:
-GraphQL `lastEditedAt`, since REST carries no edit time) and reports it as `body_edit`;
+GraphQL `lastEditedAt`, since REST carries no edit time: the
+[issue event types](https://docs.github.com/en/rest/using-the-rest-api/issue-event-types) list no
+body-edit event, and `renamed` covers only the title, as of 2026-10-31, recheck trigger: that list
+adds a body-edit event) and reports it as `body_edit`;
 `after_admission` is `true` when that edit is later than the latest `at` of the named labels,
 because a body rewritten after the labeler read it is not the body the labeler admitted.
 `admitted` is `true` only when every named label is trusted and `after_admission` is `false`; a
 trusted re-application after the edit admits the edited body. A label with no application event,
 an actor with no usable login, and a permission read that fails or returns no permission each
 yield an untrusted row with its `reason`; a failed or empty edit-time read sets `after_admission`
-to `null` with its `reason` and refuses; a failed timeline read exits with the mapped code and
-emits no result. The work-loop
+to `null` with its `reason` and refuses, which the work-loop escalates to human attention once,
+as it does an edit after admission, rather than refusing it again each cycle; a failed timeline
+read exits with the mapped code and emits no result. The work-loop
 admission gate admits an item only on exit `0` with `admitted: true`, so an adapter that declares
 no `label-provenance` key (the gate reads an absent key as `false`, exit `6`) fails closed. Only
 the GitHub adapter implements it today.
+
+`set-fields` sets single-select issue fields by option id, every `--field` in one write that
+leaves the item's other fields as they are. An option id that is not one of its field's options
+exits `5` before anything is written. It prints `{schema_version, id, fields: [{field_id,
+option_id, value}]}`, where `value` is the option's name. Only the GitHub adapter implements it,
+for organization issue fields: it reads the options from `GET /orgs/{org}/issue-fields`, which
+needs `read:org` on an OAuth or classic token, and writes names, since the REST write takes the
+option's name (pointer:
+[issue field values](https://docs.github.com/en/rest/issues/issue-field-values) and
+[organization issue fields](https://docs.github.com/en/rest/orgs/issue-fields), as of
+2026-10-18, recheck trigger: the write starts taking option ids, or the listing's permission
+changes). An adapter that declares no `set-fields` key exits `6`.
+
+`get-field-options` is the read-only counterpart of `set-fields`: it lists the options of one
+single-select issue field, so a caller such as planning's Work size can use a tracker's own size
+values. `--field` is the field's exact name or its numeric id; `--repo` picks the repository whose
+organization is read (default: the working directory's remote). It prints `{schema_version, field,
+field_id, options: [{id, name}]}`, where `field_id` is the matched field's numeric id (the id
+`set-fields` takes) or `null` when the organization has no such field. A field the organization
+does not have, or one with no options, prints an empty `options` list and exits `0`; a caller that gets one falls back to its own defaults. Only the
+GitHub adapter implements it, from the same `GET /orgs/{org}/issue-fields` listing `set-fields`
+validates against (same `read:org` need). An adapter that declares no `get-field-options` key exits
+`6`, which a caller reads as "unsupported", not as a failure. Label groups are not read by this verb.
+
+`get-statuses` reads, for each `<id>`, the item's value of one single-select issue field, by its
+exact name: the autonomous frontier asks for `Work status`. It prints `{schema_version,
+statuses: {"<id>": "<option name>" | null}}`, null for an item whose field is unset. Only the
+GitHub adapter implements it, from GraphQL `Issue.issueFieldValues`, one query per repository per
+100 items, so a session whose proxy refuses GraphQL exits `3`. When the binding sets
+`config.github.status_trust`, the GitHub adapter answers only values a trusted account set: the
+state the newest counted field event left, or null when that event removed the value, so an
+uncounted change neither sets nor clears a counted state. A missing or invalid trust
+configuration exits `3`; a read whose window may hide the counted event, or a counted state the
+model does not map, exits `1` (adapter README "Work status trust"). Without that key the read is
+plain. An adapter that declares no `get-statuses` key exits `6`.
+
+`status-storage` is a CORE-side derivation that reports where the tracker stores an item's
+status: in the `Work status` single-select issue field, or in labels. No adapter implements it,
+so it needs no manifest key. It prints `{schema_version, storage, field, reason}`, where
+`storage` is `field` or `labels`, `field` is `"Work status"` when `storage` is `field` and
+`null` otherwise, and `reason` is free text saying why. Core runs the adapter's
+`get-field-options --field "Work status"` (passing `--repo` on) and reports `field` when that
+lists at least one option. It reports `labels`, exit `0`, when the adapter declares no
+`get-field-options` (`local-markdown` always lands here), when the listing has no such field
+or the field has no options, and when the read is refused: exit `5`, or exit `4` for an HTTP
+403 that is not a rate limit (on GitHub: a user-owned repository has no organization listing,
+and a token without `read:org` cannot read it). Without `--repo`, a refused read of the working
+directory's repository lands here too. Any other failure, such as a rate limit, a session that
+is not logged in, or exit `8` for an unreachable provider, exits with the adapter's code and
+its stderr, since a provider that did not answer has not said status lives in labels.
 
 `claim --ttl-minutes <n>` (0–59) **adds to** `--ttl-hours`, it never replaces it: `--ttl-hours 24
 --ttl-minutes 30` is a 24.5-hour lease. For a sub-hour lease pass `--ttl-hours 0 --ttl-minutes <n>`.
@@ -256,15 +379,31 @@ ceiling stays truncated after the filter, because a labeled item may sit past th
 the adapter's `list-items` and filters `state == open` AND `blocked_by_count == 0` (so a
 blocker closed as won't-do keeps its dependent off the frontier) AND no
 assignee AND not a container (a `work-map` item is never its own frontier item, see
-"Containers and state"). With `--autonomous`, items labeled `needs-human` are additionally
-excluded, as are items carrying a **human-floor work class**: `work-class: structural` (C4)
-or `work-class: untrusted-provenance` (C5), whose admission disposition is human-gated
-regardless of any other signal. The floor wins over the autonomous-eligible role label: an
+"Containers and state") AND no label starting with the wayfind prefix (`config.wayfind_label_prefix`,
+default `wayfind:`; a wayfind map item belongs to
+`/planning:wayfind`, never to `/work-items:work`). With `--autonomous`, items labeled
+`needs-human` are additionally excluded, as are items carrying the **human-floor class**
+label `provenance: untrusted` (C5; its legacy name is in [`work-class-labels.md`](../../reference/work-class-labels.md)) or the
+`provenance: signal` label, which are human-gated regardless of any other signal, and items carrying a hold label
+(`config.hold_labels`, default the `owner-decision` role label, `status: needs-info` and `needs-spec`),
+which wait on a person. When `status-storage` reports
+`field` and the adapter declares `get-statuses`, core reads the `Work status` of each open,
+unblocked, unassigned item and puts it on the item as `status`. The field can only add a hold:
+an item whose `status` is a hold state (`config.hold_states`, default `needs-human`,
+`needs-owner-decision`, `needs-reporter-info` and `needs-spec`), and that carries none of those
+states' labels (the `human-gated` role label plus `config.hold_state_labels`, default `needs-human`,
+the `owner-decision` role label, `needs-owner-decision`, `status: needs-info` and `needs-spec`), is held
+too, and the labels decide everything else, since labels are written first
+and reach the field afterwards. Core checks no setter; it takes each value `get-statuses` answers,
+which counts only trusted setters when the binding configures that (`get-statuses` above). A `get-statuses` read that fails, or a `status-storage`
+read the provider did not answer, prints one line on stderr and exits with the adapter's code,
+with no envelope on stdout, so an autonomous caller reads nothing it cannot trust; an answer
+without a `statuses` object exits `1`. `labels` storage, and an adapter that declares no
+`get-statuses`, read no status and pass through. The default frontier reads no status. The floor wins over the autonomous-eligible role label: an
 item carrying both is contradictory, and resolving it against the floor is what keeps a
-worker from claiming and then escalating it once per lane pass. `work-class: scoped` (C3) is
-deliberately not floored here: its disposition turns on bug-fix-vs-feature shape and
-first-drain ratification, which the work-loop admission gate owns and no label carries. The
-floor is autonomous-only: the default (attended) frontier still surfaces these items, so they
+worker from claiming and then escalating it once per lane pass. No other work class is
+floored, and neither is an item with no `work-class:` label: work class is not an admission
+gate. The floor is autonomous-only: the default (attended) frontier still surfaces these items, so they
 never become unreachable. The filter runs core-side over the labels `list-items` already
 returns; provider search syntax never leaves the adapter. With `--parent <container-id>` the frontier is scoped
 to one container: core reads the adapter's `list-sub-items` for that container instead of the
@@ -277,9 +416,9 @@ frontier. Passing both is a usage error (exit `2`), not a silent drop.
 ## Adapter contract
 
 Adapters live at `adapters/<provider>/` as verb-per-script (`<verb>.sh`) plus a
-`capabilities.json` manifest. Adapter verb set = core public set **minus `list-frontier`**
-(`list-items` and `list-sub-items` are both core and adapter verbs: each has a native
-counterpart, unlike the core-derived `list-frontier`):
+`capabilities.json` manifest. Adapter verb set = core public set **minus the core-derived
+`list-frontier` and `status-storage`** (`list-items` and `list-sub-items` are both core and
+adapter verbs: each has a native counterpart, unlike the core-derived `list-frontier`):
 
 ```text
 adapters/<provider>/list-items.sh [--state open|closed|all] [--repo <o>/<r>] [--label <name>]
@@ -302,8 +441,8 @@ adapters/<provider>/list-sub-items.sh <parent-id> [--state open|closed|all]
   `features.list_items_label_filter: true` and puts the label in the provider query, so the
   ceiling counts labeled items only; it MAY match more loosely than exact, since core filters
   exactly afterward ("Verbs"), and it MAY refuse with exit `2` a label its provider cannot
-  hold. An adapter without the feature never receives `--label`. Every bundled adapter
-  declares it: github (`gh issue list --label`, which gh serves from the search API; that API
+  hold. An adapter without the feature never receives `--label`. Every bundled adapter and
+  seed declares it: github (`gh issue list --label`, which gh serves from the search API; that API
   returns at most 1000 results, so a labeled listing that reaches 1000 reports `truncated: true`), gitea (the `labels` query parameter), jira
   (a `labels = "<name>"` JQL clause), linear (a `labels.some.name.eq` issue filter), and
   local-markdown (filtered in its walk before the ceiling check).
@@ -332,7 +471,8 @@ Two independent resolutions, deliberately opposite:
   that exists, else `${CLAUDE_PROJECT_DIR}/tools/work-item-tracker/`, so a consuming repo runs the
   plugin's engine by default and a vendored copy still works.
 - **Adapters** (`adapters/<provider>/`): **consumer-local-first, plugin-bundled fallback; first match
-  wins.** For the bound `<provider>`, the dispatcher searches
+  wins.** The plugin bundles two adapters, `github` and `local-markdown`. For the bound
+  `<provider>`, the dispatcher searches
   `<repo root>/tools/work-item-tracker/adapters/<provider>/` first, then its own bundled
   `adapters/<provider>/`. The repo root is the same anchor the binding read resolved,
   `${CLAUDE_PROJECT_DIR}` when set, else the git toplevel, which can differ inside a worktree
@@ -340,8 +480,16 @@ Two independent resolutions, deliberately opposite:
   does not ship, or shadow a bundled adapter with a local copy it owns fully, without forking the
   plugin. `WIT_ADAPTERS_DIR` overrides the search with a single explicit adapter root (tests,
   conformance).
+- **Seeds** (`seeds/<provider>/`: `jira`, `gitea`, `linear`): **never dispatched from the plugin.**
+  `/work-items:setup apply` runs `seed-copy.sh <provider>`, which copies the seed into
+  `<repo root>/tools/work-item-tracker/adapters/<provider>/`, where the consumer owns it and the
+  consumer-local search above finds it. A binding to a seeded provider with no copy exits `3`
+  naming that setup step. The copy carries a `.seed-hash` record: on a re-run an untouched copy
+  fast-forwards to the current seed and an edited one prints its diff and is left as it is
+  (`seeds/README.md`). Versioning is the manifest's `schema_version` and the handshake below,
+  with no header in the copied files.
 
-The binding (`.work-item-tracker.json`) and any consumer-local adapters live in the consuming repo
+The binding (`<home>/work-items.yaml`) and any consumer-local adapters live in the consuming repo
 (the repo root above); the bundled engine and adapters live in the plugin (`${CLAUDE_PLUGIN_ROOT}`),
 which is read-only and replaced on plugin update. No seam state is written there.
 
@@ -352,7 +500,8 @@ that adapter's own `../../lib` points at a seam copy the consumer never vendored
 `${WIT_SEAM_LIB_DIR}` instead resolves the libs of the engine actually dispatching it, the same
 engine its manifest handshook against a step earlier. A consumer-local adapter therefore does NOT
 require vendoring the seam. Bundled adapters resolve relatively and ignore it; an adapter run
-directly (outside the dispatcher) falls back to its own relative path.
+directly (outside the dispatcher) falls back to its own relative path. Seeds source it too, since a
+copied seed is a consumer-local adapter.
 
 ## JSON output contract
 
@@ -377,18 +526,23 @@ Normalized item object:
   "blocked_by_wont_do_count": 0,
   "parent_id": null,
   "url": "https://…",
-  "created_at": "2026-03-01T10:00:00Z"
+  "created_at": "2026-03-01T10:00:00Z",
+  "milestone": null
 }
 ```
 
 - `state` is normalized lowercase: `open` | `closed`.
 - `created_at` is when the provider created the item, in UTC to the second
   (`YYYY-MM-DDTHH:MM:SSZ`), so values from one adapter sort as text; `null` when the
-  provider gives none or one the adapter cannot parse. Every bundled adapter reads the
+  provider gives none or one the adapter cannot parse. Every bundled adapter and seed reads the
   provider's own creation time (github `createdAt`, gitea `created_at`, jira `created`,
   linear `createdAt`); local-markdown records one at `create-item`, and its items created
   before that read `null`. Additive field: an adapter written before it emits none, which a
   reader treats as `null`.
+- `milestone` is the item's milestone title as the provider names it, or `null` when it has
+  none. The GitHub adapter reads it; local-markdown and the gitea, jira and linear seeds always
+  emit `null`. Additive field: an adapter written before it emits none, which a reader treats
+  as `null`.
 - `type` is the native issue-type NAME (the type axis, org-defined `Task`/`Bug`/
   `Feature`), or `null` when the item has none. On GitHub it is the native Issue Type
   (`create-item --type` sets it; requires push access, silently dropped otherwise);
@@ -454,6 +608,9 @@ Per-verb result objects:
 | `add-sub-item` | `id, parent_id, linked: true` |
 | `list-sub-items` | `{items:[…]}` envelope of normalized item objects (each `parent_id` = the container) |
 | `label-provenance` | `id, admitted` (bool), `labels: [{label, actor, at, permission, role, trusted, reason}]`, `body_edit: {edited_at, after_admission, reason}` (`null` where not read) |
+| `get-statuses` | `statuses` (item id → option name or `null`) |
+| `status-storage` | `storage` (`field` or `labels`), `field` (`"Work status"` or `null`), `reason` |
+| `add-recurrence` | `id, source_link, recorded` (bool, `false` when the link was already recorded), `reason` |
 | `capabilities` | manifest object (see below) |
 
 ## ID grammar
@@ -486,10 +643,24 @@ coerce it into one. See work-loop finding #1381.
 ## Lease protocol
 
 Claim = **assignee (authenticated human user) + lease record**. The lease is a dedicated
-issue comment with a machine marker:
+issue comment with a machine marker. The GitHub adapter's `claim` has two modes:
+
+- **Default:** the holder is the authenticated login (`gh api user`), and the claim assigns it
+  (steps 1 to 5 below). Local sessions use this mode.
+- **Lease-only (`--lease-only`):** the claim posts the lease comment and assigns no one. It skips
+  steps 1 and 2, and on a lost arbitration it supersedes its own comment and touches no assignee.
+  A failure after the comment is posted and before the emit also supersedes it.
+  `--holder <h>` names the holder instead of the authenticated login, for a caller whose token
+  cannot read `GET /user` (a GitHub App installation token, which a CI job holds). The issue lane
+  claims this way, holding `vars.AUTOMATION_LANES_APP_SENDER_ID`, before its model starts.
+  The lane releases its lease when its report job ends; a lane run cancelled by hand before that,
+  or a release that fails, leaves the lease to its TTL, which is accepted behavior.
+
+Arbitration is the same in both modes (step 4), so a local claim made while a lane lease is live
+backs off, and a lane run that finds a live local lease backs off without starting its model.
 
 ```text
-<!-- work-item-lease v1 {"schema_version":"1.0","holder":"<gh login>","acquired_at":"<ISO>","renewed_at":"<ISO>","ttl_hours":24,"session_id":"<opt>"} -->
+<!-- work-item-lease v1 {"schema_version":"1.0","holder":"<gh login>","acquired_at":"<ISO>","renewed_at":"<ISO>","ttl_hours":24,"session_id":"<opt>","phase":"<opt>"} -->
 ```
 
 - Created at claim; **edited in place** at renew (`renewed_at` bump); superseded at
@@ -498,12 +669,23 @@ issue comment with a machine marker:
   (ttl_minutes×60)` is in the future. `ttl_hours` defaults from binding
   `config.lease_ttl_hours`; `ttl_minutes` defaults to `0` and may be set per claim via
   `--ttl-minutes` or binding `config.lease_ttl_minutes`.
+- A lease with `renewed_at` more than 300 s after now is not live.
+- A lease whose TTL exceeds 168 h is not live, so the github and local-markdown `claim` refuse such a TTL (exit 2) before any write.
+- The GitHub adapter counts a lease comment only from an `OWNER`, `MEMBER` or `COLLABORATOR`
+  author, or from a bot (an App installed on the repository: the issue lane's `github-actions[bot]`
+  or a `gh-bot.sh` App).
 - `renew-lease` renews **only a live lease**. A lease that is still the active
   (non-superseded) lease but already **expired**, meaning `renewed_at + ttl_hours` elapsed with
   no back-off yet, is refused (exit `7`), never revived: a delayed holder must not undo a
   TTL-based handoff. Recovery from an expired lease is a fresh claim/reclaim, not a renew.
 - `session_id` is diagnostic metadata only, optional and collision-prone; a
   missing/duplicate `session_id` still counts as a competing lease.
+- `phase` names the work the lease is for: `triage`, `discovery` or `implementation`. The github
+  and local-markdown `claim` write it from `--phase <kind>` and refuse any other value (exit 2)
+  before any write. A lease with no `phase` field is an implementation claim. `renew-lease`, and
+  the github `reclaim`, keep the field, since they edit the lease JSON in place. It is metadata only:
+  arbitration and liveness ignore it, so a triage lease blocks an implementation claim like any
+  other live lease. The claim and renew result objects do not carry it; read it from the lease.
 - The **lease handle** (`lease_comment_id`, emitted by `claim`/`renew-lease`) is
   provider-specific: the GitHub adapter uses the lease comment's own id (external,
   not stored in the JSON); the local-markdown adapter has no external ids, so it
@@ -520,12 +702,15 @@ Claim sequence (race-safe, same-identity aware):
 4. Re-read all lease comments. If an EARLIER live lease exists that is not our own
    comment, the foreign lease wins → supersede own comment, exit `7`. (Assignee is left
    in place on a same-login race: it belongs to the winner.)
+   The back-off message prints the winner's holder with control characters removed.
 5. Emit the claim object.
 
 Release (early end of the caller's own lease): `release` supersedes a lease before its TTL
 elapses, so a session that has finished with an item hands it back at once instead of blocking
 every later claim, same-login ones included (claim step 4), until expiry. It acts only on a lease
-that is all of: on the addressed item, held by the authenticated login, and the item's active
+that is all of: on the addressed item, held by the authenticated login (or the `--holder` value,
+which, like `claim`'s, replaces the `gh api user` lookup and is asserted by the caller; the comment
+edit still needs the token's write access), and the item's active
 (newest non-superseded) lease. Anything else is refused with exit `7` and nothing is written: a
 cross-item handle, another login's lease, or a stale handle under a newer claim. The login check
 exists because lease handles are public (a GitHub comment id), and within one login the handle
@@ -585,8 +770,11 @@ surface as frontier items. `planning:wayfind` maps share this contract and resol
 same binding key (its `tracker-mechanics` doc carries the read), so one remap governs both
 container producers. Read one container's children with
 `list-sub-items <container>`; read the workable frontier within one container with
-`list-frontier --parent <container>`. Aside from that exclusion the frontier is
-label-agnostic and simply never surfaces items that are assigned or blocked.
+`list-frontier --parent <container>`. The frontier also excludes, unconditionally, any item
+carrying a label that starts `wayfind:`: those are a wayfind map's own items, which
+`/planning:wayfind` drives, so a `--parent` frontier over a wayfind map holds only its
+children without such a label. Aside from those exclusions the frontier is label-agnostic
+and simply never surfaces items that are assigned or blocked.
 
 ### Multi-provider topology: the role-split model (recorded decision, not yet built)
 
@@ -732,9 +920,9 @@ adapter checks `<repo root>/tools/github-auth/gh-bot.sh` first, independent of w
 adapter itself resolved from (so a shadowed consumer-local adapter still finds the consumer's wrapper),
 then falls back to `…/github-auth/gh-bot.sh` bundled beside the seam tree. A plugin install ships no
 wrapper at either path, so writes use bare `gh` by default (plugin-lift portability); a repo that wants
-bot-attributed writes provides the wrapper at its own project root, with zero vendoring. CLAIMS always
-assign the authenticated human user via bare `gh` (`@me` must resolve to the session identity, not the
-bot). Reads are bare `gh`.
+bot-attributed writes provides the wrapper at its own project root, with zero vendoring. A default-mode
+claim assigns the authenticated human user via bare `gh` (`@me` must resolve to the session identity,
+not the bot); a lease-only claim assigns no one. Reads are bare `gh`.
 
 ## local-markdown adapter
 
@@ -750,7 +938,13 @@ network tool (`gh`, `curl`); the conformance suite runs it in CI, offline.
   structured `Blocked by: <id>` body lines; `blocked_by_count` counts blockers whose
   file exists and that are `open`, or `closed` with any non-empty `state_reason` other
   than `completed` (such as `not_planned` or `duplicate`); those closed ones also count
-  in `blocked_by_wont_do_count`. A closed item with no `state_reason` was completed. The lease is the same inline marker used
+  in `blocked_by_wont_do_count`. A closed item with no `state_reason` was completed. An optional
+  `closed_at` field (a UTC ISO-8601 timestamp string) holds when the item was closed, and
+  `create-item`'s sibling check reads it (see "Verbs"). This adapter has no close verb (the seam
+  has none, by design), so no verb writes `state` or `closed_at`: whoever closes an item by
+  editing its file sets `state: "closed"` and, for the sibling check to count the close as
+  recent, `closed_at`. A closed item without `closed_at` counts as closed more than 24 hours
+  ago and never blocks a new create. The lease is the same inline marker used
   everywhere (see "Lease protocol"), appended to the item file.
 - **Identity.** No authenticated provider user exists offline, so `claim` records the
   holder from `git config user.name` (falling back to `$USER`, then `local`) and
@@ -788,7 +982,8 @@ until those commits are merged. `wit_next_number` is the max existing file
 number + 1 with no file lock, so two diverged branches (or two writers against
 one store) can both mint the same next number.
 
-A relative `config.storage_dir` roots against the **binding file's directory**,
+A relative `config.storage_dir` roots against the **binding file's directory**
+(for a `<home>/work-items.yaml` binding under the repo root, the repo root itself),
 not the caller's CWD (`lib/binding.sh`). Distinct worktrees that resolve the
 same binding (e.g. via a shared `CLAUDE_PROJECT_DIR`, since anchored discovery gives
 each worktree its own git-toplevel binding otherwise) therefore share one store
@@ -976,7 +1171,7 @@ concurrent assignment is arbitrated cannot be settled without a live instance, a
 lease over last-write-wins loses races silently.
 
 Provider divergences that shaped it, each verified against the Gitea source rather than assumed
-from GitHub's API, and all documented in `adapters/gitea/README.md`:
+from GitHub's API, and all documented in `seeds/gitea/README.md`:
 
 - A pull request **is** an issue (`pull_request` populated); `list-items` drops them.
 - `create-item` takes label **IDs**, not names; the adapter resolves names first and refuses an
@@ -1002,8 +1197,8 @@ throwaway target.
 adapter through the core CLI only: every verb, valid + invalid input, exit-code +
 `schema_version` + JSON-shape assertions, claim-race back-off, CR-free stdout,
 capability-gated skips (declared-unsupported verbs asserted to exit `6`), and the list
-contract: `list-items` rows carry `created_at` as a UTC timestamp or `null`, and `--label` with a
-label no item carries returns no items. Bindings live
+contract: `list-items` rows carry `created_at` as a UTC timestamp or `null` and `milestone` as a
+name or `null`, and `--label` with a label no item carries returns no items. Bindings live
 at `conformance/bindings/<name>.sh` and provide setup (clean-at-start), target context,
 and teardown.
 
@@ -1026,6 +1221,10 @@ every suite-exercised path is pre-network (capabilities cats the manifest, write
 touch no network tool. The jira read verbs are covered offline by the adapter's own
 `*.test.sh` with a mocked curl; a live-Jira conformance pass is deferred to the work-laptop
 pass that settles the exact `statusCategory` "done" key and blocker link type.
+
+The dispatcher never resolves a seed from the plugin ("Adapter resolution"), so a conformance
+run against the `jira`, `gitea` or `linear` seed itself sets `WIT_ADAPTERS_DIR` to `seeds/`, as
+`bindings/jira.test.sh` does; with it unset, the run covers the consuming repo's copy.
 
 The `gitea` and `linear` bindings are **on-demand like GitHub's**, not offline like jira's:
 both manifests declare `create-item` true, so the suite seeds a real item and every case after

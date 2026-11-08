@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2154  # FAILED/CASE_NUM initialized by the sourced helper
 set -uo pipefail
+# In a CI job the adapter wraps its gh calls and records into the job's
+# RUNNER_TEMP; the stubs here answer the unwrapped calls.
+unset RUNNER_TEMP
 
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
@@ -27,7 +30,7 @@ if [[ "$1" == "--version" ]]; then
 fi
 printf '%s\n' "$*" >>"${GH_STUB_DIR:?}/calls.log"
 native=0
-[[ "${GH_STUB_VERSION:-2.45.0}" == 2.94.0 ]] && native=1
+[[ "${GH_STUB_VERSION:-2.45.0}" == 2.94.0 && -z "${GH_STUB_REFUSE:-}" ]] && native=1
 case "$1 $2" in
 "issue create")
   if ((native)); then
@@ -37,14 +40,23 @@ case "$1 $2" in
   ;;
 "issue view")
   if ((native)); then
-    printf '{"number":42,"title":"t","state":"OPEN","assignees":[],"labels":[{"name":"a"}],"url":"https://github.com/o/r/issues/42"}\n'
+    printf '{"number":%s,"title":"t","state":"OPEN","assignees":[],"labels":[{"name":"a"}],"url":"https://github.com/o/r/issues/%s"}\n' "$3" "$3"
     exit 0
   fi
+  ;;
+"api graphql")
+  if ((native)); then
+    no_children='{"data":{"repository":{"issue":{"subIssues":{"nodes":[]}}}}}'
+    printf '%s\n' "${GH_STUB_SUBISSUES:-$no_children}"
+    exit 0
+  fi
+  printf 'HTTP 403: GitHub GraphQL is not available from Claude Code sessions\n' >&2
+  exit 1
   ;;
 esac
 case "$1" in
 issue | repo)
-  printf 'HTTP 403: GitHub GraphQL is not available\n' >&2
+  printf 'HTTP 403: GitHub GraphQL is not available from Claude Code sessions\n' >&2
   exit 1
   ;;
 api)
@@ -128,6 +140,85 @@ EOF
   assert_eq "create-item on gh 2.94 keeps the native path → exit 0" "0" "$rc"
   assert_eq "create-item on gh 2.94 emits id" "github:o/r#42" "$(jq -r '.id' <<<"$OUT")"
   assert_contains "create-item on gh 2.94 calls issue create" "$(<"$STUB/calls.log")" "issue create"
+  assert_not_contains "create-item without --parent reads no sub-issues" "$(<"$STUB/calls.log")" "api graphql"
+
+  # --- sibling dedupe under --parent: open, closed within 24h, closed earlier ---
+  siblings() { # <state> <closedAt or null> <title>
+    printf '{"data":{"repository":{"issue":{"subIssues":{"nodes":[{"number":7,"title":%s,"state":"%s","closedAt":%s,"repository":{"nameWithOwner":"O/R"}}]}}}}}' \
+      "$(jq -cn --arg t "$3" '$t')" "$1" "$2"
+  }
+  hour_ago="\"$(jq -rn 'now - 3600 | todate')\""
+  two_days_ago="\"$(jq -rn 'now - 172800 | todate')\""
+  DEDUPE_ERR="$(mktemp "$TMP_ROOT/f.XXXXXX")"
+
+  OUT="$(GH_STUB_SUBISSUES="$(siblings OPEN null '  T ')" GH_STUB_VERSION=2.94.0 \
+    run_create --title T --parent github:o/r#1 --repo o/r 2>"$DEDUPE_ERR")"
+  rc=$?
+  assert_eq "create-item --parent with an open sibling titled T → exit 0" "0" "$rc"
+  assert_eq "create-item --parent with an open sibling prints its id" "github:o/r#7" "$(jq -r '.id' <<<"$OUT")"
+  assert_not_contains "create-item --parent with an open sibling creates no issue" "$(<"$STUB/calls.log")" "issue create"
+  assert_contains "create-item --parent with an open sibling names it on stderr" "$(<"$DEDUPE_ERR")" "github:o/r#7"
+
+  OUT="$(GH_STUB_SUBISSUES="$(siblings CLOSED "$hour_ago" T)" GH_STUB_VERSION=2.94.0 \
+    run_create --title T --parent github:o/r#1 --repo o/r 2>"$DEDUPE_ERR")"
+  rc=$?
+  assert_eq "create-item --parent with a sibling closed 1h ago → exit 0" "0" "$rc"
+  assert_eq "create-item --parent with a sibling closed 1h ago prints its id" "github:o/r#7" "$(jq -r '.id' <<<"$OUT")"
+  assert_not_contains "create-item --parent with a sibling closed 1h ago creates no issue" "$(<"$STUB/calls.log")" "issue create"
+
+  OUT="$(GH_STUB_SUBISSUES="$(siblings CLOSED "$two_days_ago" T)" GH_STUB_VERSION=2.94.0 \
+    run_create --title T --parent github:o/r#1 --repo o/r 2>"$DEDUPE_ERR")"
+  rc=$?
+  assert_eq "create-item --parent with a sibling closed 2 days ago → exit 0" "0" "$rc"
+  assert_eq "create-item --parent with a sibling closed 2 days ago creates a new issue" "github:o/r#42" "$(jq -r '.id' <<<"$OUT")"
+  assert_contains "create-item --parent with a sibling closed 2 days ago calls issue create" "$(<"$STUB/calls.log")" "issue create"
+
+  OUT="$(GH_STUB_SUBISSUES="$(siblings OPEN null 'T2')" GH_STUB_VERSION=2.94.0 \
+    run_create --title T --parent github:o/r#1 --repo o/r 2>"$DEDUPE_ERR")"
+  assert_eq "create-item --parent with a differently titled sibling creates a new issue" "github:o/r#42" "$(jq -r '.id' <<<"$OUT")"
+  rm -f "$DEDUPE_ERR"
+
+  # CLAUDE_CODE_REMOTE=true: the cloud proxy refuses GraphQL, so gh 2.94 takes REST.
+  OUT="$(CLAUDE_CODE_REMOTE=true GH_STUB_VERSION=2.94.0 run_create --title t --labels a --repo o/r)"
+  rc=$?
+  assert_eq "create-item on gh 2.94 in a remote session → exit 0" "0" "$rc"
+  assert_eq "create-item on gh 2.94 in a remote session emits id" "github:o/r#42" "$(jq -r '.id' <<<"$OUT")"
+  CALLS="$(<"$STUB/calls.log")"
+  assert_contains "create-item on gh 2.94 in a remote session POSTs over REST" "$CALLS" \
+    "api --method POST repos/o/r/issues"
+  assert_not_contains "create-item on gh 2.94 in a remote session skips issue create" "$CALLS" "issue create"
+  assert_not_contains "create-item on gh 2.94 in a remote session skips issue view" "$CALLS" "issue view"
+
+  CLAUDE_CODE_REMOTE=true GH_STUB_VERSION=2.94.0 run_create --title t --parent github:o/r#1 --repo o/r >/dev/null 2>"$STUB/err"
+  assert_eq "create-item --parent in a remote session → exit 3" "3" "$?"
+  assert_contains "create-item --parent in a remote session names the unavailable edge" \
+    "$(<"$STUB/err")" "unavailable in this Claude Code cloud session"
+  assert_not_contains "create-item --parent in a remote session sends nothing" "$(<"$STUB/calls.log")" "POST"
+
+  # A native create the proxy refuses with its GraphQL 403 retries over REST.
+  OUT="$(GH_STUB_REFUSE=1 GH_STUB_VERSION=2.94.0 run_create --title t --labels a --repo o/r)"
+  rc=$?
+  assert_eq "create-item on a refused gh 2.94 create falls back → exit 0" "0" "$rc"
+  assert_eq "create-item on a refused gh 2.94 create emits id" "github:o/r#42" "$(jq -r '.id' <<<"$OUT")"
+  CALLS="$(<"$STUB/calls.log")"
+  assert_contains "create-item on a refused gh 2.94 create tries the native path first" "$CALLS" "issue create"
+  assert_contains "create-item on a refused gh 2.94 create POSTs over REST" "$CALLS" \
+    "api --method POST repos/o/r/issues"
+
+  # The refused native create degrades --type to a label, which the REST POST must carry.
+  GH_STUB_REFUSE=1 GH_STUB_VERSION=2.94.0 run_create --title t --type Task --labels a --repo o/r >/dev/null 2>&1
+  rc=$?
+  assert_eq "create-item --type on a refused gh 2.94 create falls back → exit 0" "0" "$rc"
+  CALLS="$(<"$STUB/calls.log")"
+  assert_contains "create-item --type on a refused gh 2.94 create POSTs over REST" "$CALLS" \
+    "api --method POST repos/o/r/issues"
+  assert_contains "create-item --type on a refused gh 2.94 create keeps the given label" "$CALLS" \
+    "labels[]=a"
+  assert_contains "create-item --type on a refused gh 2.94 create sends the type label" "$CALLS" \
+    "labels[]=type: task"
+
+  GH_STUB_REFUSE=1 GH_STUB_VERSION=2.94.0 run_create --title t --parent github:o/r#1 --repo o/r >/dev/null 2>&1
+  assert_eq "create-item --parent on a refused gh 2.94 create → usage error" "2" "$?"
 
   rm -rf "$STUB" "$PROJECT"
 fi
