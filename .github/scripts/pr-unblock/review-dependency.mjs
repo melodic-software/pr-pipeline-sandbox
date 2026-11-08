@@ -6,7 +6,10 @@
 //           model turn, with the job's read-only token: skips a pull request
 //           Dependabot did not open, one whose head is no longer the gated
 //           head (superseded-sha), or one dependency-classify.mjs sorts `auto`
-//           (pr-merge owns those), escalates once the configured number of
+//           (pr-merge owns those), writes the install-script pin patch
+//           (PIN_PATCH_FILE, install-script-pin.mjs) with no model turn when
+//           the head's allowScripts pin lags its lockfile, escalates once
+//           the configured number of
 //           review rounds ran, and otherwise writes the context file the skill
 //           reads (DEPENDENCY_FILE) and the run fields the verdict job reads
 //           (CONTEXT_RUN_FILE): the gated head, the security, config and
@@ -16,10 +19,11 @@
 // The PR body holds third-party release notes: it is copied into the context
 // file as data and never logged or interpolated into a command.
 
+import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-import { createGitHubApi, need, positive, SHA } from "./address-feedback.mjs";
+import { countedFetch, createGitHubApi, need, positive, SHA } from "./address-feedback.mjs";
 import {
   classifierGaps,
   classify,
@@ -30,6 +34,7 @@ import {
   provenanceReasons,
   withProvenance,
 } from "./dependency-classify.mjs";
+import { movePin, PACKAGE, unifiedDiff } from "./install-script-pin.mjs";
 
 export const DEFAULT_MAX_ROUNDS = 2;
 export const MODEL_CHECK = "pr-unblock / review-dependency";
@@ -90,13 +95,41 @@ export function countCheckRounds(checkRunsByCommit) {
   ).length;
 }
 
+const newestOf = (checkRuns) => checkRuns.filter((run) => run.app?.slug === "github-actions").sort((a, b) => b.id - a.id)[0];
+
 // The newest ci-status run GitHub Actions posted on the head: its conclusion
 // once completed, else pending.
 export function ciStatusOf(checkRuns) {
-  const newest = checkRuns
-    .filter((run) => run.app?.slug === "github-actions")
-    .sort((a, b) => b.id - a.id)[0];
+  const newest = newestOf(checkRuns);
   return newest?.status === "completed" ? String(newest.conclusion) : "pending";
+}
+
+// While a full run is in flight on the head, the contract-only ci-status fails
+// with this annotation and the full run's newer ci-status decides
+// (pr-require-checks.yml, yield-to-full-run). The rule matches the guardrails
+// merge guard's: every failure annotation is that marker for this head or the
+// runner's exit line, and at least one is the marker.
+const SUPERSEDED = /^superseded by full run https:\/\/[^ ]+\/actions\/runs\/[0-9]+ in flight on ([0-9a-f]+)[:. ]/;
+const EXIT_LINE = /^Process completed with exit code [0-9]+\.$/;
+export function supersededOnly(annotations, headSha) {
+  const failures = annotations.filter((note) => note?.annotation_level === "failure").map((note) => String(note.message ?? ""));
+  const marks = (message) => SUPERSEDED.exec(message)?.[1] === headSha;
+  return failures.some(marks) && failures.every((message) => marks(message) || EXIT_LINE.test(message));
+}
+
+// ciStatusOf, with a superseded contract-only failure read as pending. A
+// failed annotations read leaves the failure standing.
+export async function readCiStatus(api, headSha) {
+  const runs = await api.listCheckRuns(headSha, "ci-status");
+  const status = ciStatusOf(runs);
+  if (status !== "failure") {
+    return status;
+  }
+  try {
+    return supersededOnly(await api.listAnnotations(newestOf(runs).id), headSha) ? "pending" : status;
+  } catch {
+    return status;
+  }
 }
 
 // A commit's changed paths, or null when unreadable or at the listing limit,
@@ -166,6 +199,19 @@ function capPatches(files) {
   });
 }
 
+// The install-script pin move the head needs ({ from, to, patch }), or null:
+// only a pull request that changes the root package.json or package-lock.json
+// is read, and both files at the head are data. A pin it cannot move throws.
+export async function pinMove(api, files, headSha) {
+  if (!files.some((file) => file.filename === "package.json" || file.filename === "package-lock.json")) {
+    return null;
+  }
+  const manifest = await api.getText("package.json", headSha);
+  const lock = manifest === null ? null : await api.getText("package-lock.json", headSha);
+  const moved = lock === null ? null : movePin(manifest, lock);
+  return moved && { from: moved.from, to: moved.to, patch: unifiedDiff("package.json", manifest, moved.text) };
+}
+
 export async function select({ api, pr, headSha, appId, dependabotId, config = null, policy, repository = "", maxRounds = DEFAULT_MAX_ROUNDS, provenance }) {
   const pull = await api.getPull(pr);
   if (pull.user?.id !== dependabotId || pull.user?.login !== DEPENDABOT_LOGIN) {
@@ -179,7 +225,7 @@ export async function select({ api, pr, headSha, appId, dependabotId, config = n
   const commits = await api.listPullCommits(pr);
   const classification = await classifyPull({
     pull,
-    ciStatus: ciStatusOf(await api.listCheckRuns(headSha, "ci-status")),
+    ciStatus: await readCiStatus(api, headSha),
     commits,
     files,
     config,
@@ -191,20 +237,37 @@ export async function select({ api, pr, headSha, appId, dependabotId, config = n
   if (classification.tier !== "review") {
     return { decision: "skip", skipReason: "not-applicable", classification };
   }
+  // A stale install-script pin is moved before any model turn: the push job
+  // lands it, and the new head is reviewed. A pin it cannot move goes to the
+  // model with the rest.
+  let pinError = "";
+  try {
+    const pin = await pinMove(api, files, headSha);
+    if (pin) {
+      return { decision: "pin", pin, classification };
+    }
+  } catch (error) {
+    pinError = error.message;
+  }
   const comments = await api.listIssueComments(pr);
-  const checkRuns = await Promise.all(commits.map((commit) => api.listCheckRuns(commit.sha, MODEL_CHECK)));
+  // One commit's check runs at a time: element 6's serial reads.
+  const checkRuns = [];
+  for (const commit of commits) {
+    checkRuns.push(await api.listCheckRuns(commit.sha, MODEL_CHECK));
+  }
   // The commits listing stops at 250: a partial one cannot show a head is gone.
   const whole = commits.length === pull.commits && commits.at(-1)?.sha === headSha;
   const shas = whole ? commits.map((commit) => commit.sha) : null;
   const done = Math.max(countRounds(comments, appId, shas), countCheckRounds(checkRuns));
   if (done >= maxRounds) {
-    return { decision: "escalate", escalationReason: "dependency-round-cap", rounds: done, classification };
+    return { decision: "escalate", escalationReason: "dependency-round-cap", rounds: done, classification, pinError };
   }
 
   return {
     decision: "proceed",
     rounds: done,
     classification,
+    pinError,
     file: {
       version: 1,
       repository,
@@ -322,6 +385,7 @@ export async function main(argv, env, { api, log = (line) => console.log(line), 
       repository: env.GITHUB_REPOSITORY,
       apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
       graphqlUrl: env.GITHUB_GRAPHQL_URL ?? "https://api.github.com/graphql",
+      fetch: await countedFetch(),
     });
   const config = readConfig(env.DEPENDABOT_CONFIG, log);
   const result = await select({
@@ -342,8 +406,25 @@ export async function main(argv, env, { api, log = (line) => console.log(line), 
     writeFileSync(env.CONTEXT_RUN_FILE, `${JSON.stringify(run)}\n`);
   }
   const output = (key, value) => appendFileSync(env.GITHUB_OUTPUT, `${key}=${value}\n`);
+  if (result.pin) {
+    need(env, ["PIN_PATCH_FILE"]);
+    writeFileSync(env.PIN_PATCH_FILE, result.pin.patch);
+    output("pin-state", "written");
+    output("pin-sha256", createHash("sha256").update(result.pin.patch).digest("hex"));
+    const line = `${PACKAGE} install-script pin: ${result.pin.from} to ${result.pin.to}, pushed by apply-dependency-pin with no model turn`;
+    log(line);
+    if (env.GITHUB_STEP_SUMMARY) {
+      appendFileSync(env.GITHUB_STEP_SUMMARY, `${line}\n`);
+    }
+  }
+  if (result.pinError) {
+    log(`::warning::the ${PACKAGE} install-script pin was not moved (${result.pinError}); the model reviews the pull request as it stands`);
+  }
   output("proceed", String(result.decision === "proceed"));
-  output("skip-reason", result.decision === "skip" ? result.skipReason : result.decision === "escalate" ? "awaiting-human" : "");
+  output(
+    "skip-reason",
+    result.decision === "skip" ? result.skipReason : result.decision === "escalate" ? "awaiting-human" : result.decision === "pin" ? "no-model-turn" : "",
+  );
   output("escalation-reason", result.escalationReason ?? "");
   const gaps = classifierGaps(result.classification?.tier === "review" ? result.classification.reasons : []);
   if (gaps.length) {

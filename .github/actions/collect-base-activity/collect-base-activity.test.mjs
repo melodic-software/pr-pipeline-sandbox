@@ -5,15 +5,23 @@
 // instruction to commit; a merge-base skill runs on run-claude-cli alone.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 
-import { LIMITS } from "../../scripts/pr-unblock/apply-dependency-verdict.mjs";
+import { STOP_REASONS } from "../../scripts/lib/stop-reason.mjs";
+import { LIMITS, UNPLAIN_PATTERN, VERDICT_KEYS } from "../../scripts/pr-unblock/apply-dependency-verdict.mjs";
 import { VERDICTS } from "../../scripts/pr-unblock/review-dependency.mjs";
+import { tempDir } from "../../../lib/test-tmp.mjs";
+
+// Children that call mktemp (the verify-script wrapper) write here, outside the checkout fixtures.
+const childTmp = tempDir("collect-base-children-");
+process.env.TMPDIR = childTmp;
 
 const ACTION = new URL("./action.yml", import.meta.url);
+const REPO_ROOT = path.join(import.meta.dirname, "../../..");
 const COMMIT_TOOL = "mcp__github_file_ops__commit_files";
 const COMMIT_SENTENCE = "commit every repository file you changed";
 // commit_files takes each file's mode from disk, so a skill that commits
@@ -92,6 +100,13 @@ let root;
 let base;
 let resolved;
 
+// The issue lane's protected-path rules come from the base's apply-patch
+// and patch-rules.json, as committed; every issue-lane base needs them.
+const PATCH_RULE_FILES = [".github/scripts/apply-patch", ".github/scripts/pr-merge/merge-holds.mjs", ".github/scripts/pr-unblock/dependency-classify.mjs", ".github/scripts/pr-unblock/thread-scope.mjs", ".github/scripts/pr-unblock/escalation-routes.mjs", ".github/scripts/pr-unblock/escalation-routes.json", ".github/actions/resolve-config/patch-rules.json"];
+function copyPatchRules(dir) {
+  for (const file of PATCH_RULE_FILES) cpSync(path.join(REPO_ROOT, file), path.join(dir, file), { recursive: true });
+}
+
 before(() => {
   root = mkdtempSync(path.join(tmpdir(), "collect-base-activity-"));
   base = path.join(root, "base");
@@ -103,6 +118,7 @@ before(() => {
   writeFileSync(path.join(base, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "melodic-software" }));
   resolved = path.join(root, "resolved.json");
   writeFileSync(resolved, JSON.stringify({ selected: { args: "ci" } }));
+  copyPatchRules(base);
 });
 
 after(() => {
@@ -119,11 +135,12 @@ function stage(overrides) {
   writeFileSync(envFile, "");
   const env = {
     PATH: process.env.PATH,
+    TMPDIR: childTmp,
     MARKETPLACE: path.join(runTemp, "base-marketplace"),
     DOCS_DIR: path.join(runTemp, "lane-docs"),
     BASE_PATH: base,
     RESOLVED: resolved,
-    SKILL: "source-control:resolve-conflicts",
+    SKILL: "source-control:pull-request",
     GATING: "advisory",
     EFFECT: "mutate-branch",
     CAN_COMMIT: "true",
@@ -146,6 +163,18 @@ function stage(overrides) {
   const jobEnv = readFileSync(envFile, "utf8");
   return { status: result.status, stdout: result.stdout, args, allowed, denied, prompt, plugins, jobEnv, env };
 }
+
+// #8595: the lanes run the latest CLI, so the comment above shell_denied
+// records the last swept version and points at the release procedure.
+test("the shell deny set names its last swept CLI version and a procedure heading that exists", () => {
+  const action = readFileSync(ACTION, "utf8");
+  const comment = /((?:^ *#.*\n)+) *shell_denied=\(/m.exec(action)?.[1] ?? "";
+  assert.match(comment.replace(/\n *# */g, " "), /Last swept: Claude Code \d+\.\d+\.\d+ on \d{4}-\d{2}-\d{2}/);
+  const anchor = /README\.md#([a-z0-9-]+)/.exec(comment)?.[1];
+  assert.equal(anchor, "claude-code-cli-releases");
+  const readme = readFileSync(path.join(REPO_ROOT, "docs/conventions/pr-pipeline/README.md"), "utf8");
+  assert.match(readme, /^## Claude Code CLI releases$/m);
+});
 
 test("an issue lane's prompt names the issue before the activity's args", () => {
   const { status, prompt, args } = stage({ SKILL: "work-items:work", ISSUE_NUMBER: "77" });
@@ -317,7 +346,25 @@ test("a listed check's copy carries the base's shellcheck, markdownlint and ruff
   } finally {
     rmSync(path.join(base, ".shellcheckrc"));
     rmSync(path.join(base, ".markdownlint-cli2.jsonc"));
-    rmSync(path.join(base, ".github"), { recursive: true });
+    rmSync(path.join(base, ".github", "requirements-ci.txt"));
+  }
+});
+
+// check-changed-skills.sh --merge-base runs the checker beside its scripts/
+// copy, never the checkout's.
+test("a listed check's copy carries the base's skill-quality scripts", () => {
+  const scripts = path.join(base, "plugins", "skill-quality", "scripts");
+  mkdirSync(scripts, { recursive: true });
+  writeFileSync(path.join(scripts, "check-skill.sh"), "#!/usr/bin/env bash\necho base checker\n", { mode: 0o755 });
+  writeFileSync(path.join(scripts, "metadata-registry.txt"), "category\n");
+  try {
+    const { status, checksDir } = withChecks(["scripts/check-x.sh --check"]);
+    assert.equal(status, 0);
+    const copy = path.join(checksDir, "plugins", "skill-quality", "scripts");
+    assert.equal(readFileSync(path.join(copy, "check-skill.sh"), "utf8"), "#!/usr/bin/env bash\necho base checker\n");
+    assert.equal(readFileSync(path.join(copy, "metadata-registry.txt"), "utf8"), "category\n");
+  } finally {
+    rmSync(path.join(base, "plugins", "skill-quality"), { recursive: true });
   }
 });
 
@@ -504,11 +551,11 @@ test("the verify-script wrapper runs the script without GH_TOKEN or GITHUB_TOKEN
 
 // pr-run-activity.md, "Skill activities": the issue lane lists the repository's
 // test runner and git-mv-rm.sh as verify-scripts, so the same generator wraps
-// them. These stage the real scripts (and the lib they source) into the base.
+// them. These stage the real scripts (and the libs they source) into the base.
 const REPO = new URL("../../../", import.meta.url);
 const LANE_TOOLS = ["scripts/run-test-file.sh", "scripts/git-mv-rm.sh"];
 function withLaneTools() {
-  for (const file of [...LANE_TOOLS, "scripts/lib/checkout-path.sh"]) {
+  for (const file of [...LANE_TOOLS, "scripts/lib/checkout-path.sh", "scripts/lib/pytest-python.sh", "scripts/lib/test-git-env.sh"]) {
     mkdirSync(path.join(base, path.dirname(file)), { recursive: true });
     writeFileSync(path.join(base, file), readFileSync(new URL(file, REPO)));
   }
@@ -635,6 +682,45 @@ test("new-changelog-fragment writes a fragment into the checkout from the read-o
   assert.equal(readFileSync(path.join(workspace, run.stdout.trim()), "utf8"), "---\nbump: patch\n---\n\n");
 });
 
+// An issue lane's checkout is detached: the wrapper names the fragment after
+// the lane branch built from the run's ids, and a caller's value cannot steer it.
+test("in an issue lane new-changelog-fragment names a detached checkout's fragment after the lane branch", () => {
+  const files = ["scripts/new-changelog-fragment.sh", "scripts/lib/changelog-fragments.sh", "scripts/lib/read-list.sh"];
+  for (const file of files) {
+    mkdirSync(path.join(base, path.dirname(file)), { recursive: true });
+    writeFileSync(path.join(base, file), readFileSync(new URL(file, REPO)));
+  }
+  const { status, verifyDir, workspace } = withVerify([files[0]], { ISSUE_NUMBER: "77", RUN_ID: "123", RUN_ATTEMPT: "2" });
+  assert.equal(status, 0);
+  const git = (...args) => spawnSync("git", ["-C", workspace, "-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@example.com", ...args]);
+  git("init", "-q");
+  mkdirSync(path.join(workspace, "plugins", "alpha", ".claude-plugin"), { recursive: true });
+  writeFileSync(path.join(workspace, "plugins", "alpha", ".claude-plugin", "plugin.json"), '{"name":"alpha"}\n');
+  mkdirSync(path.join(workspace, "scripts"), { recursive: true });
+  writeFileSync(path.join(workspace, "scripts", "fragment-plugins.txt"), "alpha\n");
+  git("add", "-A");
+  git("commit", "-qm", "base");
+  assert.equal(git("checkout", "-q", "--detach").status, 0);
+  const run = spawnSync(path.join(verifyDir, "bin", "new-changelog-fragment"), ["alpha", "patch"], {
+    cwd: root,
+    encoding: "utf8",
+    env: { ...process.env, CHANGELOG_FRAGMENT_BRANCH: "steered" },
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /^\.changes\/alpha\/work-resolve-issue-issue-77-123-2-[0-9a-f]{8}\.md\n$/);
+});
+
+test("an issue lane refuses to stage new-changelog-fragment without a numeric run id and attempt", () => {
+  const script = "scripts/new-changelog-fragment.sh";
+  mkdirSync(path.join(base, "scripts"), { recursive: true });
+  writeFileSync(path.join(base, script), readFileSync(new URL(script, REPO)));
+  for (const ids of [{}, { RUN_ID: "123", RUN_ATTEMPT: "2 x" }]) {
+    const { status, stdout } = withVerify([script], { ISSUE_NUMBER: "77", ...ids });
+    assert.notEqual(status, 0);
+    assert.match(stdout, /the issue number, run id or run attempt is not a number/);
+  }
+});
+
 test("run-test-file runs an in-checkout test file by its runner and prints the exit status", () => {
   const { status, run, dir } = withLaneTools();
   assert.equal(status, 0);
@@ -650,7 +736,7 @@ test("run-test-file runs an in-checkout test file by its runner and prints the e
   assert.equal(node.status, 0, node.stderr);
   assert.match(node.stdout, /pass 1/);
   assert.match(node.stderr, /exit status: 0\n$/);
-  // pytest for test_*.py, through whichever python3 is on PATH.
+  // pytest for test_*.py, through python3 when no venv has pytest and setup-env is not staged.
   const shim = path.join(dir, "shim");
   mkdirSync(shim);
   writeFileSync(path.join(shim, "python3"), '#!/usr/bin/env bash\necho "python3 $*"\nexit 5\n', { mode: 0o755 });
@@ -1032,7 +1118,8 @@ test("web-access with any domain allows every fetch, search and the research ski
     assert.ok(allowed.includes(rule), `${rule} in ${allowed.join(" | ")}`);
   }
   assert.deepEqual(plugins, ["work-items@melodic-software", "discovery@melodic-software", "knowledge@melodic-software"]);
-  assert.match(args, /\/discovery:research/);
+  // A lane run has nobody to answer an ask, so the prompt passes --unattended.
+  assert.match(args, /\/discovery:research --unattended/);
 });
 
 // pr-run-activity.md, "Skill activities": for `any` only, the two docs
@@ -1375,6 +1462,26 @@ test("run-claude-cli: an issue lane's patch skill stages its check and verify-sc
   assert.ok(pr.deniedTools.includes("Bash(git *)") && !pr.allowedTools.some((rule) => rule.includes("git")));
 });
 
+// pr-run-activity.md, "Issue mode": the paths apply-issue-patch refuses are
+// denied to the issue lane's file tools, and the preamble tells the run to
+// stop with patch-protected-path when its change needs one, so it stops at
+// its first such write instead of at the push. A plugin's settings file,
+// which apply-patch pushes, stays writable; a PR lane gets none of this.
+test("run-claude-cli: an issue lane's patch skill is denied the paths apply-issue-patch refuses and told to stop on one", () => {
+  const run = launch({ ISSUE_NUMBER: "7", SKILL: "source-control:pull-request", RESOLVED: launchResolved(PATCH) });
+  assert.equal(run.status, 0, run.stdout);
+  for (const rule of ["Edit(/.github/workflows/**)", "Edit(/.github/CODEOWNERS)", "Edit(.gitmodules)", "Edit(/settings*.json)", "Edit(/.github/**/settings*.json)"]) {
+    assert.ok(run.deniedTools.includes(rule), `${rule} in ${run.deniedTools.join(" | ")}`);
+  }
+  assert.ok(!run.deniedTools.some((rule) => rule.includes("plugins/**/settings")), run.deniedTools.join(" | "));
+  assert.ok(run.preamble.includes("the file tools are denied them: /.github/workflows/**, /CODEOWNERS, /.github/CODEOWNERS,"), run.preamble);
+  assert.ok(run.preamble.includes("a reason that starts with patch-protected-path: and names the path."), run.preamble);
+  const pr = launch({ SKILL: "source-control:pull-request", RESOLVED: launchResolved(PATCH) });
+  assert.equal(pr.status, 0, pr.stdout);
+  assert.ok(!pr.deniedTools.some((rule) => rule.includes("workflows")), pr.deniedTools.join(" | "));
+  assert.doesNotMatch(pr.preamble, /patch-protected-path/);
+});
+
 // git-read, run against a real checkout: the four read commands run with
 // fsmonitor, hooks and external diff programs off, and every option that
 // writes a file or reads one outside the checkout is refused before git runs.
@@ -1487,9 +1594,9 @@ test("run-claude-cli: a patch-producing skill with no prepare mode gets Bash, Ed
 // tool's wrapper as its one Bash rule (bare and quoted), the thread files
 // staged read-only and denied to the file tools, and state/ left writable for
 // the replies file. pr-run-activity.md, "prepare: review-threads".
-function launchThreads({ runFile = true } = {}) {
+function launchThreads({ runFile = true, threads = '{"threads":[]}\n' } = {}) {
   const feedbackDir = mkdtempSync(path.join(root, "launch-feedback-"));
-  writeFileSync(path.join(feedbackDir, "threads.json"), '{"threads":[]}\n');
+  writeFileSync(path.join(feedbackDir, "threads.json"), threads);
   if (runFile) writeFileSync(path.join(feedbackDir, "run.json"), '{"version":1}\n');
   const scripts = path.join(base, "plugins", "source-control", "skills", "pull-request", "scripts");
   mkdirSync(scripts, { recursive: true });
@@ -1502,7 +1609,7 @@ const FEEDBACK_FILE_DENIED = ["threads.json", "run.json", "feedback-thread.sh", 
   ["Edit", "Write", "NotebookEdit"].map((tool) => `${tool}(./.lane/feedback/${file})`),
 );
 
-test("run-claude-cli: review-threads gets the patch tool set and the review-thread wrapper as its one Bash rule", () => {
+test("run-claude-cli: review-threads gets the patch tool set, the review-thread wrapper and chmod -x as its Bash rules", () => {
   const run = launchThreads();
   assert.equal(run.status, 0, run.stdout);
   assert.deepEqual(run.tools.toSorted(), ["Agent", "Bash", "Edit", "Glob", "Grep", "Read", "Skill", "Write"]);
@@ -1510,6 +1617,8 @@ test("run-claude-cli: review-threads gets the patch tool set and the review-thre
     "Agent",
     `Bash("${FEEDBACK_TOOL}" *)`,
     `Bash(${FEEDBACK_TOOL} *)`,
+    // Only removes an executable bit; apply-patch refuses a new one.
+    "Bash(chmod -x *)",
     "Edit",
     "Edit(./.lane/scratch/**)",
     "Glob",
@@ -1534,13 +1643,24 @@ test("run-claude-cli: the preamble names the review-thread tool's path and subco
   const run = launchThreads();
   assert.equal(run.status, 0, run.stdout);
   const sentence =
-    `The review-thread tool is ${FEEDBACK_TOOL}: run it by exactly this path as ${FEEDBACK_TOOL} list, ` +
+    `The review-thread tool is ${FEEDBACK_TOOL}: run it by exactly this path as ${FEEDBACK_TOOL} list, ${FEEDBACK_TOOL} notes, ` +
     `${FEEDBACK_TOOL} check-paths <path>... and ${FEEDBACK_TOOL} record <thread-id> <file>, with each disposition file in ${WORKSPACE}/.lane/scratch. ` +
-    "The tool posts and commits nothing: a later job pushes your uncommitted fix and posts what you record.";
+    "The tool posts and commits nothing: a later job pushes your uncommitted fix and posts what you record. " +
+    "To revert an executable bit the pull request added, run chmod -x on that file: the fix carries the mode, and only a mode back to the base's is pushed.";
   assert.ok(run.preamble.endsWith(sentence), run.preamble);
+  assert.ok(!run.allowedTools.includes(CHMOD_RULE), "no chmod +x");
   assert.ok(run.preamble.includes(UNCOMMITTED_SENTENCE), run.preamble);
   const named = /The review-thread tool is (\S+):/.exec(run.preamble)[1];
   assert.ok(run.allowedTools.includes(`Bash(${named} *)`), `the allow rule names ${named}`);
+});
+
+test("run-claude-cli: the fresh fixer round's brief from the thread file ends the preamble; a thread file without one adds nothing", () => {
+  const brief = "Fix each finding in the code it names. Never weaken a test.";
+  const run = launchThreads({ threads: `${JSON.stringify({ threads: [], retry: { brief } })}\n` });
+  assert.equal(run.status, 0, run.stdout);
+  assert.ok(run.preamble.endsWith(`a mode back to the base's is pushed. ${brief}`), run.preamble);
+  const plain = launchThreads();
+  assert.ok(plain.preamble.endsWith("a mode back to the base's is pushed."), plain.preamble);
 });
 
 test("run-claude-cli: review-threads stages the thread file, run.json, the tool copy, its wrapper and an empty state/ for .lane/", () => {
@@ -1584,7 +1704,7 @@ test("run-claude-cli: fix-ci and fix-docs get no review-thread wrapper and stage
 
 // fix-docs runs ai-slop:audit under dontAsk: Bash runs exactly the skill's
 // own scripts by absolute path, bare and quoted (its `!` line runs
-// "<dir>/detect.sh" --show-config), and the fix flow's digest commands,
+// "<dir>/detect.sh" --show-config), the fix flow's digest guard among them,
 // with git, the user-scope script and the read-only print commands denied.
 const SLOP = `${WORKSPACE}/.lane/plugins/ai-slop/skills/audit/scripts`;
 test("run-claude-cli: fix-docs gets exactly the ai-slop scripts' rules and the shell deny set", () => {
@@ -1599,18 +1719,21 @@ test("run-claude-cli: fix-docs gets exactly the ai-slop scripts' rules and the s
     [
       `Bash("${SLOP}/cross-check.sh" *)`,
       `Bash("${SLOP}/detect.sh" *)`,
+      `Bash("${SLOP}/digest-guard.sh" *)`,
       `Bash("${SLOP}/emit-findings.sh" *)`,
       `Bash("${SLOP}/emit-fix-record.sh" *)`,
       `Bash("${SLOP}/rubric-fanout.sh" *)`,
       `Bash(${SLOP}/cross-check.sh *)`,
       `Bash(${SLOP}/detect.sh *)`,
+      `Bash(${SLOP}/digest-guard.sh *)`,
       `Bash(${SLOP}/emit-findings.sh *)`,
       `Bash(${SLOP}/emit-fix-record.sh *)`,
       `Bash(${SLOP}/rubric-fanout.sh *)`,
-      `Bash(mkdir -p ${WORKSPACE}/.lane/scratch/*)`,
-      "Bash(sha256sum *)",
     ].toSorted(),
   );
+  for (const rule of ["Bash(sha256sum *)", `Bash(mkdir -p ${WORKSPACE}/.lane/scratch/*)`]) {
+    assert.ok(!run.allowedTools.includes(rule), `${rule} in ${run.allowedTools.join(" | ")}`);
+  }
   for (const rule of [
     ...SHELL_DENIED.filter((rule) => rule.startsWith("Bash")),
     "Read(//proc/**)",
@@ -1634,6 +1757,37 @@ test("run-claude-cli: a ci-context skill that hands on a patch keeps the ci-cont
   assert.equal(run.status, 0, run.stdout);
   assert.ok(run.allowedTools.includes("Bash"), "ci-context keeps its own tool set");
   assert.ok(!run.preamble.includes(UNCOMMITTED_SENTENCE), run.preamble);
+});
+
+// ci-ci.md, "A digest pin the pull request moved": a ci-context skill's
+// verify-scripts are staged as base copies under .lane/verify, denied to the
+// file tools, and named in the preamble as the only copy to run. Its Bash is
+// bare, so the plain-command rule of a patch skill's verify prompt stays out.
+test("run-claude-cli: a ci-context skill's verify-scripts are staged base copies the preamble names as the only copy to run", () => {
+  const ciDir = mkdtempSync(path.join(root, "ci-launch-verify-"));
+  writeFileSync(path.join(ciDir, "context.json"), "{}");
+  const scripts = path.join(base, "plugins", "vtest", "skills", "audit", "scripts");
+  mkdirSync(scripts, { recursive: true });
+  writeFileSync(path.join(scripts, "scan.sh"), "echo scan\n");
+  const run = launch({ RESOLVED: launchResolved({ ...PATCH, "verify-scripts": [VERIFY] }), PREPARE: "ci-context", CI_DIR: ciDir, SKILL: "source-control:pull-request" });
+  assert.equal(run.status, 0, run.stdout);
+  const lane = `${WORKSPACE}/.lane`;
+  assert.equal(readFileSync(path.join(run.stageDir, "verify", VERIFY), "utf8"), "echo scan\n");
+  assert.ok(readFileSync(path.join(run.stageDir, "verify", "bin", "scan"), "utf8").includes(`copy=${lane}/verify/${VERIFY}\n`));
+  for (const rule of ["Edit(./.lane/verify/**)", "Write(./.lane/verify/**)", "NotebookEdit(./.lane/verify/**)"]) {
+    assert.ok(run.deniedTools.includes(rule), `${rule} in ${run.deniedTools.join(" | ")}`);
+  }
+  assert.ok(run.allowedTools.includes("Bash"), "ci-context keeps its bare Bash");
+  assert.ok(run.preamble.includes(`with the script's own arguments: ${lane}/verify/bin/scan. Run one of these scripts only through its wrapper, never the checkout's copy.`), run.preamble);
+  assert.doesNotMatch(run.preamble, /Bash runs only the wrappers/);
+});
+
+test("prepare: ci-context with verify-scripts on claude-code-action fails red", () => {
+  const ciDir = mkdtempSync(path.join(root, "ci-cca-verify-"));
+  writeFileSync(path.join(ciDir, "context.json"), "{}");
+  const run = stage({ PREPARE: "ci-context", CI_DIR: ciDir, EFFECT: "read", CAN_COMMIT: "false", SKILL: "source-control:pull-request", RESOLVED: launchResolved({ ...PATCH, "verify-scripts": [VERIFY] }) });
+  assert.notEqual(run.status, 0);
+  assert.match(run.stdout, /::error::ci-context: verify-scripts stage on run-claude-cli only/);
 });
 
 // web-access on the launcher: `any` only, with the research plugins staged
@@ -1714,6 +1868,87 @@ test("run-claude-cli: web-access with a malformed host, or a research plugin mis
   }
 });
 
+// tidy on the launcher (#8485): an issue lane's patch skill gets the entry and
+// its passes and no other skill, their plugins under .lane/ beside its own, the
+// tidy scripts' rules, and the cutoffs and turn budget in the preamble.
+const TIDY = {
+  entry: "code-tidying:tidy-diff",
+  passes: ["docs-hygiene:write-for-agents", "ai-slop:audit"],
+  "turn-share": 25,
+  cutoffs: { "max-files": 10, "max-lines": 300, "max-areas": 1, "shared-paths": [".github/", "scripts/", "AGENTS.md"] },
+};
+function tidyBase() {
+  const dir = mkdtempSync(path.join(root, "base-tidy-"));
+  for (const skill of ["work-items/skills/work", "code-tidying/skills/tidy-diff", "docs-hygiene/skills/write-for-agents", "ai-slop/skills/audit"]) {
+    mkdirSync(path.join(dir, "plugins", skill), { recursive: true });
+    writeFileSync(path.join(dir, "plugins", skill, "SKILL.md"), "---\n---\n");
+  }
+  mkdirSync(path.join(dir, ".claude-plugin"));
+  writeFileSync(path.join(dir, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "melodic-software" }));
+  copyPatchRules(dir);
+  return dir;
+}
+const tidyResolved = (tidy = TIDY, models = { "max-turns": 150 }) => launchResolved({ ...PATCH, tidy, models });
+const TIDY_SCRIPTS = `${WORKSPACE}/.lane/plugins/code-tidying/skills/tidy-diff/scripts`;
+
+test("run-claude-cli: tidy gives an issue lane's patch skill the tidy skills, their plugins and scripts, and the cutoffs and turn budget", () => {
+  const run = launch({ BASE_PATH: tidyBase(), ISSUE_NUMBER: "7", SKILL: "work-items:work", RESOLVED: tidyResolved() });
+  assert.equal(run.status, 0, run.stdout);
+  assert.deepEqual(
+    run.allowedTools.filter((rule) => rule.startsWith("Skill(")),
+    ["Skill(work-items:work)", "Skill(code-tidying:tidy-diff)", "Skill(docs-hygiene:write-for-agents)", "Skill(ai-slop:audit)"],
+  );
+  for (const rule of [`Bash(${TIDY_SCRIPTS}/change-shape.sh *)`, `Bash("${TIDY_SCRIPTS}/change-shape.sh" *)`, `Bash(${SLOP}/detect.sh *)`, `Bash(${SLOP}/digest-guard.sh *)`]) {
+    assert.ok(run.allowedTools.includes(rule), `${rule} in ${run.allowedTools.join(" | ")}`);
+  }
+  for (const rule of [`Bash(${SLOP}/user-scope.sh *)`, "Bash(git *)", "Edit(./.lane/plugins/**)", "Write(./.lane/plugins/**)"]) {
+    assert.ok(run.deniedTools.includes(rule), `${rule} in ${run.deniedTools.join(" | ")}`);
+  }
+  assert.equal(run.pluginDirs, ".lane/plugins/work-items\n.lane/plugins/code-tidying\n.lane/plugins/docs-hygiene\n.lane/plugins/ai-slop");
+  for (const plugin of ["code-tidying", "docs-hygiene", "ai-slop"]) {
+    assert.equal(readFileSync(path.join(run.stageDir, "plugins", plugin, ".mcp.json"), "utf8"), '{"mcpServers":{}}\n', plugin);
+  }
+  assert.ok(
+    run.preamble.includes(
+      "Tidy cutoffs: at most 10 changed files, 300 changed lines and 1 areas, and no change under these shared paths: .github/ scripts/ AGENTS.md. " +
+        "Tidy entry: code-tidying:tidy-diff; the skills it may call: docs-hygiene:write-for-agents ai-slop:audit. " +
+        "Tidy turn budget: 37 of this run's 150 turns.",
+    ),
+    run.preamble,
+  );
+});
+
+test("run-claude-cli: an issue lane's patch skill without tidy gets no tidy skill, plugin or preamble line", () => {
+  const run = launch({ BASE_PATH: tidyBase(), ISSUE_NUMBER: "7", SKILL: "work-items:work", RESOLVED: launchResolved(PATCH) });
+  assert.equal(run.status, 0, run.stdout);
+  assert.deepEqual(run.allowedTools.filter((rule) => rule.startsWith("Skill(")), ["Skill(work-items:work)"]);
+  assert.equal(run.pluginDirs, ".lane/plugins/work-items");
+  assert.doesNotMatch(run.preamble, /Tidy/);
+});
+
+test("run-claude-cli: tidy outside an issue lane's no-prepare patch skill, a tidy skill missing from the base, or no turn cap fails red before any output", () => {
+  for (const [overrides, message] of [
+    [{ RESOLVED: tidyResolved() }, /tidy: only an issue lane's skill/],
+    [{ ISSUE_NUMBER: "7", RESOLVED: launchResolved({ tidy: TIDY }) }, /tidy: only an issue lane's skill/],
+    [{ ISSUE_NUMBER: "7", RESOLVED: tidyResolved(), PREPARE: "merge-base" }, /tidy: only an issue lane's skill/],
+    [{ ISSUE_NUMBER: "7", RESOLVED: tidyResolved({ ...TIDY, passes: ["docs-hygiene:compress"] }) }, /tidy: docs-hygiene:compress is not in the base/],
+    [{ ISSUE_NUMBER: "7", RESOLVED: tidyResolved(TIDY, {}) }, /tidy: the turn share or the run's turn cap is missing/],
+    [{ ISSUE_NUMBER: "7", RESOLVED: tidyResolved(TIDY, { "max-turns": 3 }) }, /tidy: the turn share leaves tidy no turn/],
+  ]) {
+    const run = launch({ BASE_PATH: tidyBase(), SKILL: "work-items:work", ...overrides });
+    assert.notEqual(run.status, 0, JSON.stringify(overrides));
+    assert.match(run.stdout, message);
+    assert.deepEqual(run.tools, []);
+  }
+});
+
+test("claude-code-action: tidy fails red before any output", () => {
+  const run = stage({ RESOLVED: launchResolved({ tidy: TIDY }) });
+  assert.notEqual(run.status, 0);
+  assert.match(run.stdout, /tidy: only an issue lane's skill/);
+  assert.equal(run.args, "");
+});
+
 // review-dependency on the launcher: Edit, Write and Agent with no Bash, the
 // context file staged read-only under .lane/dependency/ and denied to the file
 // tools, git and the shell read commands denied though no Bash is granted,
@@ -1781,15 +2016,36 @@ test("run-claude-cli: the dependency verdict schema matches the verdict job's ve
   assert.equal(run.status, 0, run.stdout);
   const schema = JSON.parse(readFileSync(path.join(run.schemaDir, "verdict.schema.json"), "utf8"));
   assert.deepEqual(schema.properties.verdict.enum, [...VERDICTS]);
-  assert.deepEqual(schema.required, ["verdict", "reasons", "evidence"]);
+  assert.deepEqual(schema.properties.owner_reason.enum, [...STOP_REASONS]);
+  assert.deepEqual(schema.required, [...VERDICT_KEYS]);
   assert.equal(schema.additionalProperties, false);
   assert.deepEqual(
     [schema.properties.reasons.minItems, schema.properties.reasons.maxItems, schema.properties.reasons.items.maxLength],
     [1, LIMITS.reasons, LIMITS.reason],
   );
   assert.deepEqual([schema.properties.evidence.maxItems, schema.properties.evidence.items.maxLength], [LIMITS.evidence, LIMITS.evidenceItem]);
+  assert.deepEqual([schema.properties.reasons.items.not, schema.properties.evidence.items.not], [{ pattern: UNPLAIN_PATTERN }, { pattern: UNPLAIN_PATTERN }]);
   // With no web access the web tools stay denied.
   assert.ok(run.deniedTools.includes("WebFetch") && run.deniedTools.includes("WebSearch"), run.deniedTools.join(" | "));
+});
+
+// The launcher validates structured output against draft-07
+// (https://code.claude.com/docs/en/agent-sdk/structured-outputs), as Ajv's
+// default class does: a bare @-mention, a fence or an HTML comment in a reason
+// or evidence item fails the schema, a URL, a scoped package or a backticked
+// handle passes.
+test("run-claude-cli: the dependency verdict schema rejects a bare @-mention and passes URLs and scoped packages", () => {
+  const run = launchDependency({ web: false });
+  assert.equal(run.status, 0, run.stdout);
+  const { default: Ajv } = createRequire(new URL("../resolve-config/package.json", import.meta.url))("ajv");
+  const valid = new Ajv({ strict: true }).compile(JSON.parse(readFileSync(path.join(run.schemaDir, "verdict.schema.json"), "utf8")));
+  const verdict = (text) => ({ verdict: "escalate", owner_reason: "none", reasons: [text], evidence: [text] });
+  for (const text of ["maintained by @koromix alone", "@koromix", "cc @a-b.c", "see\n", "```sh", "<!-- x -->"]) {
+    assert.equal(valid(verdict(text)), false, text);
+  }
+  for (const text of ["https://x/@a", "@scope/name", "maintained by `@koromix` alone", "mail a@b.org", "@ alone"]) {
+    assert.equal(valid(verdict(text)), true, `${text}: ${JSON.stringify(valid.errors)}`);
+  }
 });
 
 test("run-claude-cli: a dependency-review skill with no context file fails red before any output", () => {
@@ -1807,10 +2063,10 @@ test("run-claude-cli: a dependency-review skill with no context file fails red b
 const MERGE_FILE_DENIED = ["Edit(./.lane/merge/**)", "Write(./.lane/merge/**)", "NotebookEdit(./.lane/merge/**)"];
 
 test("run-claude-cli: a merge-base skill gets Edit, Write and Agent with no Bash, and the merge context denied to the file tools", () => {
-  const run = launch({ RESOLVED: launchResolved({ "applied-by": { patch: "apply-conflict-patch" }, args: "ci" }), PREPARE: "merge-base", SKILL: "source-control:resolve-conflicts" });
+  const run = launch({ RESOLVED: launchResolved({ "applied-by": { patch: "apply-conflict-patch" }, args: "conflicts --ci --unattended" }), PREPARE: "merge-base", SKILL: "source-control:pull-request" });
   assert.equal(run.status, 0, run.stdout);
   assert.deepEqual(run.tools.toSorted(), ["Agent", "Edit", "Glob", "Grep", "Read", "Skill", "Write"]);
-  assert.deepEqual(run.allowedTools.toSorted(), ["Agent", "Edit", "Edit(./.lane/scratch/**)", "Glob", "Grep", "Skill(source-control:resolve-conflicts)", "Write"].toSorted());
+  assert.deepEqual(run.allowedTools.toSorted(), ["Agent", "Edit", "Edit(./.lane/scratch/**)", "Glob", "Grep", "Skill(source-control:pull-request)", "Write"].toSorted());
   for (const rule of [
     "Bash(git *)",
     ...SHELL_DENIED.filter((rule) => rule.startsWith("Bash(") || rule === "Read(//proc/**)"),
@@ -1830,12 +2086,12 @@ test("run-claude-cli: a merge-base skill gets Edit, Write and Agent with no Bash
   assert.match(run.preamble, /leave a path you cannot resolve with its conflict markers, and edit no other file/);
   assert.match(run.preamble, /You run no command and post nothing\./);
   assert.doesNotMatch(run.preamble, /shell command|commit tool|commit your/i, "no Bash and no commit tool, so no such instruction");
-  assert.equal(run.promptFile, "Call the Skill tool with skill source-control:resolve-conflicts and args ci, then follow the skill instructions to the end.\n");
+  assert.equal(run.promptFile, "Call the Skill tool with skill source-control:pull-request and args conflicts --ci --unattended, then follow the skill instructions to the end.\n");
   assert.equal(run.args, "", "no claude_args for the launcher");
 });
 
 test("run-claude-cli: a merge-base skill that hands on no patch fails red before any output", () => {
-  const run = launch({ PREPARE: "merge-base", SKILL: "source-control:resolve-conflicts" });
+  const run = launch({ PREPARE: "merge-base", SKILL: "source-control:pull-request" });
   assert.notEqual(run.status, 0);
   assert.match(run.stdout, /only a read skill/);
   assert.deepEqual(run.tools, []);

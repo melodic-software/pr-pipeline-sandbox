@@ -2,9 +2,10 @@
 // Uncertainty fields, and the run budget they set. Field and option ids are
 // the org's live ones (gh api orgs/melodic-software/issue-fields, 2026-10-18).
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { checkDimensions, dimensionBudget, issueDimensions, parsePin } from "./dimensions.mjs";
+import { checkDimensions, dimensionBudget, issueDimensions, parsePin, splitChildDims } from "./dimensions.mjs";
 import { Rejection } from "./resolve.mjs";
 
 const HUMAN = 153232337;
@@ -70,6 +71,15 @@ for (const [who, id] of [
     assert.equal(read({ size: 27053567, setters: { 15462270: id } }).size, "small");
   });
 }
+
+// models.issue-status's bot-setters widen the Work status field alone: a
+// dimension one of them set still reads as unset, under the live trusted list.
+test("a Size github-actions[bot] or a melodic- App set reads as unset", () => {
+  const live = JSON.parse(readFileSync(new URL("../../standards/trusted-actors/trusted-actors.json", import.meta.url), "utf8"));
+  for (const setter of [41898282, 288071998]) {
+    assert.equal(issueDimensions(facts({ size: 27053567, setters: { 15462270: setter } }), CONFIG, live).size, "small", setter);
+  }
+});
 
 test("an option id the config does not map stops with unmapped-dimension", () => {
   assert.throws(
@@ -155,3 +165,21 @@ for (const [why, config] of [
     assert.throws(() => checkDimensions(config), (error) => error instanceof Rejection && error.code === "undefined-dimension");
   });
 }
+
+// A trusted size-split sub-issue rated with a split size takes
+// split-child-size; nothing else changes.
+test("splitChildDims gives a trusted split child of a split size the split-child size, and leaves everything else", () => {
+  const config = { ...CONFIG, "split-child-size": "medium" };
+  const large = { size: "large", complexity: "low", uncertainty: "known" };
+  assert.deepEqual(splitChildDims(large, config, true), { ...large, size: "medium" });
+  assert.deepEqual(splitChildDims(large, config, false), large);
+  assert.deepEqual(splitChildDims(large, CONFIG, true), large, "no split-child-size, no change");
+  assert.deepEqual(splitChildDims({ ...large, size: "small" }, config, true), { ...large, size: "small" });
+  assert.deepEqual(splitChildDims({ ...large, size: null }, config, true), { ...large, size: null });
+});
+
+test("checkDimensions refuses a split-child-size that names no size that runs", () => {
+  for (const size of ["huge", "large"]) {
+    assert.throws(() => checkDimensions({ ...CONFIG, "split-child-size": size }), /split-child-size/, size);
+  }
+});

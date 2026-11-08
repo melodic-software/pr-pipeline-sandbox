@@ -74,5 +74,20 @@
     "stage": "post-merge",
     "forbidden-effects": ["merge"],
     "never": "Reopens merged PRs"
+  },
+  "upstream-apply-changelog": {
+    "stage": "upstream",
+    "forbidden-effects": ["mutate-tracker", "merge"],
+    "never": "Merges, or writes to main or a branch outside changelog/<plugin>/v<release>"
+  },
+  "maintenance-tidy-code-upkeep": {
+    "stage": "maintenance",
+    "forbidden-effects": ["mutate-tracker", "merge"],
+    "never": "Merges, or writes to main or a branch outside chore/tidy-adhoc-<slug>-<date>"
+  },
+  "maintenance-measure-skill-edit": {
+    "stage": "maintenance",
+    "forbidden-effects": ["mutate-tracker", "merge"],
+    "never": "Merges, marks a pull request ready, or writes to main or a branch outside chore/hill-climb-<plugin>-<skill>-<run id>, which holds only the skill's markdown and one .changes/<plugin>/ fragment"
   }
 }

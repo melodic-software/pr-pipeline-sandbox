@@ -21,9 +21,14 @@ run, and mints nothing ([Check mode](#check-mode)).
 | `lane`, `activity` | Sent to the broker; the lane must be the caller workflow's file stem |
 | `pr-number` | `token` mode: the gated PR; sent as `pr_number` when set, which the broker needs off `pull_request` |
 | `issue-number` | `token` mode: the issue an `issues` lane works; sent as `issue_number` when set, which the broker needs on an `issues` event. Never with `pr-number` or `dispatcher-run-id` |
+| `release` | `token` mode: the Claude Code release an `upstream-apply-changelog.yml` job works, one `MAJOR.MINOR.PATCH`; sent as `release`, a string, when set, which the broker needs from that caller and refuses from any other. Anything else fails red. Never with `pr-number`, `issue-number` or `dispatcher-run-id` |
 | `dispatcher-run-id` | `token` mode: the `pr-unblock-dispatch.yml` run that dispatched this one; sent as `dispatcher_run_id` when set. The broker needs it to trust a run sent by `github-actions[bot]` |
+| `expected-upstream-head` | `token` mode: for a job after `pr-unblock`'s model job, the head that job was gated on; sent as `expected_upstream_head` when set. A lowercase commit SHA, with `dispatcher-run-id` only |
+| `pushed-commit` | `token` mode: with `expected-upstream-head`, the commit this run's push job pushed onto it; sent as `pushed_commit` when set, the one other head the broker accepts. A lowercase commit SHA; empty sends no key |
 | `effect`, `contents`, `pull-requests`, `issues`, `actions` | `token` mode: this job's own `resolve-config` outputs, compared with the broker's answer. `actions` is `read` or empty; empty expects no `actions` permission |
 | `superseded-ok` | `true` ends green, with a `lane-token-superseded` warning and no token, on a 403 whose reason is `workflow-modified` (a newer copy of the caller workflow on the default branch, whose run does the work). Default `false` |
+| `kill-switch-ok` | `true` ends green, with a `lane-token-stopped` notice (`lane-check-stopped` in `check` mode), no token, no `allowed` and `skip-reason` `kill-switch`, on a 403 whose reason is `kill-switch` (a kill switch turned on after the run read its variables, a designed stop). Steps that use the token must gate on `token`, and jobs that need this one on `skip-reason`. Default `false` |
+| `rate-limit-hold-ok` | `true` ends green, with a `Lane token hold` notice, no token, no `allowed` and `skip-reason` `rate-limited`, when the broker's last answer is 503 `github-rate-limited`: a rate limit the 1-minute retry budget could not wait out, which the caller holds on. The same gating rules as `kill-switch-ok`. Default `false` |
 | `pr-workflow-change-ok` | `token` mode with `pr-number`: `true` ends green, with no token and `skip-reason` `workflow-modified`, on a 403 `workflow-modified` naming a workflow file the PR itself changes ([below](#a-workflow-file-the-pr-changes)). Default `false` |
 | `head-sha`, `default-branch`, `github-token` | Required with `pr-workflow-change-ok`: the gated head, the default branch, and a token that reads the repository's contents, for the compare |
 
@@ -35,7 +40,8 @@ run, and mints nothing ([Check mode](#check-mode)).
 | `expires-at` | The expiry the broker returned |
 | `mint-id` | `<check_run_id>-<run_attempt>`, the broker's audit key for this mint |
 | `failure-reason` | The one-line reason the step failed with (`lane-token-denied: ...`); empty on a success |
-| `skip-reason` | `workflow-modified` when `pr-workflow-change-ok` skipped; empty otherwise |
+| `skip-reason` | `workflow-modified` when `pr-workflow-change-ok` skipped, `kill-switch` when `kill-switch-ok` did, `rate-limited` when `rate-limit-hold-ok` did; empty otherwise |
+| `allowed` | `check` mode: `true` on the broker's allow; unset otherwise |
 
 ## What it does
 
@@ -43,20 +49,22 @@ run, and mints nothing ([Check mode](#check-mode)).
    each of `contents`, `pull-requests` and `issues`, or when the job lacks `id-token: write`.
 2. Requests an OIDC token for `audience` and masks it.
 3. Sends a `POST` to `broker-url` with `Authorization: Bearer <OIDC token>` and the body
-   `{"lane", "activity", "pr_number"?, "issue_number"?, "dispatcher_run_id"?}`. It retries, up to
-   three times and each with a fresh OIDC token, only two 503s that come before the broker reserves
-   the job's mint, as GitHub's
+   `{"lane", "activity", "pr_number"?, "issue_number"?, "release"?, "dispatcher_run_id"?}`. It sends
+   at most three requests, each with a fresh OIDC token, and retries only two 503s that come before
+   the broker reserves the job's mint, as GitHub's
    [rate-limit guidance](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#exceeding-the-rate-limit)
    asks:
    - `github-rate-limited`: GitHub rate-limited the broker. The retry waits exactly the
-     `Retry-After` header (a minute when it is absent) plus up to 20 seconds of jitter. When that
-     wait would end more than 8 minutes after the first request, it fails red at once, naming the
-     limit kind (`primary` or `secondary`), its resource and the time it resets. On an issue lane,
+     `Retry-After` header (a minute when it is absent) plus up to 20 seconds of jitter, cut to fit
+     the budget below. When that wait does not fit, it fails red at once (holds green under
+     `rate-limit-hold-ok`), naming the limit kind
+     (`primary` or `secondary`), its resource and the time it resets. On an issue lane,
      work-unblock's hourly sweep re-fires such a run once the reset has passed.
-   - `github-unavailable`: another broker call to GitHub failed. The retry waits 60, 120 and 240
-     seconds plus up to 20 seconds of jitter, or a longer `Retry-After`.
+   - `github-unavailable`: another broker call to GitHub failed. The retry waits a random 0 to 20
+     seconds, then 0 to 40 (full jitter), or a longer `Retry-After`.
 
-   No retry starts more than 8 minutes after the first request. `mint-unavailable`, a failed mint
+   The waits add up to at most 60 seconds, the per-step budget of the outage posture's retry rule
+   ([the audit](../../../docs/outage-posture-audit.md), element 1); a wait past it is not taken. `mint-unavailable`, a failed mint
    after the broker reserved the job's one mint, is final, and its failure says so; a retry would
    be denied `already-minted`, and a failure after a retry names the 503 before it. Every other
    answer is final, and no response at all fails red with `broker-unreachable`, since a 200 lost in
@@ -66,13 +74,22 @@ run, and mints nothing ([Check mode](#check-mode)).
    With `superseded-ok: true`, a 403 with reason `workflow-modified` warns and ends green instead,
    setting no output, so steps gated on the `token` output skip. With `pr-workflow-change-ok: true`,
    such a 403 for a workflow file the PR changes ends green with `skip-reason` set
-   ([below](#a-workflow-file-the-pr-changes)).
+   ([below](#a-workflow-file-the-pr-changes)). With `kill-switch-ok: true`, a 403 with reason
+   `kill-switch` ends green with a notice and `skip-reason` `kill-switch`, setting no token. With
+   `rate-limit-hold-ok: true`, a last answer of 503 `github-rate-limited` holds green the same way,
+   with a `Lane token hold` notice and `skip-reason` `rate-limited` (the outage posture's element 2).
 5. On 200, masks the token, then compares the broker's `effect`, `permissions`, `lane`, `activity`
    and `repository_ids` with this job's values (`pull-requests` is `pull_requests` in the API). Any
    difference revokes the token and fails red with `effect-mismatch`. That happens when the PR's
    base SHA and the default-branch tip resolve the activity differently.
 6. Writes the outputs. Any failure after the broker issued a token attempts to revoke it, and prints the status, before the step
    exits.
+7. When the 200 carries an optional `rate_limit` object (`remaining`, `limit` and `reset` in epoch
+   seconds), the lanes App's REST quota at the mint, it writes an `api-budget` notice,
+   `mint lanes-app core remaining=R used=U limit=L reset=<ISO>`, and a job summary line. The
+   monitoring lane reads that notice from lane runs, since its `GITHUB_TOKEN` cannot read the App's
+   quota. With no `rate_limit` it writes nothing more; with one that is not three whole numbers,
+   `remaining` at most `limit`, it warns `lane-token-quota-unread` and still passes.
 
 It does not revoke a token it handed out. The workflow does, in a final step with
 `if: always() && steps.<id>.outputs.token != ''`, because a composite action has no post step.
@@ -127,11 +144,14 @@ controls that job, so this adds nothing it could not already do.
 ## Check mode
 
 With `mode: check` the action takes only `broker-url`, `audience`, `lane` and `activity`; a
-`pr-number`, `issue-number`, effect or grant fails it red, so the read file's check job never carries the write
+`pr-number`, `issue-number`, `release`, effect or grant fails it red, so the read file's check job never carries the write
 path's inputs. It posts to `broker-url`, retrying a 503 `github-unavailable` or `github-rate-limited` as in step 3, with its final `/token` replaced by `/check` (a URL
 that does not match `^https://[^/]+/(.+/)?token$` fails red), with the body `{"lane", "activity"}`, and passes only on a 200
 whose `decision` is `allow` and whose `lane` and `activity` are its own. Any other answer fails red
-with `lane-check-denied`; no response is `broker-unreachable`. It sets no output.
+with `lane-check-denied`; no response is `broker-unreachable`. An allow sets `allowed=true`. With
+`kill-switch-ok: true`, a 403 `kill-switch` ends green with a `lane-check-stopped` notice,
+`skip-reason=kill-switch` and no `allowed`, so the job reads the allow from `allowed`, never from
+the step's outcome.
 
 ```yaml
 - name: Ask the broker whether the lane may run
@@ -143,4 +163,5 @@ with `lane-check-denied`; no response is `broker-unreachable`. It sets no output
     audience: ${{ vars.LANES_BROKER_AUDIENCE }}
     lane: ${{ inputs.lane }}
     activity: ${{ inputs.activity }}
+    kill-switch-ok: true
 ```

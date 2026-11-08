@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { withRetry } from "../../scripts/pr-merge/enable-auto-merge.mjs";
 import { readOutputs } from "../check-kill-switch/fixtures/read-outputs.mjs";
-import { commitPulls as readCommitPulls, createGitHub, GitHubError, loadTrustedActors, main } from "./check-trusted-trigger.mjs";
+import { createRateLimitLatch, RateLimitStop } from "../log-api-budget/rate-guard.mjs";
+import { appCloseKind, commitPulls as readCommitPulls, createGitHub, GitHubError, isTrustedClose, loadTrustedActors, loadTrustedList, main, reconcilerRecordVouches } from "./check-trusted-trigger.mjs";
+import { main as recordMain } from "./reconciler-record.mjs";
+import { tempDir } from "../../../lib/test-tmp.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(HERE, "fixtures");
@@ -78,7 +81,7 @@ function fakeSleep() {
 
 let dir;
 beforeEach(() => {
-  dir = mkdtempSync(path.join(tmpdir(), "trusted-trigger-"));
+  dir = tempDir("trusted-trigger-");
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
@@ -102,13 +105,17 @@ async function gate({
   dispatcherWorkflow,
   runDispatcherWorkflow,
   runDispatcherUpstreams,
+  runDispatcherRelay,
   expectedUpstreamHead,
+  pushedCommit,
   lanesAppId,
   requirePr,
   runId = OWN_RUN_ID,
   dispatchedWorkflow,
   requireKind,
   appLabel,
+  appFieldId,
+  appFieldOption,
   reconcilerWorkflow,
   ciStatusRerunWorkflow,
   runAttempt = "1",
@@ -116,6 +123,7 @@ async function gate({
   ownRun,
   sleep = fakeSleep(),
   attemptTimeoutMs,
+  faultReason,
 }) {
   const outputPath = writeJson("output", "");
   // This run's own record, unless the test routes it: the re-runner is read
@@ -151,16 +159,21 @@ async function gate({
       ...(runDispatcherUpstreams === undefined
         ? {}
         : { RUN_DISPATCHER_UPSTREAMS: runDispatcherUpstreams }),
+      ...(runDispatcherRelay === undefined ? {} : { RUN_DISPATCHER_RELAY: runDispatcherRelay }),
       ...(expectedUpstreamHead === undefined ? {} : { EXPECTED_UPSTREAM_HEAD: expectedUpstreamHead }),
+      ...(pushedCommit === undefined ? {} : { PUSHED_COMMIT: pushedCommit }),
       ...(lanesAppId === undefined ? {} : { LANES_APP_ID: lanesAppId }),
       ...(requirePr === undefined ? {} : { REQUIRE_PR: requirePr }),
       ...(runId === undefined ? {} : { GITHUB_RUN_ID: runId }),
       ...(dispatchedWorkflow === undefined ? {} : { DISPATCHED_WORKFLOW: dispatchedWorkflow }),
       ...(requireKind === undefined ? {} : { REQUIRE_KIND: requireKind }),
       ...(appLabel === undefined ? {} : { APP_LABEL: appLabel }),
+      ...(appFieldId === undefined ? {} : { APP_FIELD_ID: appFieldId }),
+      ...(appFieldOption === undefined ? {} : { APP_FIELD_OPTION: appFieldOption }),
       ...(reconcilerWorkflow === undefined ? {} : { RECONCILER_WORKFLOW: reconcilerWorkflow }),
       ...(ciStatusRerunWorkflow === undefined ? {} : { CI_STATUS_RERUN_WORKFLOW: ciStatusRerunWorkflow }),
       ...(runAttempt === undefined ? {} : { GITHUB_RUN_ATTEMPT: runAttempt }),
+      ...(faultReason === undefined ? {} : { FAULT_REASON: faultReason }),
     },
     github: withOwnRun,
     sleep,
@@ -1071,19 +1084,23 @@ test("dispatcher: a listed human's own dispatch reads no record", async () => {
   assert.equal(artifactReads(github), 0);
 });
 
-// A lost lane run re-run by the lost-run reconciler: attempt 2, started by
-// github-actions[bot], trusted only through the reconciler run's record
-// reconcile-rerun-<run id>-2-<head sha>, uploaded before the re-run. Run and
-// artifact shapes follow the recorded fixtures above.
+// A lost lane run re-run by the lost-run reconciler: attempt 2 (or up to
+// RECONCILER_ATTEMPT_CAP), started by github-actions[bot], trusted only through
+// the reconciler run's record reconcile-rerun-<run id>-<attempt>-<head sha>,
+// uploaded before the re-run. Run and artifact shapes follow the recorded
+// fixtures above.
 
 const RECONCILER_WORKFLOW = ".github/workflows/maintenance-reconcile-lost-runs.yml";
 const RECONCILER_RUN_ID = 39320000001;
 const RECONCILER_HEAD = "7777777777777777777777777777777777777777";
 const LOST_RUN_ID = "39310000002";
 const LOST_HEAD = "6666666666666666666666666666666666666666";
-const RERUN_RECORD = `reconcile-rerun-${LOST_RUN_ID}-2-${LOST_HEAD}`;
-const attemptRoute = `GET /repos/${REPOSITORY}/actions/runs/${LOST_RUN_ID}/attempts/2`;
-const rerunArtifactsRoute = `GET /repos/${REPOSITORY}/actions/artifacts?name=${RERUN_RECORD}&per_page=100&page=1`;
+const rerunRecordAt = (n) => `reconcile-rerun-${LOST_RUN_ID}-${n}-${LOST_HEAD}`;
+const attemptRouteAt = (n) => `GET /repos/${REPOSITORY}/actions/runs/${LOST_RUN_ID}/attempts/${n}`;
+const rerunArtifactsRouteAt = (n) => `GET /repos/${REPOSITORY}/actions/artifacts?name=${rerunRecordAt(n)}&per_page=100&page=1`;
+const RERUN_RECORD = rerunRecordAt(2);
+const attemptRoute = attemptRouteAt(2);
+const rerunArtifactsRoute = rerunArtifactsRouteAt(2);
 const reconcilerRoute = `GET /repos/${REPOSITORY}/actions/runs/${RECONCILER_RUN_ID}`;
 const reconcilerCompare = `GET /repos/${REPOSITORY}/compare/${RECONCILER_HEAD}...${TIP_SHA}`;
 
@@ -1138,11 +1155,12 @@ const rerunRecord = (overrides = {}) => ({
 });
 
 // No tagRoute: the fake answers 404, so no tag shares the branch name.
-function rerunRoutes({ attempt = {}, reconciler = {}, artifacts = listing(rerunRecord()), compare = { status: "ahead" }, extra = {} } = {}) {
+// `at` is the attempt the reconciler's record names and the re-run started.
+function rerunRoutes({ at = 2, attempt = {}, reconciler = {}, artifacts = listing(rerunRecord({ name: rerunRecordAt(at) })), compare = { status: "ahead" }, extra = {} } = {}) {
   return {
     [commitPulls]: [fixture("api-pull-42.json")],
-    [attemptRoute]: { ...lostAttempt(), ...attempt },
-    [rerunArtifactsRoute]: artifacts,
+    [attemptRouteAt(at)]: { ...lostAttempt({ run_attempt: at }), ...attempt },
+    [rerunArtifactsRouteAt(at)]: artifacts,
     [reconcilerRoute]: typeof reconciler === "function" ? reconciler : reconcilerRun(reconciler),
     [tipRoute]: TIP_REF,
     [reconcilerCompare]: compare,
@@ -1268,9 +1286,33 @@ test("reconciler re-run: a record does not vouch for an unlisted upstream actor"
   assert.ok(!github.calls.includes(rerunArtifactsRoute));
 });
 
-for (const runAttempt of ["1", "3", ""]) {
+test("reconciler re-run: a valid record vouches for github-actions[bot] at attempt 3, the cap", async () => {
+  const github = fakeGitHub(rerunRoutes({ at: 3 }));
+  assert.deepEqual(await reconcilerRerun({ github, runAttempt: "3" }), PROCEED);
+  assert.ok(github.calls.includes(rerunArtifactsRouteAt(3)));
+  assert.ok(!github.calls.includes(rerunArtifactsRoute));
+});
+
+test("reconciler re-run: an attempt-2 record does not vouch for attempt 3", async () => {
+  const github = fakeGitHub(rerunRoutes({ at: 3, artifacts: listing(), extra: { [rerunArtifactsRoute]: listing(rerunRecord()) } }));
+  assert.deepEqual(await reconcilerRerun({ github, runAttempt: "3" }), STOPPED("untrusted-rerunner"));
+  assert.ok(!github.calls.includes(rerunArtifactsRoute));
+});
+
+for (const [label, reconciler] of [
+  ["is another workflow", { path: ".github/workflows/pr-merge.yml" }],
+  ["was dispatched by an unlisted user", { event: "workflow_dispatch", actor: STRANGER }],
+  ["was re-run by an unlisted user", { run_attempt: 2, triggering_actor: STRANGER }],
+]) {
+  test(`reconciler re-run: at attempt 3, refused when the recording run ${label}`, async () => {
+    const github = fakeGitHub(rerunRoutes({ at: 3, reconciler }));
+    assert.deepEqual(await reconcilerRerun({ github, runAttempt: "3" }), STOPPED("untrusted-rerunner"));
+  });
+}
+
+for (const runAttempt of ["1", "4", ""]) {
   test(`reconciler re-run: attempt ${runAttempt || "(none)"} is never vouched for and nothing is read`, async () => {
-    const github = fakeGitHub(rerunRoutes());
+    const github = fakeGitHub({ ...rerunRoutes(), ...rerunRoutes({ at: 4 }) });
     assert.deepEqual(await reconcilerRerun({ github, runAttempt }), STOPPED("untrusted-rerunner"));
     assert.deepEqual(github.calls, [commitPulls]);
   });
@@ -1550,6 +1592,24 @@ test("app-label:an App issues event other than labeled stops with bot-actor", as
   assert.deepEqual(calls, []);
 });
 
+// work-resolve-issue's field trigger: a listed human setting the Work status
+// field passes on the sender alone; the App's mirror write starts nothing.
+test("app-label: the App's field_added stops with bot-actor and reads nothing", async () => {
+  const { outputs, calls } = await appLabel({ action: "field_added", event: { action: "field_added", issue: { number: 7 }, sender: LANES_APP } });
+  assert.deepEqual(outputs, STOPPED("bot-actor"));
+  assert.deepEqual(calls, []);
+});
+
+test("app-label: a listed human's field_added proceeds on the sender", async () => {
+  const { outputs } = await appLabel({ event: { action: "field_added", issue: { number: 7 }, sender: KYLE, repository: { full_name: REPOSITORY } }, triggeringActor: "kyle-sexton" });
+  assert.deepEqual(outputs, ACTORS_OK);
+});
+
+test("app-label: an unlisted sender's field_added stops with untrusted-actor", async () => {
+  const { outputs } = await appLabel({ event: { action: "field_added", issue: { number: 7 }, sender: STRANGER, repository: { full_name: REPOSITORY } }, triggeringActor: "stranger" });
+  assert.deepEqual(outputs, STOPPED("untrusted-actor"));
+});
+
 test("app-label:unset, the App's agent-ready label still stops with bot-actor", async () => {
   const { outputs, calls } = await appLabel({ appLabel: "" });
   assert.deepEqual(outputs, STOPPED("bot-actor"));
@@ -1582,6 +1642,84 @@ test("app-label:outside issues, the App sender still stops with bot-actor", asyn
   const { outputs, calls } = await appLabel({ eventName: "workflow_dispatch" });
   assert.deepEqual(outputs, STOPPED("bot-actor"));
   assert.deepEqual(calls, []);
+});
+
+// app-field-id and app-field-option: the lanes App setting that one field to
+// that one option in issue mode starts the lane, as work-resolve-issue's Work
+// status field (48484079) set to agent-ready (84879220) does.
+function appField({ fieldId = 48484079, optionId = 84879220, sender = LANES_APP, issue = { number: 7 }, ...rest } = {}) {
+  const github = fakeGitHub({});
+  return gate({
+    eventName: "issues",
+    event: {
+      action: "field_added",
+      issue,
+      issue_field: { id: fieldId },
+      issue_field_value: { option: { id: optionId } },
+      sender,
+      repository: { full_name: REPOSITORY },
+    },
+    github,
+    requirePr: "false",
+    requireKind: "human",
+    deniedActorIds: "337595936",
+    lanesAppId: "337595936",
+    appFieldId: "48484079",
+    appFieldOption: "84879220",
+    triggeringActor: "melodic-automation-lanes[bot]",
+    ...rest,
+  }).then((outputs) => ({ outputs, calls: github.calls }));
+}
+
+test("app-field: the App setting the field to the option proceeds and reads only its own run", async () => {
+  const { outputs, calls } = await appField();
+  assert.deepEqual(outputs, ACTORS_OK);
+  assert.deepEqual(calls, [OWN_ROUTE]);
+});
+
+test("app-field: the App setting another field or another option stops with bot-actor and reads nothing", async () => {
+  for (const [name, args] of [
+    ["another field", { fieldId: 1 }],
+    ["another option", { optionId: 86380002 }],
+    ["no option", { optionId: null }],
+  ]) {
+    const { outputs, calls } = await appField(args);
+    assert.deepEqual(outputs, STOPPED("bot-actor"), name);
+    assert.deepEqual(calls, [], name);
+  }
+});
+
+test("app-field: one input of the pair alone keeps the App's field event stopped with bot-actor", async () => {
+  for (const [name, args] of [
+    ["no option input", { appFieldOption: "" }],
+    ["no field input", { appFieldId: "" }],
+    ["a malformed option input", { appFieldOption: "84879220 1" }],
+  ]) {
+    const { outputs, calls } = await appField(args);
+    assert.deepEqual(outputs, STOPPED("bot-actor"), name);
+    assert.deepEqual(calls, [], name);
+  }
+});
+
+test("app-field: a listed human re-running the App's field run proceeds; an unlisted one stops", async () => {
+  assert.deepEqual((await appField({ triggeringActor: "kyle-sexton" })).outputs, ACTORS_OK);
+  assert.deepEqual((await appField({ triggeringActor: "stranger" })).outputs, STOPPED("untrusted-rerunner"));
+});
+
+test("app-field: an App field event with no issue number stops with untrusted-actor", async () => {
+  const { outputs } = await appField({ issue: {} });
+  assert.deepEqual(outputs, STOPPED("untrusted-actor"));
+});
+
+test("app-field: the App's agent-ready label stops with bot-actor when only the field pair is set", async () => {
+  const { outputs, calls } = await appLabel({ appLabel: undefined, appFieldId: "48484079", appFieldOption: "84879220" });
+  assert.deepEqual(outputs, STOPPED("bot-actor"));
+  assert.deepEqual(calls, []);
+});
+
+test("app-field: a listed human's field write proceeds on the sender; a stranger's stops", async () => {
+  assert.deepEqual((await appField({ sender: KYLE, triggeringActor: "kyle-sexton" })).outputs, ACTORS_OK);
+  assert.deepEqual((await appField({ sender: STRANGER, triggeringActor: "stranger" })).outputs, STOPPED("untrusted-actor"));
 });
 
 test("require-pr: a value other than true or false stops with no-pr, even for a valid PR", async () => {
@@ -1883,8 +2021,8 @@ test("createGitHub opted into keepGraphQLErrors returns the answer with its erro
   assert.deepEqual(await github("POST", "/graphql", { query: "{}" }), answer);
 });
 
-// A GET that GitHub answers 5xx, or that never gets an answer, is sent again
-// after 2 s, 4 s and 8 s, each with equal jitter (half fixed, half random), and
+// A GET that GitHub answers 5xx, or that never gets an answer, is sent at most
+// 3 times, after a full-jitter wait (a random share of 2 s, then of 4 s), and
 // no client waits more than 60 s in all (runs 39786710017 and 39788855311 each
 // failed a lane on one 500 from GET /commits/{sha}/pulls).
 function flaky(answers) {
@@ -1905,17 +2043,28 @@ const PULLS_PATH = "/repos/o/r/commits/b71c10a14e3a918023100604e2272592ed11f677/
 
 test("createGitHub sends a GET that answered 500 again and returns the next answer", async () => {
   const gh = flaky([{ status: 500 }, { status: 200, body: '[{"number":7}]' }]);
-  const github = createGitHub({ ...gh.options, random: () => 0 });
+  const github = createGitHub({ ...gh.options, random: () => 0.5 });
   assert.deepEqual(await github("GET", PULLS_PATH), [{ number: 7 }]);
   assert.deepEqual(gh.sent, [`GET ${PULLS_PATH}`, `GET ${PULLS_PATH}`]);
   assert.deepEqual(gh.slept, [1000]);
+});
+
+// Outage posture element 1: full jitter, so a wait is any share of its cap,
+// none of it fixed.
+test("createGitHub's resend waits are full jitter: none when random is 0, the whole cap when it is 1", async () => {
+  for (const [random, waits] of [[0, [0, 0]], [1, [2000, 4000]]]) {
+    const gh = flaky([{ status: 500 }, { status: 502 }, { status: 200, body: "[]" }]);
+    const github = createGitHub({ ...gh.options, random: () => random });
+    assert.deepEqual(await github("GET", PULLS_PATH), []);
+    assert.deepEqual(gh.slept, waits, String(random));
+  }
 });
 
 // GitHub Support's probe on 2026-10-22: GET /commits/{sha}/pulls
 // answered 200 with an empty body ("unexpected end of JSON input").
 test("createGitHub sends a GET answered 200 with an empty body again", async () => {
   const gh = flaky([{ status: 200, body: "" }, { status: 200, body: '[{"number":7}]' }]);
-  const github = createGitHub({ ...gh.options, random: () => 0 });
+  const github = createGitHub({ ...gh.options, random: () => 0.5 });
   assert.deepEqual(await github("GET", PULLS_PATH), [{ number: 7 }]);
   assert.deepEqual(gh.slept, [1000]);
 });
@@ -1935,12 +2084,12 @@ test("createGitHub sends a GET whose fetch threw again", async () => {
   assert.deepEqual(gh.slept, [2000]);
 });
 
-test("createGitHub gives up on a GET after four 5xx answers and raises the last status", async () => {
-  const gh = flaky([{ status: 500 }, { status: 502 }, { status: 503 }, { status: 504 }, { status: 200 }]);
-  const github = createGitHub({ ...gh.options, random: () => 0 });
-  await assert.rejects(github("GET", PULLS_PATH), (error) => error instanceof GitHubError && error.status === 504);
-  assert.equal(gh.sent.length, 4);
-  assert.deepEqual(gh.slept, [1000, 2000, 4000]);
+test("createGitHub gives up on a GET after three 5xx answers and raises the last status", async () => {
+  const gh = flaky([{ status: 500 }, { status: 502 }, { status: 503 }, { status: 200 }]);
+  const github = createGitHub({ ...gh.options, random: () => 0.5 });
+  await assert.rejects(github("GET", PULLS_PATH), (error) => error instanceof GitHubError && error.status === 503);
+  assert.equal(gh.sent.length, 3);
+  assert.deepEqual(gh.slept, [1000, 2000]);
 });
 
 test("createGitHub sends a 404, a 403 and a POST answered 500 once", async () => {
@@ -1953,17 +2102,98 @@ test("createGitHub sends a 404, a 403 and a POST answered 500 once", async () =>
   assert.deepEqual(gh.slept, []);
 });
 
+// Runs 41814429466 and 41814435576: issue-field-values and blocked-by POSTs
+// answered 500 and 502 in a GitHub incident. A write marked resendOnce is sent
+// again once, 3 s later, on a 5xx or a dropped socket, and never on a 4xx.
+const FIELDS_PATH = "/repos/o/r/issues/7/issue-field-values";
+test("createGitHub sends a resendOnce write answered 500 again once and returns the next answer", async () => {
+  const gh = flaky([{ status: 500 }, { status: 200, body: '[{"issue_field_id":1}]' }]);
+  const github = createGitHub({ ...gh.options, random: () => 0 });
+  assert.deepEqual(await github("POST", FIELDS_PATH, {}, {}, { resendOnce: true }), [{ issue_field_id: 1 }]);
+  assert.deepEqual(gh.sent, [`POST ${FIELDS_PATH}`, `POST ${FIELDS_PATH}`]);
+  assert.deepEqual(gh.slept, [3000]);
+});
+
+test("createGitHub sends a resendOnce write that lost its socket again once", async () => {
+  const reset = Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } });
+  const gh = flaky([reset, { status: 200, body: "[]" }]);
+  const github = createGitHub({ ...gh.options, random: () => 0 });
+  assert.deepEqual(await github("POST", FIELDS_PATH, {}, {}, { resendOnce: true }), []);
+  assert.equal(gh.sent.length, 2);
+});
+
+test("createGitHub raises a resendOnce write's second 5xx and sends no third", async () => {
+  const gh = flaky([{ status: 500 }, { status: 502 }, { status: 200, body: "[]" }]);
+  const github = createGitHub({ ...gh.options, random: () => 0 });
+  await assert.rejects(github("POST", FIELDS_PATH, {}, {}, { resendOnce: true }), (error) => error instanceof GitHubError && error.status === 502);
+  assert.equal(gh.sent.length, 2);
+  assert.deepEqual(gh.slept, [3000]);
+});
+
+test("createGitHub never resends a resendOnce write answered 429 or 403", async () => {
+  const limited = { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "9999999999", "retry-after": "60" };
+  for (const answer of [{ status: 429, headers: limited }, { status: 403, body: '{"message":"secondary rate limit"}' }]) {
+    const gh = flaky([answer, { status: 200, body: "[]" }]);
+    const github = createGitHub({ ...gh.options, random: () => 0, latch: { guard: (f) => f, waitOut: async () => {}, waits: () => false } });
+    await assert.rejects(github("POST", FIELDS_PATH, {}, {}, { resendOnce: true }), (error) => error.status === answer.status);
+    assert.equal(gh.sent.length, 1, String(answer.status));
+  }
+});
+
+test("createGitHub sends a write not marked resendOnce once on a 500", async () => {
+  const gh = flaky([{ status: 500 }, { status: 200, body: "[]" }]);
+  const github = createGitHub({ ...gh.options, random: () => 0 });
+  await assert.rejects(github("POST", FIELDS_PATH, {}), (error) => error.status === 500);
+  assert.equal(gh.sent.length, 1);
+  assert.deepEqual(gh.slept, []);
+});
+
+const ISSUE_QUERY = 'query($n: Int!) { repository(owner: "o", name: "r") { issue(number: $n) { title } } }';
+const dropped = () => Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } });
+
+test("createGitHub sends a GraphQL query that answered 502 or lost its socket again", async () => {
+  const gh = flaky([{ status: 502 }, dropped(), { status: 200, body: '{"data":{"ok":true}}' }]);
+  const github = createGitHub({ ...gh.options, random: () => 0.5 });
+  assert.deepEqual(await github("POST", "/graphql", { query: ISSUE_QUERY, variables: { n: 1 } }), { data: { ok: true } });
+  assert.deepEqual(gh.sent, ["POST /graphql", "POST /graphql", "POST /graphql"]);
+  assert.deepEqual(gh.slept, [1000, 2000]);
+});
+
+test("createGitHub sends a GraphQL query again when a comment or the shorthand starts it", async () => {
+  const gh = flaky([dropped(), { status: 200, body: '{"data":{}}' }, dropped(), { status: 200, body: '{"data":{}}' }]);
+  const github = createGitHub({ ...gh.options, random: () => 0 });
+  await github("POST", "/graphql", { query: `# the closer\n${ISSUE_QUERY}` });
+  await github("POST", "/graphql", { query: "{ viewer { login } }" });
+  assert.equal(gh.sent.length, 4);
+});
+
+test("createGitHub sends a GraphQL mutation once, on a 500 and on a dropped socket", async () => {
+  const mutation = "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id } } }";
+  // A query document that also holds a mutation operation is a write.
+  const mixed = `${ISSUE_QUERY}\nmutation M { addStar(input: {}) { clientMutationId } }`;
+  // A `#` inside a string is not a comment, so it hides nothing after it.
+  const hashed = 'query Q { search(query: "#1", type: ISSUE, first: 1) { issueCount } } mutation M { addStar(input: {}) { clientMutationId } }';
+  const gh = flaky([{ status: 500 }, dropped(), dropped(), dropped()]);
+  const github = createGitHub({ ...gh.options, random: () => 0 });
+  await assert.rejects(github("POST", "/graphql", { query: mutation, variables: { id: "t" } }), (error) => error.status === 500);
+  await assert.rejects(github("POST", "/graphql", { query: mutation, variables: { id: "t" } }), TypeError);
+  await assert.rejects(github("POST", "/graphql", { query: mixed, operationName: "M" }), TypeError);
+  await assert.rejects(github("POST", "/graphql", { query: hashed, operationName: "M" }), TypeError);
+  assert.equal(gh.sent.length, 4);
+  assert.deepEqual(gh.slept, []);
+});
+
 test("createGitHub waits at most 60 s on 5xx answers across all its calls", async () => {
-  const gh = flaky(Array.from({ length: 30 }, () => ({ status: 500 })));
-  const github = createGitHub({ ...gh.options, random: () => 1 });
-  for (let call = 0; call < 5; call += 1) {
+  const gh = flaky(Array.from({ length: 40 }, () => ({ status: 500 })));
+  const github = createGitHub({ ...gh.options, random: () => 1, now: () => 0 });
+  for (let call = 0; call < 11; call += 1) {
     await assert.rejects(github("GET", PULLS_PATH), (error) => error.status === 500);
   }
-  // Four calls wait 2 + 4 + 8 s each; the fifth waits 2 s, and its next 4 s
-  // would pass 60, so it raises after its second answer.
-  assert.deepEqual(gh.slept.slice(-2), [8000, 2000]);
-  assert.equal(gh.slept.reduce((sum, ms) => sum + ms, 0), 58000);
-  assert.equal(gh.sent.length, 4 * 4 + 2);
+  // Ten calls wait 2 + 4 s each, 60 s in all; the eleventh's 2 s would pass
+  // 60, so it raises after its first answer.
+  assert.deepEqual(gh.slept.slice(-2), [2000, 4000]);
+  assert.equal(gh.slept.reduce((sum, ms) => sum + ms, 0), 60000);
+  assert.equal(gh.sent.length, 10 * 3 + 1);
 });
 
 // A connection that never answers: undici would wait its own header timeout
@@ -1982,12 +2212,12 @@ test("createGitHub aborts a GET that never answers and sends it again", async ()
     fetchImpl: hung(sent),
     attemptTimeoutMs: 5,
     sleep: async (ms) => slept.push(ms),
-    random: () => 0,
+    random: () => 0.5,
     log: () => {},
   });
   await assert.rejects(github("GET", PULLS_PATH), (error) => error.name === "TimeoutError");
-  assert.equal(sent.length, 4);
-  assert.deepEqual(slept, [1000, 2000, 4000]);
+  assert.equal(sent.length, 3);
+  assert.deepEqual(slept, [1000, 2000]);
 });
 
 // A write GitHub accepts slowly must not look failed: a dispatch retried
@@ -2014,6 +2244,166 @@ test("createGitHub never aborts a slow POST and sends it once", async () => {
   assert.deepEqual(sent, ["POST"]);
 });
 
+// A GraphQL query is a read sent as a POST: it gets the GET attempt timeout and
+// its resends. Without the timeout the hung read never ends and the test times out.
+test("createGitHub aborts a GraphQL query that never answers and sends it again", { timeout: 5000 }, async () => {
+  const sent = [];
+  const slept = [];
+  const github = createGitHub({
+    token: "t",
+    apiUrl: "https://api.example",
+    fetchImpl: hung(sent),
+    attemptTimeoutMs: 5,
+    sleep: async (ms) => slept.push(ms),
+    random: () => 0.5,
+    log: () => {},
+  });
+  await assert.rejects(github("POST", "/graphql", { query: "query { viewer { login } }" }), (error) => error.name === "TimeoutError");
+  assert.equal(sent.length, 3);
+  assert.deepEqual(slept, [1000, 2000]);
+});
+
+test("createGitHub never aborts a slow GraphQL mutation and sends it once", async () => {
+  const sent = [];
+  const github = createGitHub({
+    token: "t",
+    apiUrl: "https://api.example",
+    fetchImpl: async (url, init) => {
+      sent.push(init.method);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      if (init.signal?.aborted) {
+        throw init.signal.reason;
+      }
+      return new Response('{"data":{}}', { status: 200 });
+    },
+    attemptTimeoutMs: 5,
+    sleep: async () => {},
+    log: () => {},
+  });
+  assert.deepEqual(await github("POST", "/graphql", { query: "mutation { a }" }), { data: {} });
+  assert.deepEqual(sent, ["POST"]);
+});
+
+test("createGitHub sends a GraphQL query answered 502 again and a GraphQL mutation answered 502 once", async () => {
+  const gh = flaky([{ status: 502 }, { status: 200, body: '{"data":{"n":1}}' }, { status: 502 }, { status: 200 }]);
+  const github = createGitHub({ ...gh.options, random: () => 0.5 });
+  assert.deepEqual(await github("POST", "/graphql", { query: "query { n }" }), { data: { n: 1 } });
+  await assert.rejects(github("POST", "/graphql", { query: "mutation { a }" }), (error) => error instanceof GitHubError && error.status === 502);
+  assert.deepEqual(gh.sent, ["POST /graphql", "POST /graphql", "POST /graphql"]);
+  assert.deepEqual(gh.slept, [1000]);
+});
+
+// Outage posture element 1, at most 3 attempts per call: enable-auto-merge's
+// withRetry resends only a GraphQL mutation that fails on the network, up to
+// three sends, and leaves a query to this client's own three.
+test("withRetry over createGitHub sends a query or a mutation that keeps failing on the network 3 times", async () => {
+  // attempts counts withRetry's own sends: one for the query, three for the mutation.
+  for (const [query, sends, attempts] of [["query { n }", 3, 1], ["mutation { a }", 3, 3]]) {
+    const gh = flaky(Array.from({ length: 20 }, () => new TypeError("fetch failed")));
+    const github = withRetry(createGitHub({ ...gh.options, random: () => 0 }), { sleep: async () => {}, random: () => 0 });
+    await assert.rejects(github("POST", "/graphql", { query }), (error) => error.message === "fetch failed" && error.attempts === attempts);
+    assert.equal(gh.sent.length, sends, query);
+  }
+});
+
+// A 502 that carries retry-after latches its pool (rate-guard.mjs classify:
+// a retry-after header stops every pool), so no resend and no later call
+// goes out.
+test("a GraphQL query answered 502 with retry-after is not sent again, and the next call sends nothing", async () => {
+  const gh = flaky([{ status: 502, headers: { "retry-after": "60" } }, { status: 200 }, { status: 200 }]);
+  const latch = createRateLimitLatch({ now: () => 0, log: () => {}, fail: () => {}, limits: () => ({}), stopFile: null });
+  const github = createGitHub({ ...gh.options, random: () => 0, latch });
+  await assert.rejects(github("POST", "/graphql", { query: "query { n }" }), RateLimitStop);
+  assert.equal(gh.sent.length, 1);
+  await assert.rejects(github("GET", PULLS_PATH), RateLimitStop);
+  assert.equal(gh.sent.length, 1);
+});
+
+// A rate latch on a fake clock that each sleep moves on.
+function latchClock({ hold = false } = {}) {
+  const clock = { now: 0 };
+  const slept = [];
+  let failed = 0;
+  const latch = createRateLimitLatch({
+    now: () => clock.now,
+    log: () => {},
+    fail: () => {
+      failed += 1;
+    },
+    limits: () => ({}),
+    stopFile: null,
+    hold,
+  });
+  const sleep = async (ms) => {
+    slept.push(ms);
+    clock.now += ms;
+  };
+  return { slept, latch, failed: () => failed, options: { latch, sleep, now: () => clock.now } };
+}
+const secondaryLimit = (seconds) => ({ status: 403, headers: { "retry-after": String(seconds) }, body: '{"message":"You have exceeded a secondary rate limit."}' });
+
+// Outage posture element 1: the rate latch waits out a reset within the 60 s
+// budget (the reset plus a second) instead of refusing. The read the limit
+// refused goes once more; a mutation does not, but the next call waits; a
+// reset past the budget is refused without a request.
+test("createGitHub waits on the rate latch for a reset within the budget, and refuses one past it", async () => {
+  const gh = flaky([secondaryLimit(30), { status: 200, body: '[{"number":7}]' }, secondaryLimit(20), { status: 200, body: "[]" }, secondaryLimit(120)]);
+  const { slept, failed, options } = latchClock();
+  const github = createGitHub({ ...gh.options, ...options, random: () => 0 });
+  assert.deepEqual(await github("GET", PULLS_PATH), [{ number: 7 }]);
+  assert.deepEqual(slept, [31_000]);
+  assert.equal(failed(), 0, "a read that rode the limit out fails nothing");
+  await assert.rejects(github("POST", "/graphql", { query: "mutation { a }" }), (error) => error instanceof GitHubError && error.status === 403);
+  assert.equal(failed(), 1, "a refused mutation, never resent, fails the step");
+  assert.deepEqual(await github("GET", PULLS_PATH), []);
+  assert.deepEqual(slept, [31_000, 21_000]);
+  assert.deepEqual(gh.sent, [`GET ${PULLS_PATH}`, `GET ${PULLS_PATH}`, "POST /graphql", `GET ${PULLS_PATH}`]);
+  // 50 s waited: a 120 s reset is not, and the read's own answer stands.
+  await assert.rejects(github("GET", PULLS_PATH), (error) => error instanceof GitHubError && error.status === 403);
+  await assert.rejects(github("GET", PULLS_PATH), RateLimitStop);
+  assert.equal(gh.sent.length, 5);
+  assert.equal(failed(), 3);
+});
+
+// The same ride-out end to end on the process-wide latch: a read answered
+// retry-after 1 waits 2 s, is sent again and answered, and the process exits
+// with main's code, with no error annotation.
+test("a read that rides out a short rate limit leaves the process green", () => {
+  const script = `
+    import { createGitHub } from "./.github/actions/check-trusted-trigger/check-trusted-trigger.mjs";
+    const answers = [
+      new Response('{"message":"You have exceeded a secondary rate limit."}', { status: 403, headers: { "retry-after": "1" } }),
+      new Response('[{"number":7}]', { status: 200 }),
+    ];
+    const github = createGitHub({ token: "t", fetchImpl: async () => answers.shift() });
+    console.log("read=" + JSON.stringify(await github("GET", "/repos/o/r/pulls")));
+    process.exitCode = 0;
+  `;
+  const root = path.join(HERE, "../../..");
+  const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], { cwd: root, encoding: "utf8", env: { ...process.env, RESOLVED_CONFIG: "", RUNNER_TEMP: "", API_BUDGET_HOLD: "" } });
+  assert.match(run.stdout, /read=\[\{"number":7\}\]/);
+  assert.doesNotMatch(run.stdout, /::error::/);
+  assert.equal(run.status, 0);
+});
+
+// Safety: a hold never turns a refusal into a pass. A trust read the holding
+// latch refuses still stops the lane; the same gate over an answered read
+// proceeds, so the stop is the refusal's.
+test("a trust check whose read a holding rate latch refuses stops the lane, never proceeds", async () => {
+  const pull = readFileSync(path.join(FIXTURES, "api-pull-42.json"), "utf8");
+  const limited = () => new Response('{"message":"API rate limit exceeded for installation ID 1."}', { status: 403, headers: { "x-ratelimit-limit": "5000", "x-ratelimit-remaining": "0", "x-ratelimit-reset": "3600", "x-ratelimit-resource": "core" } });
+  const run = (answerPull) => {
+    const { options } = latchClock({ hold: true });
+    const fetchImpl = async (url) => (url.endsWith("/pulls/42") ? answerPull() : new Response(JSON.stringify(HEAD_REF_AT), { status: 200 }));
+    const github = createGitHub({ token: "t", apiUrl: "https://api.example", fetchImpl, log: () => {}, ...options });
+    return gate({ eventName: "workflow_dispatch", event: fixture("event-workflow-dispatch.json"), github, prNumber: "42" });
+  };
+  assert.deepEqual(await run(() => new Response(pull, { status: 200 })), PROCEED);
+  const held = await run(limited);
+  assert.equal(held.proceed, "false");
+  assert.equal(held["head-sha"], "");
+});
+
 test("createGitHub counts the time a failed attempt took against the 60 s budget", async () => {
   let clock = 0;
   const sent = [];
@@ -2021,10 +2411,10 @@ test("createGitHub counts the time a failed attempt took against the 60 s budget
   const github = createGitHub({
     token: "t",
     apiUrl: "https://api.example",
-    // Each attempt takes 20 s of the clock, then times out.
+    // Each attempt takes 28 s of the clock, then times out.
     fetchImpl: async (url) => {
       sent.push(url);
-      clock += 20_000;
+      clock += 28_000;
       throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
     },
     now: () => clock,
@@ -2032,13 +2422,58 @@ test("createGitHub counts the time a failed attempt took against the 60 s budget
       slept.push(ms);
       clock += ms;
     },
-    random: () => 0,
+    random: () => 1,
     log: () => {},
   });
   await assert.rejects(github("GET", PULLS_PATH), (error) => error.name === "TimeoutError");
-  // 20 + 1 + 20 + 2 + 20 s is 63 s: the third attempt's 4 s wait is not taken.
-  assert.equal(sent.length, 3);
-  assert.deepEqual(slept, [1000, 2000]);
+  // 28 + 2 + 28 + 4 s is 62 s: the second attempt's 4 s wait is not taken.
+  assert.equal(sent.length, 2);
+  assert.deepEqual(slept, [2000]);
+});
+
+const limitedResponse = (seconds) => {
+  const { status, headers, body } = secondaryLimit(seconds);
+  return new Response(body, { status, headers });
+};
+
+test("createGitHub waits out the rate latch before an attempt's timeout starts, so the resent read goes out live", async () => {
+  const clock = { now: 0 };
+  const latch = createRateLimitLatch({ now: () => clock.now, log: () => {}, fail: () => {}, limits: () => ({}), stopFile: null });
+  // Each sleep moves the latch's clock on and takes 80 ms of real time, past
+  // the 30 ms attempt timeout.
+  const sleep = async (ms) => {
+    clock.now += ms;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  };
+  const answers = [limitedResponse(1), new Response('[{"number":7}]', { status: 200 })];
+  const aborted = [];
+  const fetchImpl = async (_url, init) => {
+    aborted.push(init.signal.aborted);
+    init.signal.throwIfAborted();
+    return answers.shift();
+  };
+  const github = createGitHub({ token: "t", apiUrl: "https://api.example", fetchImpl, latch, sleep, now: () => clock.now, attemptTimeoutMs: 30, random: () => 0, log: () => {} });
+  assert.deepEqual(await github("GET", PULLS_PATH), [{ number: 7 }]);
+  assert.deepEqual(aborted, [false, false], "the resent read goes out once, on a live signal");
+});
+
+test("createGitHub keeps the rate latch's wait out of the 60 s server-retry budget", async () => {
+  const clock = { now: 0 };
+  const latch = createRateLimitLatch({ now: () => clock.now, log: () => {}, fail: () => {}, limits: () => ({}), stopFile: null });
+  const slept = [];
+  const sleep = async (ms) => {
+    slept.push(ms);
+    clock.now += ms;
+  };
+  // A 55 s limit, then a 500 that takes 5 s, then the answer: 5 s of failed
+  // attempts fits the budget, while 56 s of latch wait plus them would not.
+  const answers = [() => limitedResponse(55), () => ((clock.now += 5000), new Response("{}", { status: 500 })), () => new Response('[{"number":7}]', { status: 200 })];
+  let sent = 0;
+  const fetchImpl = async () => answers[sent++]();
+  const github = createGitHub({ token: "t", apiUrl: "https://api.example", fetchImpl, latch, sleep, now: () => clock.now, random: () => 0, log: () => {} });
+  assert.deepEqual(await github("GET", PULLS_PATH), [{ number: 7 }]);
+  assert.equal(sent, 3);
+  assert.deepEqual(slept, [56_000, 0]);
 });
 
 const FAKE_TOKEN = "fake-secret-marker-9c41";
@@ -2223,8 +2658,199 @@ test("workflow_run dispatcher: a review a listed human started proceeds", async 
   assert.deepEqual(await runDispatched({ github }), PROCEED);
 });
 
+// A listed human's review comment, relayed by pr-review-comment-relay.yml
+// (ADR 0088): the gate accepts that upstream by path, event and actor id.
+const RELAY_WORKFLOW = ".github/workflows/pr-review-comment-relay.yml";
+const RELAY = {
+  path: RELAY_WORKFLOW,
+  name: "pr-review-comment-relay",
+  event: "pull_request_review_comment",
+  actor: KYLE,
+  triggering_actor: KYLE,
+  pull_requests: [{ number: 42 }],
+};
+const STRANGER_USER = { login: "stranger", id: 999, type: "User" };
+const relayDispatched = (options) => runDispatched({ runDispatcherRelay: RELAY_WORKFLOW, ...options });
+
+test("workflow_run dispatcher: a listed human's relayed review comment at the PR head proceeds", async () => {
+  const github = fakeGitHub(runDispatcherRoutes({ upstream: RELAY }));
+  assert.deepEqual(await relayDispatched({ github }), PROCEED);
+  assert.ok(github.calls.includes(upstreamRoute));
+});
+
+for (const [label, upstream, options = {}] of [
+  ["the gate names no relay", RELAY, { runDispatcherRelay: "" }],
+  ["the gate passes no relay input", RELAY, { runDispatcherRelay: undefined }],
+  ["the relay ran on pull_request", { ...RELAY, event: "pull_request" }],
+  ["the relay ran on pull_request_review", { ...RELAY, event: "pull_request_review" }],
+  ["the relay was started by the lanes App", { ...RELAY, actor: LANES_BOT, triggering_actor: LANES_BOT }],
+  ["the relay was started by an unlisted account", { ...RELAY, actor: STRANGER_USER, triggering_actor: STRANGER_USER }],
+  ["the relay was re-run by an unlisted account", { ...RELAY, triggering_actor: STRANGER_USER }],
+  ["the relay was re-run by the lanes App", { ...RELAY, triggering_actor: LANES_BOT }],
+  ["the relay names no actor", { ...RELAY, actor: undefined }],
+  ["the relay's listed actor is denied", RELAY, { deniedActorIds: String(KYLE.id) }],
+  ["the relay names another PR", { ...RELAY, pull_requests: [{ number: 43 }] }],
+  ["the relay names no PR", { ...RELAY, pull_requests: [] }],
+  ["the relay has no pull_requests", { ...RELAY, pull_requests: undefined }],
+  ["the relay ran at an older head", { ...RELAY, head_sha: BASE_SHA }],
+  ["the relay ran on a fork's head", { ...RELAY, head_repository: { id: 2, full_name: "stranger/claude-code-plugins" } }],
+  ["a review-comment run of another workflow", { ...RELAY, path: ".github/workflows/copy.yml" }],
+  ["a review-comment run of a review workflow", { ...RELAY, path: REVIEW_WORKFLOW }],
+]) {
+  test(`workflow_run dispatcher: relay refused with untrusted-actor when ${label}`, async () => {
+    const github = fakeGitHub(runDispatcherRoutes({ dispatcher: { status: "completed" }, upstream }));
+    assert.deepEqual(await relayDispatched({ github, ...options }), STOPPED("untrusted-actor"));
+  });
+}
+
+test("workflow_run dispatcher: naming a relay leaves a review run's terms unchanged", async () => {
+  assert.deepEqual(await relayDispatched({ github: fakeGitHub(runDispatcherRoutes()) }), PROCEED);
+  const unlisted = { actor: STRANGER_USER, triggering_actor: STRANGER_USER };
+  assert.deepEqual(
+    await relayDispatched({ github: fakeGitHub(runDispatcherRoutes({ dispatcher: { status: "completed" }, upstream: unlisted })) }),
+    STOPPED("untrusted-actor"),
+  );
+});
+
+// A pull_request_target run of the push dispatcher's workflow (ADR 0090): its
+// head_branch and head_sha are the PR's (run 42286186105), so the PR entry and
+// the record's commit stand in for the default-branch checks.
+const REFINE_WORKFLOW = ".github/workflows/pr-refine.yml";
+const PR_HEAD_COMPARE = `GET /repos/${REPOSITORY}/compare/${HEAD_SHA}...${TIP_SHA}`;
+const prEntry = (overrides = {}) => ({
+  id: 3001,
+  number: 42,
+  head: { ref: "feat/lane-probe", sha: HEAD_SHA, repo: { id: 1, name: "claude-code-plugins" } },
+  base: { ref: "main", sha: BASE_SHA, repo: { id: 1, name: "claude-code-plugins" } },
+  ...overrides,
+});
+const TARGET_DISPATCHER = {
+  event: "pull_request_target",
+  head_branch: "feat/lane-probe",
+  head_sha: HEAD_SHA,
+  actor: LANES_BOT,
+  triggering_actor: LANES_BOT,
+  pull_requests: [prEntry()],
+};
+const targetRecord = (name = `pr-unblock-target-dispatched-${DISPATCHER_HEAD}-${SELF_RUN_ID}`) =>
+  listing(record({ name }));
+const targetRoutes = ({ dispatcher = {}, artifacts = targetRecord(), ...rest } = {}) =>
+  dispatcherRoutes({
+    dispatcher: { ...TARGET_DISPATCHER, ...dispatcher },
+    self: { path: REFINE_WORKFLOW, name: "pr-refine" },
+    artifacts,
+    ...rest,
+  });
+const targetDispatched = (options) =>
+  dispatched({ dispatchedWorkflow: REFINE_WORKFLOW, lanesAppId: String(LANES_BOT.id), ...options });
+
+test("pull_request_target dispatcher: a pr-refine.yml run proceeds, and only the recorded commit is compared", async () => {
+  const github = fakeGitHub(targetRoutes());
+  assert.deepEqual(await targetDispatched({ github }), PROCEED);
+  assert.ok(github.calls.includes(compareRoute), "the recorded commit is compared with the tip");
+  assert.ok(!github.calls.includes(PR_HEAD_COMPARE), "the run's head_sha, the PR head, is never compared");
+});
+
+test("pull_request_target dispatcher: a listed human's event proceeds", async () => {
+  const github = fakeGitHub(targetRoutes({ dispatcher: { actor: KYLE, triggering_actor: KYLE } }));
+  assert.deepEqual(await targetDispatched({ github }), PROCEED);
+});
+
+test("pull_request_target dispatcher: the matching entry may follow another PR's", async () => {
+  const github = fakeGitHub(targetRoutes({ dispatcher: { pull_requests: [prEntry({ number: 43 }), prEntry()] } }));
+  assert.deepEqual(await targetDispatched({ github }), PROCEED);
+});
+
+test("pull_request_target dispatcher: a recorded commit off the default branch refuses even when the PR head is on it", async () => {
+  const github = fakeGitHub({ ...targetRoutes({ compare: { status: "diverged" } }), [PR_HEAD_COMPARE]: { status: "ahead" } });
+  assert.deepEqual(await targetDispatched({ github }), STOPPED("untrusted-actor"));
+});
+
+test("pull_request_target dispatcher: a push-form record naming a short commit refuses even where that commit is on main", async () => {
+  const github = fakeGitHub({
+    ...targetRoutes({ dispatcher: { status: "completed" }, artifacts: targetRecord(`pr-unblock-dispatched-4444444-${SELF_RUN_ID}`) }),
+    [`GET /repos/${REPOSITORY}/compare/4444444...${TIP_SHA}`]: { status: "ahead" },
+  });
+  assert.deepEqual(await targetDispatched({ github }), STOPPED("untrusted-actor"));
+});
+
+test("pull_request_target dispatcher: a pr-unblock.yml run refuses, whatever dispatched-workflow says", async () => {
+  const github = fakeGitHub({ ...targetRoutes(), [selfRoute]: fixture("api-run-self.json") });
+  assert.deepEqual(await targetDispatched({ github, dispatchedWorkflow: DISPATCHED_WORKFLOW }), STOPPED("untrusted-actor"));
+});
+
+test("pull_request_target dispatcher: a payload with no repository id refuses entries with no repo ids", async () => {
+  const event = fixture("event-workflow-dispatch-dispatcher.json");
+  delete event.repository.id;
+  const bare = prEntry({ head: { ref: "feat/lane-probe", repo: {} }, base: { ref: "main", repo: {} } });
+  const github = fakeGitHub(targetRoutes({ dispatcher: { pull_requests: [bare] } }));
+  assert.deepEqual(await targetDispatched({ github, event }), STOPPED("untrusted-actor"));
+});
+
+const STRANGER_ACTOR = { login: "stranger", id: 999, type: "User" };
+const FORK = { id: 2, name: "claude-code-plugins" };
+for (const [label, overrides, options = {}] of [
+  ["its head repository is a fork", { dispatcher: { head_repository: { id: 2, full_name: "stranger/claude-code-plugins" } } }],
+  ["its entry names another PR", { dispatcher: { pull_requests: [prEntry({ number: 43 })] } }],
+  ["its entry's base is another branch", {
+    dispatcher: { pull_requests: [prEntry({ base: { ref: "feat/stack-parent", repo: { id: 1 } } })] },
+  }],
+  ["its entry's base is another repository", { dispatcher: { pull_requests: [prEntry({ base: { ref: "main", repo: FORK } })] } }],
+  ["its entry's head is another repository", {
+    dispatcher: { pull_requests: [prEntry({ head: { ref: "feat/lane-probe", repo: FORK } })] },
+  }],
+  ["its entry's head ref is not the run's head_branch", {
+    dispatcher: { pull_requests: [prEntry({ head: { ref: "feat/other", repo: { id: 1 } } })] },
+  }],
+  ["it names no head_branch and its entry no head ref", {
+    dispatcher: { head_branch: undefined, pull_requests: [prEntry({ head: { repo: { id: 1 } } })] },
+  }],
+  ["its pull_requests is empty", { dispatcher: { pull_requests: [] } }],
+  ["it has no pull_requests", { dispatcher: { pull_requests: undefined } }],
+  ["no one entry holds every term", {
+    dispatcher: {
+      pull_requests: [
+        prEntry({ head: { ref: "feat/other", repo: { id: 1 } } }),
+        prEntry({ number: 43 }),
+      ],
+    },
+  }],
+  ["an unlisted account started it", { dispatcher: { actor: STRANGER_ACTOR } }],
+  ["an unlisted account triggered it", { dispatcher: { triggering_actor: STRANGER_ACTOR } }],
+  ["github-actions[bot] started it", { dispatcher: { actor: ACTIONS_BOT, triggering_actor: ACTIONS_BOT } }],
+  ["its re-run attempt was triggered by the lanes App", { dispatcher: { run_attempt: 2 } }],
+  ["it is another workflow's run", { dispatcher: { path: ".github/workflows/ci.yml" } }],
+  ["its record has the push dispatcher's name", { artifacts: targetRecord(`pr-unblock-dispatched-${SELF_RUN_ID}`) }],
+  ["its record has the workflow_run dispatcher's name", {
+    artifacts: targetRecord(`pr-feedback-dispatched-${UPSTREAM_RUN_ID}-${SELF_RUN_ID}`),
+  }],
+  ["its record names another run", { artifacts: targetRecord(`pr-unblock-target-dispatched-${DISPATCHER_HEAD}-38155580530`) }],
+  ["its record names a short commit", { artifacts: targetRecord(`pr-unblock-target-dispatched-4444444-${SELF_RUN_ID}`) }],
+  ["the lanes App id is not passed", {}, { lanesAppId: "" }],
+  ["a later job passes an expected upstream head", {}, { expectedUpstreamHead: HEAD_SHA }],
+]) {
+  test(`pull_request_target dispatcher: refused with untrusted-actor when ${label}`, async () => {
+    const github = fakeGitHub(targetRoutes({ ...overrides, dispatcher: { status: "completed", ...overrides.dispatcher } }));
+    assert.deepEqual(await targetDispatched({ github, ...options }), STOPPED("untrusted-actor"));
+  });
+}
+
+for (const [label, routes, options] of [
+  ["a push dispatcher", dispatcherRoutes({ dispatcher: { status: "completed" }, artifacts: targetRecord() }), {}],
+  ["a workflow_run dispatcher", runDispatcherRoutes({ dispatcher: { status: "completed" }, artifacts: targetRecord() }), {
+    runDispatcherWorkflow: RUN_DISPATCHER_WORKFLOW,
+    runDispatcherUpstreams: UPSTREAMS,
+    lanesAppId: String(LANES_BOT.id),
+  }],
+]) {
+  test(`pull_request_target record: refused with untrusted-actor on ${label}`, async () => {
+    assert.deepEqual(await dispatched({ github: fakeGitHub(routes), ...options }), STOPPED("untrusted-actor"));
+  });
+}
+
 // A job after pr-unblock's model job: the review was of the head that job was
-// gated on, and the PR has since moved by the lanes App's own signed commits.
+// gated on, and the PR has since moved to the commit apply-feedback-patch
+// pushed, a lanes App commit GitHub signed during this run.
 const GATED_SHA = "9".repeat(40);
 const afterRoute = `GET /repos/${REPOSITORY}/compare/${GATED_SHA}...${HEAD_SHA}`;
 // The shape of the lanes App's commits on #7493 and #7520: author the App,
@@ -2241,40 +2867,58 @@ const range = (...commits) => ({ status: "ahead", total_commits: commits.length,
 const afterRoutes = (compare, upstream = {}) =>
   fakeGitHub({ ...runDispatcherRoutes({ upstream: { head_sha: GATED_SHA, ...upstream } }), [afterRoute]: compare });
 
-test("expected upstream head: verified lanes App commits after the gated head proceed", async () => {
-  const github = afterRoutes(range(laneCommit(), laneCommit({ sha: "7".repeat(40) })));
-  assert.deepEqual(await runDispatched({ github, expectedUpstreamHead: GATED_SHA }), PROCEED);
-  assert.ok(github.calls.includes(afterRoute));
-});
-
 test("expected upstream head: a PR head still at the gated head proceeds with no range read", async () => {
   const github = fakeGitHub(runDispatcherRoutes());
   assert.deepEqual(await runDispatched({ github, expectedUpstreamHead: HEAD_SHA }), PROCEED);
 });
 
-for (const [label, github] of [
-  ["a foreign commit follows the gated head", () => afterRoutes(range(laneCommit(), laneCommit({ author: KYLE })))],
-  ["an unsigned lanes App commit follows the gated head", () =>
-    afterRoutes(range(laneCommit({ commit: { committer: { date: "2026-10-11T12:30:00Z" }, verification: { verified: false, reason: "unsigned" } } })))],
-  ["a human signed and pushed a commit naming the App as author", () =>
-    afterRoutes(range(laneCommit({ committer: KYLE })))],
-  ["a verified commit whose reason is not valid follows the gated head", () =>
-    afterRoutes(range(laneCommit({ commit: { committer: { date: "2026-10-11T12:30:00Z" }, verification: { verified: true, reason: "bad_email" } } })))],
-  ["an App commit made before this run was created follows the gated head", () =>
-    afterRoutes(range(laneCommit({ commit: { committer: { date: "2026-10-11T11:00:00Z" }, verification: { verified: true, reason: "valid" } } })))],
-  ["a commit with no linked author follows the gated head", () => afterRoutes(range(laneCommit({ author: null })))],
-  ["GitHub truncated the range", () => afterRoutes({ ...range(laneCommit()), total_commits: 251 })],
-  ["the PR head diverged from the gated head", () => afterRoutes({ ...range(laneCommit()), status: "diverged" })],
-  ["the range read fails", () => afterRoutes(new GitHubError(404, "compare"))],
-  ["the upstream reviewed another head than the gated one", () =>
-    afterRoutes(range(laneCommit()), { head_sha: BASE_SHA })],
-  ["the gated head is not a SHA", () => afterRoutes(range(laneCommit()))],
+for (const [label, upstream, expectedUpstreamHead] of [
+  ["the upstream reviewed another head than the gated one", { head_sha: BASE_SHA }, GATED_SHA],
+  ["the gated head is not a SHA", {}, "main"],
 ]) {
-  test(`expected upstream head: refused with untrusted-actor when ${label}`, async () => {
-    const expectedUpstreamHead = label === "the gated head is not a SHA" ? "main" : GATED_SHA;
-    assert.deepEqual(await runDispatched({ github: github(), expectedUpstreamHead }), STOPPED("untrusted-actor"));
+  test(`expected upstream head: refused with untrusted-actor when ${label}, even at the pushed commit`, async () => {
+    const github = afterRoutes(range(laneCommit({ sha: HEAD_SHA })), upstream);
+    assert.deepEqual(await runDispatched({ github, expectedUpstreamHead, pushedCommit: HEAD_SHA }), STOPPED("untrusted-actor"));
   });
 }
+
+// The issue the pushed-commit binding answers: a verified lanes App commit
+// made during this run proves an App token signed it, not that this run's
+// push job made it, so only the commit apply-feedback-patch pushed may follow
+// the gated head.
+test("pushed commit: a verified lanes App commit that is not the pushed commit is refused", async () => {
+  const github = afterRoutes(range(laneCommit({ sha: HEAD_SHA })));
+  assert.deepEqual(
+    await runDispatched({ github, expectedUpstreamHead: GATED_SHA, pushedCommit: "7".repeat(40) }),
+    STOPPED("untrusted-actor"),
+  );
+});
+
+test("pushed commit: none passed, a head moved by a verified lanes App commit is refused", async () => {
+  const github = afterRoutes(range(laneCommit({ sha: HEAD_SHA })));
+  assert.deepEqual(await runDispatched({ github, expectedUpstreamHead: GATED_SHA }), STOPPED("untrusted-actor"));
+  assert.deepEqual(await runDispatched({ github, expectedUpstreamHead: GATED_SHA, pushedCommit: "" }), STOPPED("untrusted-actor"));
+});
+
+test("pushed commit: a PR head equal to the pushed commit proceeds", async () => {
+  const github = afterRoutes(range(laneCommit({ sha: HEAD_SHA })));
+  assert.deepEqual(await runDispatched({ github, expectedUpstreamHead: GATED_SHA, pushedCommit: HEAD_SHA }), PROCEED);
+});
+
+test("pushed commit: a PR head still at the gated head proceeds whether or not a push is named", async () => {
+  const github = fakeGitHub(runDispatcherRoutes());
+  assert.deepEqual(await runDispatched({ github, expectedUpstreamHead: HEAD_SHA, pushedCommit: "7".repeat(40) }), PROCEED);
+});
+
+test("pushed commit: refused when it is not a SHA or rides without an expected upstream head", async () => {
+  const github = afterRoutes(range(laneCommit({ sha: HEAD_SHA })));
+  assert.deepEqual(
+    await runDispatched({ github, expectedUpstreamHead: GATED_SHA, pushedCommit: "A".repeat(40) }),
+    STOPPED("untrusted-actor"),
+  );
+  assert.ok(!github.calls.includes(upstreamRoute), "refused before the upstream read");
+  assert.deepEqual(await runDispatched({ github: fakeGitHub(runDispatcherRoutes()), pushedCommit: HEAD_SHA }), STOPPED("untrusted-actor"));
+});
 
 // GET /pulls lags a push by minutes (run 39615724332 on #8870 gated the head
 // the model job had already moved past), so the gate re-reads it until it
@@ -2286,22 +2930,21 @@ const pullAt = (sha) => {
 };
 
 test("expected upstream head: a pulls read lagging the branch ref is re-read until it shows the pushed head", async () => {
-  const github = afterRoutes(range(laneCommit()));
+  const github = afterRoutes(range(laneCommit({ sha: HEAD_SHA })));
   github.routes[pullRoute] = inTurn(pullAt(GATED_SHA), pullAt(GATED_SHA), pullAt(HEAD_SHA));
   const sleep = fakeSleep();
-  const outputs = await runDispatched({ github, expectedUpstreamHead: GATED_SHA, sleep });
+  const outputs = await runDispatched({ github, expectedUpstreamHead: GATED_SHA, pushedCommit: HEAD_SHA, sleep });
   assert.equal(outputs["head-sha"], HEAD_SHA);
   assert.deepEqual(outputs, PROCEED);
   assert.deepEqual(sleep.waits, [5000, 10_000]);
-  assert.ok(github.calls.includes(afterRoute));
 });
 
 test("expected upstream head: a pulls read that never reaches the branch ref stops with head-lag", async () => {
-  const github = afterRoutes(range(laneCommit()));
+  const github = afterRoutes(range(laneCommit({ sha: HEAD_SHA })));
   github.routes[pullRoute] = pullAt(GATED_SHA);
   const sleep = fakeSleep();
   assert.deepEqual(
-    await runDispatched({ github, expectedUpstreamHead: GATED_SHA, sleep }),
+    await runDispatched({ github, expectedUpstreamHead: GATED_SHA, pushedCommit: HEAD_SHA, sleep }),
     STOPPED("head-lag"),
   );
   assert.deepEqual(sleep.waits, [5000, 10_000, 20_000, 25_000]);
@@ -2595,7 +3238,48 @@ for (const [label, name] of [
   });
 }
 
-for (const runAttempt of [1, 3]) {
+// The spec re-run's second time on one head: pr-verify on the reconciler's
+// attempt 3 of pr-require-checks, recorded under that attempt.
+test("upstream re-run: a CI attempt 3 by github-actions[bot] with the reconciler's attempt-3 record proceeds", async () => {
+  const name = `reconcile-rerun-${CI_RERUN_ID}-3-${HEAD_SHA}`;
+  const attempt3 = `GET /repos/${REPOSITORY}/actions/runs/${CI_RERUN_ID}/attempts/3`;
+  const github = fakeGitHub(
+    upstreamRoutes({
+      artifacts: listing(),
+      extra: {
+        [attempt3]: lostAttempt({ id: CI_RERUN_ID, name: "pr-require-checks", path: ".github/workflows/pr-require-checks.yml", event: "pull_request", head_branch: "feat/lane-probe", head_sha: HEAD_SHA, run_attempt: 3 }),
+        [artifactsByName(name)]: listing(rerunRecord({ name })),
+      },
+    }),
+  );
+  assert.deepEqual(await upstreamRerun({ github, event: upstreamRerunEvent({ run_attempt: 3 }) }), PROCEED);
+  assert.ok(github.calls.includes(attempt3));
+  assert.ok(github.calls.includes(artifactsByName(name)));
+  assert.ok(!github.calls.includes(upstreamArtifactsRoute));
+});
+
+for (const [label, reconciler] of [
+  ["is another workflow", { path: ".github/workflows/pr-merge.yml" }],
+  ["was dispatched by an unlisted user", { event: "workflow_dispatch", actor: STRANGER }],
+]) {
+  test(`upstream re-run: at attempt 3, refused when the recording run ${label}`, async () => {
+    const name = `reconcile-rerun-${CI_RERUN_ID}-3-${HEAD_SHA}`;
+    const github = fakeGitHub(
+      upstreamRoutes({
+        artifacts: listing(),
+        extra: {
+          [`GET /repos/${REPOSITORY}/actions/runs/${CI_RERUN_ID}/attempts/3`]: lostAttempt({ id: CI_RERUN_ID, name: "pr-require-checks", path: ".github/workflows/pr-require-checks.yml", event: "pull_request", head_branch: "feat/lane-probe", head_sha: HEAD_SHA, run_attempt: 3 }),
+          [artifactsByName(name)]: listing(rerunRecord({ name })),
+          [reconcilerRoute]: reconcilerRun(reconciler),
+        },
+      }),
+    );
+    assert.deepEqual(await upstreamRerun({ github, event: upstreamRerunEvent({ run_attempt: 3 }) }), STOPPED("untrusted-actor"));
+    assert.ok(github.calls.includes(artifactsByName(name)));
+  });
+}
+
+for (const runAttempt of [1, 4]) {
   test(`upstream re-run: github-actions[bot] at attempt ${runAttempt} refuses and reads no record`, async () => {
     const github = fakeGitHub(upstreamRoutes());
     assert.deepEqual(await upstreamRerun({ github, event: upstreamRerunEvent({ run_attempt: runAttempt }) }), STOPPED("untrusted-actor"));
@@ -2684,7 +3368,9 @@ function ciStatusRoutes({ attempt = 3, upstream = {}, dispatch = {}, artifacts, 
       run_started_at: "2026-10-19T19:00:45Z",
       ...upstream,
     }),
-    [reconcilerListing]: listing(),
+    // The reconciler's record at this attempt, read first while the attempt is
+    // at most RECONCILER_ATTEMPT_CAP.
+    [artifactsByName(`reconcile-rerun-${CI_RERUN_ID}-${attempt}-${HEAD_SHA}`)]: listing(),
     [artifactsByName(ciStatusRecord(attempt))]: artifacts ?? listing(ciStatusArtifact(attempt)),
     [dispatchRoute]: dispatchRun(dispatch),
     [tipRoute]: TIP_REF,
@@ -2753,9 +3439,16 @@ test("ci-status re-run: github-actions[bot] at attempt 1 refuses and reads no re
   assert.deepEqual(github.calls, [commitPulls]);
 });
 
-test("ci-status re-run: without ci-status-rerun-workflow attempt 3 refuses and reads no record", async () => {
+test("ci-status re-run: without ci-status-rerun-workflow attempt 3 reads only the reconciler's record", async () => {
   const github = fakeGitHub(ciStatusRoutes());
   assert.deepEqual(await ciStatusRerun({ github, ciStatusRerunWorkflow: "" }), STOPPED("untrusted-actor"));
+  assert.ok(github.calls.includes(artifactsByName(`reconcile-rerun-${CI_RERUN_ID}-3-${HEAD_SHA}`)));
+  assert.ok(!github.calls.includes(artifactsByName(ciStatusRecord(3))));
+});
+
+test("ci-status re-run: without ci-status-rerun-workflow attempt 4 refuses and reads no record", async () => {
+  const github = fakeGitHub(ciStatusRoutes({ attempt: 4 }));
+  assert.deepEqual(await ciStatusRerun({ github, attempt: 4, ciStatusRerunWorkflow: "" }), STOPPED("untrusted-actor"));
   assert.deepEqual(github.calls, [commitPulls]);
 });
 
@@ -2848,8 +3541,347 @@ test("ci-status re-run: the record vouches only for the upstream run, never this
     triggeringActor: "github-actions[bot]",
     reconcilerWorkflow: RECONCILER_WORKFLOW,
     ciStatusRerunWorkflow: CI_STATUS_RERUN_WORKFLOW,
-    runAttempt: "3",
+    // Past RECONCILER_ATTEMPT_CAP, where only rerun-ci-status records.
+    runAttempt: "4",
   });
   assert.deepEqual(outputs, STOPPED("untrusted-rerunner"));
   assert.deepEqual(github.calls, [commitPulls]);
+});
+
+// isTrustedClose and the lanes App's already-done close (owner Q9,
+// 2026-10-29): the close counts only when report-outcome's close comment
+// names already-done and the pull request it cites is still merged into the
+// default branch with a merge commit that closes the issue. The comment body
+// is the shape report-outcome writes on close (its round-trip test pins it).
+const isLanesApp = (actor) => actor?.id === LANES_APP.id;
+const MERGE_SHA = "3333333333333333333333333333333333333333";
+const closeComment = (stop, words, user = LANES_APP) => ({
+  user,
+  body: [
+    "<!-- work-resolve-issue outcome=closed run=555 -->",
+    `The work-resolve-issue lane stopped on this issue (\`${stop}\`): the run found the issue's work already on the default branch.`,
+    "It closes the issue as completed.",
+    "",
+    "In the run's words:",
+    "",
+    `> ${words}`,
+  ].join("\n"),
+});
+const APP_CLOSED = { number: 77, state: "closed", closed_by: LANES_APP };
+const appCloseRoutes = ({ comments = [closeComment("already-done", "already-done: ＃5 shipped it")], message = "fix: tidy (#5)\n\nCloses #77", merged = true, events = [] } = {}) => ({
+  "POST /graphql": { data: { repository: { issue: { timelineItems: { nodes: [{ closer: null }] } } } } },
+  "GET /repos/o/r/issues/77/comments?per_page=100&page=1": comments,
+  "GET /repos/o/r/issues/77": { number: 77, created_at: "2026-10-01T00:00:00Z" },
+  "GET /repos/o/r/issues/77/events?per_page=100&page=1": events,
+  "GET /repos/o/r": { default_branch: "main" },
+  "GET /repos/o/r/pulls/5": { merged_at: merged ? "2026-10-20T00:00:00Z" : null, base: { ref: "main" }, merge_commit_sha: MERGE_SHA },
+  [`GET /repos/o/r/commits/${MERGE_SHA}`]: { commit: { message } },
+});
+const routeClient = (routes, failOn = "") => async (method, path) => {
+  const key = `${method} ${path}`;
+  if (key === failOn) {
+    throw new GitHubError(502, key);
+  }
+  if (!Object.hasOwn(routes, key)) {
+    throw new GitHubError(404, key);
+  }
+  return routes[key];
+};
+
+test("isTrustedClose: the lanes App's already-done close counts when its merged pull request still closes the issue", async () => {
+  assert.equal(await isTrustedClose(routeClient(appCloseRoutes()), "o/r", APP_CLOSED, new Set(), isLanesApp), true);
+});
+
+// Security review on #10978: a person who reopens an issue after the cited
+// merge says the work is not done, so the App's later close on that same
+// merge counts for nothing; a reopen before the merge changes nothing.
+test("isTrustedClose: the lanes App's already-done close counts for nothing when the issue was reopened after the cited merge", async () => {
+  const reopened = (at) => [{ event: "reopened", created_at: at }];
+  const close = (routes, failOn) => isTrustedClose(routeClient(routes, failOn), "o/r", APP_CLOSED, new Set(), isLanesApp);
+  assert.equal(await close(appCloseRoutes({ events: reopened("2026-10-25T00:00:00Z") })), false);
+  assert.equal(await close(appCloseRoutes({ events: reopened("2026-10-10T00:00:00Z") })), true);
+  assert.equal(await close(appCloseRoutes(), "GET /repos/o/r/issues/77/events?per_page=100&page=1"), false, "an unreadable event list");
+});
+
+test("isTrustedClose: the lanes App's already-done close counts for nothing once its evidence no longer verifies", async () => {
+  const humans = new Set();
+  assert.equal(await isTrustedClose(routeClient(appCloseRoutes({ message: "fix: tidy (#5)" })), "o/r", APP_CLOSED, humans, isLanesApp), false, "the merge commit closes nothing");
+  assert.equal(await isTrustedClose(routeClient(appCloseRoutes({ merged: false })), "o/r", APP_CLOSED, humans, isLanesApp), false, "the pull request is not merged");
+  assert.equal(await isTrustedClose(routeClient(appCloseRoutes()), "o/r", APP_CLOSED, humans), false, "a caller that names no App");
+  const forged = [closeComment("already-done", "already-done: ＃5 shipped it", STRANGER)];
+  assert.equal(await isTrustedClose(routeClient(appCloseRoutes({ comments: forged })), "o/r", APP_CLOSED, humans, isLanesApp), false, "a close comment the App did not write");
+  const reopened = [closeComment("already-done", "already-done: ＃5 shipped it"), closeComment("report-delivered", "report-delivered: ＃5 shipped it")];
+  assert.equal(await isTrustedClose(routeClient(appCloseRoutes({ comments: reopened })), "o/r", APP_CLOSED, humans, isLanesApp), false, "the last close is a report");
+});
+
+// #12456 class A: the App's verified-done close of a finished parent counts
+// when every sub-issue, read fresh, is closed as completed by a close this
+// function trusts (here a listed human's); a not_planned or untrusted one, or
+// no sub-issue, leaves it untrusted.
+test("isTrustedClose: the lanes App's verified-done close counts only while every sub-issue's close holds", async () => {
+  const OWNER_ID = 101;
+  const humans = new Set([OWNER_ID]);
+  const child = (number, extra = {}) => ({ number, state: "closed", state_reason: "completed", closed_by: { id: OWNER_ID }, repository_url: "https://api.github.com/repos/o/r", ...extra });
+  const verified = (children) =>
+    routeClient({
+      ...appCloseRoutes({ comments: [closeComment("verified-done", "verified-done: each done-when item checks out")] }),
+      "GET /repos/o/r/issues/77/sub_issues?per_page=100&page=1": children,
+      ...Object.fromEntries(children.map((item) => [`GET /repos/o/r/issues/${item.number}`, item])),
+    });
+  assert.equal(await isTrustedClose(verified([child(80), child(81)]), "o/r", APP_CLOSED, humans, isLanesApp), true);
+  assert.equal(await isTrustedClose(verified([child(80), child(81, { state_reason: "not_planned" })]), "o/r", APP_CLOSED, humans, isLanesApp), false, "a not_planned sub-issue");
+  assert.equal(await isTrustedClose(verified([child(80), child(81, { closed_by: STRANGER })]), "o/r", APP_CLOSED, humans, isLanesApp), false, "an untrusted close");
+  assert.equal(await isTrustedClose(verified([]), "o/r", APP_CLOSED, humans, isLanesApp), false, "no sub-issue");
+  // A same-numbered issue here, closed by a listed human, never vouches for a sub-issue elsewhere.
+  assert.equal(await isTrustedClose(verified([child(80), child(81, { repository_url: "https://api.github.com/repos/o/other" })]), "o/r", APP_CLOSED, humans, isLanesApp), false, "a sub-issue in another repository");
+});
+
+test("isTrustedClose: the lanes App's report-delivered close counts for nothing", async () => {
+  const comments = [closeComment("report-delivered", "report-delivered: ＃5 shipped it")];
+  assert.equal(await isTrustedClose(routeClient(appCloseRoutes({ comments })), "o/r", APP_CLOSED, new Set(), isLanesApp), false);
+});
+
+test("isTrustedClose: a read that fails leaves the lanes App's close untrusted", async () => {
+  for (const failOn of [
+    "GET /repos/o/r/issues/77/comments?per_page=100&page=1",
+    "GET /repos/o/r/issues/77",
+    "GET /repos/o/r",
+    "GET /repos/o/r/pulls/5",
+    `GET /repos/o/r/commits/${MERGE_SHA}`,
+  ]) {
+    assert.equal(await isTrustedClose(routeClient(appCloseRoutes(), failOn), "o/r", APP_CLOSED, new Set(), isLanesApp), false, failOn);
+  }
+});
+
+// appCloseKind says what kind of close the lanes App made, never that the
+// work is done: admission routes a report-delivered blocker's dependent to
+// re-triage from it, and only isTrustedClose counts a close as completion.
+test("appCloseKind: reads the lanes App's report-delivered close and its comment, and isTrustedClose still counts it for nothing", async () => {
+  const report = { ...closeComment("report-delivered", "the report"), html_url: "https://github.com/o/r/issues/77#issuecomment-1", created_at: "2026-10-28T00:00:00Z" };
+  const routes = appCloseRoutes({ comments: [report] });
+  assert.deepEqual(await appCloseKind(routeClient(routes), "o/r", 77, isLanesApp), {
+    stop: "report-delivered",
+    reason: "the report",
+    url: "https://github.com/o/r/issues/77#issuecomment-1",
+    at: "2026-10-28T00:00:00Z",
+  });
+  assert.equal(await isTrustedClose(routeClient(routes), "o/r", APP_CLOSED, new Set(), isLanesApp), false);
+});
+
+test("appCloseKind: an outsider's close comment or an unreadable comment list reads as no close kind", async () => {
+  const forged = appCloseRoutes({ comments: [closeComment("report-delivered", "the report", STRANGER)] });
+  assert.equal(await appCloseKind(routeClient(forged), "o/r", 77, isLanesApp), null);
+  const routes = appCloseRoutes();
+  assert.equal(await appCloseKind(routeClient(routes, "GET /repos/o/r/issues/77/comments?per_page=100&page=1"), "o/r", 77, isLanesApp), null);
+});
+
+// reconcilerRecordVouches: the reconciler-record check alone, for a recorder
+// that vouches for an attempt another workflow causes (pr-feedback-dispatch.yml
+// rerun-ci-status after the reconciler re-ran a review run). Same rules as the
+// reconciler re-run cases above, read at the run's attempt 2.
+const vouches = ({ github, sleep = async () => {} } = {}) =>
+  reconcilerRecordVouches({
+    github,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    list: loadTrustedList(LIST),
+    deniedIds: new Set(),
+    reconcilerWorkflow: RECONCILER_WORKFLOW,
+    runId: LOST_RUN_ID,
+    sleep,
+  });
+
+test("reconciler record: a valid record for the run's attempt 2 vouches", async () => {
+  assert.equal(await vouches({ github: fakeGitHub(rerunRoutes()) }), true);
+});
+
+test("reconciler record: no record does not vouch, after one re-read", async () => {
+  const sleeps = [];
+  const github = fakeGitHub(rerunRoutes({ artifacts: listing() }));
+  assert.equal(await vouches({ github, sleep: async (ms) => sleeps.push(ms) }), false);
+  assert.equal(sleeps.length, 1);
+});
+
+// Outage posture element 6 (docs/outage-posture-audit.md): the record listing's
+// re-read is a conditional request. GitHub answers 304 to an If-None-Match
+// naming the page's current ETag and, for an authorized request, does not count
+// it against the primary rate limit
+// (https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#use-conditional-requests).
+// The routes go through a real createGitHub, so the client's header and ETag
+// handling are what is tested. `listings` answers the record listing in turn:
+// `{ etag, body }` is a 304 to a request naming that ETag, else a 200 with the
+// body (and the ETag header, unless it is null); `{ status: 304 }` is a 304
+// whatever was sent. With `runFailsFirst`, the reconciler run's first read
+// answers 404, so a record listed at the first read vouches only when the
+// re-read gives it back and it is judged again.
+const RECORD_LISTING = listing(rerunRecord({ name: rerunRecordAt(2) }));
+function conditionalClient(listings, { runFailsFirst = true } = {}) {
+  const routes = rerunRoutes();
+  const sent = [];
+  let runReads = 0;
+  const fetchImpl = async (url, init) => {
+    const key = `${init.method ?? "GET"} ${url.slice("https://api.example".length)}`;
+    const ifNoneMatch = init.headers["If-None-Match"];
+    if (key === rerunArtifactsRouteAt(2)) {
+      sent.push(ifNoneMatch);
+      const { etag = null, body, status } = listings.shift();
+      const headers = etag === null ? {} : { etag };
+      return status === 304 || (etag !== null && ifNoneMatch === etag) ? new Response(null, { status: 304, headers }) : Response.json(body, { headers });
+    }
+    if (key === reconcilerRoute && runFailsFirst && (runReads += 1) === 1) {
+      return Response.json({ message: "Not Found" }, { status: 404 });
+    }
+    return key in routes ? Response.json(routes[key]) : Response.json({ message: "Not Found" }, { status: 404 });
+  };
+  const latch = { guard: (f) => f, waitOut: async () => {}, waits: () => false };
+  return { github: createGitHub({ token: "t", apiUrl: "https://api.example", fetchImpl, latch, random: () => 0, log: () => {} }), sent };
+}
+
+test("reconciler record: the re-read sends the listing's ETag, and a 304 gives back the listing that ETag came with", async () => {
+  const sleeps = [];
+  const { github, sent } = conditionalClient([{ etag: '"e1"', body: RECORD_LISTING }, { etag: '"e1"' }]);
+  assert.equal(await vouches({ github, sleep: async (ms) => sleeps.push(ms) }), true);
+  assert.deepEqual(sent, [undefined, '"e1"']);
+  assert.equal(sleeps.length, 1);
+});
+
+test("reconciler record: a listing that changed since its ETag answers 200 and is judged as sent", async () => {
+  const { github, sent } = conditionalClient([{ etag: '"e1"', body: listing() }, { etag: '"e2"', body: RECORD_LISTING }], { runFailsFirst: false });
+  assert.equal(await vouches({ github }), true);
+  assert.deepEqual(sent, [undefined, '"e1"']);
+});
+
+test("reconciler record: a page that came with no ETag is read again unconditionally, and a 304 to it is a failed read", async () => {
+  const { github, sent } = conditionalClient([{ body: RECORD_LISTING }, { status: 304 }]);
+  assert.equal(await vouches({ github }), false);
+  assert.deepEqual(sent, [undefined, undefined]);
+});
+
+test("reconciler record: a record from a run the gate does not accept does not vouch", async () => {
+  for (const reconciler of [{ path: ".github/workflows/pr-review-hosted.yml" }, { event: "pull_request" }, { head_branch: "fix/x" }]) {
+    assert.equal(await vouches({ github: fakeGitHub(rerunRoutes({ reconciler })) }), false, JSON.stringify(reconciler));
+  }
+});
+
+test("reconciler record: an attempt 2 a person started does not vouch", async () => {
+  assert.equal(await vouches({ github: fakeGitHub(rerunRoutes({ attempt: { triggering_actor: KYLE } })) }), false);
+});
+
+test("reconciler record: without a reconciler workflow nothing is read and nothing vouches", async () => {
+  const github = fakeGitHub(rerunRoutes());
+  assert.equal(await reconcilerRecordVouches({ github, repository: REPOSITORY, defaultBranch: "main", list: loadTrustedList(LIST), deniedIds: new Set(), reconcilerWorkflow: "", runId: LOST_RUN_ID }), false);
+  assert.deepEqual(github.calls, []);
+});
+
+const recordEnv = (overrides = {}) => ({
+  GITHUB_REPOSITORY: REPOSITORY,
+  REVIEW_RUN_ID: LOST_RUN_ID,
+  DEFAULT_BRANCH: "main",
+  TRUSTED_ACTORS: LIST,
+  RECONCILER_WORKFLOW,
+  ...overrides,
+});
+
+test("reconciler-record.mjs: exit 0 when the record vouches, 3 when it does not, 2 on a bad input", async () => {
+  const quiet = async () => {};
+  assert.equal(await recordMain({ env: recordEnv(), github: fakeGitHub(rerunRoutes()), sleep: quiet }), 0);
+  assert.equal(await recordMain({ env: recordEnv(), github: fakeGitHub(rerunRoutes({ artifacts: listing() })), sleep: quiet }), 3);
+  assert.equal(await recordMain({ env: recordEnv({ RECONCILER_WORKFLOW: "" }), github: fakeGitHub(rerunRoutes()), sleep: quiet }), 3);
+  for (const bad of [{ REVIEW_RUN_ID: "" }, { REVIEW_RUN_ID: "9; rm" }, { GITHUB_REPOSITORY: "x" }, { DEFAULT_BRANCH: "" }, { TRUSTED_ACTORS: path.join(FIXTURES, "absent.json") }]) {
+    const github = fakeGitHub(rerunRoutes());
+    assert.equal(await recordMain({ env: recordEnv(bad), github, sleep: quiet }), 2, JSON.stringify(bad));
+    assert.deepEqual(github.calls, [], JSON.stringify(bad));
+  }
+});
+
+// fault-reason (pr-verify's gate): a stop a read GitHub failed to answer
+// caused writes read-fault, so pr-verify can mark the run held for the
+// reconciler. proceed stays false, and every refusal on an answer GitHub
+// gave keeps its own reason, whatever the input says.
+
+const FAULTS = [
+  ["a 502", () => new GitHubError(502, "read")],
+  ["a 503", () => new GitHubError(503, "read")],
+  ["a 429", () => new GitHubError(429, "read")],
+];
+
+for (const [label, fault] of FAULTS) {
+  test(`fault-reason: ${label} on the PR read stops with read-fault, and with the input off with no-pr`, async () => {
+    const routes = () => fakeGitHub({ [pullRoute]: fault() });
+    const run = (faultReason) => gate({ eventName: "workflow_dispatch", event: fixture("event-workflow-dispatch.json"), prNumber: "42", github: routes(), faultReason });
+    assert.deepEqual(await run("true"), STOPPED("read-fault"));
+    assert.deepEqual(await run(undefined), STOPPED("no-pr"));
+    assert.deepEqual(await run(""), STOPPED("no-pr"));
+  });
+
+  test(`fault-reason: ${label} on both reads of the run's pull requests stops with read-fault`, async () => {
+    const github = fakeGitHub({ [commitPulls]: fault(), "POST /graphql": fault() });
+    assert.deepEqual(await gate({ eventName: "workflow_run", event: fixture("event-workflow-run.json"), github, faultReason: "true" }), STOPPED("read-fault"));
+  });
+
+  test(`fault-reason: ${label} on this run's own record stops with read-fault, and with the input off with untrusted-rerunner`, async () => {
+    const run = (faultReason) => gate({ eventName: "pull_request", event: fixture("event-pull-request.json"), ownRun: fault(), faultReason });
+    assert.deepEqual(await run("true"), STOPPED("read-fault"));
+    assert.deepEqual(await run(undefined), STOPPED("untrusted-rerunner"));
+  });
+
+  test(`fault-reason: ${label} on the dispatcher's tag lookup stops with read-fault`, async () => {
+    const github = fakeGitHub({ ...dispatcherRoutes(), [tagRoute]: fault() });
+    assert.deepEqual(await dispatched({ github, faultReason: "true" }), STOPPED("read-fault"));
+  });
+}
+
+test("fault-reason: a read that got no answer stops with read-fault", async () => {
+  const github = fakeGitHub({});
+  const offline = async (method, apiPath) => {
+    if (`${method} ${apiPath}` === pullRoute) {
+      github.calls.push(`${method} ${apiPath}`);
+      throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } });
+    }
+    return github(method, apiPath);
+  };
+  offline.calls = github.calls;
+  offline.routes = github.routes;
+  assert.deepEqual(await gate({ eventName: "workflow_dispatch", event: fixture("event-workflow-dispatch.json"), prNumber: "42", github: offline, faultReason: "true" }), STOPPED("read-fault"));
+});
+
+// Guards: the input changes no refusal. Each case is refused today with the
+// reason named, and stays refused with that reason with the input on.
+test("fault-reason: every refusal on an answer GitHub gave keeps its reason", async () => {
+  const on = { faultReason: "true" };
+  // A 404 PR is a refusal, not a fault.
+  assert.deepEqual(await gate({ eventName: "workflow_dispatch", event: fixture("event-workflow-dispatch.json"), prNumber: "42", ...on }), STOPPED("no-pr"));
+  // A 403 on this run's record is a token that cannot read it.
+  assert.deepEqual(await gate({ eventName: "pull_request", event: fixture("event-pull-request.json"), ownRun: new GitHubError(403, "own run"), ...on }), STOPPED("untrusted-rerunner"));
+  const fork = fixture("event-pull-request.json");
+  fork.pull_request.head.repo.full_name = "stranger/claude-code-plugins";
+  assert.deepEqual(await gate({ eventName: "pull_request", event: fork, ...on }), STOPPED("fork"));
+  const actor = fixture("event-pull-request.json");
+  actor.sender = STRANGER;
+  assert.deepEqual(await gate({ eventName: "pull_request", event: actor, ...on }), STOPPED("untrusted-actor"));
+  const author = fixture("event-pull-request.json");
+  author.pull_request.user = STRANGER;
+  assert.deepEqual(await gate({ eventName: "pull_request", event: author, ...on }), STOPPED("untrusted-author"));
+  assert.deepEqual(await gate({ eventName: "pull_request", event: fixture("event-pull-request.json"), triggeringActor: "stranger", ...on }), STOPPED("untrusted-rerunner"));
+  const run = fixture("event-workflow-run.json");
+  run.workflow_run.triggering_actor = STRANGER;
+  assert.deepEqual(await gate({ eventName: "workflow_run", event: run, github: fakeGitHub({ [commitPulls]: [fixture("api-pull-42.json")] }), ...on }), STOPPED("untrusted-actor"));
+  assert.deepEqual(await gate({ eventName: "workflow_run", event: fixture("event-workflow-run.json"), github: fakeGitHub({ [commitPulls]: [] }), ...on }), STOPPED("no-pr"));
+  // A tag that shares the default branch's name, and a tip that 404s.
+  assert.deepEqual(
+    await dispatched({ github: fakeGitHub({ ...dispatcherRoutes(), [tagRoute]: { ref: "refs/tags/main", object: { sha: DISPATCHER_HEAD, type: "commit" } } }), ...on }),
+    STOPPED("untrusted-actor"),
+  );
+  const noTip = dispatcherRoutes();
+  delete noTip[tipRoute];
+  assert.deepEqual(await dispatched({ github: fakeGitHub(noTip), ...on }), STOPPED("untrusted-actor"));
+  // A trusted trigger still proceeds with the input on.
+  assert.deepEqual(await gate({ eventName: "pull_request", event: fixture("event-pull-request.json"), ...on }), PROCEED);
+  assert.deepEqual(await dispatched({ github: fakeGitHub(dispatcherRoutes()), ...on }), PROCEED);
+});
+
+test("fault-reason: action.yml passes the input as FAULT_REASON, empty by default", () => {
+  const action = readFileSync(path.join(HERE, "action.yml"), "utf8");
+  assert.match(action, /\n  fault-reason:\n(?: {4}.*\n)+? {4}default: ""\n/);
+  assert.match(action, /\n {8}FAULT_REASON: \$\{\{ inputs\.fault-reason \}\}\n/);
 });

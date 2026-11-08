@@ -7,9 +7,12 @@ description: >
   revoking the token, unless the broker's effect, permissions, lane, activity
   and repository equal what this job resolved; with `pr-workflow-change-ok` a
   `workflow-modified` refusal of a workflow file the PR changes skips instead
-  of failing. In `check` mode it asks the
+  of failing, with `kill-switch-ok` a `kill-switch` refusal skips with a
+  notice, and with `rate-limit-hold-ok` a rate limit past the retry budget
+  holds with a notice. In `check` mode it asks the
   broker's check endpoint, which mints nothing, whether a read lane may run,
-  and fails red on anything but an allow. Contract:
+  and fails red on anything but an allow, or, with `kill-switch-ok`, a
+  `kill-switch` refusal, which skips with a notice. Contract:
   docs/conventions/pr-pipeline/pr-run-activity.md, run job step 6 and the
   check job.
 
@@ -44,6 +47,14 @@ inputs:
       Never with `pr-number` or `dispatcher-run-id`. `token` mode only.
     required: false
     default: ""
+  release:
+    description: >-
+      The Claude Code release an upstream-apply-changelog.yml job works, one
+      MAJOR.MINOR.PATCH; sent as `release`, a string, which the broker needs
+      from that caller and refuses from any other. Never with `pr-number`,
+      `issue-number` or `dispatcher-run-id`. `token` mode only.
+    required: false
+    default: ""
   dispatcher-run-id:
     description: >-
       The pr-unblock-dispatch.yml run that dispatched this run; sent as
@@ -56,6 +67,13 @@ inputs:
       For a job after pr-unblock's model job, the head that job was gated on;
       sent as `expected_upstream_head`, with `dispatcher-run-id` only.
       `token` mode only.
+    required: false
+    default: ""
+  pushed-commit:
+    description: >-
+      With `expected-upstream-head`, the commit this run's push job pushed
+      onto that head; sent as `pushed_commit`, the one other head the broker
+      accepts. Empty, when nothing was pushed, sends no key. `token` mode only.
     required: false
     default: ""
   effect:
@@ -86,6 +104,30 @@ inputs:
       answers 403 with reason `workflow-modified`: the caller workflow changed
       on the default branch after this run started, so a newer run does its
       work. Any other denial still fails red. Default `false`.
+    required: false
+    default: "false"
+  kill-switch-ok:
+    description: >-
+      `true` ends the step green, with a notice, no token and the
+      `skip-reason` output `kill-switch`, when the broker answers 403 with
+      reason `kill-switch`: a kill switch turned on after this run read its
+      variables, a designed stop. Every step that uses the token must run
+      only when the `token` output is set, and every job that depends on this
+      one must skip on `skip-reason`. In `check` mode the same refusal ends
+      green with `skip-reason` `kill-switch` and `allowed` unset, so a caller
+      reads the allow from `allowed`, never from the step's outcome. Any other
+      denial still fails red. Default `false`.
+    required: false
+    default: "false"
+  rate-limit-hold-ok:
+    description: >-
+      `true` ends the step green, with a `Lane token hold` notice, no token
+      and the `skip-reason` output `rate-limited`, when the broker's last
+      answer is 503 `github-rate-limited`: a rate limit the 1-minute retry
+      budget could not wait out, an unknown the caller holds on (outage
+      posture element 2). The same token-output and `skip-reason` rules as
+      `kill-switch-ok` bind the caller; in `check` mode `allowed` stays
+      unset. Default `false`.
     required: false
     default: "false"
   pr-workflow-change-ok:
@@ -129,8 +171,13 @@ outputs:
     value: ${{ steps.request.outputs.failure-reason }}
   skip-reason:
     description: >-
-      `workflow-modified` when `pr-workflow-change-ok` skipped the activity; empty otherwise.
+      `workflow-modified` when `pr-workflow-change-ok` skipped the activity,
+      `kill-switch` when `kill-switch-ok` did, `rate-limited` when
+      `rate-limit-hold-ok` did; empty otherwise.
     value: ${{ steps.request.outputs.skip-reason }}
+  allowed:
+    description: "`true` when a `check` mode request got the broker's allow; unset otherwise."
+    value: ${{ steps.request.outputs.allowed }}
 
 runs:
   using: composite
@@ -146,14 +193,18 @@ runs:
         ACTIVITY: ${{ inputs.activity }}
         PR_NUMBER: ${{ inputs.pr-number }}
         ISSUE_NUMBER: ${{ inputs.issue-number }}
+        RELEASE: ${{ inputs.release }}
         DISPATCHER_RUN_ID: ${{ inputs.dispatcher-run-id }}
         EXPECTED_UPSTREAM_HEAD: ${{ inputs.expected-upstream-head }}
+        PUSHED_COMMIT: ${{ inputs.pushed-commit }}
         EFFECT: ${{ inputs.effect }}
         CONTENTS: ${{ inputs.contents }}
         PULL_REQUESTS: ${{ inputs.pull-requests }}
         ISSUES: ${{ inputs.issues }}
         ACTIONS: ${{ inputs.actions }}
         SUPERSEDED_OK: ${{ inputs.superseded-ok }}
+        KILL_SWITCH_OK: ${{ inputs.kill-switch-ok }}
+        RATE_LIMIT_HOLD_OK: ${{ inputs.rate-limit-hold-ok }}
         PR_WORKFLOW_CHANGE_OK: ${{ inputs.pr-workflow-change-ok }}
         HEAD_SHA: ${{ inputs.head-sha }}
         DEFAULT_BRANCH: ${{ inputs.default-branch }}
@@ -180,6 +231,10 @@ runs:
         [[ $LANE =~ $name && $ACTIVITY =~ $name ]] || fail "the lane and activity must be kebab-case names"
         SUPERSEDED_OK=${SUPERSEDED_OK:-false}
         [[ $SUPERSEDED_OK == true || $SUPERSEDED_OK == false ]] || fail "superseded-ok must be true or false"
+        KILL_SWITCH_OK=${KILL_SWITCH_OK:-false}
+        [[ $KILL_SWITCH_OK == true || $KILL_SWITCH_OK == false ]] || fail "kill-switch-ok must be true or false"
+        RATE_LIMIT_HOLD_OK=${RATE_LIMIT_HOLD_OK:-false}
+        [[ $RATE_LIMIT_HOLD_OK == true || $RATE_LIMIT_HOLD_OK == false ]] || fail "rate-limit-hold-ok must be true or false"
         PR_WORKFLOW_CHANGE_OK=${PR_WORKFLOW_CHANGE_OK:-false}
         [[ $PR_WORKFLOW_CHANGE_OK == true || $PR_WORKFLOW_CHANGE_OK == false ]] ||
           fail "pr-workflow-change-ok must be true or false"
@@ -200,17 +255,23 @@ runs:
           [[ -z ${ISSUE_NUMBER:-} || $ISSUE_NUMBER =~ ^[1-9][0-9]{0,9}$ ]] || fail "the issue number is malformed"
           [[ -z ${ISSUE_NUMBER:-} || -z $PR_NUMBER$DISPATCHER_RUN_ID ]] ||
             fail "an issue number goes without a PR number or dispatcher run id"
+          [[ -z ${RELEASE:-} || $RELEASE =~ ^(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,5})$ ]] ||
+            fail "the release must be one MAJOR.MINOR.PATCH"
+          [[ -z ${RELEASE:-} || -z $PR_NUMBER$ISSUE_NUMBER$DISPATCHER_RUN_ID ]] ||
+            fail "a release goes without a PR number, issue number or dispatcher run id"
           # At most 15 digits keeps it a safe JSON integer for the broker.
           [[ -z ${DISPATCHER_RUN_ID:-} || $DISPATCHER_RUN_ID =~ ^[1-9][0-9]{0,14}$ ]] ||
             fail "the dispatcher run id is malformed"
           [[ -z ${EXPECTED_UPSTREAM_HEAD:-} || ($EXPECTED_UPSTREAM_HEAD =~ ^[0-9a-f]{40}$ && -n $DISPATCHER_RUN_ID) ]] ||
             fail "the expected upstream head must be a commit SHA and ride with a dispatcher run id"
+          [[ -z ${PUSHED_COMMIT:-} || ($PUSHED_COMMIT =~ ^[0-9a-f]{40}$ && -n ${EXPECTED_UPSTREAM_HEAD:-}) ]] ||
+            fail "the pushed commit must be a commit SHA and ride with an expected upstream head"
           ;;
         check)
           # The check job resolves no grant and gates no PR, and the broker's
           # check endpoint answers 400 to any body field but lane and activity.
-          [[ -z $EFFECT$CONTENTS$PULL_REQUESTS$ISSUES${ACTIONS:-}$PR_NUMBER$ISSUE_NUMBER$DISPATCHER_RUN_ID${EXPECTED_UPSTREAM_HEAD:-} ]] ||
-            fail "check mode takes no effect, grant, PR or issue number, or dispatcher run id"
+          [[ -z $EFFECT$CONTENTS$PULL_REQUESTS$ISSUES${ACTIONS:-}$PR_NUMBER$ISSUE_NUMBER${RELEASE:-}$DISPATCHER_RUN_ID${EXPECTED_UPSTREAM_HEAD:-}${PUSHED_COMMIT:-} ]] ||
+            fail "check mode takes no effect, grant, PR or issue number, release, or dispatcher run id"
           [[ $BROKER_URL =~ ^https://[^/]+/(.+/)?token$ ]] ||
             fail "lane-token-unconfigured: LANES_BROKER_URL does not end in a /token path segment, so it names no check endpoint"
           BROKER_URL="${BROKER_URL%/token}/check"
@@ -242,12 +303,15 @@ runs:
         trap cleanup EXIT
 
         body=$(jq -cn --arg lane "$LANE" --arg activity "$ACTIVITY" --arg pr "$PR_NUMBER" \
-          --arg issue "$ISSUE_NUMBER" --arg dispatcher "$DISPATCHER_RUN_ID" --arg upstream "${EXPECTED_UPSTREAM_HEAD:-}" \
+          --arg issue "$ISSUE_NUMBER" --arg release "${RELEASE:-}" --arg dispatcher "$DISPATCHER_RUN_ID" --arg upstream "${EXPECTED_UPSTREAM_HEAD:-}" \
+          --arg pushed "${PUSHED_COMMIT:-}" \
           '{lane: $lane, activity: $activity}
             + (if $pr == "" then {} else {pr_number: ($pr | tonumber)} end)
             + (if $issue == "" then {} else {issue_number: ($issue | tonumber)} end)
+            + (if $release == "" then {} else {release: $release} end)
             + (if $dispatcher == "" then {} else {dispatcher_run_id: ($dispatcher | tonumber)} end)
-            + (if $upstream == "" then {} else {expected_upstream_head: $upstream} end)')
+            + (if $upstream == "" then {} else {expected_upstream_head: $upstream} end)
+            + (if $pushed == "" then {} else {pushed_commit: $pushed} end)')
 
         reason_of() { jq -r 'if type == "object" and (.reason | type) == "string" then .reason else "" end' "$response" 2>/dev/null || true; }
         detail_of() { jq -r 'if type == "object" and (.detail | type) == "string" then .detail else "" end' "$response" 2>/dev/null | one_line || true; }
@@ -255,20 +319,22 @@ runs:
         # Two 503s come before the broker reserves anything, so they are retried,
         # each with a fresh OIDC token, as GitHub's rate-limit guidance asks:
         # https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#exceeding-the-rate-limit
-        # github-rate-limited carries GitHub's wait as Retry-After: the retry
-        # waits exactly that (a minute when absent) plus jitter, never less, and
-        # a wait that would end past the budget fails at once. github-unavailable
-        # backs off exponentially from a minute, or waits a longer Retry-After.
+        # At most 3 requests, and at most 60 s of waiting in all (the outage
+        # posture's element 1 budget, docs/outage-posture-audit.md): a wait
+        # past it is not taken, and the step fails as it does on any final
+        # answer. github-rate-limited carries GitHub's wait as Retry-After: the
+        # retry waits exactly that (a minute when absent) plus jitter cut to fit
+        # the budget, never less. github-unavailable backs off with full jitter,
+        # up to 20 s and then 40 s, or waits a longer Retry-After.
         # mint-unavailable is a failed mint after the job's one reservation, so
         # it is final, as is every other answer and no answer: a 200 lost in
-        # transit is revoked by nobody. No retry starts more than 8 minutes
-        # after the first request, so with its 30 s OIDC and 60 s broker
-        # timeouts the last answer comes within 9.5 minutes. A check is never
+        # transit is revoked by nobody. With its 30 s OIDC and 60 s broker
+        # timeouts the last answer comes within 5.5 minutes. A check is never
         # reserved, so re-running all jobs asks again; "Re-run failed jobs"
         # reuses an earlier allow, which the read file's run job refuses.
-        backoff=(60 120 240)
-        budget=480
-        attempt=0 start=$SECONDS retried="" rate_limit=""
+        backoff=(20 40)
+        budget=60
+        attempt=0 waited=0 retried="" rate_limit=""
         while :; do
           oidc=$(printf 'Authorization: bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
             curl -sS --fail --max-time 30 -H @- "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" |
@@ -284,10 +350,9 @@ runs:
           [[ $status == 503 && $attempt -lt ${#backoff[@]} && $reason =~ ^github-(unavailable|rate-limited)$ ]] || break
           after=$(tr -d '\r' <"$headers" 2>/dev/null |
             awk -F': *' 'tolower($1) == "retry-after" && $2 ~ /^[0-9]+$/ && length($2) <= 6 { v = $2 + 0 } END { print v }') || after=""
-          elapsed=$((SECONDS - start))
           if [ "$reason" = github-rate-limited ]; then
             delay=${after:-60}
-            if [ $((elapsed + delay)) -gt "$budget" ]; then
+            if [ $((waited + delay)) -gt "$budget" ]; then
               # The anchored allowlists below are what keep broker text out of
               # the ::error:: command and $GITHUB_OUTPUT: never loosen them.
               limit=$(jq -r 'if (.limit | type) == "string" then .limit else "" end' "$response" 2>/dev/null) || limit=""
@@ -297,20 +362,21 @@ runs:
               resets=$(jq -rn --argjson s "$delay" 'now + $s | ceil | todate')
               when="resets at"
               [ -n "$after" ] || when="sent no Retry-After, so its earliest retry is"
-              rate_limit="; GitHub's $limit rate limit${resource:+ ($resource)} $when $resets, past the 8-minute retry budget"
+              rate_limit="; GitHub's $limit rate limit${resource:+ ($resource)} $when $resets, past the 1-minute retry budget"
               break
             fi
             jitter=$((RANDOM % 21))
-            [ "$jitter" -le $((budget - elapsed - delay)) ] || jitter=$((budget - elapsed - delay))
+            [ "$jitter" -le $((budget - waited - delay)) ] || jitter=$((budget - waited - delay))
             delay=$((delay + jitter))
           else
-            delay=$((backoff[attempt] + RANDOM % 21))
+            delay=$((RANDOM % (backoff[attempt] + 1)))
             [[ -z $after || $after -le $delay ]] || delay=$after
-            [ $((elapsed + delay)) -le "$budget" ] || break
+            [ $((waited + delay)) -le "$budget" ] || break
           fi
           detail=$(detail_of)
           retried="503 with reason $reason${detail:+: $detail}"
           attempt=$((attempt + 1))
+          waited=$((waited + delay))
           echo "::warning::lane-token-retry: the broker answered $retried; retry $attempt of ${#backoff[@]} in ${delay}s"
           sleep "$delay"
         done
@@ -332,6 +398,27 @@ runs:
             msg="lane-token-superseded: $LANE.yml changed on the default branch after this run started, so a newer run of it does this work; this run takes no token and skips the rest"
             echo "::warning::$msg"
             printf -- '- %s\n' "$msg" >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # The broker reads the kill switches live; this run's vars were read
+          # when it was queued, so a switch turned on since reaches it here.
+          if [[ $KILL_SWITCH_OK == true && $status == 403 && $reason == kill-switch ]]; then
+            msg="lane-token-stopped: the broker refused the token because a lanes kill switch is on, a designed stop; this run takes no token and skips the rest"
+            [ "$MODE" = token ] ||
+              msg="lane-check-stopped: the broker refused the check because a lanes kill switch is on, a designed stop; this run runs no lane and skips the rest"
+            echo "::notice::$msg"
+            printf -- '- %s\n' "$msg" >>"$GITHUB_STEP_SUMMARY"
+            echo "skip-reason=kill-switch" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A rate limit the retry budget could not wait out leaves the answer
+          # unknown, so the outage posture's element 2 holds instead of failing.
+          # Only the allowlisted $rate_limit text reaches the notice.
+          if [[ $RATE_LIMIT_HOLD_OK == true && $status == 503 && $reason == github-rate-limited ]]; then
+            msg="lane-token-held: the broker answered 503 github-rate-limited after its retries${rate_limit}; this run takes no token and skips the rest, and the next run asks again"
+            echo "::notice title=Lane token hold::$msg"
+            printf -- '- %s\n' "$msg" >>"$GITHUB_STEP_SUMMARY"
+            echo "skip-reason=rate-limited" >>"$GITHUB_OUTPUT"
             exit 0
           fi
           # The refusal does not say whether the PR or the default branch
@@ -378,6 +465,7 @@ runs:
           [ "$allowed" = true ] || fail "$denied: the broker's 200 is not an allow for this lane and activity"
           # shellcheck disable=SC2016  # the backticks are Markdown, not expansions
           printf -- '- Broker check allowed: lane `%s`, activity `%s`\n' "$LANE" "$ACTIVITY" >>"$GITHUB_STEP_SUMMARY"
+          echo "allowed=true" >>"$GITHUB_OUTPUT"
           exit 0
         fi
 
@@ -408,3 +496,22 @@ runs:
         # shellcheck disable=SC2016  # the backticks are Markdown, not expansions
         printf -- '- Lane token minted: effect `%s`, mint `%s`, expires `%s`\n' "$EFFECT" "$mint_id" "$expires" >>"$GITHUB_STEP_SUMMARY"
         issued=""
+        # The lanes App's REST quota as the broker read it at this mint, an
+        # optional rate_limit {remaining, limit, reset in epoch seconds}: the
+        # monitoring lane's GITHUB_TOKEN cannot read the App's own quota, so it
+        # reads this notice, in log-api-budget's start shape (signals.mjs
+        # parseBudget). Absent, nothing is written; malformed, a warning.
+        quota=$(jq -r 'if type == "object" and has("rate_limit") then .rate_limit
+          | if type == "object" and ([.remaining, .limit, .reset] | all(type == "number" and . >= 0 and . == floor))
+            then "\(.remaining) \(.limit) \(.reset)" else "malformed" end
+          else "" end' "$response" 2>/dev/null) || quota=malformed
+        if [[ $quota =~ ^([0-9]{1,9})\ ([0-9]{1,9})\ ([0-9]{1,12})$ ]] &&
+          [ "${BASH_REMATCH[1]}" -le "${BASH_REMATCH[2]}" ] && [ "${BASH_REMATCH[2]}" -gt 0 ]; then
+          remaining=${BASH_REMATCH[1]} limit=${BASH_REMATCH[2]}
+          resets=$(jq -rn --argjson s "${BASH_REMATCH[3]}" '$s | todate') || resets=unknown
+          echo "::notice title=api-budget::mint lanes-app core remaining=$remaining used=$((limit - remaining)) limit=$limit reset=$resets"
+          # shellcheck disable=SC2016  # the backticks are Markdown, not expansions
+          printf -- '- Lanes App REST quota at mint: `%s` of `%s` remaining, resets `%s`\n' "$remaining" "$limit" "$resets" >>"$GITHUB_STEP_SUMMARY"
+        elif [ -n "$quota" ]; then
+          echo "::warning::lane-token-quota-unread: the broker's rate_limit is not remaining, limit and reset as whole numbers, remaining at most limit"
+        fi

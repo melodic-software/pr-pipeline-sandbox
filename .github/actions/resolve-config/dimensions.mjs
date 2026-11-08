@@ -11,7 +11,7 @@ const NOT_ASSESSED = "not-assessed";
 const LANES_APP_LOGIN = "melodic-automation-lanes[bot]";
 
 // The account ids whose field values count: the listed humans and the lanes App.
-function trustedSetters(trustedActors) {
+export function trustedSetters(trustedActors) {
   const actors = Array.isArray(trustedActors?.actors) ? trustedActors.actors : [];
   return new Set(
     actors
@@ -21,32 +21,38 @@ function trustedSetters(trustedActors) {
   );
 }
 
+// The config's key for the option a single-select field holds, or null when
+// no trusted account set it. `facts.fieldValues` is the REST issue-field-values
+// rows as {field, option} ids; `facts.fieldSetters` maps a field id to the
+// account id that last set it (GraphQL field events), or null. An untrusted
+// setter's value is ignored, mapped or not, so it cannot fail the read; a
+// trusted option `field.options` does not map throws `unmapped(option)`.
+export function trustedOption(facts, field, trustedActors, unmapped) {
+  const fieldId = field["field-id"];
+  const row = facts.fieldValues.find((value) => value.field === fieldId);
+  if (row === undefined || !trustedSetters(trustedActors).has(facts.fieldSetters[String(fieldId)])) {
+    return null;
+  }
+  const option = String(row.option);
+  if (!Object.hasOwn(field.options, option)) {
+    throw unmapped(option);
+  }
+  return field.options[option];
+}
+
 // {size, complexity, uncertainty}, each the config's key for the issue's
-// option, or UNSET's when no trusted account set the field. `facts.fieldValues` is the REST
-// issue-field-values rows as {field, option} ids; `facts.fieldSetters` maps a
-// field id to the account id that last set it (GraphQL field events), or null.
-// A value counts only when its setter is trusted; a trusted option the config
-// does not map stops the run.
+// option (trustedOption), or UNSET's when no trusted account set the field.
 export function issueDimensions(facts, config, trustedActors) {
-  const trusted = trustedSetters(trustedActors);
   const result = {};
   for (const name of DIMENSIONS) {
-    const { "field-id": fieldId, options } = config.fields[name];
-    const row = facts.fieldValues.find((value) => value.field === fieldId);
-    // An untrusted setter's value is ignored, mapped or not, so it cannot
-    // fail the resolve.
-    if (row === undefined || !trusted.has(facts.fieldSetters[String(fieldId)])) {
-      result[name] = UNSET[name];
-      continue;
-    }
-    const option = String(row.option);
-    if (!Object.hasOwn(options, option)) {
-      throw new Rejection(
-        "unmapped-dimension",
-        `issue field ${fieldId} (${name}) holds option ${option}, which models.issue-dimensions does not map`,
-      );
-    }
-    result[name] = options[option];
+    const field = config.fields[name];
+    result[name] =
+      trustedOption(facts, field, trustedActors, (option) =>
+        new Rejection(
+          "unmapped-dimension",
+          `issue field ${field["field-id"]} (${name}) holds option ${option}, which models.issue-dimensions does not map`,
+        ),
+      ) ?? UNSET[name];
   }
   return result;
 }
@@ -75,6 +81,14 @@ export function dimensionBudget(dims, config) {
     "timeout-minutes": size["timeout-minutes"],
     pin,
   };
+}
+
+// `dims` for a trusted size-split sub-issue (`splitChild`): a size that
+// splits becomes `split-child-size`, since admission takes such a child
+// whatever its Size (owner Q93). Anything else is returned as is. Pure.
+export function splitChildDims(dims, config, splitChild) {
+  const size = config["split-child-size"];
+  return splitChild === true && size !== undefined && config.sizes[dims.size] === "split" ? { ...dims, size } : dims;
 }
 
 // The dimensions a pin (dimensionBudget's `pin`) names.
@@ -113,6 +127,10 @@ export function checkDimensions(config) {
   }
   if (new Set(DIMENSIONS.map((name) => config.fields[name]["field-id"])).size !== DIMENSIONS.length) {
     throw new Rejection("undefined-dimension", "models.issue-dimensions names one field id for two dimensions");
+  }
+  const child = config["split-child-size"];
+  if (child !== undefined && (!Object.hasOwn(config.sizes, child) || config.sizes[child] === "split")) {
+    throw new Rejection("undefined-dimension", `models.issue-dimensions.split-child-size \`${child}\` names no size that runs`);
   }
   if (config.sizes[UNSET.size] === "split") {
     throw new Rejection("undefined-dimension", `models.issue-dimensions.sizes.${UNSET.size}, which an unset size reads as, does not run`);

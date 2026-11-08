@@ -1,9 +1,26 @@
 #!/usr/bin/env bash
-# report-escalation.sh: the pr-unblock lane's report-escalation leaf. Hands the
-# PR to a person: one machine-marked comment with the reason, the resume key
-# and how to resume, plus the human-gated role label. Run from the base copy;
-# it reads only the trusted base checkout and the GitHub API, never a PR head
+# report-escalation.sh: the pr-unblock lane's report-escalation leaf. Ends a
+# lane run that stopped, on the route escalation-routes.json (beside this
+# script, the one routing table) gives its reason. Run from the base copy; it
+# reads only the trusted base checkout and the GitHub API, never a PR head
 # file, and never writes to the branch.
+#
+# - route `hold` (only the owner's three reasons: an intent or design
+#   question, a CRITICAL security risk or a billing risk, a person's own
+#   thread or hold): hands the PR to a person with one machine-marked comment
+#   holding the reason, the resume key and how to resume, plus the
+#   human-gated role label; a PR the label goes on while it sits in the merge
+#   queue leaves it (leave_queue). Every hold row's `owner-reason` adds the
+#   ../lib/stop-reason.mjs marker and line naming which owner reason it is.
+#   A reason the table does not list holds
+#   too, with no activity to resume (fail-safe).
+# - route `fail` (a stop the lane's own bounded retries did not mend): no
+#   human-gated label; the entry's `label` (needs-session), when it names one,
+#   puts the PR in the session-builder queue for a change the lane cannot
+#   make, written before the comment. One lanes App comment per activity, marked LANE_STOPPED, is posted
+#   once and edited in place after, naming the reason and the head; status
+#   mode (below) puts a failing commit status on that head. A new head carries
+#   no status, so the lane's next run there starts clean.
 #
 # Environment:
 #   GH_TOKEN            token with pull-requests: write and issues: write
@@ -11,104 +28,175 @@
 #   GITHUB_REPOSITORY   owner/repo
 #   PR_NUMBER           the pull request
 #   HEAD_SHA            the gated head; it is the resume key
-#   ESCALATION_REASON   protected-path-conflict | workflow-staged
-#                       | unexpected-path-staged | repeat-cap
-#                       | unresolved-conflict | feedback-protected-path
-#                       | feedback-round-cap | feedback-uncertain
-#                       | feedback-not-landed | feedback-invalid
-#                       | feedback-partial | feedback-incomplete
-#                       | feedback-disputed | feedback-unadjudicated
-#                       | feedback-question-intent | feedback-question-design
-#                       | feedback-question-security | feedback-not-converging
-#                       | dependency-round-cap
-#                       | dependency-invalid | dependency-fix-not-landed
-#                       | dependency-security-close | dependency-escalate
-#                       | dependency-config-unreadable
-#                       | dependency-files-truncated
-#                       | dependency-control-uncited
-#                       | dependency-workflow-unpinned
-#                       | dependency-fix-refused | ci-fix-round-cap
-#                       | ci-fix-empty | ci-fix-invalid
-#                       | ci-fix-protected-path | ci-fix-not-applied
-#                       | ci-fix-escalated | conflict-patch-invalid
-#                       | conflict-patch-not-applied
-#                       | conflict-patch-protected-path
-#   TRACKER_CONFIG      base .work-item-tracker.json
-#                       (default .base/.work-item-tracker.json)
+#   ESCALATION_REASON   a key of escalation-routes.json; any other well-formed
+#                       reason holds for a person
+#   TRACKER_CONFIG      the base tracker binding: the `tracker` mapping of a
+#                       .yaml file, else a JSON file
+#                       (default .base/docs/conventions/work-items.yaml)
 #   LANES_BOT_LOGIN     the lanes App bot login, the only author whose marker
 #                       counts (default melodic-automation-lanes[bot])
 #
 # The role label is config.role_labels["human-gated"]. A missing file or entry
 # means needs-human; a present entry that is not a non-empty string fails.
-# Idempotent: with the label on the PR and a LANES_BOT_LOGIN marker for this
-# resume key and reason, it writes nothing; another reason on the same head
-# gets its own comment, so gate-source.mjs reads every reason the label holds
-# for. Without the label (a person removed it to resume), it
+# Hold is idempotent: with the label on the PR and a LANES_BOT_LOGIN marker
+# for this resume key and reason, it writes nothing; another reason on the
+# same head gets its own comment, so gate-source.mjs reads every reason the
+# label holds for. Without the label (a person removed it to resume), it
 # escalates again. The label is written before the comment, so a retry after a
 # failure between the two finds the label and posts at most one comment. The
-# comment write is tried three times, so a transient failure does not leave the
-# label without its explanation.
+# comment write, a POST that is not idempotent, goes out once: when it fails,
+# the job fails with the label on, and the next run, finding no marker, posts
+# the explanation. Fail writes nothing when its comment already reads as it
+# would.
 #
-# With the argument `status`, it instead posts one failing `pr-unblock/conflict`
-# commit status on HEAD_SHA when the reason is unresolved-conflict, and nothing
-# for any other reason. GitHub starts no pull_request workflow on a conflicted
-# PR, so this status is what shows the head why its CI is missing. That mode
-# needs GH_TOKEN with statuses: write and reads TARGET_URL (optional, the run).
+# With the argument `clear` (below), it reads ACTIVITY in place of the reason.
+#
+# With the argument `status`, it instead posts one failing commit status on
+# HEAD_SHA for a fail-routed reason, and nothing for a held one: context
+# `pr-unblock/conflict` for resolve-conflicts (GitHub starts no pull_request
+# workflow on a conflicted PR, so this status is also what shows the head why
+# its CI is missing), else `pr-unblock/<activity>`. That mode needs GH_TOKEN
+# with statuses: write and reads TARGET_URL (optional, the run). For
+# feedback-publish-failed it posts nothing when the reply job's lane token was
+# refused in a way a retry takes the head on (retried_refusal), which also
+# reads GITHUB_RUN_ID with actions: read and checks: read, and writes
+# `status-withheld=true` to GITHUB_OUTPUT, so the caller's report-escalation
+# job posts no lane-stopped comment either.
 #
 # Exit: 0 when escalated or already escalated; 1 on bad input or API failure.
 set -euo pipefail
+# In a job, each gh call keeps its rate-limit reading for the job-end
+# api-budget notice (.github/actions/log-api-budget).
+# shellcheck source=/dev/null
+[[ -z "${RUNNER_TEMP:-}" ]] || ! . "${BASH_SOURCE[0]%/*}/../../../.github/actions/log-api-budget/api-budget.bash" 2>/dev/null || api_budget_wrap_gh github-token
 
 die() {
   printf 'report-escalation.sh: %s\n' "$*" >&2
   exit 1
 }
 
-case ${ESCALATION_REASON:-} in
-  protected-path-conflict) why='a conflicted path is a workflow, submodule config or a settings file, which the lane does not resolve' ;;
-  workflow-staged) why='the merge stages a change under .github/workflows/, which the lane does not push' ;;
-  unexpected-path-staged) why='the conflict resolution changes a path outside the conflicted ones, which the lane does not push' ;;
-  repeat-cap) why='the lane has resolved conflicts on this branch as many times in a row as its cap allows' ;;
-  unresolved-conflict) why='the lane could not resolve every conflict' ;;
-  feedback-protected-path) why='the pull request changes .github/workflows/, which the lane token cannot push, so the lane does not address its review threads' ;;
-  feedback-round-cap) why='the lane has addressed review threads on this pull request as many rounds as its cap allows, and an open thread is a security or intent finding or a person holds the pull request, so a person decides' ;;
-  feedback-not-converging) why='review rounds are not converging: after the round cap and one fresh fixer round the code review still has open findings, so the fixer and the reviewer disagree on what the change should be' ;;
-  feedback-uncertain) why='a review finding is uncertain or deferred, so a person decides it' ;;
-  feedback-not-landed) why='a fix the lane recorded did not reach the branch, so none of its review replies was posted' ;;
-  feedback-invalid) why='the review replies the lane recorded did not pass validation, so none was posted' ;;
-  feedback-partial) why='posting the review replies stopped partway, or a fixed thread could not be resolved, so a person finishes them' ;;
-  feedback-incomplete) why='the lane did not record a disposition for every review thread it kept, so none was posted' ;;
-  feedback-disputed) why='a disputed review finding is one only a person decides (a security-review finding, a thread a person directed, or one an adjudicator found stands and the next round left open again)' ;;
-  feedback-unadjudicated) why='the lane replied with evidence that a review finding is incorrect, and no adjudicator verdict on that thread was recorded, so a person decides it' ;;
-  feedback-question-intent) why='an adjudicator found that a disputed review finding turns on what the change is meant to do, which a person decides' ;;
-  feedback-question-design) why='an adjudicator found that a disputed review finding turns on a design choice, which a person decides' ;;
-  feedback-question-security) why='an adjudicator found that a disputed review finding turns on a security judgment, which a person decides' ;;
-  dependency-round-cap) why='the lane has reviewed this dependency update as many rounds as its cap allows' ;;
-  dependency-invalid) why='the dependency review verdict did not pass validation, so the lane acted on none of it' ;;
-  dependency-fix-not-landed) why='the dependency review chose a fix, but no fix commit reached the branch (the lane lands a fix only when it changes nothing but the versions in npm or pip manifest and lock files outside .github/)' ;;
-  dependency-security-close) why='the dependency review would close a security update, which the lane never closes' ;;
-  dependency-escalate) why='the dependency review found a risk the lane does not decide alone' ;;
-  dependency-config-unreadable) why='the lane could not read the base .github/dependabot.yml, so it does not mark this dependency update for merge' ;;
-  dependency-files-truncated) why='the dependency review chose merge, but the files listing it read was cut short, so the lane does not mark this dependency update for merge' ;;
-  dependency-fix-refused) why='a commit on the dependency update other than Dependabot'"'"'s changes more than a version of an npm or pip manifest or lock file, as a regular file outside .github/, so the lane does not act on the review' ;;
-  dependency-control-uncited) why='the dependency review chose merge for a review-only dependency without quoting its control, so the lane does not mark it for merge' ;;
-  dependency-workflow-unpinned) why='the dependency review chose merge, but the update changes a workflow or action file by more than swapping one full-SHA action pin for another, so the lane does not mark it for merge' ;;
-  ci-fix-round-cap) why='the lane has pushed as many CI fixes to this pull request as its cap allows, and CI still fails' ;;
-  ci-fix-empty) why='the lane changed nothing that fixes the failing checks' ;;
-  ci-fix-invalid) why='the CI fix the lane wrote did not pass validation, so it was not pushed' ;;
-  ci-fix-protected-path) why='the CI fix changes a path the lane does not push: .github/workflows/, CODEOWNERS, .gitmodules or a settings file' ;;
-  ci-fix-not-applied) why='the CI fix did not apply to the head it was written for, so it was not pushed' ;;
-  ci-fix-escalated) why='the lane could not fix every failing check; its run log names each one and why' ;;
-  conflict-patch-invalid) why='the conflict resolution the lane wrote did not pass validation, so the merge was not pushed' ;;
-  conflict-patch-not-applied) why='the conflict resolution did not apply to the merge it was written for, so the merge was not pushed' ;;
-  conflict-patch-protected-path) why='the conflict resolution changes a path the lane does not push: .github/workflows/, CODEOWNERS, .gitmodules or a settings file' ;;
-  *) die "unknown escalation reason [${ESCALATION_REASON:-}]" ;;
-esac
-case $ESCALATION_REASON in
-  feedback-*) activity=address-feedback ;;
-  dependency-*) activity=review-dependency ;;
-  ci-fix-*) activity=fix-ci ;;
-  *) activity=resolve-conflicts ;;
-esac
+routes=$(dirname "${BASH_SOURCE[0]}")/escalation-routes.json
+
+# After the hold route adds the human-gated label: a queued PR leaves the merge
+# queue, so its group does not run only for ci-status to fail it on the label.
+# The read and the dequeue are address-feedback.mjs's QUEUE_ENTRY_QUERY and
+# DEQUEUE_MUTATION (leaveQueueOnHold), the one copy of each. A refused read or
+# dequeue warns and the escalation goes on: the label is the hold. Prints one
+# hold-label-dequeue notice.
+leave_queue() {
+  local queries answer entry outcome number=${PR_NUMBER:-} repo=${GITHUB_REPOSITORY:-}
+  if ! queries=$(QUEUE_MODULE="$(dirname "${BASH_SOURCE[0]}")/address-feedback.mjs" node --input-type=module -e '
+    const { pathToFileURL } = await import("node:url");
+    const m = await import(pathToFileURL(process.env.QUEUE_MODULE).href);
+    process.stdout.write(JSON.stringify({ read: m.QUEUE_ENTRY_QUERY, dequeue: m.DEQUEUE_MUTATION }));'); then
+    outcome=refused:queries-unread
+    echo "::warning::#$number: the merge-queue queries did not load; it was not dequeued"
+  elif ! answer=$(gh api graphql -f "query=$(jq -r .read <<<"$queries")" -f "owner=${repo%/*}" -f "name=${repo#*/}" -F "pr=$number") ||
+    ! entry=$(jq -er '.data.repository.pullRequest | select(.id | type == "string") | [.id, (.mergeQueueEntry != null)] | @tsv' <<<"$answer"); then
+    outcome=refused:read-failed
+    echo "::warning::#$number: its merge-queue entry did not read; it was not dequeued"
+  elif [[ ${entry#*$'\t'} != true ]]; then
+    outcome=not-queued
+  elif gh api graphql -f "query=$(jq -r .dequeue <<<"$queries")" -f "id=${entry%%$'\t'*}" >/dev/null; then
+    outcome=dequeued
+  else
+    outcome=refused:dequeue-failed
+    echo "::warning::#$number: could not dequeue it; ci-status still fails its merge group on $1"
+  fi
+  echo "::notice title=hold-label-dequeue::pr=$number label=$1 outcome=$outcome"
+}
+
+# Status mode, feedback-publish-failed: whether this run's reply job failed at
+# its lane token for a reason a retry takes the head on, read from this run's
+# jobs (actions: read) and that job's annotations (checks: read) by
+# ../pr-merge/refire-refused.mjs tokenRefusal, the one copy of those reasons.
+# A workflow-modified refusal, which the feedback sweep sends again with no
+# lane-file, branch or author filter (feedback-dispatch.mjs sweepRefused),
+# prints its path and returns 0. A transient refusal returns 1: pr-merge's
+# re-fire skips a PR that changes a lane file, a skip branch or one that fails
+# qualifies (refire-refused.mjs), so it is no proof of a retry. Anything else,
+# a failed read included, returns 1 and the status goes on: only positive
+# evidence withholds it. A head with SWEEP_HEAD_CAP address-feedback rounds,
+# which the sweep skips, returns 1 too, so a refusal it will not resend posts.
+retried_refusal() {
+  local jobs ids id notes annotations='{}'
+  [[ ${GITHUB_RUN_ID:-} =~ ^[1-9][0-9]*$ ]] || return 1
+  jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100") || return 1
+  ids=$(jq -er '[.jobs[] | select(.name == "publish-feedback / run" and .conclusion == "failure") | .id | select(type == "number")] | .[]' <<<"$jobs") || return 1
+  for id in $ids; do
+    notes=$(gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations?per_page=100") || return 1
+    annotations=$(jq -c --arg id "$id" --argjson notes "$notes" '. + {($id): $notes}' <<<"$annotations") || return 1
+  done
+  # The head's address-feedback rounds, which the sweep counts against its cap.
+  rounds=$(gh api "repos/$GITHUB_REPOSITORY/commits/${HEAD_SHA:-}/check-runs?check_name=pr-unblock%20%2F%20address-feedback&per_page=100") || return 1
+  # shellcheck disable=SC2016 # a JavaScript template literal, not a shell expansion
+  REFIRE_MODULE="$(dirname "${BASH_SOURCE[0]}")/../pr-merge/refire-refused.mjs" DISPATCH_MODULE="$(dirname "${BASH_SOURCE[0]}")/feedback-dispatch.mjs" JOBS="$jobs" ANNOTATIONS="$annotations" ROUNDS="$rounds" node --input-type=module -e '
+    const { pathToFileURL } = await import("node:url");
+    const { tokenRefusal } = await import(pathToFileURL(process.env.REFIRE_MODULE).href);
+    const { DEFAULTS, SWEEP_HEAD_CAP } = await import(pathToFileURL(process.env.DISPATCH_MODULE).href);
+    const notes = JSON.parse(process.env.ANNOTATIONS);
+    const why = await tokenRefusal({ jobs: JSON.parse(process.env.JOBS).jobs, readAnnotations: async (id) => notes[id] ?? [], activity: "address-feedback" });
+    if (why === null || why.kind === "transient") process.exit(1);
+    // The URL names the check; a renamed one reads no rounds, so post.
+    if (DEFAULTS.checkName !== "pr-unblock / address-feedback") process.exit(1);
+    const rounds = (JSON.parse(process.env.ROUNDS).check_runs ?? []).filter((c) => c.name === DEFAULTS.checkName && c.app?.id === DEFAULTS.appId).length;
+    if (rounds >= SWEEP_HEAD_CAP) process.exit(1);
+    process.stdout.write(`workflow-modified, ${why.path}`);' 2>/dev/null
+}
+
+# `clear`: an attempt of ACTIVITY on HEAD_SHA ended without a stop (a same-head
+# retry landed). When the newest status of the activity's context on the
+# head, by github-actions[bot], is a failure or error, it posts success over it, so a
+# stop the retry mended no longer fails the head. Needs statuses: write.
+if [[ ${1:-} == clear ]]; then
+  [[ ${HEAD_SHA:-} =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || die "HEAD_SHA is not a commit id"
+  [[ ${GITHUB_REPOSITORY:-} =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "GITHUB_REPOSITORY is not owner/repo"
+  jq -e --arg a "${ACTIVITY:-}" 'any(.[]; .activity == $a)' "$routes" >/dev/null || die "ACTIVITY is not an activity the table routes"
+  if [[ $ACTIVITY == resolve-conflicts ]]; then context=pr-unblock/conflict; else context=pr-unblock/$ACTIVITY; fi
+  # Every page, newest first, and failure or error, as ci-status reads the same context.
+  # A refused read prints its JSON error on stdout, which jq would die on with
+  # no annotation, so the read is checked before jq sees it.
+  gh_error=$(mktemp)
+  trap 'rm -f "$gh_error"' EXIT
+  if ! statuses=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100" 2>"$gh_error"); then
+    message=$(<"$gh_error")
+    message=${message//'%'/%25}
+    message=${message//$'\r'/%0D}
+    message=${message//$'\n'/%0A}
+    echo "::error::cannot read the statuses of $HEAD_SHA: $message"
+    exit 1
+  fi
+  state=$(jq -rs --arg c "$context" \
+    '[.[][] | select(.context == $c and .creator.login == "github-actions[bot]")][0].state // ""' <<<"$statuses")
+  if [[ $state != failure && $state != error ]]; then
+    echo "no failing $context on $HEAD_SHA to clear"
+    exit 0
+  fi
+  args=(-f state=success -f "context=$context" -f "description=The lane ran again on this head and did not stop")
+  [[ -n ${TARGET_URL:-} ]] && args+=(-f "target_url=$TARGET_URL")
+  gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" "${args[@]}" >/dev/null
+  echo "cleared $context on $HEAD_SHA"
+  exit 0
+fi
+[[ ${ESCALATION_REASON:-} =~ ^[a-z]+(-[a-z]+)*$ ]] || die "unknown escalation reason [${ESCALATION_REASON:-}]"
+entry=$(jq -c --arg r "$ESCALATION_REASON" 'if has($r) then .[$r] else null end' "$routes") || die "cannot read $routes"
+if [[ $entry == null ]]; then
+  # Fail-safe: a reason the table does not list holds for a person, with no
+  # activity to resume.
+  why="the lane stopped on a reason its routing table does not list, so a person decides"
+  activity='' route=hold session_label='' owner_reason=''
+else
+  why=$(jq -er '.why | strings' <<<"$entry") || die "no why for $ESCALATION_REASON in $routes"
+  activity=$(jq -er '.activity | strings' <<<"$entry") || die "no activity for $ESCALATION_REASON in $routes"
+  route=$(jq -er '.route | select(. == "hold" or . == "fail")' <<<"$entry") || die "no route for $ESCALATION_REASON in $routes"
+  # The session-builder queue label a fail-routed reason may name.
+  session_label=$(jq -er --arg route "$route" 'if has("label") then .label | strings | select(test("^[a-z]+(-[a-z]+)*$") and $route == "fail") else "" end' <<<"$entry") ||
+    die "the label for $ESCALATION_REASON in $routes is not a label name on a fail route"
+  # The stop-reason code a hold row names (`owner-reason`), which the hold
+  # comment carries as ../lib/stop-reason.mjs's marker and visible line.
+  owner_reason=$(jq -er --arg route "$route" 'if has("owner-reason") then ."owner-reason" | strings | select(test("^[a-z]+$") and $route == "hold") else "" end' <<<"$entry") ||
+    die "the owner-reason for $ESCALATION_REASON in $routes is not a code on a hold route"
+fi
 [[ ${PR_NUMBER:-} =~ ^[1-9][0-9]*$ ]] || die "PR_NUMBER is not a pull request number"
 [[ ${HEAD_SHA:-} =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || die "HEAD_SHA is not a commit id"
 [[ ${GITHUB_REPOSITORY:-} =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "GITHUB_REPOSITORY is not owner/repo"
@@ -116,43 +204,87 @@ esac
 case ${1:-} in
   '') ;;
   status)
-    if [[ $ESCALATION_REASON != unresolved-conflict ]]; then
-      echo "no conflict status for $ESCALATION_REASON"
+    if [[ $route != fail ]]; then
+      echo "no status for $ESCALATION_REASON: it holds for a person"
       exit 0
     fi
-    args=(-f state=failure -f context=pr-unblock/conflict
-      -f "description=Conflicts with the base branch; CI does not run until they are resolved")
+    # shellcheck disable=SC2310 # retried_refusal returns 1 itself on every failed read
+    if [[ $ESCALATION_REASON == feedback-publish-failed ]] && refusal=$(retried_refusal); then
+      echo "::notice title=report-stop-status::no status for $ESCALATION_REASON: the reply job's lane token was refused ($refusal), and a retry takes this head"
+      # The step's status-withheld output: report-escalation posts no
+      # lane-stopped comment for the same refusal.
+      [[ -z ${GITHUB_OUTPUT:-} ]] || echo "status-withheld=true" >>"$GITHUB_OUTPUT"
+      exit 0
+    fi
+    if [[ $activity == resolve-conflicts ]]; then
+      context=pr-unblock/conflict
+    else
+      context=pr-unblock/$activity
+    fi
+    if [[ $ESCALATION_REASON == unresolved-conflict ]]; then
+      description='Conflicts with the base branch; CI does not run until they are resolved'
+    else
+      description="Lane stopped: $ESCALATION_REASON; checked again on a new head"
+    fi
+    args=(-f state=failure -f "context=$context" -f "description=$description")
     [[ -n ${TARGET_URL:-} ]] && args+=(-f "target_url=$TARGET_URL")
     gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" "${args[@]}" >/dev/null
-    echo "posted pr-unblock/conflict failure on $HEAD_SHA"
+    echo "posted $context failure on $HEAD_SHA"
     exit 0
     ;;
   *) die "unknown mode [$1]" ;;
 esac
 
-tracker=${TRACKER_CONFIG:-.base/.work-item-tracker.json}
+bot=${LANES_BOT_LOGIN:-melodic-automation-lanes[bot]}
+issue="repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER"
+dispatch="gh workflow run pr-unblock.yml -R $GITHUB_REPOSITORY -f pr-number=$PR_NUMBER -f activity=$activity"
+tracker=${TRACKER_CONFIG:-.base/docs/conventions/work-items.yaml}
 label=needs-human
 if [[ -f $tracker ]]; then
+  if [[ $tracker == *.yaml ]]; then
+    binding=$(yq -o=json -I=0 '.tracker' "$tracker") || die "cannot read the human-gated role label from $tracker"
+  else
+    binding=$(<"$tracker")
+  fi
   label=$(jq -er '.config.role_labels // {}
-    | if has("human-gated") then .["human-gated"] | strings | select(length > 0) else "needs-human" end' "$tracker") ||
+    | if has("human-gated") then .["human-gated"] | strings | select(length > 0) else "needs-human" end' <<<"$binding") ||
     die "cannot read the human-gated role label from $tracker"
 fi
 
-bot=${LANES_BOT_LOGIN:-melodic-automation-lanes[bot]}
-issue="repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER"
-marker='<!-- work-items:escalation lane=pr-unblock kind=escalated -->'
-key_line="<!-- pr-unblock resume-key=$HEAD_SHA -->"
-
-labeled=$(gh api "$issue" | jq --arg l "$label" '[.labels[].name] | index($l) != null')
-if [[ $labeled == true ]]; then
-  marked=$(gh api --paginate "$issue/comments" | jq -s --arg bot "$bot" --arg m "$marker" --arg k "$key_line" \
-    --arg r "- Reason: \`$ESCALATION_REASON\`" \
-    '[add[] | select(.user.login == $bot) | (.body // "") | split("\n") | map(rtrimstr("\r"))
-      | select(.[0] == $m and (.[1] // "") == $k and any(.[]; . == $r))] | length > 0')
-  if [[ $marked == true ]]; then
-    echo "already escalated $ESCALATION_REASON for resume key $HEAD_SHA"
-    exit 0
+if [[ $route == hold ]]; then
+  marker='<!-- work-items:escalation lane=pr-unblock kind=escalated -->'
+  key_line="<!-- pr-unblock resume-key=$HEAD_SHA -->"
+  # personReasonLines throws for a code that is not a person reason, so a bad
+  # row fails here, before the label goes on.
+  reason_lines=''
+  if [[ -n $owner_reason ]]; then
+    reason_lines=$(STOP_REASON_MODULE="$(dirname "${BASH_SOURCE[0]}")/../lib/stop-reason.mjs" OWNER_REASON=$owner_reason node --input-type=module -e '
+      const { pathToFileURL } = await import("node:url");
+      const m = await import(pathToFileURL(process.env.STOP_REASON_MODULE).href);
+      process.stdout.write(m.personReasonLines("pr-unblock", process.env.OWNER_REASON).join("\n"));') ||
+      die "cannot write the stop-reason lines for $ESCALATION_REASON"
   fi
+  labeled=$(gh api "$issue" | jq --arg l "$label" '[.labels[].name] | index($l) != null')
+  if [[ $labeled == true ]]; then
+    marked=$(gh api --paginate "$issue/comments?per_page=100" | jq -s --arg bot "$bot" --arg m "$marker" --arg k "$key_line" \
+      --arg r "- Reason: \`$ESCALATION_REASON\`" \
+      '[add[] | select(.user.login == $bot) | (.body // "") | split("\n") | map(rtrimstr("\r"))
+        | select(.[0] == $m and (.[1] // "") == $k and any(.[]; . == $r))] | length > 0')
+    if [[ $marked == true ]]; then
+      echo "already escalated $ESCALATION_REASON for resume key $HEAD_SHA"
+      exit 0
+    fi
+  fi
+else
+  # gate-source.mjs LANE_STOPPED: one per activity, edited in place.
+  marker="<!-- pr-unblock:lane-stopped activity=$activity -->"
+  if [[ $activity == resolve-conflicts ]]; then
+    context=pr-unblock/conflict
+  else
+    context=pr-unblock/$activity
+  fi
+  existing=$(gh api --paginate "$issue/comments?per_page=100" | jq -sc --arg bot "$bot" --arg m "$marker" \
+    '[add[] | select(.user.login == $bot and ((.body // "") | split("\n")[0] | rtrimstr("\r")) == $m)] | last // {} | {id, body}')
 fi
 
 # For a review that is not converging: each open review thread. The count
@@ -161,7 +293,6 @@ fi
 # path is data: backticks, line breaks and angle brackets are dropped so it
 # stays one code span and cannot open an HTML comment (a marker line).
 details=''
-resume="To resume, deal with the reason above, remove the \`$label\` label (and \`do-not-merge\`, if set), then dispatch the \`pr-unblock\` workflow with \`pr-number=$PR_NUMBER\` and \`activity=$activity\`:"
 if [[ $ESCALATION_REASON == feedback-not-converging ]]; then
   # Page by page, as address-feedback.mjs listThreads reads them: an open
   # thread past the first 100 can be the one that stopped the lane. Anyone
@@ -169,9 +300,9 @@ if [[ $ESCALATION_REASON == feedback-not-converging ]]; then
   # pages and the comment says so.
   # shellcheck disable=SC2016  # GraphQL variables, not shell expansions
   query='query($owner: String!, $name: String!, $number: Int!, $endCursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) {
-    reviewThreads(first: 100, after: $endCursor) { nodes { isResolved path line comments(first: 1) { nodes { url } } } pageInfo { hasNextPage endCursor } } } } }'
+    author { login } reviewThreads(first: 100, after: $endCursor) { nodes { isResolved path line comments(first: 1) { nodes { url } } } pageInfo { hasNextPage endCursor } } } } }'
   MAX_THREAD_PAGES=10
-  nodes='[]' cursor='' unread=false read_ok=true
+  nodes='[]' cursor='' unread=false read_ok=true lane_pr=false
   for ((page_n = 1; ; page_n++)); do
     args=(-f query="$query" -f owner="${GITHUB_REPOSITORY%%/*}" -f name="${GITHUB_REPOSITORY#*/}" -F number="$PR_NUMBER")
     [[ -n $cursor ]] && args+=(-f endCursor="$cursor")
@@ -180,6 +311,11 @@ if [[ $ESCALATION_REASON == feedback-not-converging ]]; then
       ! next=$(jq -er '.data.repository.pullRequest.reviewThreads.pageInfo | if .hasNextPage then .endCursor else "" end' <<<"$page"); then
       read_ok=false
       break
+    fi
+    # The first page names the author: GraphQL gives an App's login without
+    # the [bot] suffix. One that does not read is not the lanes App's.
+    if ((page_n == 1)) && [[ $(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$page") == "${bot%\[bot\]}" ]]; then
+      lane_pr=true
     fi
     [[ -n $next ]] || break
     if ((page_n >= MAX_THREAD_PAGES)); then
@@ -198,37 +334,114 @@ if [[ $ESCALATION_REASON == feedback-not-converging ]]; then
     threads='- the open review threads could not be read; see the pull request'"'"'s Files changed tab'
   fi
   details=$'\n'"The review rounds are not converging after the round cap and one fresh fixer round. Open review threads:"$'\n\n'"$threads"$'\n'
-  # The rounds already run keep counting, so removing the label alone would
-  # stop again on the same head; only the threads move it.
-  resume="Removing the \`$label\` label alone does not resume: the rounds already run still count, so the lane stops again on this head. Do one of these instead:
-
-1. Resolve each open review thread yourself (fix it, or decide it stays as it is), then remove the \`$label\` label (and \`do-not-merge\`, if set).
-2. From an account with write access, reply on a thread with a line that starts \`PR-fix lane: please fix this finding\`, then dispatch the \`pr-unblock\` workflow with \`pr-number=$PR_NUMBER\` and \`activity=$activity\`. The lane runs one round on the threads you asked it to fix:"
+elif [[ $ESCALATION_REASON == feedback-incomplete ]]; then
+  # Each kept thread with no disposition, as publish-feedback.mjs named it
+  # (undisposedLines) in the newest lanes App round marker on this head. Only
+  # a line of that exact shape is copied, rebuilt from its id and comment id.
+  # When this round's marker failed to post, an earlier round's on the same
+  # head is the newest; the run's publish-feedback log names this round's.
+  round_marker='<!-- pr-unblock:address-feedback-round -->'
+  discussion="${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/pull/$PR_NUMBER#discussion_r"
+  # shellcheck disable=SC2016  # jq string interpolation, not shell expansions
+  if threads=$(gh api --paginate "$issue/comments?per_page=100" | jq -sr --arg bot "$bot" --arg m "$round_marker" \
+    --arg on " on $HEAD_SHA." --arg url "$discussion" \
+    '[add[] | select(.user.login == $bot) | (.body // "") | split("\n") | map(rtrimstr("\r"))
+      | select(.[0] == $m and any(.[]; endswith($on)))] | last // []
+      | [.[] | (capture("^- `(?<id>PRRT_[A-Za-z0-9_-]{1,100})` \\(root comment (?<c>[1-9][0-9]{0,18})\\)$") | "- `\(.id)`: \($url)\(.c)"),
+        select(test("^- and [1-9][0-9]* more$"))]
+      | join("\n")'); then
+    [[ -n $threads ]] || threads='- none named in the lane'"'"'s round record on this head; the run'"'"'s publish-feedback log names them'
+  else
+    threads='- the lane'"'"'s round record could not be read; the run'"'"'s publish-feedback log names them'
+  fi
+  details=$'\n'"Kept review threads with no disposition:"$'\n\n'"$threads"$'\n'
 fi
 
 body=$(mktemp)
 trap 'rm -f "$body"' EXIT
-cat >"$body" <<EOF
+
+if [[ $route == fail ]]; then
+  # The rounds already run keep counting for a capped reason, so a new head
+  # meets the cap again; a write-access fix request, or a person resolving
+  # the threads, moves a review that is not converging.
+  # The run that stopped: each stop names its own, so the comment's last edit
+  # is the newest stop's time (the monitoring lane's stalled-PR signal reads
+  # it).
+  run_line=''
+  if [[ ${GITHUB_RUN_ID:-} =~ ^[1-9][0-9]*$ ]]; then
+    run_line="- Run: ${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"$'\n'
+  fi
+  labels_line='The lane sets no label: the run'
+  if [[ -n $session_label ]]; then
+    labels_line="The lane labels it \`$session_label\` for a session builder, who makes the change this lane cannot, and the run"
+  fi
+  more=''
+  next_text='When a retry on this head can change the outcome, the lane runs one on its own, up to its per-head cap, and edits this comment if it stops again; a run that does not stop clears the status. When no retry can (a review thread the lane does not take or settle, or a failing check after the retries are spent), a person resolves the threads or gets the checks green, then dispatches the workflow below: that run finds the cause gone and clears the status. On a pull request the lanes App opened, the dispatchers start that run once per stop; on any other, a person does. A new commit to the branch starts clean.'
+  if [[ $ESCALATION_REASON == feedback-not-converging && ${lane_pr:-false} == true ]]; then
+    # The pr-merge lane closes a lanes App pull request stopped here and
+    # re-admits its issue (enable-auto-merge.mjs notConverging).
+    next_text="The pr-merge lane closes this pull request on its next run and re-admits its issue for a fresh attempt. To keep it open for one more round, first add \`$label\`, which holds the close but not a requested round, then reply on a thread, from an account with write access, starting \`PR-fix lane: please fix this finding\`. \`do-not-merge\` holds the close too, but it also stops the lane's rounds, so with it a person resolves the threads and dispatches the workflow below before removing it."
+  elif [[ $ESCALATION_REASON == feedback-not-converging ]]; then
+    more=" A reply on a thread, from an account with write access, starting \`PR-fix lane: please fix this finding\` grants one more round on that thread."
+  fi
+  cat >"$body" <<EOF
 $marker
-$key_line
-The pr-unblock lane stopped on this pull request and needs a person: $why.
+The pr-unblock lane stopped \`$activity\` on this pull request: $why. $labels_line ends in a failing \`$context\` status on the head the lane gated.
 
 - Reason: \`$ESCALATION_REASON\`
-- Resume key: \`$HEAD_SHA\` (the head the lane stopped on)
-$details
-$resume
+- Head: \`$HEAD_SHA\`
+$run_line$details
+$next_text$more
+
+To run it again on this head now, dispatch the \`pr-unblock\` workflow:
 
 \`\`\`sh
-gh workflow run pr-unblock.yml -R $GITHUB_REPOSITORY -f pr-number=$PR_NUMBER -f activity=$activity
+$dispatch
 \`\`\`
+EOF
+  # The session-builder queue label goes on before the comment that explains it, and back on when
+  # a session removed it and the lane stops again with the same comment.
+  if [[ -n $session_label ]] && [[ $(gh api "$issue" | jq --arg l "$session_label" '[.labels[].name] | index($l) != null') != true ]]; then
+    gh api -X POST "$issue/labels" -f "labels[]=$session_label" >/dev/null
+  fi
+  id=$(jq -r '.id // empty' <<<"$existing")
+  if [[ -n $id && $(jq -r '.body // ""' <<<"$existing" | tr -d '\r') == "$(cat "$body")" ]]; then
+    echo "already reported $ESCALATION_REASON on $HEAD_SHA"
+    exit 0
+  fi
+  if [[ -n $id ]]; then
+    [[ $id =~ ^[1-9][0-9]*$ ]] || die "the lane-stopped comment id is not a number"
+    gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F "body=@$body" >/dev/null
+    echo "stopped: $ESCALATION_REASON on $HEAD_SHA, comment $id edited"
+    exit 0
+  fi
+  gh api -X POST "$issue/comments" -F "body=@$body" >/dev/null || die "cannot post the lane-stopped comment"
+  echo "stopped: $ESCALATION_REASON on $HEAD_SHA, ${session_label:-no} label"
+  exit 0
+fi
+
+if [[ -n $activity ]]; then
+  resume="To resume, deal with the reason above, remove the \`$label\` label (and \`do-not-merge\`, if set), then dispatch the \`pr-unblock\` workflow with \`pr-number=$PR_NUMBER\` and \`activity=$activity\`:"$'\n\n```sh\n'"$dispatch"$'\n```'
+else
+  resume="To resume, deal with the reason above, then remove the \`$label\` label (and \`do-not-merge\`, if set)."
+fi
+{
+  printf '%s\n%s\n' "$marker" "$key_line"
+  # The stop-reason marker, then its visible line after the summary.
+  [[ -z $reason_lines ]] || printf '%s\n' "${reason_lines%%$'\n'*}"
+  printf 'The pr-unblock lane stopped on this pull request and needs a person: %s.\n\n' "$why"
+  [[ -z $reason_lines ]] || printf '%s\n\n' "${reason_lines#*$'\n'}"
+} >"$body"
+cat >>"$body" <<EOF
+- Reason: \`$ESCALATION_REASON\`
+- Resume key: \`$HEAD_SHA\` (the head the lane stopped on)
+
+$resume
 EOF
 
 if [[ $labeled != true ]]; then
   gh api -X POST "$issue/labels" -f "labels[]=$label" >/dev/null
+  leave_queue "$label"
 fi
-for attempt in 1 2 3; do
-  gh api -X POST "$issue/comments" -F "body=@$body" >/dev/null && break
-  ((attempt < 3)) || die "cannot post the escalation comment after $attempt attempts; the $label label is on"
-  sleep $((attempt * 5))
-done
+gh api -X POST "$issue/comments" -F "body=@$body" >/dev/null || die "cannot post the escalation comment; the $label label is on"
 echo "escalated: $ESCALATION_REASON, label $label, resume key $HEAD_SHA"
