@@ -58,8 +58,9 @@ jobs:
     # job so it turns red. A skipped required check reports success.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
-    # Up to 15 s of retry sleeps per API read in the review-gate steps.
-    timeout-minutes: 7
+    # Up to 15 s of retry sleeps per API read in the review-gate steps; in the
+    # merge queue, the verdict reader's listing and FAIL reads on top.
+    timeout-minutes: 20
     permissions:
       actions: read # the review lanes' runs and jobs
       contents: read # .work-item-tracker.json and trusted-actors.json at the base
@@ -370,3 +371,381 @@ jobs:
             esac
           done <<<"$lanes"
           exit "$failed"
+      # THE QUEUE RE-CHECKS WHAT THE ARM JUDGED, AT THE HEAD IT MERGES. pr-merge's
+      # enable-auto-merge arms a lanes App pull request on one head, and a later
+      # push by the lanes App or anyone with write access leaves the arm on, so
+      # the queue could merge a head the arm never judged. For a lanes App pull
+      # request in a merge group, the last step below therefore holds (each
+      # lifted by an approving review of the head by a person on the
+      # trusted-actor list):
+      # - a head the lanes App's newest pin comment does not name, or an edited
+      #   pin (merge-holds.mjs pinHold); with no pin nothing holds;
+      # - no pr-verify PASS or PASS-NOTES at the head from a completed,
+      #   successful pr-verify.yml run on main (verdictHold);
+      # - a FAIL the verdict reader counts, or a reader report that does not read
+      #   (evidenceHold), and a pass whose issue link changed (linkHold).
+      # merge-holds.mjs also applies its member veto, cost-path and trusted-actor
+      # list holds there; hold paths stay off while pr-pipeline.yaml's
+      # merge.diff-check.path-holds is unset.
+      # Every other author's pull request exits at the author test: nothing
+      # holds an owner-queued, standards-sync or dependency pull request. A
+      # missing or unreadable input, the base config or the author read
+      # included, fails the group closed for every author, so re-run it.
+      # All of these steps are merge_group only; a pull_request run reads none
+      # of it. A gh api read goes through gh_read, which sends it at most three
+      # times; a read that still fails fails this job.
+      - name: Write the rate-limit-aware read helper
+        if: ${{ !cancelled() && github.event_name == 'merge_group' }}
+        env:
+          GH_READ_JOB_SECONDS: 1200
+          GH_READ_MARGIN_SECONDS: 375
+        run: |
+          gh_read() {
+            local pool=core deadline err out now until wait at attempt=1 waited=
+            ! declare -F api_budget_pool >/dev/null || pool=$(api_budget_pool api "$@")
+            deadline=$(cat "$RUNNER_TEMP/gh-read.deadline")
+            err=$(mktemp)
+            while :; do
+              if out=$(gh api "$@" 2>"$err"); then
+                cat "$err" >&2
+                rm -f "$err"
+                [ -z "$out" ] || printf '%s\n' "$out"
+                return 0
+              fi
+              cat "$err" >&2
+              until=
+              ! declare -F api_budget_stop_until >/dev/null || until=$(api_budget_stop_until "$pool")
+              # A 4xx that is no rate limit (404, 422, a 403 the token lacks)
+              # answers every send the same, so it is not sent again.
+              if grep -qE '(^|[^0-9])HTTP 4[0-9]{2}([^0-9]|$)' "$err" &&
+                ! grep -qiE 'rate limit|RATE_LIMITED|abuse detection|HTTP 429' "$err"; then
+                rm -f "$err"
+                return 1
+              fi
+              if [ "$attempt" -ge 3 ]; then
+                if [[ $until =~ ^[0-9]+$ ]] && ! api_budget_guessed "$until"; then
+                  at=$(jq -rn --argjson t "$until" '$t | todate')
+                  echo "::error::GitHub's $pool API rate limit blocks 'gh api $*' until $at, and this read has made its 3 sends; a re-run after $at is needed." >&9
+                fi
+                rm -f "$err"
+                return 1
+              fi
+              attempt=$((attempt + 1))
+              now=$(date +%s)
+              if [ -z "$until" ]; then
+                # No rate limit: full jitter, capped at 5 s, then 10 s.
+                wait=$((RANDOM % ((5 << (attempt - 2)) + 1)))
+                if [ $((now + wait)) -gt "$deadline" ]; then
+                  rm -f "$err"
+                  return 1
+                fi
+                sleep "$wait"
+                continue
+              fi
+              # A guessed stop (no header gave its time) gets no wait, and a
+              # second rate limit after the wait none either.
+              if [ -n "$waited" ] || ! [[ $until =~ ^[0-9]+$ ]] || api_budget_guessed "$until"; then
+                rm -f "$err"
+                return 1
+              fi
+              wait=$((until - now + 1))
+              if [ $((now + wait)) -gt "$deadline" ]; then
+                at=$(jq -rn --argjson t "$until" '$t | todate')
+                echo "::error::GitHub's $pool API rate limit blocks 'gh api $*' until $at, past the $(jq -rn --argjson t "$deadline" '$t | todate') ci-status can wait to inside its timeout; a re-run after $at is needed." >&9
+                rm -f "$err"
+                return 1
+              fi
+              echo "::notice::'gh api $*' is rate limited ($pool); waiting ${wait}s for the reset, then reading again." >&9
+              sleep "$wait"
+              waited=1
+            done
+          }
+          pr_read() {
+            local file out
+            file=$(pr_read_file "$@") || file=
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              cat "$file"
+              return 0
+            fi
+            out=$(gh_read "$@") || return 1
+            [ -z "$file" ] || pr_read_put "$out" "$@"
+            [ -z "$out" ] || printf '%s\n' "$out"
+          }
+          pr_read_file() {
+            local dir=${RUNNER_TEMP:-}/pr-reads
+            if [ -z "${RUNNER_TEMP:-}" ] || ! mkdir -p "$dir" 2>/dev/null; then
+              return 1
+            fi
+            printf '%s/%s\n' "$dir" "$(printf '%s\0' "$@" | sha256sum | cut -c1-40)"
+          }
+          pr_read_put() {
+            local out=$1 file
+            shift
+            file=$(pr_read_file "$@") || return 0
+            if ! { [ -z "$out" ] || printf '%s\n' "$out"; } >"$file.$$" 2>/dev/null || ! mv -f "$file.$$" "$file" 2>/dev/null; then
+              rm -f "$file.$$"
+            fi
+            return 0
+          }
+          echo $(($(date +%s) + GH_READ_JOB_SECONDS - GH_READ_MARGIN_SECONDS)) >"$RUNNER_TEMP/gh-read.deadline"
+          { echo 'exec 9>&2'; declare -f gh_read pr_read pr_read_file pr_read_put; } >"$RUNNER_TEMP/gh-read.sh"
+      - name: Resolve main's tip
+        id: tip
+        if: ${{ !cancelled() && github.event_name == 'merge_group' }}
+        env:
+          TIP_BRANCH: ${{ github.event.repository.default_branch }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
+              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
+            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
+            sleep "$((RANDOM % (2 * i + 1)))"
+          done
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+      # main's Node pin and verdict reader, with no pull request code and no kept
+      # credential.
+      - name: Check out main's Node pin and verdict reader
+        if: ${{ !cancelled() && github.event_name == 'merge_group' && steps.tip.outputs.sha != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.tip.outputs.sha }}
+          path: .base
+          persist-credentials: false
+          sparse-checkout: |
+            /.node-version
+            /.github/actions/setup-pinned-node/
+            /.github/actions/log-api-budget/rate-limits.json
+            /plugins/source-control/skills/babysit-prs/scripts/*.py
+            /plugins/source-control/skills/babysit-prs/scripts/verify-legacy-fails.json
+            /plugins/source-control/lib/parse-concern-value.sh
+            /plugins/source-control/lib/yaml-subset.awk
+          sparse-checkout-cone-mode: false
+      - name: Set up Node
+        if: ${{ !cancelled() && github.event_name == 'merge_group' }}
+        uses: ./.base/.github/actions/setup-pinned-node # zizmor: ignore[self-repository]
+        with:
+          node-version-file: .base/.node-version
+      # The hold rules and config at the group's base commit, so the queued
+      # change cannot rewrite its own hold. A failed checkout leaves
+      # BASE_CONFIG empty, which the step below fails closed on.
+      - name: Check out the base commit's hold config
+        id: base_config
+        if: ${{ !cancelled() && github.event_name == 'merge_group' }}
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.merge_group.base_sha }}
+          path: base-config
+          persist-credentials: false
+          sparse-checkout: |
+            /docs/conventions/pr-pipeline.yaml
+            /docs/conventions/source-control.yaml
+            /docs/conventions/work-items.yaml
+            /.github/standards/trusted-actors/trusted-actors.json
+            /.github/scripts/pr-merge/merge-holds.mjs
+          sparse-checkout-cone-mode: false
+      - name: Fail a queued lanes App pull request on its pin, verifier or veto
+        if: ${{ !cancelled() && github.event_name == 'merge_group' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LANES_APP_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
+          VERIFY_EVIDENCE_SCRIPT: .base/plugins/source-control/skills/babysit-prs/scripts/babysit_verify_evidence.py
+          ACTIONS_TOKEN: ${{ github.token }}
+          BABYSIT_VERIFY_LISTING: ${{ runner.temp }}/verify-listing.json
+          BABYSIT_CONFIG_CHECKOUT: ${{ steps.base_config.outcome == 'success' && format('{0}/base-config', github.workspace) || '' }}
+          BABYSIT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BABYSIT_VERIFY_PULL: ${{ runner.temp }}/lanes-pull.json
+          API_BUDGET_TOKEN: github-token
+          GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          BASE_CONFIG: ${{ steps.base_config.outcome == 'success' && format('{0}/base-config', github.workspace) || '' }}
+        run: |
+          . "$RUNNER_TEMP/gh-read.sh"
+          if [[ ! ${LANES_APP_ID:-} =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::the job's LANES_APP_ID is not a numeric id."
+            exit 1
+          fi
+          # A stale or mistyped variable would read the lanes App's pull request
+          # as another author's and skip every hold here.
+          if [ ! -d "${BASE_CONFIG:-}" ] ||
+            ! identity=$(yq -er '.merge."agent-identity"' "$BASE_CONFIG/docs/conventions/pr-pipeline.yaml") ||
+            ! want=$(jq -er --arg login "$identity" '[.actors[] | select(.login == $login) | .id | numbers]
+              | if length == 1 then .[0] else error("not one entry") end' "$BASE_CONFIG/.github/standards/trusted-actors/trusted-actors.json"); then
+            echo "::error::cannot read merge.agent-identity's trusted-actor id from the hold config at the group's base commit; re-run this run."
+            exit 1
+          fi
+          if [ "$want" != "$LANES_APP_ID" ]; then
+            echo "::error::the job's LANES_APP_ID ($LANES_APP_ID, the AUTOMATION_LANES_APP_SENDER_ID variable) is not $identity's trusted-actor id ($want); correct the variable."
+            exit 1
+          fi
+          pr=$(sed -nE 's#^(refs/heads/)?gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]{40}$#\2#p' <<<"$GITHUB_REF")
+          if [ -z "$pr" ]; then
+            echo "::error::cannot read a pull request number from the merge-group ref '$GITHUB_REF'."
+            exit 1
+          fi
+          if [[ ! $pr =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::the pull request number '${pr//%/%25}' is not a number."
+            exit 1
+          fi
+          read_api() {
+            local body
+            body=$("${READER:-gh_read}" "${@:2}") || { echo "::error::could not read $1; re-run this run." >&2; return 1; }
+            printf '%s\n' "$body"
+          }
+          pull=$(READER=pr_read read_api "#$pr" "repos/$GITHUB_REPOSITORY/pulls/$pr") || exit 1
+          if ! jq -e '(.user.id | numbers) and (.user.type | strings)' <<<"$pull" >/dev/null; then
+            echo "::error::the author of #$pr could not be read."
+            exit 1
+          fi
+          if ! jq -e --argjson id "$LANES_APP_ID" '.user.id == $id and .user.type == "Bot"' <<<"$pull" >/dev/null; then
+            echo "#$pr is not the lanes App's; pr-merge's gate or a person reads its holds."
+            exit 0
+          fi
+          printf '%s\n' "$pull" >"$RUNNER_TEMP/lanes-pull.json"
+          BASE_SHA=$GROUP_BASE_SHA
+          if [[ ! $BASE_SHA =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::the base commit '$BASE_SHA' is not a commit SHA."
+            exit 1
+          fi
+          # The module, pr-pipeline.yaml and the trusted-actor list come from the
+          # hold config checkout: no contents read. A file missing there fails
+          # closed.
+          for file in .github/scripts/pr-merge/merge-holds.mjs docs/conventions/pr-pipeline.yaml .github/standards/trusted-actors/trusted-actors.json; do
+            if [ ! -s "$BASE_CONFIG/$file" ] || ! cp "$BASE_CONFIG/$file" "$RUNNER_TEMP/${file##*/}"; then
+              echo "::error::could not read $file in the hold config at the group's base commit; re-run this run."
+              exit 1
+            fi
+          done
+          jq -r '.body // ""' <<<"$pull" >"$RUNNER_TEMP/pr-body.txt"
+          config=docs/conventions/pr-pipeline.yaml
+          yq -o=json '.merge."diff-check"."denied-paths" // []' "$RUNNER_TEMP/pr-pipeline.yaml" >"$RUNNER_TEMP/denied-paths.json" || {
+            echo "::error::cannot read merge.diff-check.denied-paths from $config in the hold config."
+            exit 1
+          }
+          # merge.diff-check.path-holds in the hold config: absent or false
+          # turns the hold paths off (merge-holds.mjs pathHoldsOf).
+          PATH_HOLDS=$(yq '.merge."diff-check"."path-holds" // false' "$RUNNER_TEMP/pr-pipeline.yaml") || {
+            echo "::error::cannot read merge.diff-check.path-holds from $config in the hold config."
+            exit 1
+          }
+          export PATH_HOLDS
+          : >"$RUNNER_TEMP/files.jsonl"
+          read_api "the files of #$pr" "repos/$GITHUB_REPOSITORY/pulls/$pr/files?per_page=100" --paginate \
+            --jq '.[] | [.filename, .previous_filename, .status] | @json' >"$RUNNER_TEMP/files.jsonl" || exit 1
+          changed=$(jq -er '.changed_files | numbers' <<<"$pull") || { echo "::error::the changed-file count of #$pr could not be read."; exit 1; }
+          if [ "$(grep -c . "$RUNNER_TEMP/files.jsonl")" -lt "$changed" ]; then
+            echo "::error::GitHub listed fewer files than #$pr changes, so its hold paths cannot be checked; a person merges it."
+            exit 1
+          fi
+          head=$(jq -r '.head.sha' <<<"$pull")
+          if [[ ! $head =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::the head of #$pr could not be read."
+            exit 1
+          fi
+          : >"$RUNNER_TEMP/discussion.jsonl"
+          for kind in "issues/$pr/comments" "pulls/$pr/reviews" "pulls/$pr/comments"; do
+            raw=$(read_api "the $kind of #$pr" "repos/$GITHUB_REPOSITORY/$kind?per_page=100" --paginate) || exit 1
+            rows=$(jq -c '.[]' <<<"$raw") || { echo "::error::the $kind of #$pr do not parse."; exit 1; }
+            [ -z "$rows" ] || printf '%s\n' "$rows" >>"$RUNNER_TEMP/discussion.jsonl"
+          done
+          ref=$(jq -r '.head.ref // ""' <<<"$pull")
+          if [ -z "$ref" ]; then
+            echo "::error::the head branch of #$pr could not be read."
+            exit 1
+          fi
+          digest=$(printf '%s' "$ref" | sha256sum | cut -c1-16)
+          index_mode=false
+          [ ! -f "$(dirname "$VERIFY_EVIDENCE_SCRIPT")/verify-legacy-fails.json" ] || index_mode=true
+          rm -f "$BABYSIT_VERIFY_LISTING"
+          report=$(BABYSIT_READ_FLOOR_STOP=1 python3 "$VERIFY_EVIDENCE_SCRIPT" evidence --repo "$GITHUB_REPOSITORY" --base-sha "$BASE_SHA" "$pr" "$head") || {
+            echo "::error::babysit_verify_evidence.py could not judge #$pr at $head; re-run this run."
+            exit 1
+          }
+          printf '%s\n' "$report" | tail -n 1 >"$RUNNER_TEMP/evidence.json"
+          : >"$RUNNER_TEMP/verdicts.jsonl"
+          # A refusal returned before any listing (an unread config or commit
+          # list) goes on with no pass names: merge-holds.mjs holds on it and on
+          # the missing pass, and a trusted approval of the head lifts both. An
+          # allow with no listing has no pass to bind.
+          listed=true
+          pass_names=("pr-verify-$pr-$head-pass" "pr-verify-$pr-$head-pass-$digest"
+            "pr-verify-$pr-$head-pass-notes" "pr-verify-$pr-$head-pass-notes-$digest")
+          if [ ! -s "$BABYSIT_VERIFY_LISTING" ]; then
+            if jq -e --arg head "$head" '.head == $head and (.refusal | type) == "string"' "$RUNNER_TEMP/evidence.json" >/dev/null 2>&1; then
+              listed=false
+              echo "::notice::the verdict reader refused #$pr before listing artifacts; merge-holds.mjs judges its refusal with no pass."
+            elif [ "$index_mode" = true ]; then
+              # FAIL index mode: the reader reads by exact name and saves no
+              # listing, so the head's pass names are read the same way.
+              found=""
+              for name in "${pass_names[@]}"; do
+                page=$(read_api "the $name artifacts" "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=100" --jq '.artifacts[]') || exit 1
+                found+="$page"$'\n'
+              done
+              jq -sc '{artifacts: .}' <<<"$found" >"$BABYSIT_VERIFY_LISTING" || {
+                echo "::error::the pass artifacts of #$pr do not parse."
+                exit 1
+              }
+              echo "the verdict reader ran in FAIL index mode for #$pr; its pass artifacts were read by exact name."
+            else
+              echo "::error::the verdict reader read no artifact listing for #$pr: $(tr -d '\r\n%' <"$RUNNER_TEMP/evidence.json")"
+              exit 1
+            fi
+          fi
+          [ "$listed" = false ] || for name in "${pass_names[@]}"; do
+            verdict=${name#"pr-verify-$pr-$head-"}
+            verdict=${verdict%"-$digest"}
+            runs=$(jq -r --arg name "$name" '.artifacts[] | select(.name == $name and .expired == false) | "\(.workflow_run.id) \(.id)"' "$BABYSIT_VERIFY_LISTING") || {
+              echo "::error::the verdict reader's artifact listing does not parse."
+              exit 1
+            }
+            while read -r run artifact; do
+              [[ $run =~ ^[1-9][0-9]*$ && $artifact =~ ^[1-9][0-9]*$ ]] || continue
+              record=$(read_api "run $run" "repos/$GITHUB_REPOSITORY/actions/runs/$run") || exit 1
+              jq -c --arg name "$name" --arg verdict "$verdict" --argjson id "$run" --argjson artifact "$artifact" '{name: $name, verdict: $verdict, runId: $id, artifact: $artifact, run: .}' <<<"$record" >>"$RUNNER_TEMP/verdicts.jsonl" || exit 1
+            done <<<"$runs"
+            # A pass merge-holds.mjs verdictHold would count ends the lookup.
+            ! jq -se --arg repo "$GITHUB_REPOSITORY" 'any(.runId as $id | .run | .id == $id and .status == "completed" and .conclusion == "success"
+              and .path == ".github/workflows/pr-verify.yml" and .event == "workflow_run" and .head_branch == "main"
+              and .repository.full_name == $repo and .head_repository.full_name == $repo)' "$RUNNER_TEMP/verdicts.jsonl" >/dev/null || break
+          done
+          # The counted pass's record and the closing issues, for linkHold.
+          artifact=$(jq -sr --arg repo "$GITHUB_REPOSITORY" '[.[] | select(.runId as $id | .run | .id == $id and .status == "completed" and .conclusion == "success"
+            and .path == ".github/workflows/pr-verify.yml" and .event == "workflow_run" and .head_branch == "main"
+            and .repository.full_name == $repo and .head_repository.full_name == $repo)] | first | .artifact // empty' "$RUNNER_TEMP/verdicts.jsonl") || exit 1
+          # A 5xx or a network error with no HTTP response is read again after
+          # each of 5, 15 and 30 s. Any other failure is final.
+          record=null
+          if [[ $artifact =~ ^[1-9][0-9]*$ ]]; then
+            for wait in 5 15 30 ''; do
+              # gh-read-exempt: a binary archive, which gh_read's text capture would corrupt.
+              if gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact/zip" >"$RUNNER_TEMP/verdict.zip" 2>"$RUNNER_TEMP/verdict.err"; then
+                record=$(unzip -p "$RUNNER_TEMP/verdict.zip" verdict.json | jq -c .) || record=null
+                break
+              fi
+              cat "$RUNNER_TEMP/verdict.err" >&2
+              if [ -z "$wait" ] || ! grep -qiE 'HTTP 5[0-9][0-9]|error connecting to|connection reset by peer|connection refused|i/o timeout|tls handshake timeout|unexpected eof' "$RUNNER_TEMP/verdict.err"; then
+                echo "::error::could not read the verdict of artifact $artifact; re-run this run."
+                exit 1
+              fi
+              sleep "$wait"
+            done
+          fi
+          # shellcheck disable=SC2016 # GraphQL variables, not shell
+          closing=$(read_api "the closing issues of #$pr" graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){closingIssuesReferences(first:10){totalCount nodes{number repository{nameWithOwner}}}}}}' \
+            -F owner="${GITHUB_REPOSITORY%%/*}" -F name="${GITHUB_REPOSITORY#*/}" -F number="$pr" --jq '.data.repository.pullRequest.closingIssuesReferences') || exit 1
+          jq -cn --argjson record "${record:-null}" --argjson closing "${closing:-null}" '{record: $record, closing: $closing}' >"$RUNNER_TEMP/link.json" || {
+            echo "::error::the verdict record or closing issues of #$pr do not parse."
+            exit 1
+          }
+          export BASE_SHA
+          out=$(node "$RUNNER_TEMP/merge-holds.mjs" "$pr" "$RUNNER_TEMP/pr-body.txt" "$RUNNER_TEMP/discussion.jsonl" \
+            "$RUNNER_TEMP/files.jsonl" "$RUNNER_TEMP/denied-paths.json" "$RUNNER_TEMP/trusted-actors.json" "$head" \
+            "$RUNNER_TEMP/verdicts.jsonl" "$RUNNER_TEMP/link.json" "$RUNNER_TEMP/evidence.json") || {
+            printf '%s\n' "$out"
+            exit 1
+          }
+          # Exit 0 without the module's no-hold lines ran no check: fail closed.
+          printf '%s\n' "$out"
+          grep -qxF "#$pr: no member veto and no hold path." <<<"$out" || { echo "::error::merge-holds.mjs exited 0 without its verdict."; exit 1; }
+          grep -qE "^#$pr: no verifier hold: " <<<"$out" || { echo "::error::merge-holds.mjs exited 0 without its verifier verdict."; exit 1; }
+          grep -qE "^#$pr: no pr-verify FAIL hold: " <<<"$out" || { echo "::error::merge-holds.mjs exited 0 without its pr-verify FAIL verdict."; exit 1; }
