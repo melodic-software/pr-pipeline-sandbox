@@ -1,4 +1,4 @@
-# test-scope: .claude/source-control.md .github/workflows/*
+# test-scope: docs/conventions/source-control.yaml .github/workflows/*
 """Table tests for the unattended-merge diff risk scorer.
 
 `babysit_risk.score` is a pure function, so every case builds a `RiskInput` and
@@ -294,7 +294,7 @@ class HighReasonTests(unittest.TestCase):
         # generated copies hold; here the count of each class.
         self.assertEqual(
             Counter(c for _, c in FLOOR.classes),
-            {"trust": 19, "gate": 53, "enforcement": 53},
+            {"trust": 20, "gate": 62, "enforcement": 58},
         )
         self.assertEqual(
             FLOOR.high,
@@ -347,6 +347,7 @@ class HighReasonTests(unittest.TestCase):
             (".github/scripts/pr-unblock/fix-ci-context.mjs", ".github/scripts/pr-unblock/fix-ci-context.mjs"),
             (".github/scripts/pr-unblock/feedback-dispatch.mjs", ".github/scripts/pr-unblock/feedback-dispatch.mjs"),
             (".github/scripts/pr-unblock/verify-notes.mjs", ".github/scripts/pr-unblock/verify-notes.mjs"),
+            (".github/scripts/pr-unblock/earlier-fail-notes.mjs", ".github/scripts/pr-unblock/earlier-fail-notes.mjs"),
             (".github/scripts/pr-unblock/limit-stop.mjs", ".github/scripts/pr-unblock/limit-stop.mjs"),
             (".github/scripts/pr-unblock/dispatch-record.mjs", ".github/scripts/pr-unblock/dispatch-record.mjs"),
             (".github/scripts/maintenance-reconcile-lost-runs/infra-failure.mjs", ".github/scripts/maintenance-reconcile-lost-runs/infra-failure.mjs"),
@@ -1237,6 +1238,7 @@ class LanePathFloorTests(unittest.TestCase):
             ".github/scripts/pr-unblock/fix-ci-context.mjs",
             ".github/scripts/pr-unblock/feedback-dispatch.mjs",
             ".github/scripts/pr-unblock/verify-notes.mjs",
+            ".github/scripts/pr-unblock/earlier-fail-notes.mjs",
             ".github/scripts/pr-unblock/limit-stop.mjs",
             ".github/scripts/pr-unblock/dispatch-record.mjs",
             ".github/scripts/maintenance-reconcile-lost-runs/infra-failure.mjs",
@@ -2296,7 +2298,7 @@ class ReviewClearedFloorTests(unittest.TestCase):
         return score(_input(files=(_file(path),), lanes=lanes))
 
     def test_a_clean_bound_security_review_clears_each_enforcement_path(self):
-        self.assertEqual(len(FLOOR.review), 53)
+        self.assertEqual(len(FLOOR.review), 58)
         for glob in FLOOR.review:
             with self.subTest(glob):
                 result = self._score(glob, (_lane("claude-security-review"),))
@@ -2547,7 +2549,8 @@ class AuthorReviewedGatePathTests(unittest.TestCase):
             ".claude/rules/cost-claims.md",
             "plugins/x/.claude/rules/a.md",
             ".claude/ai-slop.json",
-            ".claude/source-control.md",
+            # The team layer the babysit loop reads keeps the same hold.
+            "docs/conventions/source-control.yaml",
             ".claude-lane/profile.json",
             # Every name and depth under .claude (owner decision Q11).
             ".claude/output-styles/terse.md",

@@ -1321,6 +1321,10 @@ def _check(name: str, conclusion: str | None) -> dict[str, Any]:
     }
 
 
+def _status(context: str, state: str) -> dict[str, Any]:
+    return {"__typename": "StatusContext", "context": context, "state": state}
+
+
 class AutoMergeArming(unittest.TestCase):
     """`--auto` arms auto-merge only when running checks are the sole hold and
     both AI review lanes have finished on the live head."""
@@ -1431,6 +1435,60 @@ class AutoMergeArming(unittest.TestCase):
             result["autoMerge"]["blockers"],
         )
 
+    def test_pr_review_cli_review_status_checks_satisfy_both_lanes(self) -> None:
+        result = self._evaluate(
+            [
+                _check("ci-status", None),
+                _check("pr-review / review-status", "SUCCESS"),
+                _check("pr-review-security / review-status", "SUCCESS"),
+            ],
+            mergeStateStatus="BLOCKED",
+        )
+        self.assertTrue(result["autoMerge"]["ready"], result["autoMerge"])
+
+    def test_a_failing_review_status_check_holds_only_its_own_lane(self) -> None:
+        for failing, held, other in (
+            (
+                "pr-review / review-status",
+                "claude-review-status",
+                "claude-security-review-status",
+            ),
+            (
+                "pr-review-security / review-status",
+                "claude-security-review-status",
+                "claude-review-status",
+            ),
+        ):
+            with self.subTest(failing=failing):
+                result = self._evaluate(
+                    [
+                        _check("ci-status", None),
+                        *(
+                            _check(name, "FAILURE" if name == failing else "SUCCESS")
+                            for name in (
+                                "pr-review / review-status",
+                                "pr-review-security / review-status",
+                            )
+                        ),
+                    ],
+                    mergeStateStatus="BLOCKED",
+                )
+                blockers = result["autoMerge"]["blockers"]
+                hold = "AI review check {!r} has not succeeded on the live head"
+                self.assertIn(hold.format(held), blockers)
+                self.assertNotIn(hold.format(other), blockers)
+
+    def test_another_callers_review_status_job_satisfies_no_lane(self) -> None:
+        result = self._evaluate(
+            [
+                _check("ci-status", None),
+                _check("other / review-status", "SUCCESS"),
+                _check("review-status", "SUCCESS"),
+            ],
+            mergeStateStatus="BLOCKED",
+        )
+        self.assertEqual(len(result["autoMerge"]["blockers"]), 2, result["autoMerge"])
+
     def test_other_callers_security_review_job_does_not_satisfy_renamed_lane(
         self,
     ) -> None:
@@ -1510,6 +1568,51 @@ class AutoMergeArming(unittest.TestCase):
             rollup("SUCCESS"), mergeStateStatus="UNSTABLE", headRefOid=STALE
         )
         self.assertFalse(moved["autoMerge"]["ready"], moved["autoMerge"])
+
+    def test_unarmed_status_left_by_a_failed_review_holds_no_rejudgment(
+        self,
+    ) -> None:
+        def rollup(review: str, *, also: str | None = None) -> list[dict[str, Any]]:
+            return [
+                _check("ci-status", "SUCCESS"),
+                _check("review / claude-review-status", review),
+                _check("security-review / claude-security-review-status", "SUCCESS"),
+                _status(merge.UNARMED_STATUS_CONTEXT, "FAILURE"),
+                *([_check(also, "FAILURE")] if also else []),
+            ]
+
+        refused = self._evaluate(rollup("FAILURE"), mergeStateStatus="UNSTABLE")
+        self.assertFalse(refused["autoMerge"]["ready"], refused["autoMerge"])
+
+        rejudged = self._evaluate(rollup("SUCCESS"), mergeStateStatus="UNSTABLE")
+        self.assertTrue(rejudged["autoMerge"]["ready"], rejudged["autoMerge"])
+        self.assertEqual(rejudged["failingChecks"], [])
+        self.assertFalse(
+            [b for b in rejudged["blockers"] if b.startswith("mergeStateStatus=")],
+            rejudged["blockers"],
+        )
+
+        other = self._evaluate(
+            rollup("SUCCESS", also="test-windows"), mergeStateStatus="UNSTABLE"
+        )
+        self.assertFalse(other["autoMerge"]["ready"], other["autoMerge"])
+        self.assertIn("failing checks: test-windows", other["blockers"])
+        self.assertTrue(
+            [b for b in other["blockers"] if b.startswith("mergeStateStatus=UNSTABLE")],
+            other["blockers"],
+        )
+
+    def test_a_check_run_named_like_the_unarmed_status_still_fails(self) -> None:
+        result = self._evaluate(
+            [
+                _check("ci-status", "SUCCESS"),
+                _check("review / claude-review-status", "SUCCESS"),
+                _check("security-review / claude-security-review-status", "SUCCESS"),
+                _check(merge.UNARMED_STATUS_CONTEXT, "FAILURE"),
+            ],
+            mergeStateStatus="UNSTABLE",
+        )
+        self.assertFalse(result["autoMerge"]["ready"], result["autoMerge"])
 
     def test_unresolved_thread_holds(self) -> None:
         rollup = [
@@ -2303,7 +2406,7 @@ class RepoPolicyReachesTheGate(unittest.TestCase):
         self.assertEqual((code, result["ready"]), (0, True), result["blockers"])
 
         RepoConfigFake(
-            {"owner/repo": "## babysit_merge_block_labels\n- repo-veto\n"}
+            {"owner/repo": "babysit_merge_block_labels:\n  - repo-veto\n"}
         ).install(self)
         code, result = self._run_real_gate("owner/repo#1", labeled, *self.TIER_FLAGS)
         self.assertEqual((code, result["ready"]), (10, False))
@@ -2312,8 +2415,8 @@ class RepoPolicyReachesTheGate(unittest.TestCase):
     def test_two_repositories_get_different_effective_holds(self) -> None:
         RepoConfigFake(
             {
-                "owner/a": "## babysit_merge_block_labels\n- hold-a\n",
-                "owner/b": "## babysit_merge_block_labels\n- hold-b\n",
+                "owner/a": "babysit_merge_block_labels:\n  - hold-a\n",
+                "owner/b": "babysit_merge_block_labels:\n  - hold-b\n",
             }
         ).install(self)
         pr = _pr(labels=[{"name": "hold-a"}])
@@ -2324,7 +2427,7 @@ class RepoPolicyReachesTheGate(unittest.TestCase):
 
     def test_repo_block_label_is_add_only(self) -> None:
         RepoConfigFake(
-            {"owner/repo": "## babysit_merge_block_labels\n- repo-veto\n"}
+            {"owner/repo": "babysit_merge_block_labels:\n  - repo-veto\n"}
         ).install(self)
         code, result = self._run_real_gate(
             "owner/repo#1",
@@ -2340,7 +2443,7 @@ class RepoPolicyReachesTheGate(unittest.TestCase):
         flags = self.TIER_FLAGS[:-2]
         self.assertNotIn("--block-labels", flags)
         RepoConfigFake(
-            {"owner/repo": "## babysit_merge_block_labels\n- repo-veto\n"}
+            {"owner/repo": "babysit_merge_block_labels:\n  - repo-veto\n"}
         ).install(self)
         code, held = self._run_real_gate(
             "owner/repo#1", _pr(labels=[{"name": "repo-veto"}]), *flags
@@ -2370,7 +2473,7 @@ class RepoPolicyReachesTheGate(unittest.TestCase):
         RepoConfigFake(
             {
                 "owner/repo": (
-                    "## babysit_extra_dependency_manager_logins\n- Repo-Dep[bot]\n"
+                    "babysit_extra_dependency_manager_logins:\n  - Repo-Dep[bot]\n"
                 )
             }
         ).install(self)
@@ -2406,18 +2509,16 @@ class RepoPolicyReachesTheGate(unittest.TestCase):
         evaluate.assert_not_called()
 
     def test_invalid_repo_file_refuses_a_merge_run(self) -> None:
-        RepoConfigFake(
-            {"owner/repo": "## babysit_merge_method\nfast-forward\n"}
-        ).install(self)
+        RepoConfigFake({"owner/repo": "babysit_merge_method: fast-forward\n"}).install(
+            self
+        )
         code, result, _ = self._run_stubbed_gate("--merge", "--expected-head", HEAD)
         self.assertEqual(code, 2)
         self.assertIn("babysit_merge_method", result["error"])
         self.assertFalse(result.get("merged", False))
 
     def test_repo_merge_method_wins_over_the_flag(self) -> None:
-        RepoConfigFake({"owner/repo": "## babysit_merge_method\nrebase\n"}).install(
-            self
-        )
+        RepoConfigFake({"owner/repo": "babysit_merge_method: rebase\n"}).install(self)
         code, _, method = self._run_stubbed_gate(
             "--merge", "--expected-head", HEAD, "--method", "squash"
         )
@@ -2432,9 +2533,7 @@ class RepoPolicyReachesTheGate(unittest.TestCase):
         method.assert_called_once_with("owner/repo", "merge")
 
     def test_auto_refuses_a_repo_method_other_than_squash(self) -> None:
-        RepoConfigFake({"owner/repo": "## babysit_merge_method\nrebase\n"}).install(
-            self
-        )
+        RepoConfigFake({"owner/repo": "babysit_merge_method: rebase\n"}).install(self)
         code, result, method = self._run_stubbed_gate(
             "--merge", "--expected-head", HEAD, "--auto"
         )
@@ -2445,9 +2544,7 @@ class RepoPolicyReachesTheGate(unittest.TestCase):
     def test_auto_with_a_non_squash_flag_is_judged_on_the_effective_method(
         self,
     ) -> None:
-        RepoConfigFake({"owner/repo": "## babysit_merge_method\nsquash\n"}).install(
-            self
-        )
+        RepoConfigFake({"owner/repo": "babysit_merge_method: squash\n"}).install(self)
         code, result, method = self._run_stubbed_gate(
             "--merge", "--expected-head", HEAD, "--auto", "--method", "merge"
         )

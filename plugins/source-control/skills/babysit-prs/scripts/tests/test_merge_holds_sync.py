@@ -1,4 +1,5 @@
-# test-scope: scripts/sync-hold-floor.py .github/scripts/pr-merge/merge-holds.mjs .github/scripts/pr-merge/enable-auto-merge.mjs .github/workflows/pr-review-hosted.yml .github/workflows/pr-review-security-hosted.yml .github/workflows/pr-require-checks.yml docs/conventions/pr-pipeline.yaml
+# test-scope: scripts/sync-hold-floor.py docs/conventions/pr-pipeline.yaml .github/actions/* .github/scripts/* .github/workflows/* .github/recurring-schedule.json .github/standards/trusted-actors/*
+# test-scope: plugins/source-control/skills/babysit-prs/scripts/babysit_*.py lib/prerequisites.mjs lib/publish-gate.mjs plugins/evals/skills/plugin-eval/scripts/noise-report.py plugins/evals/skills/plugin-eval/scripts/run-validity.py plugins/evals/skills/plugin-eval/scripts/win-test.py plugins/evals/skills/validate/scripts/validate-cases.py plugins/harness-ops/skills/inventory/scripts/parser_reader.py plugins/performance/scripts/ratchet.py plugins/work-items/scripts/charge-words.json scripts/check-declared-prerequisites.mjs scripts/validate-plugin-contracts.mjs
 """The native auto-merge holds (`.github/scripts/pr-merge/merge-holds.mjs`,
 run here under node) cover the merge gate's cost paths, so a lane pull
 request native auto-merge merges cannot skip them. The gate's other cost
@@ -420,7 +421,7 @@ class TheNativeHoldsCoverTheGate(unittest.TestCase):
                 if g not in surface and not g.startswith(".github/workflows/")
             ],
         )
-        self.assertEqual(len(FLOOR.author_review), 15)
+        self.assertEqual(len(FLOOR.author_review), 18)
         samples = [g.removeprefix("**/").replace("**", "x.mjs") for g in gate]
         self.assertEqual(module(samples)["held"], [True] * len(samples))
         step = (ROOT / ".github/workflows/pr-require-checks.yml").read_text(
@@ -442,7 +443,7 @@ class TheNativeHoldsCoverTheGate(unittest.TestCase):
             check=True,
         )
         self.assertEqual(tuple(json.loads(proc.stdout)), FLOOR.high)
-        self.assertEqual(len(FLOOR.high), 72)
+        self.assertEqual(len(FLOOR.high), 82)
 
     def test_the_floor_holds_what_its_actions_load(self) -> None:
         files = import_closure(FLOOR_ENTRIES)
@@ -862,7 +863,10 @@ DECISIONS = {
     "another decision": (_link(7), _comment(7, body="**Decision recorded.** Ship")),
     "indented": (_link(7), _comment(7, body=f"  {DECISION}")),
 }
-CHECKS = dict(policy.REVIEW_LANES)
+CHECKS = {
+    "pr-review-hosted.yml": "pr-review / review-status",
+    "pr-review-security-hosted.yml": "pr-review-security / review-status",
+}
 
 
 def _run(
@@ -976,6 +980,12 @@ CARRIES = {
     },
     "a job other than the status job": {
         "runs": [_run(HEAD, job="pr-review / review-key")]
+    },
+    "a status job named as pr-review.yml names it": {
+        "runs": [_run(HEAD, job="pr-review / claude-review-status")]
+    },
+    "a status job under another caller job": {
+        "runs": [_run(HEAD, job="other / review-status")]
     },
     "a notice naming another head than its run's": {"runs": [_run(OLD, notice=HEAD)]},
     "a notice without cost": {"runs": [_run(HEAD, criteria="trust-gate")]},
@@ -1293,6 +1303,7 @@ class TheCostDecisionIsTheGates(unittest.TestCase):
             "a notice at the head",
             "a base merge since the decided head",
             "a notice from the security lane",
+            "a status job named as pr-review.yml names it",
             "a newer head pushed before it with a run of every lane",
         }
         for case in carried:

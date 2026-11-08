@@ -331,6 +331,7 @@ FLOOR_CLASSES: tuple[tuple[str, str], ...] = (
     ("plugins/source-control/skills/babysit-prs/scripts/babysit_checks.py", "enforcement"),
     ("plugins/source-control/skills/babysit-prs/scripts/babysit_classify.py", "enforcement"),
     ("plugins/source-control/skills/babysit-prs/scripts/babysit_dependabot.py", "enforcement"),
+    ("plugins/source-control/skills/babysit-prs/scripts/babysit_evidence_comment.py", "enforcement"),
     ("plugins/source-control/skills/babysit-prs/scripts/babysit_feedback.py", "enforcement"),
     ("plugins/source-control/skills/babysit-prs/scripts/babysit_gh.py", "enforcement"),
     ("plugins/source-control/skills/babysit-prs/scripts/babysit_merge.py", "trust"),
@@ -346,9 +347,10 @@ FLOOR_CLASSES: tuple[tuple[str, str], ...] = (
     ("plugins/source-control/skills/babysit-prs/scripts/babysit_verify_evidence.py", "enforcement"),
     ("plugins/source-control/skills/babysit-prs/scripts/babysit_whole_review.py", "enforcement"),
     ("**/.claude/**", "gate"),
-    # The team layer the babysit loop reads before `.claude/source-control.md`
+    # The team layer the babysit loop reads
     # (`babysit_repo_config.fetch_repo_config`), trusted bot logins included,
-    # so it keeps the hold the `.claude/**` row gave that file.
+    # so it keeps the hold the `.claude/**` row gave the retired
+    # `.claude/source-control.md`.
     ("docs/conventions/source-control.yaml", "gate"),
     ("**/.claude-lane/**", "gate"),
     ("**/.mcp.json", "gate"),

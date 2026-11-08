@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import contextlib
 import json
 import ntpath
@@ -35,8 +36,16 @@ import sys
 import tempfile
 import time
 import urllib.request
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, field, replace
+from collections import Counter
+from collections.abc import (
+    Callable,
+    Collection,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -93,7 +102,6 @@ NOT_ASSESSED = "not-assessed"
 
 CONFIG_PATH = "docs/conventions/pr-pipeline.yaml"
 FLOOR_PATHS_KEY = "merge.diff-check.floor-paths"
-SOURCE_CONTROL_PATH = repo_config.CONFIG_PATH
 LOOP_MERGE_KEY = "babysit_loop_merge"
 # The largest `merge.max-in-flight` the gate takes, as the schema's maximum:
 # over twice the 11 the sizing formula gives for the day recorded in
@@ -113,9 +121,10 @@ LOOP_MERGE_RUNG = {
     "full-autonomy": "C3",
 }
 # The trust hold: a pull request whose linked issue carries this label, or
-# had it removed by a non-human, waits for a human merge. No other class
-# label is read.
-UNTRUSTED_PROVENANCE_LABEL = "work-class: untrusted-provenance"
+# had it removed by a non-human, waits for a human merge. The hold also
+# reads the label's legacy work-class name through `_untrusted`, which
+# matches any label holding "untrusted". No other class label is read.
+UNTRUSTED_PROVENANCE_LABEL = "provenance: untrusted"
 
 OPT_IN_LABEL = "merge: agent-allowed"
 # The PR author's own hold, written in the body ("Do not merge this draft", or
@@ -131,13 +140,11 @@ BODY_MERGE_HOLD_RE = re.compile(
 # autopilot merge tier is engaged. `--block-labels` only adds to it.
 # `pr-verify-failed` is pr-verify's FAIL on a person's pull request, which
 # ci-status enforces only in the merge queue: held here, it is never queued.
-# `human-merge-hold` is the lanes App's label on a pull request a person merges;
 # `security: outside-actor` is security-outside-actor.yml's flag on an item
 # someone outside the organization wrote on, which only a person removes.
 MERGE_HOLD_LABELS = (
     "do-not-merge",
     "pr-verify-failed",
-    "human-merge-hold",
     "security: outside-actor",
 )
 # An `adoption.idle-hours` value outside 1 to `MAX_ADOPTION_IDLE_HOURS`, or
@@ -426,6 +433,82 @@ def floor_paths_in(text: str) -> FloorRows:
     return rows
 
 
+_ISSUE_STATUS: dict[str, IssueStatusConfig | None] = {}
+
+
+def _issue_status_config(text: str) -> IssueStatusConfig | None:
+    """The `models.issue-status` block of a pipeline document, read once per
+    document from its `yaml_records`: None when it has none, and an
+    `IssueStatusConfig` whose `error` names the fault when the block or the
+    document cannot be read whole."""
+    if "issue-status" not in text:
+        return None
+    if text not in _ISSUE_STATUS:
+        try:
+            rows = {
+                key[len(ISSUE_STATUS_KEY) + 1 :]: value
+                for key, value in yaml_records(text).items()
+                if key == ISSUE_STATUS_KEY or key.startswith(f"{ISSUE_STATUS_KEY}.")
+            }
+            _ISSUE_STATUS[text] = _issue_status_rows(rows) if rows else None
+        except PolicyReadError as exc:
+            _ISSUE_STATUS[text] = IssueStatusConfig(0, (), (), (), (), str(exc))
+    return _ISSUE_STATUS[text]
+
+
+def _issue_status_rows(rows: Mapping[str, str]) -> IssueStatusConfig:
+    """`_issue_status_config` of the block's records, keyed below
+    `ISSUE_STATUS_KEY`."""
+
+    def items(prefix: str) -> dict[str, str]:
+        return {k[len(prefix) :]: v for k, v in rows.items() if k.startswith(prefix)}
+
+    def listed(prefix: str, parts: tuple[str, ...] = ("",)) -> list[dict[str, str]]:
+        found = items(prefix)
+        count = len(found) // len(parts)
+        keys = [f"{i}{f and '.'}{f}" for i in range(count) for f in parts]
+        if sorted(found) != sorted(keys) or not all(found.values()):
+            raise ValueError(f"{prefix.rstrip('.')} is not a list of {parts}")
+        return [{f: found[f"{i}{f and '.'}{f}"] for f in parts} for i in range(count)]
+
+    def ident(value: str) -> bool:
+        return re.fullmatch(r"[1-9][0-9]*", value) is not None
+
+    try:
+        field_id = rows.get("field-id") or ""
+        if not ident(field_id):
+            raise ValueError(f"field-id {field_id!r} is not an id")
+        options = tuple(items("options.").items())
+        states = [state for _, state in options]
+        if not options or not all(ident(o) and s for o, s in options):
+            raise ValueError("options must map option ids to states")
+        if len(set(states)) != len(states):
+            raise ValueError("options map two option ids to one state")
+        setters = listed("bot-setters.", ("id", "login"))
+        if not all(ident(s["id"]) for s in setters):
+            raise ValueError("a bot-setters id is not an id")
+        if {k.rsplit(".", 1)[0] for k in items("labels.")} - set(states):
+            raise ValueError("labels names a state no option maps")
+        labels = tuple(
+            (state, tuple(row[""] for row in listed(f"labels.{state}.")))
+            for state in states
+        )
+        if not all(names for _, names in labels):
+            raise ValueError("labels gives a mapped state no label")
+        order = tuple(row[""] for row in listed("order."))
+        if sorted(order) != sorted(states):
+            raise ValueError("order must list every mapped state once")
+    except ValueError as exc:
+        return IssueStatusConfig(0, (), (), (), (), f"{ISSUE_STATUS_KEY}: {exc}")
+    return IssueStatusConfig(
+        int(field_id),
+        options,
+        tuple((int(s["id"]), s["login"]) for s in setters),
+        labels,
+        order,
+    )
+
+
 def yaml_records(text: str) -> dict[str, str]:
     """A YAML document's `lib/yaml-subset.awk` records: each scalar's dotted
     key to its value. Raises `PolicyReadError` when the parser cannot run or
@@ -684,8 +767,8 @@ MAX_QUARANTINE_DAYS = 30
 # `red-main.confirm-wait-minutes` when absent or not a whole number from 0 to
 # `MAX_CONFIRM_WAIT_MINUTES`, as `RED_MAIN_DEFAULTS` in
 # .github/scripts/post-merge-demotion-alert/red-main.mjs resolves it.
-CONFIRM_WAIT_MINUTES = 40
-MAX_CONFIRM_WAIT_MINUTES = 45
+CONFIRM_WAIT_MINUTES = 55
+MAX_CONFIRM_WAIT_MINUTES = 60
 # The default `merge.max-verify-fails`: three heads' FAILs is a pull request
 # the verifier keeps refusing, not one noisy verdict (owner decision
 # 2026-10-21).
@@ -792,6 +875,11 @@ class PipelineConfig:
     # against its title and body, as a person's is. Any other App needs a
     # closing issue. An entry that is not an id empties it. Main's.
     spec_from_body_apps: tuple[int, ...] = ()
+    # `adoption.self-merging-apps`: the App ids that enqueue and merge their
+    # own pull requests, so the pr-merge lane writes no reasons comment or
+    # risk escalation on one; its score still holds the lane's own merge. An
+    # entry that is not an id empties it. Main's.
+    self_merging_apps: tuple[int, ...] = ()
     # `merge.quarantine-days`: days a quarantined suite's failures on the
     # default branch stop demoting (`babysit_postmerge`). Absent, or anything
     # but a whole number from 1 to `MAX_QUARANTINE_DAYS`, is `QUARANTINE_DAYS`.
@@ -811,6 +899,42 @@ class PipelineConfig:
     # empty, the tracker's human-gated role label holds instead.
     # `stricter_config` takes both sides'.
     issue_holds: tuple[str, ...] = ()
+    # `models.issue-status`: the Work status issue field a linked issue is
+    # also held on (`issue_status`). None when the file sets none, which
+    # reads labels alone. `stricter_config` takes main's when set.
+    issue_status: IssueStatusConfig | None = None
+
+
+@dataclass(frozen=True)
+class IssueStatusConfig:
+    """`models.issue-status` (`ISSUE_STATUS_KEY`): the field id, each option
+    id with its state, the `bot-setters` (id, login) pairs, each state's
+    labels, and the collapse order. `error` names a malformed block, which
+    `issue_status` refuses to read."""
+
+    field_id: int
+    options: tuple[tuple[str, str], ...]
+    bot_setters: tuple[tuple[int, str], ...]
+    labels: tuple[tuple[str, tuple[str, ...]], ...]
+    order: tuple[str, ...]
+    error: str | None = None
+
+
+ISSUE_STATUS_KEY = "models.issue-status"
+# The Work status states that hold an issue for a person (read-status.mjs
+# HOLD_STATES).
+HOLD_STATES = (
+    "needs-human",
+    "needs-owner-decision",
+    "needs-reporter-info",
+    "needs-spec",
+)
+# The one state a `bot-setters` account's value never counts for.
+PERSON_ONLY_STATE = "agent-ready"
+# The job token's bot, a bot setter the trusted-actor list does not list.
+ACTIONS_BOT = (41898282, "github-actions[bot]")
+# The one App whose field values count for every state.
+LANES_APP_LOGIN = "melodic-automation-lanes[bot]"
 
 
 LANE_PRS_MODES = ("native", "gate")
@@ -868,37 +992,6 @@ def _file_at(owner: str, name: str, path: str, sha: str) -> str | None:
         raise PolicyReadError(f"{path} at {sha} is unreadable: {exc}") from exc
 
 
-def _loop_merge(text: str) -> tuple[str | None, bool]:
-    """(the one `## babysit_loop_merge` value or None when the file has no
-    such H2, whether the file can be trusted: False for a file the
-    repository-config parser rejects, two such H2s or an empty one)."""
-    try:
-        repo_config.parse_repo_config(text)
-    except repo_config.RepoConfigError:
-        return None, False
-    values: list[str] = []
-    current: list[str] | None = None
-    in_fence = False
-    for raw in text.removeprefix("﻿").replace("\r\n", "\n").split("\n"):
-        if repo_config.FENCE_RE.match(raw):
-            in_fence = not in_fence
-            continue
-        heading = None if in_fence else repo_config.HEADING_RE.match(raw)
-        if heading:
-            current = None
-            if (
-                raw.startswith(repo_config.H2_PREFIX)
-                and heading.group(1) == LOOP_MERGE_KEY
-            ):
-                current = []
-                values.append("")
-        elif current is not None and raw.strip() and not values[-1]:
-            values[-1] = raw.strip().strip("`").strip()
-    if not values:
-        return None, True
-    return (values[0], True) if len(values) == 1 and values[0] else (None, False)
-
-
 def _team_loop_merge(text: str) -> tuple[str | None, str | None]:
     """(`babysit_loop_merge` from the team YAML or None when it sets none,
     a note when the file cannot be trusted). A file the shared reader
@@ -920,20 +1013,9 @@ def _team_loop_merge(text: str) -> tuple[str | None, str | None]:
 def _resolve_loop_merge(
     file_at: Callable[[str, str], str | None], base_sha: str, notes: list[str]
 ) -> str | None:
-    """`babysit_loop_merge` at `base_sha`. With no legacy file the YAML value
-    sets the rung by itself, and None (off) when it sets none. While the
-    legacy file exists it must set the key, else None (off), so a raise needs
-    both files; the result is the lower of the two, or the legacy value when
-    the YAML sets none. Either file unreadable or untrustworthy yields None
-    (off), never the other file's value alone."""
-    try:
-        source = file_at(SOURCE_CONTROL_PATH, base_sha)
-    except PolicyReadError as exc:
-        notes.append(f"{SOURCE_CONTROL_PATH} unreadable: {exc}")
-        return None
-    legacy, trusted = _loop_merge(source) if source is not None else (None, True)
-    if not trusted:
-        return None
+    """`babysit_loop_merge` from the team YAML at `base_sha`, or None (off)
+    when it sets none. A YAML that is unreadable or untrustworthy yields None
+    (off) with a note. The retired `.claude/source-control.md` is not read."""
     try:
         team_text = file_at(repo_config.YAML_CONFIG_PATH, base_sha)
     except PolicyReadError as exc:
@@ -943,11 +1025,7 @@ def _resolve_loop_merge(
     if note:
         notes.append(note)
         return None
-    if source is None:
-        return team
-    if legacy is None or team is None:
-        return legacy
-    return min(team, legacy, key=lambda v: RUNG_RANK[LOOP_MERGE_RUNG.get(v, "off")])
+    return team
 
 
 def read_config_at(
@@ -956,8 +1034,7 @@ def read_config_at(
     file_at: Callable[[str, str], str | None] | None = None,
 ) -> PipelineConfig:
     """`merge:` from `docs/conventions/pr-pipeline.yaml` and `babysit_loop_merge`
-    (`_resolve_loop_merge`: `docs/conventions/source-control.yaml` alone when
-    `.claude/source-control.md` is absent, else the lower of the two), all read
+    (`_resolve_loop_merge`: `docs/conventions/source-control.yaml`), all read
     at `base_sha` through
     `file_at(path, sha)` (text, or None when absent), by default a local clone
     holding `base_sha` (`_clones_holding`), else a checkout of `base_sha`
@@ -1017,6 +1094,7 @@ def read_config_at(
             ("merge.check-inputs", True),
             ("adoption.idle-hours", False),
             ("adoption.spec-from-body-apps", True),
+            ("adoption.self-merging-apps", True),
             ("merge.quarantine-days", False),
             ("red-main.confirm-wait-minutes", False),
             ("merge.lane-prs", False),
@@ -1149,6 +1227,13 @@ def read_config_at(
             "is not an account id; every App needs a closing issue"
         )
         body_apps = ()
+    self_merging = tuple(values["adoption.self-merging-apps"])
+    if not all(re.fullmatch(r"[1-9][0-9]*", i) for i in self_merging):
+        notes.append(
+            f"adoption.self-merging-apps {list(self_merging)!r} holds an entry "
+            "that is not an account id; every App gets its reasons comment"
+        )
+        self_merging = ()
     quarantine_days = scalar("merge.quarantine-days")
     if quarantine_days is not None and not (
         re.fullmatch(r"[1-9][0-9]?", quarantine_days)
@@ -1173,6 +1258,9 @@ def read_config_at(
     if lane_prs not in LANE_PRS_MODES:
         notes.append(f"merge.lane-prs {lane_prs!r} is not native or gate")
         lane_prs = None
+    issue_status = _issue_status_config(text)
+    if issue_status is not None and issue_status.error:
+        notes.append(f"{issue_status.error}; every linked issue is held")
     return PipelineConfig(
         base_sha=base_sha,
         rung=rung,
@@ -1202,12 +1290,14 @@ def read_config_at(
         check_inputs=tuple(values["merge.check-inputs"]),
         adoption_idle_hours=idle_hours,
         spec_from_body_apps=tuple(int(i) for i in body_apps),
+        self_merging_apps=tuple(int(i) for i in self_merging),
         quarantine_days=int(quarantine_days) if quarantine_days else QUARANTINE_DAYS,
         confirm_wait_minutes=int(confirm_wait)
         if confirm_wait is not None
         else CONFIRM_WAIT_MINUTES,
         lane_prs=lane_prs,
         issue_holds=tuple(values[ISSUE_HOLDS_KEY]),
+        issue_status=issue_status,
     )
 
 
@@ -1284,7 +1374,9 @@ def stricter_config(base: PipelineConfig, main: PipelineConfig) -> PipelineConfi
         # Read at main (owner decision Q22).
         adoption_idle_hours=main.adoption_idle_hours,
         spec_from_body_apps=main.spec_from_body_apps,
+        self_merging_apps=main.self_merging_apps,
         issue_holds=_union(base.issue_holds, main.issue_holds),
+        issue_status=main.issue_status or base.issue_status,
     )
 
 
@@ -1298,11 +1390,20 @@ SHARED_HEAD_CONFIGS: dict[str, str] = {}
 def _cached_config(value: Any) -> PipelineConfig | None:
     """A saved config, or None (a miss, read again) for anything a config
     read could not have produced."""
-    if not isinstance(value, dict) or "floor_paths" not in value:
+    if (
+        not isinstance(value, dict)
+        or "floor_paths" not in value
+        or "issue_status" not in value
+    ):
         return None
     try:
         c = PipelineConfig(
-            **{k: tuple(v) if isinstance(v, list) else v for k, v in value.items()}
+            **{
+                k: tuple(v) if isinstance(v, list) else v
+                for k, v in value.items()
+                if k != "issue_status"
+            },
+            issue_status=_cached_issue_status(value.get("issue_status")),
         )
         c = replace(c, floor_paths=tuple(tuple(row) for row in c.floor_paths))
 
@@ -1365,10 +1466,55 @@ def _cached_config(value: Any) -> PipelineConfig | None:
             )
             and isinstance(c.spec_from_body_apps, tuple)
             and all(count(i, 1) for i in c.spec_from_body_apps)
+            and isinstance(c.self_merging_apps, tuple)
+            and all(count(i, 1) for i in c.self_merging_apps)
         )
     except (TypeError, ValueError):
         return None
     return c if ok else None
+
+
+def _cached_issue_status(value: Any) -> IssueStatusConfig | None:
+    """A saved `IssueStatusConfig`, or None for none saved; raises
+    `ValueError` for anything a config read could not have saved, so the
+    whole config is a miss."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("not a saved issue status")
+
+    def pairs(rows: Any, first: type, second: Callable[[Any], bool]) -> tuple:
+        if not isinstance(rows, list) or not all(
+            isinstance(r, list) and len(r) == 2 and type(r[0]) is first and second(r[1])
+            for r in rows
+        ):
+            raise ValueError("not a saved issue status")
+        return tuple((a, tuple(b) if isinstance(b, list) else b) for a, b in rows)
+
+    def text(v: Any) -> bool:
+        return isinstance(v, str) and bool(v)
+
+    def texts(v: Any) -> bool:
+        return isinstance(v, list) and bool(v) and all(text(x) for x in v)
+
+    order = value.get("order")
+    status = IssueStatusConfig(
+        value.get("field_id"),
+        pairs(value.get("options"), str, text),
+        pairs(value.get("bot_setters"), int, text),
+        pairs(value.get("labels"), str, texts),
+        tuple(order) if texts(order) else (),
+        value.get("error"),
+    )
+    if (
+        type(status.field_id) is not int
+        or status.field_id < 1
+        or status.error is not None
+        or not status.order
+        or set(value) != {f.name for f in fields(IssueStatusConfig)}
+    ):
+        raise ValueError("not a saved issue status")
+    return status
 
 
 CONFIG_AT_SECTION = "config-at"
@@ -1686,12 +1832,14 @@ DEMOTION_RECORD = (
 # `read_demotion`: records per query, as `babysit_postmerge.read_pins` batches pins.
 DEMOTION_BATCH = 20
 # A record of a red full run on main, the one kind a later green clears
-# (`_recovered_at`); canary and read-back records stay human-close.
+# (`_recovered_at`). Canary, revert and read-back records lift on their own
+# evidence (`_lift`).
 RED_MAIN_RECORD = re.compile(
     r"<!-- babysit-merge-demotion sha=([0-9a-f]{40}) signal=(?:schedule|dispatch) -->"
 )
-# The holds a red-main record's later green lifts: how it was closed, never
-# what its edit history or a failed read says.
+# The holds a red-main record's later green, or a revert or read-back
+# record's lift, clears: how it was closed, never what its edit history or a
+# failed read says.
 RECOVERABLE_HOLDS = ("open", "closed-by-non-human", "closed-by-reference")
 # Green full runs on main of one event created in one span after a record, a
 # page at a time: each span is read whole, so its earliest run stays put as
@@ -1707,6 +1855,60 @@ GREEN_PAGES = 5
 GREEN_SPAN = timedelta(days=7)
 # Spans read before giving up (holding the record), about a year.
 GREEN_SPANS = 53
+# A canary, revert or read-back record, which `_lift` lifts. A canary record
+# may be a post-merge-failure one, which holds nothing but is closed the same
+# way (babysit_lift.py close).
+LIFTABLE_RECORD = re.compile(
+    r"<!-- (babysit-merge-demotion|post-merge-failure) sha=([0-9a-f]{40}) "
+    r"signal=(canary|revert|read-back) -->"
+)
+# The content a canary or revert record's lift checks on main: per path, the
+# hash and count of each line the merge deleted (`lift_block`), on one line of
+# the record's body, or of an unedited comment by a filer on a canary record
+# filed without it. `{"paths": {}}` records that the merge deleted nothing.
+LIFT_BLOCK = re.compile(r"^<!-- lift-content v1 (\{.*\}) -->$")
+LIFT_HASH = re.compile(r"^[0-9a-f]{12}$")
+# The longest block a record carries; a larger deletion is recorded as none.
+LIFT_BLOCK_LIMIT = 40000
+# Green canary push runs at one commit on main.
+CANARY_RUNS = (
+    "repos/{}/{}/actions/workflows/post-merge-detect-silent-revert.yml/runs"
+    "?head_sha={}&event=push&status=success&per_page=100"
+)
+# The pull request a read-back record names, as `babysit_postmerge._issue_body`
+# writes it.
+RECORD_PULL = re.compile(r"^- Pull request: (?:https://\S+/pull/|#)([1-9][0-9]*)$")
+PIN_LINE = re.compile(r"^<!-- babysit-merge-pin sha=([0-9a-f]{40}) -->$")
+# A pull request's merge and the agent identity's pin read-back over its first
+# 100 comments; a longer thread proves no read-back.
+LIFT_PULL = (
+    "number merged mergedAt baseRefName headRefOid mergeCommit{oid} "
+    "repository{nameWithOwner} comments(first:100){pageInfo{hasNextPage} "
+    "nodes{author{__typename login} body createdAt lastEditedAt}}"
+)
+
+
+def _lift_query(with_pull: bool) -> str:
+    """The pull requests that reference a record (its first 100
+    cross-references) and its first 100 comments, and with `with_pull` the
+    pull request `$p` too."""
+    references = (
+        "issue(number:$n){timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],first:100){"
+        "pageInfo{hasNextPage} nodes{... on CrossReferencedEvent{referencedAt "
+        "actor{__typename login} source{"
+        "__typename ... on PullRequest{" + LIFT_PULL + "}}}}} "
+        "comments(first:100){pageInfo{hasNextPage} "
+        "nodes{author{__typename login} body lastEditedAt}}}"
+    )
+    pull = " pullRequest(number:$p){" + LIFT_PULL + "}" if with_pull else ""
+    return (
+        "query PolicyRecordLift($o:String!,$r:String!,$n:Int!"
+        + (",$p:Int!" if with_pull else "")
+        + "){repository(owner:$o,name:$r){"
+        + references
+        + pull
+        + "}}"
+    )
 
 
 @dataclass(frozen=True)
@@ -1920,13 +2122,18 @@ class _GreenMain:
     def on_main(self, sha: str) -> bool:
         """Whether `sha` is on main's history, read by heads/main: a ref named
         main, a tag included, can sit anywhere."""
+        tip = self.main_tip()
+        return sha == tip or self.ahead(sha, tip)
+
+    def main_tip(self) -> str:
+        """main's tip, read once by heads/main."""
         if self.tip is None:
             answer = self._read(f"repos/{self.owner}/{self.name}/git/ref/heads/main")
             tip = str(json_object(json_object(answer).get("object")).get("sha") or "")
             if not SHA_RE.fullmatch(tip):
                 raise PolicyReadError("main's tip names no commit")
             self.tip = tip
-        return sha == self.tip or self.ahead(sha, self.tip)
+        return self.tip
 
 
 def _recovered_at(
@@ -1955,6 +2162,308 @@ def _recovered_at(
     return None
 
 
+def _read_back_holds(pull: dict[str, Any], identity: str | None) -> bool:
+    """Whether a merged pull request's read-back holds: the agent identity's
+    newest pin comment, among its first 100 comments, is unedited, was
+    posted no later than the merge, and names the head that merged."""
+    comments = json_object(pull.get("comments"))
+    if (
+        not identity
+        or json_object(comments.get("pageInfo")).get("hasNextPage") is not False
+    ):
+        return False
+    pins = [
+        c
+        for c in map(json_object, json_array(comments.get("nodes")))
+        # The judge's author test (`babysit_postmerge._identity_marks`): a
+        # User who owns the bare slug is never the App.
+        if actor_key(c.get("author")) == str(identity).strip().casefold()
+        and PIN_LINE.match(str(c.get("body") or "").split("\n", 1)[0].rstrip())
+    ]
+    if not pins or not pull.get("merged"):
+        return False
+    pin = pins[-1]
+    sha = PIN_LINE.match(str(pin.get("body")).split("\n", 1)[0].rstrip())[1]
+    return (
+        not pin.get("lastEditedAt")
+        and _time(pin.get("createdAt")) <= _time(pull.get("mergedAt"))
+        and sha == pull.get("headRefOid")
+    )
+
+
+def line_hash(line: bytes) -> str:
+    """A deleted line's hash in a lift block: its bytes, without the newline."""
+    return hashlib.sha256(line).hexdigest()[:12]
+
+
+def lift_block(lines: Iterable[tuple[str, bytes]]) -> str | None:
+    """The lift block for `(path, line)` deletions, or None when a path is
+    empty or holds a control character, or the block passes
+    `LIFT_BLOCK_LIMIT`. No line at all is the block of a merge that deleted
+    nothing."""
+    paths: dict[str, Counter[str]] = {}
+    for path, line in lines:
+        if not path or any(ord(ch) < 32 for ch in path):
+            return None
+        paths.setdefault(path, Counter())[line_hash(line)] += 1
+    text = json.dumps(
+        {"paths": {p: dict(sorted(c.items())) for p, c in sorted(paths.items())}},
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).replace(">", "\\u003e")
+    block = f"<!-- lift-content v1 {text} -->"
+    return block if len(block) <= LIFT_BLOCK_LIMIT else None
+
+
+def read_lift_block(text: Any) -> dict[str, dict[str, int]] | None:
+    """The paths of the first well-formed lift block line in `text`, or None."""
+    for line in str(text or "").split("\n"):
+        match = LIFT_BLOCK.match(line.rstrip("\r"))
+        if not match:
+            continue
+        try:
+            paths = json.loads(match[1]).get("paths")
+        except (ValueError, AttributeError):
+            return None
+        if not is_json_object(paths) or not all(
+            isinstance(p, str)
+            and p
+            and is_json_object(c)
+            and all(
+                LIFT_HASH.fullmatch(h) and type(n) is int and n > 0
+                for h, n in c.items()
+            )
+            for p, c in paths.items()
+        ):
+            return None
+        return paths
+    return None
+
+
+def _line_counts(text: str | None) -> Counter[str]:
+    """The hash count of each line of `text`, as git counts lines: a final
+    newline ends the last line and adds no empty one. None counts nothing."""
+    lines = (text or "").split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return Counter(line_hash(line.encode("utf-8", "surrogateescape")) for line in lines)
+
+
+def _content_present(
+    owner: str, name: str, paths: dict[str, dict[str, int]], ref: str, base: str
+) -> bool:
+    """Whether every deleted line a lift block counts is back in its path's
+    file at `ref`, as often as it was deleted, over and above the copies the
+    file held at `base`, the record's own SHA (the state just after the
+    deletion): a copy the deletion left behind, such as a moved line or a
+    common one, is no restore. A file missing at `ref` is not present, one
+    missing at `base` held nothing; a failed read raises."""
+    for path, wanted in paths.items():
+        text = _raw_at(owner, name, path, ref)
+        if text is None:
+            return False
+        have = _line_counts(text)
+        left = _line_counts(_raw_at(owner, name, path, base))
+        if any(have[h] < left[h] + n for h, n in wanted.items()):
+            return False
+    return True
+
+
+def _canary_green_at(owner: str, name: str, sha: str) -> bool:
+    """Whether a canary push run on main at `sha` passed."""
+    status, answer = _get(CANARY_RUNS.format(owner, name, sha))
+    if status != 200:
+        raise PolicyReadError(f"canary runs at {sha}: {status}")
+    return any(
+        run.get("conclusion") == "success"
+        and run.get("event") == "push"
+        and run.get("head_sha") == sha
+        and run.get("head_branch") == "main"
+        and str(json_object(run.get("head_repository")).get("full_name") or "").casefold()
+        == f"{owner}/{name}".casefold()
+        for run in map(json_object, json_array(json_object(answer).get("workflow_runs")))
+    )
+
+
+def _filer_bodies(comments: dict[str, Any], identity: str | None) -> list[str]:
+    """The bodies of a filer's (`github-actions[bot]` or the agent identity)
+    unedited comments among the record's first 100, oldest first; none when
+    it has more."""
+    if json_object(comments.get("pageInfo")).get("hasNextPage") is not False:
+        return []
+    filers = {DEMOTION_FILER, str(identity or "").strip().casefold()} - {""}
+    return [
+        str(comment.get("body") or "")
+        for comment in map(json_object, json_array(comments.get("nodes")))
+        if actor_key(comment.get("author")) in filers
+        and not comment.get("lastEditedAt")
+    ]
+
+
+# The commit `babysit_lift.py close` found the content back at, on the first
+# line of its close comment, so a later edit on main does not re-demote a
+# record the lane closed: a commit's tree never changes.
+LIFT_EVIDENCE = re.compile(r"^<!-- lift-evidence sha=([0-9a-f]{40}) -->$")
+
+
+def lift_evidence(sha: str) -> str:
+    return f"<!-- lift-evidence sha={sha} -->"
+
+
+@dataclass(frozen=True)
+class Lift:
+    """A record's lift: its clear time, what proved it, and for content found
+    back on main the commit it was found at."""
+
+    at: datetime
+    why: str
+    evidence: str | None = None
+
+
+def _lift(
+    issue: dict[str, Any],
+    human: Callable[[Any], bool],
+    green: _GreenMain,
+    identity: str | None,
+) -> Lift | None:
+    """How a canary, revert or read-back record lifted, or None.
+
+    (1) The record's own condition holds again on main: a canary or revert
+    record whose lift block names deleted content, once every counted line is
+    in its path's file at main's tip (`_content_present`), or at the commit a
+    filer's unedited `lift-evidence` comment names when that commit is on
+    main at or after the record's SHA, so a later edit does not re-demote a
+    record the lane closed; a read-back record,
+    once the pull request its body names, merged at the record's SHA, reads
+    back (`_read_back_holds`). The record's creation is the clear time.
+    (2) A pull request that references the record merges into main after it
+    was filed, in this repository, at a merge commit on main's history, the
+    reference made no later than the merge by a person with write access or
+    the agent identity, and
+    the record's own condition holds at that merge commit: a canary record's
+    content is in the tree there, or, for a canary record whose block says
+    nothing was deleted, a canary push run passed there; that pull request
+    reads back, for a read-back record; and nothing more for a revert record,
+    whose referencing merge confirms the revert. The earliest such merge is
+    the clear time.
+
+    None for any other record, one a non-human edited (its SHA, pull request
+    and block come from its body), a canary record with no lift block in its
+    body or a filer's unedited comment, or no such evidence; a failed read, or
+    more than 100 references, raises."""
+    body = str(issue.get("body") or "").lstrip()
+    marker = LIFTABLE_RECORD.fullmatch(body.split("\n", 1)[0].rstrip())
+    if marker is None or _edits_refusal(issue, human):
+        return None
+    sha, signal = marker[2], marker[3]
+    owner, name = green.owner, green.name
+    number = None
+    if signal == "read-back":
+        number = next(
+            (
+                int(m[1])
+                for line in body.split("\n")
+                if (m := RECORD_PULL.match(line.rstrip()))
+            ),
+            None,
+        )
+    data = json_object(
+        _graphql(
+            _lift_query(number is not None),
+            f"issue #{issue.get('number')} references",
+            o=owner,
+            r=name,
+            n=issue.get("number"),
+            p=number,
+        ).get("repository")
+    )
+    created = _time(issue.get("createdAt"))
+    record = json_object(data.get("issue"))
+    notes = _filer_bodies(json_object(record.get("comments")), identity)
+    block = None
+    if signal != "read-back":
+        block = read_lift_block(body)
+        if block is None and signal == "canary":
+            block = next(
+                (p for n in notes if (p := read_lift_block(n)) is not None), None
+            )
+        if block is None and signal == "canary":
+            return None
+    own = json_object(data.get("pullRequest"))
+    if (
+        number is not None
+        and own.get("number") == number
+        and json_object(own.get("mergeCommit")).get("oid") == sha
+        and _read_back_holds(own, identity)
+    ):
+        return Lift(created, f"pull request #{number} reads back")
+    if block:
+        # The commit a lane's close found the content at, when it is on main
+        # at or after the record's SHA; else main's tip.
+        pinned = next(
+            (
+                m[1]
+                for n in notes
+                if (m := LIFT_EVIDENCE.match(n.split("\n", 1)[0].rstrip()))
+            ),
+            None,
+        )
+        ref = green.main_tip()
+        if pinned and green.on_main(pinned) and (pinned == sha or green.ahead(sha, pinned)):
+            ref = pinned
+        if _content_present(owner, name, block, ref, sha):
+            return Lift(created, f"the deleted content is on main at {ref}", ref)
+    timeline = json_object(record.get("timelineItems"))
+    if json_object(timeline.get("pageInfo")).get("hasNextPage") is not False:
+        raise PolicyReadError(f"issue #{issue.get('number')}: more than 100 references")
+    merges = []
+    for node in map(json_object, json_array(timeline.get("nodes"))):
+        pull = json_object(node.get("source"))
+        oid = str(json_object(pull.get("mergeCommit")).get("oid") or "")
+        if (
+            pull.get("__typename") != "PullRequest"
+            or not pull.get("merged")
+            or pull.get("baseRefName") != "main"
+            or str(json_object(pull.get("repository")).get("nameWithOwner") or "").casefold()
+            != f"{owner}/{name}".casefold()
+            or not SHA_RE.fullmatch(oid)
+            or _time(pull.get("mergedAt")) <= created
+            # Made before the merge by a write-access person or the agent
+            # identity: anyone can mention the record in a comment on a
+            # pull request, merged or not, and that makes a reference too.
+            or _time(node.get("referencedAt")) > _time(pull.get("mergedAt"))
+            or not (
+                human(node.get("actor"))
+                or (identity and actor_key(node.get("actor")) == identity.strip().casefold())
+            )
+            or (signal == "read-back" and not _read_back_holds(pull, identity))
+        ):
+            continue
+        merges.append((_time(pull.get("mergedAt")), oid, pull.get("number")))
+    for merged_at, oid, pr in sorted(merges):
+        if not green.on_main(oid):
+            continue
+        if signal == "canary" and not (
+            _content_present(owner, name, block, oid, sha)
+            if block
+            else _canary_green_at(owner, name, oid)
+        ):
+            continue
+        return Lift(merged_at, f"pull request #{pr} merged at {oid}")
+    return None
+
+
+def _lifted_at(
+    issue: dict[str, Any],
+    human: Callable[[Any], bool],
+    green: _GreenMain,
+    identity: str | None,
+) -> datetime | None:
+    """`_lift`'s clear time, or None."""
+    lift = _lift(issue, human, green, identity)
+    return lift.at if lift else None
+
+
 def read_demotion(
     repo: str,
     *,
@@ -1970,7 +2479,8 @@ def read_demotion(
     marker or the label hides none. A record holds the rung off unless its
     latest `ClosedEvent` has no `closer` and a human actor, and no non-human
     ever edited it, or, for a red-main record however it stands, main went
-    green past it (`_recovered_at`), whose time clears it. The first holding
+    green past it (`_recovered_at`), or, for a canary, revert or read-back
+    record, its lift evidence holds (`_lift`), whose time clears it. The first holding
     record names the reason and ends `records`; the rest are still read, so
     the hold carries the newest clear before that record's creation (the
     post-merge floor in force when the hold began). Any read failure holds it
@@ -2038,6 +2548,8 @@ def read_demotion(
             if hold in RECOVERABLE_HOLDS:
                 try:
                     recovered = _recovered_at(issue, human, green, clock)
+                    if recovered is None:
+                        recovered = _lifted_at(issue, human, green, agent_identity)
                 except PolicyReadError:
                     recovered = None
             if hold and recovered is None:
@@ -2295,12 +2807,19 @@ def issue_hold_labels(
     return (human_gated,) if human_gated else ()
 
 
-def issue_hold_refusal(issue: dict[str, Any], holds: Collection[str]) -> str | None:
+def issue_hold_refusal(
+    issue: dict[str, Any],
+    holds: Collection[str],
+    status: Callable[[int], str | None] | None = None,
+) -> str | None:
     """Why a hold refuses the lane's linked `issue` (a node read with its
     `labels`), or None: no hold label resolved (`issue_hold_labels`), labels
     that cannot be read whole, or a label in `holds`, matched
-    case-insensitively and named. A person clears it by removing the label;
-    an edit to the issue is the verifier's (`verify:spec-changed`)."""
+    case-insensitively and named; then, when `status` reads the issue's Work
+    status (`issue_status_reader`), a state in `HOLD_STATES`, named, or a
+    read that raises `PolicyReadError`. A person clears it by removing the
+    label or setting the field; an edit to the issue is the verifier's
+    (`verify:spec-changed`)."""
     if not holds:
         return "closing-issue-holds-unresolved"
     labels = _label_names(issue)
@@ -2308,7 +2827,242 @@ def issue_hold_refusal(issue: dict[str, Any], holds: Collection[str]) -> str | N
         return "issue-labels-unreadable"
     names = {label.casefold() for label in labels}
     held = next((h for h in holds if h.casefold() in names), None)
-    return f"closing-issue-held:{held}" if held else None
+    if held or status is None:
+        return f"closing-issue-held:{held}" if held else None
+    try:
+        state = status(issue["number"])
+    except PolicyReadError:
+        return "closing-issue-status-unreadable"
+    return f"closing-issue-held:{state}" if state in HOLD_STATES else None
+
+
+# The field values one read takes: a full page may hold more, so it fails the
+# read rather than miss the Work status value.
+FIELD_VALUE_PAGE = 25
+ISSUE_STATUS_QUERY = (
+    "query PolicyIssueStatus($o:String!,$r:String!,$n:Int!){"
+    "repository(owner:$o,name:$r){issue(number:$n){"
+    f"issueFieldValues(first:{FIELD_VALUE_PAGE}){{nodes{{"
+    "... on IssueFieldSingleSelectValue{"
+    "name field{...field}}}} "
+    "timelineItems(last:100,itemTypes:[ISSUE_FIELD_ADDED_EVENT,"
+    "ISSUE_FIELD_CHANGED_EVENT,ISSUE_FIELD_REMOVED_EVENT]){nodes{__typename "
+    "... on IssueFieldAddedEvent{createdAt value actor{...who} issueField{...field}} "
+    "... on IssueFieldChangedEvent{createdAt newValue actor{...who} issueField{...field}} "
+    "... on IssueFieldRemovedEvent{actor{...who} issueField{...field}}}}}}} "
+    "fragment who on Actor{__typename login ... on User{databaseId} "
+    "... on Bot{databaseId}} "
+    "fragment field on IssueFields{... on IssueFieldSingleSelect{fullDatabaseId}}"
+)
+# The field events one read sees: a full window holding no Work status event
+# may have pushed the setter out.
+FIELD_EVENT_WINDOW = 100
+
+
+def issue_status(
+    repo: str, ref: str, number: int, config: IssueStatusConfig
+) -> str | None:
+    """The state the newest counted Work status event on issue `number` left
+    (`config`), or None when that event removed the value or no event counts.
+    An event counts when a listed human or the lanes App on the trusted list
+    at `ref` wrote it, or a `bot-setters` account wrote any state but
+    `PERSON_ONLY_STATE`, github-actions[bot] always and any other only while
+    the list holds it as a bot with the same id and login. Unlike
+    issue-status.mjs issueStatus, which reads the newest event's setter, an
+    uncounted later change or removal leaves a counted state standing.
+    Raises `PolicyReadError` on a malformed `config`, a failed or malformed
+    read, an unreadable trusted list, a counted state no option maps, a full
+    page of field values, or a full event window with a value and no counted
+    event."""
+    if config.error:
+        raise PolicyReadError(config.error)
+    owner, name = _split_repo(repo)
+    data = _graphql(
+        ISSUE_STATUS_QUERY, f"#{number} Work status", o=owner, r=name, n=number
+    )
+    issue = json_object(data.get("repository")).get("issue")
+    if not is_json_object(issue):
+        raise PolicyReadError(f"#{number} Work status: the answer names no issue")
+    values = json_object(issue.get("issueFieldValues")).get("nodes")
+    events = json_object(issue.get("timelineItems")).get("nodes")
+    if not is_json_array(values) or not is_json_array(events):
+        raise PolicyReadError(f"#{number} Work status: the answer holds no list")
+    if len(values) >= FIELD_VALUE_PAGE:
+        raise PolicyReadError(
+            f"#{number} Work status: {len(values)} field values fill the page"
+        )
+    field_id = str(config.field_id)
+
+    def ours(node: Any, key: str) -> bool:
+        return json_object(json_object(node).get(key)).get("fullDatabaseId") == field_id
+
+    value = next((json_object(v).get("name") for v in values if ours(v, "field")), None)
+    ours_newest_first = [
+        json_object(e) for e in reversed(events) if ours(e, "issueField")
+    ]
+    actors = trusted_listing(repo, ref) if ours_newest_first else ()
+    people = {
+        i for i, login, kind in actors if kind == "human" or login == LANES_APP_LOGIN
+    }
+    listed_bots = {
+        (i, login)
+        for i, login, kind in actors
+        if kind == "bot" and isinstance(login, str)
+    }
+    bots = {
+        entry[0]
+        for entry in config.bot_setters
+        if entry == ACTIONS_BOT or entry in listed_bots
+    }
+    # An uncounted event neither sets nor clears a counted state: the newest
+    # counted one decides, whatever came after it.
+    for event in ours_newest_first:
+        setter = json_object(event.get("actor")).get("databaseId")
+        kind = event.get("__typename")
+        state = (
+            None
+            if kind == "IssueFieldRemovedEvent"
+            else event.get("newValue" if kind == "IssueFieldChangedEvent" else "value")
+        )
+        if type(setter) is not int or not (
+            setter in people or setter in bots and state != PERSON_ONLY_STATE
+        ):
+            continue
+        if state is not None and state not in config.order:
+            raise PolicyReadError(
+                f"#{number} Work status holds {state!r}, which {ISSUE_STATUS_KEY} does not map"
+            )
+        return state
+    if value is not None and len(events) >= FIELD_EVENT_WINDOW:
+        raise PolicyReadError(
+            f"#{number} Work status: no counted setter in its newest {FIELD_EVENT_WINDOW} field events"
+        )
+    return None
+
+
+# The Work status that stays with its label until its readers move to the field.
+AGENT_READY_STATE = "agent-ready"
+
+
+def status_label_names(
+    state: str | None, names: list[str], config: IssueStatusConfig | None
+) -> list[str]:
+    """`names` (an issue's labels) as its Work status `state` decides them
+    (read-status.mjs statusLabels). With no state, `names` unchanged. With
+    one: every queue-state label (a state neither held nor agent-ready) is
+    dropped, hold labels and agent-ready are kept, and the state's first label
+    is added unless present or the state is agent-ready."""
+    if state is None or config is None:
+        return names
+    labels = dict(config.labels)
+    queue = {
+        n.casefold()
+        for s, group in labels.items()
+        if s != AGENT_READY_STATE and s not in HOLD_STATES
+        for n in group
+    }
+    kept = [n for n in names if n.casefold() not in queue]
+    label = next(iter(labels.get(state, ())), None)
+    if state == AGENT_READY_STATE or label is None:
+        return kept
+    return kept if any(n.casefold() == label.casefold() for n in kept) else [*kept, label]
+
+
+# The REST version that documents issue-field-values.
+FIELD_API_VERSION = "2026-03-10"
+
+
+def issue_status_write(repo: str, issue: int, field_id: int, state: str) -> list[str]:
+    """The gh arguments that set issue `issue`'s Work status field
+    `field_id` to `state` with one POST (write-status.mjs writeState), never
+    PUT, which replaces every field value on the issue."""
+    return [
+        "api",
+        "-X",
+        "POST",
+        f"repos/{repo}/issues/{issue}/issue-field-values",
+        "-H",
+        f"X-GitHub-Api-Version: {FIELD_API_VERSION}",
+        "-F",
+        f"issue_field_values[][field_id]={field_id}",
+        "-f",
+        f"issue_field_values[][value]={state}",
+    ]
+
+
+def issue_status_clear(repo: str, issue: int, field_id: int) -> list[str]:
+    """The gh arguments that clear issue `issue`'s Work status field
+    `field_id` (write-status.mjs restart), so the next set sends the
+    field_added that starts a run."""
+    return [
+        "api",
+        "-X",
+        "DELETE",
+        f"repos/{repo}/issues/{issue}/issue-field-values/{field_id}",
+        "-H",
+        f"X-GitHub-Api-Version: {FIELD_API_VERSION}",
+    ]
+
+
+def issue_status_set_since(
+    repo: str,
+    number: int,
+    config: IssueStatusConfig,
+    login: str,
+    state: str,
+    since: datetime,
+) -> bool:
+    """Whether `login` set issue `number`'s Work status field to `state` at
+    or after `since` (one-second resolution), read from the Work status
+    query's field events. Raises `PolicyReadError` on a failed or malformed
+    read, or a full event window with no such set, which may have pushed it
+    out."""
+    owner, name = _split_repo(repo)
+    data = _graphql(
+        ISSUE_STATUS_QUERY, f"#{number} Work status", o=owner, r=name, n=number
+    )
+    events = json_object(
+        json_object(json_object(data.get("repository")).get("issue")).get(
+            "timelineItems"
+        )
+    ).get("nodes")
+    if not is_json_array(events):
+        raise PolicyReadError(f"#{number} Work status: the answer holds no list")
+    for event in map(json_object, events):
+        kind = event.get("__typename")
+        if (
+            kind in ("IssueFieldAddedEvent", "IssueFieldChangedEvent")
+            and json_object(event.get("issueField")).get("fullDatabaseId")
+            == str(config.field_id)
+            and event.get("newValue" if kind == "IssueFieldChangedEvent" else "value")
+            == state
+            and _login_key(json_object(event.get("actor")).get("login"))
+            == _login_key(login)
+            and _time(event.get("createdAt")) >= since
+        ):
+            return True
+    if len(events) >= FIELD_EVENT_WINDOW:
+        raise PolicyReadError(
+            f"#{number} Work status: no {state} set in its newest {FIELD_EVENT_WINDOW} field events"
+        )
+    return False
+
+
+def issue_status_reader(
+    repo: str, status: IssueStatusConfig | None, branch: str | None = None
+) -> Callable[[int], str | None] | None:
+    """`issue_status` for `issue_hold_refusal` under `status` (a config's
+    `issue_status`), the trusted list read at the default branch head
+    (`branch` when already read); None when `status` is None, which reads no
+    field."""
+    if status is None:
+        return None
+
+    def read(number: int) -> str | None:
+        head = _default_branch_config(repo, branch).base_sha
+        return issue_status(repo, head, number, status)
+
+    return read
 
 
 def _claimed_before(
@@ -2760,12 +3514,16 @@ def _after(value: Any, opened: datetime | None) -> bool:
 
 
 # The review lanes whose status job records a `claude-lane-hold` notice, as
-# (workflow file, status job name) (merge-holds.mjs `REVIEW_LANES`, and
-# ci-status's cost-hold step). The notice's head and criteria, and the base
-# branch name a compare takes, as the hold step reads it.
+# (workflow file, status job names) (merge-holds.mjs `REVIEW_LANES`, and
+# ci-status's cost-hold step): pr-review-cli.yml's name, then the one
+# pr-review.yml and pr-review-security.yml give it. The notice's head and
+# criteria, and the base branch name a compare takes, as the hold step reads it.
 REVIEW_LANES = (
-    ("pr-review-hosted.yml", "pr-review / claude-review-status"),
-    ("pr-review-security-hosted.yml", "pr-review-security / security-review"),
+    ("pr-review-hosted.yml", ("pr-review / review-status", "pr-review / claude-review-status")),
+    (
+        "pr-review-security-hosted.yml",
+        ("pr-review-security / review-status", "pr-review-security / security-review"),
+    ),
 )
 HOLD_NOTICE = re.compile(
     r"claude-lane-hold lane=[a-z-]+ sha=([0-9a-f]{40}) criteria=([a-z,-]+) label="
@@ -2899,7 +3657,7 @@ def _noticed_head(owner: str, name: str, branch: Any, base: str, at: Any) -> str
     notices: list[tuple[str, Any]] = []
     vetted: set[str] = set()
     ran: list[list[str]] = []
-    for file, check in REVIEW_LANES:
+    for file, checks in REVIEW_LANES:
         heads: list[str] = []
         ran.append(heads)
         runs = _paginated(
@@ -2933,7 +3691,7 @@ def _noticed_head(owner: str, name: str, branch: Any, base: str, at: Any) -> str
             )
             for job in jobs:
                 done = parse_timestamp(job.get("completed_at"))
-                if job.get("name") != check or done is None or done >= cutoff:
+                if job.get("name") not in checks or done is None or done >= cutoff:
                     continue
                 notices += cost_notices(
                     _paginated(
@@ -3194,9 +3952,11 @@ CARRY_REFUSES: tuple[str, ...] = (
     _skill_scripts("testing:check-visual-parity"),
     ".github/recurring-schedule.json",
     _skill_scripts("evals:validate"),
+    _skill_scripts("evals:plugin-eval"),
     "plugins/testing/evals/browser-probe/**",
     "plugins/work-items/scripts/**",
     "plugins/work-items/tools/work-item-tracker/**",
+    _skill_scripts("harness-ops:changelog"),
 )
 
 
@@ -3772,24 +4532,33 @@ def trusted_actors(
     does not match its schema is empty, which adopts nothing."""
     key = (repo, ref, *sorted(exclude))
     if key not in _TRUSTED_IDS:
-        owner, name = _split_repo(repo)
         try:
-            listing = json_object(
-                json.loads(_file_at(owner, name, TRUSTED_ACTORS_PATH, ref) or "{}")
-            )
-        except (PolicyReadError, ValueError):
-            listing = {}
-        actors = [json_object(a) for a in json_array(listing.get("actors"))]
-        ids = tuple(a.get("id") for a in actors)
-        valid = listing.get("version") == 1 and all(
-            type(i) is int and i > 0 for i in ids
-        )
-        humans = tuple(a["id"] for a in actors if a.get("kind") == "human")
-        kept = tuple(
-            a.get("id") for a in actors if _login_key(a.get("login")) not in exclude
-        )
-        _TRUSTED_IDS[key] = (kept, humans) if valid else ((), ())
+            actors = trusted_listing(repo, ref)
+        except PolicyReadError:
+            actors = ()
+        humans = tuple(i for i, _, kind in actors if kind == "human")
+        kept = tuple(i for i, login, _ in actors if _login_key(login) not in exclude)
+        _TRUSTED_IDS[key] = (kept, humans)
     return _TRUSTED_IDS[key]
+
+
+def trusted_listing(repo: str, ref: str) -> tuple[tuple[int, Any, Any], ...]:
+    """Each actor on `TRUSTED_ACTORS_PATH` at `ref` as (id, login, kind).
+    Raises `PolicyReadError` when the list is absent, unreadable or does not
+    match its schema (version 1, every id a positive whole number)."""
+    owner, name = _split_repo(repo)
+    try:
+        listing = json_object(
+            json.loads(_file_at(owner, name, TRUSTED_ACTORS_PATH, ref) or "{}")
+        )
+    except ValueError as exc:
+        raise PolicyReadError(f"{TRUSTED_ACTORS_PATH} at {ref}: {exc}") from exc
+    actors = [json_object(a) for a in json_array(listing.get("actors"))]
+    if listing.get("version") != 1 or not all(
+        type(a.get("id")) is int and a["id"] > 0 for a in actors
+    ):
+        raise PolicyReadError(f"{TRUSTED_ACTORS_PATH} at {ref} is absent or invalid")
+    return tuple((a["id"], a.get("login"), a.get("kind")) for a in actors)
 
 
 # The timeline events that are their actor's own act on a pull request: a
@@ -4156,6 +4925,7 @@ def lane_eligibility(
     ejected_enqueue: Callable[[], Any] = lambda: None,
     toggled_at_head: Callable[[], bool] = lambda: False,
     issue_holds: Collection[str] = (),
+    issue_status: Callable[[int], str | None] | None = None,
 ) -> Eligibility:
     """Whether the pr-merge lane may consider a pull request: not a fork or a
     dependency manager's, opened by the agent identity or adopted
@@ -4171,7 +4941,8 @@ def lane_eligibility(
     class `LANE_CLASS`; no `work-class:` label is read, but the linked issue
     must clear the trust hold (`trust_refusal`, as `eligibility` reads it,
     a human judged with `agent_identity`, `self_logins` and `permission`)
-    and carry none of `issue_holds` (`issue_hold_refusal`; empty refuses).
+    and carry none of `issue_holds` nor a held `issue_status`
+    (`issue_hold_refusal`; empty `issue_holds` refuses).
     `pr` is the REST record, whose `changed_files` the file listing must
     reach. Holds on the pull request (a hold label, a `Hold:` line) are the
     gate's, and adoption's too."""
@@ -4242,7 +5013,7 @@ def lane_eligibility(
                     permission=permission,
                 ),
                 {},
-            ) or issue_hold_refusal(issue, issue_holds)
+            ) or issue_hold_refusal(issue, issue_holds, issue_status)
         # An adopted pull request closing no issue here is its own intent,
         # the verifier judging its title and body (owner decision 2026-10-22),
         # when a person or a script wrote them (`spec_from_body_ids`: the
@@ -4711,13 +5482,18 @@ def dependabot_eligibility(
 
 
 def recheck_lane_issue(
-    repo: str, number: int, *, issue: int | None, holds: Collection[str] = ()
+    repo: str,
+    number: int,
+    *,
+    issue: int | None,
+    holds: Collection[str] = (),
+    status: Callable[[int], str | None] | None = None,
 ) -> str | None:
     """The linked issue read again right before the enqueue: it must still
     be the one, in this repository, that the eligibility read found (`issue`),
-    since the verifier verdict binds to it, still carry none of `holds`
-    (`issue_hold_refusal`; empty refuses), and the base must still be the
-    default branch (`_base_refusal`, read fresh)."""
+    since the verifier verdict binds to it, still carry none of `holds` nor a
+    held `status` (`issue_hold_refusal`; empty `holds` refuses), and the base
+    must still be the default branch (`_base_refusal`, read fresh)."""
     owner, name = _split_repo(repo)
     try:
         data = _graphql(ELIGIBILITY, f"#{number}", o=owner, r=name, n=number)
@@ -4731,7 +5507,9 @@ def recheck_lane_issue(
             return refusal
         if found["number"] != issue:
             return f"closing-issue-changed:{issue}>{found['number']}"
-        return issue_hold_refusal(found, holds) or _base_refusal(owner, name, node)
+        return issue_hold_refusal(found, holds, status) or _base_refusal(
+            owner, name, node
+        )
     except PolicyReadError as exc:
         return f"unreadable: {exc}"
 
@@ -4762,9 +5540,10 @@ def _merged_since(
     before `since` (a merge updates the PR, so every PR merged since then comes
     first) or the history ends; a PR merged earlier and updated since is
     skipped. A PR updated mid-read jumps to page 1 and can slip past a walk of
-    more than one page, so page 1 is then read again: a merge there the walk
-    missed makes the history unreadable. None when the page limit is reached
-    first."""
+    more than one page, so page 1 is then read again and a merge there the
+    walk missed is added: pages follow the update time, so a PR the walk
+    skipped can only have moved to the front. None when the page limit is
+    reached first."""
     found: list[dict[str, Any]] = []
     cursor: str | None = None
     for pages in range(1, MERGED_PAGE_LIMIT + 1):
@@ -4789,9 +5568,7 @@ def _merged_since(
             if _time(pr.get("updatedAt")) < since:
                 break
             if _time(pr.get("mergedAt")) >= since and pr.get("number") not in numbers:
-                raise PolicyReadError(
-                    "merged pull requests: the history changed while it was read"
-                )
+                found.append(pr)
     return found
 
 
@@ -5843,8 +6620,12 @@ PROMOTION_OPTIONS = (
     "promotion_evidence_checker",
 )
 # Optional options whose values are not local paths: the credential roots name
-# the probe host, so only the settings file they came from is checked.
-PROMOTION_SETTINGS_ONLY_OPTIONS = ("promotion_evidence_credential_roots",)
+# the probe host and the age bound is a number of hours, so only the settings
+# file each came from is checked.
+PROMOTION_SETTINGS_ONLY_OPTIONS = (
+    "promotion_evidence_credential_roots",
+    "promotion_evidence_max_age_hours",
+)
 PROMOTION_RESOLVER = (
     Path(__file__).resolve().parents[2]
     / "babysit-loop"
@@ -5966,8 +6747,9 @@ def read_promotion(
     Every worktree of the checkout is a `--worktree-root`, so a surface in a
     sibling worktree refuses. With a demotion record, `--window-start` is its
     creation: the checker reads the source's events plus one `gate-failure`
-    per promotable cell then, so a cell stays unpromoted until it is
-    re-ratified after the demotion. A value the resolver reports, or the
+    per promotable cell then, so a cell stays unpromoted until the evidence
+    holds a `re-earned` event for it counted from that creation or later. A
+    value the resolver reports, or the
     settings file it came from, that the lane user can write refuses.
     Anything doubtful is unpromoted."""
     roots = worktrees(checkout)
@@ -5999,11 +6781,19 @@ def read_promotion(
 class PostMergeGate:
     """The post-merge check's answer, as `assess()` consumes it: a refusal
     (a failure or an unreadable verdict) or None, the verdict's report, and
-    the `verified` callable `in_flight` judges each auto-merge with."""
+    the `verified` callable `in_flight` judges each auto-merge with, and the
+    floor the check read from when it names one (the lane's anchored floor,
+    `babysit_postmerge.lane_floor`)."""
 
     refusal: str | None
     report: Mapping[str, Any]
     verified: Callable[[AutoMerge], bool] | None
+    floor: datetime | None = None
+
+    def floor_from(self, floor: datetime) -> datetime:
+        """The floor `in_flight` and a shared answer use with this gate: the
+        later of the policy `floor` and the check's own, never lower."""
+        return max(floor, self.floor) if self.floor else floor
 
 
 # How old a shared post-merge answer may be: the pr-merge job's timeout.
@@ -6048,6 +6838,9 @@ class SharedPostMerge:
     demotion: Demotion
     floor: datetime
     gate: PostMergeGate
+    # The policy floor (`merged_since_floor`) `floor` was anchored from, which
+    # `shared_refusal` compares; None when `floor` is the policy floor.
+    policy_floor: datetime | None = None
 
 
 def newest_config_commit(repo: str, sha: str) -> str:
@@ -6201,7 +6994,7 @@ def shared_refusal(
         # walks its own config history to the floor it would read.
         if newest_config_commit(
             repo, base_sha
-        ) != shared.config_sha and shared.floor != merged_since_floor(
+        ) != shared.config_sha and (shared.policy_floor or shared.floor) != merged_since_floor(
             repo, base_sha, shared.demotion, authority
         ):
             return "floor-differs"
@@ -6480,7 +7273,6 @@ def assess(
             floor = merged_since_floor(repo, history_sha, demotion, authority)
         except PolicyReadError as exc:
             return replace(stopped, reason=f"post-merge:floor-unreadable: {exc}")
-    details["mergedSince"] = floor.isoformat()
     gate = (
         reuse.gate
         if reuse
@@ -6488,6 +7280,10 @@ def assess(
         if post_merge is not None
         else PostMergeGate("unchecked", {}, None)
     )
+    policy_floor = None if reuse else floor
+    if not reuse:
+        floor = gate.floor_from(floor)
+    details["mergedSince"] = floor.isoformat()
     details["postMerge"] = dict(gate.report)
     if (
         share is not None
@@ -6511,6 +7307,7 @@ def assess(
                     demotion=demotion,
                     floor=floor,
                     gate=gate,
+                    policy_floor=policy_floor,
                 )
             )
     if gate.refusal:
@@ -6608,6 +7405,7 @@ def assess(
         inputs["trusted_humans"] = trusted[1]
         # Read again right before the enqueue (`recheck_lane_issue`).
         inputs["issue_holds"] = issue_hold_labels(config, human_gated)
+        inputs["issue_status"] = issue_status_reader(repo, config.issue_status, default)
         eligible = lane_eligibility(
             repo,
             number,
@@ -6634,6 +7432,7 @@ def assess(
                 str(pr.get("node_id") or ""),
             ),
             issue_holds=inputs["issue_holds"],
+            issue_status=inputs["issue_status"],
             **readers,
         )
         promoted = True
@@ -6742,7 +7541,7 @@ def _moved(
     `config-moved`), no demotion record was filed or changed since
     (`_demotion_changed`, else `demotion-changed`), and `runs_unchanged`:
     none of its unverified merges' verifying runs reached a conclusion since
-    (else `runs-moved`). With `reread_demotion`, a tripped demotion probe
+    that the check did not already read (else `runs-moved`). With `reread_demotion`, a tripped demotion probe
     counts only when `read_demotion`, read after the runs, differs from the
     shared demotion in any field, as `settle_shared` keeps a
     `demotion-changed` answer. Raises `PolicyReadError`."""
@@ -6809,8 +7608,8 @@ def _recompute_shared(
         self_logins=self_logins,
         permission=permission_reader(repo),
     )
-    floor = merged_since_floor(repo, head, demotion, PR_MERGE)
-    gate = post_merge(floor, identity)
+    policy_floor = merged_since_floor(repo, head, demotion, PR_MERGE)
+    gate = post_merge(policy_floor, identity)
     if gate.report.get("readable") is not True:
         return None
     return SharedPostMerge(
@@ -6821,8 +7620,9 @@ def _recompute_shared(
         lane_merges_only=True,
         computed_at=computed_at,
         demotion=demotion,
-        floor=floor,
+        floor=gate.floor_from(policy_floor),
         gate=gate,
+        policy_floor=policy_floor,
     )
 
 

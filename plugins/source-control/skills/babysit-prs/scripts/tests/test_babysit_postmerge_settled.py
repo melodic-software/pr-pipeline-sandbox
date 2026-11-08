@@ -20,9 +20,10 @@ import pathlib
 import sys
 import tempfile
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -382,6 +383,100 @@ class WhatGetsSettled(SettledCase):
         self.assertEqual(verdict.report()["settle"], [])
 
 
+class SettledForTheAnchor(SettledCase):
+    """#7336: a settled merge the anchor needs is judged again from its runs,
+    for `final_by_runs` alone; the marker still verifies it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.gh.pin_comments = [pin_comment(HEAD_SHA), marker()]
+
+    def rejudged(
+        self, anchor: pm.Anchor | None = None, now: datetime = SOON
+    ) -> pm.PostMergeVerdict:
+        reader = pm.pin_reader(REPO, IDENTITY)
+        return pm.check(
+            REPO,
+            agent_identity=IDENTITY,
+            is_human=human,
+            merged_since=SINCE,
+            now=now,
+            pinned_sha=reader,
+            lane_merges_only=True,
+            settled=reader.settled,
+            rejudge=pm.anchor_needs(anchor),
+        )
+
+    def test_a_settled_merge_final_from_its_runs_seeds_the_anchor(self) -> None:
+        self.lane_dispatch()
+        plain = self.settled_check(now=SOON)
+        verdict = self.rejudged()
+        state = verdict.merges[0]
+        self.assertTrue(state.settled and state.final_by_runs)
+        self.assertGreater(self.window_reads(), 0)
+        # The verdict reads as it would without the second judgment.
+        self.assertEqual(verdict.report(), plain.report())
+        self.assertFalse(plain.merges[0].final_by_runs)
+        merged_at = pm._time(state.merge.merged_at)
+        self.assertEqual(pm.advance_anchor(verdict, None), pm.Anchor(merged_at))
+        self.assertIsNone(pm.advance_anchor(plain, None))
+        self.assertEqual(self.gh.writes(), [])
+
+    def test_unreadable_runs_hold_it_and_leave_the_verdict_readable(self) -> None:
+        # Its record expired: judged on its runs alone it is an unlisted-record
+        # hold, which here only keeps it from passing.
+        self.lane_dispatch(recorded=False)
+        verdict = self.rejudged(now=LATE)
+        self.assertTrue(verdict.ok, verdict.reason)
+        self.assertTrue(verdict.merges[0].settled)
+        self.assertFalse(verdict.merges[0].final_by_runs)
+        self.assertIsNone(pm.advance_anchor(verdict, None))
+
+    def test_runs_that_do_not_show_it_final_hold_it(self) -> None:
+        self.lane_dispatch()
+        self.gh.add_runs(
+            "post-merge-detect-silent-revert.yml",
+            "push",
+            canary_run(22, conclusion=None, status="in_progress"),
+        )
+        verdict = self.rejudged()
+        self.assertTrue(verdict.ok, verdict.reason)
+        self.assertFalse(verdict.merges[0].final_by_runs)
+        self.assertIsNone(pm.advance_anchor(verdict, None))
+
+    def test_the_merges_after_the_first_not_final_are_not_judged(self) -> None:
+        # The anchor stops at that merge, so judging later ones spends reads
+        # that cannot move it.
+        merges = [
+            pm.AutoMerge(n, MERGE_SHA, HEAD_SHA, "2026-10-12T10:00:00+00:00")
+            for n in (1, 2, 3)
+        ]
+        ctx = pm._Context("o", "r", IDENTITY, branch="main", now=SOON)
+        settleable = {1: True, 2: False, 3: True}
+        with (
+            mock.patch.object(pm, "_listed_runs", return_value=([], [])),
+            mock.patch.object(
+                pm,
+                "_judge",
+                side_effect=lambda m, *a, **k: pm.MergeState(
+                    m, True, (), True, settleable=settleable[m.number]
+                ),
+            ) as judge,
+        ):
+            final = pm._final_by_runs(ctx, merges, pins={}, pin_required=(), now=SOON)
+        self.assertEqual(final, frozenset({1}))
+        self.assertEqual(judge.call_count, 2)
+
+    def test_a_merge_the_anchor_carries_reads_no_runs(self) -> None:
+        self.lane_dispatch()
+        anchor = pm.Anchor(SINCE, frozenset({NUMBER}))
+        verdict = self.rejudged(anchor)
+        self.assertFalse(verdict.merges[0].final_by_runs)
+        self.assertEqual(self.window_reads(), 0)
+        merged_at = pm._time(verdict.merges[0].merge.merged_at)
+        self.assertEqual(pm.advance_anchor(verdict, anchor), pm.Anchor(merged_at))
+
+
 class Settle(SettledCase):
     """`settle` and `--settle-from`: the only writes."""
 
@@ -444,12 +539,19 @@ class Settle(SettledCase):
         self.assertEqual((posted, len(warnings)), ([], 1))
         self.assertEqual(self.gh.writes(), [])
 
-    def run_settle_from(self, report: Any) -> tuple[int, dict[str, Any]]:
+    def run_settle_from(
+        self, report: Any, anchor: Any = "covers"
+    ) -> tuple[int, dict[str, Any]]:
+        if anchor == "covers":
+            anchor = pm.Anchor(datetime(2026, 1, 1, tzinfo=UTC), frozenset({NUMBER}))
         with tempfile.TemporaryDirectory(prefix="settle-") as tmp:
             path = pathlib.Path(tmp) / "post-merge.json"
             path.write_text(json.dumps(report), encoding="utf-8")
             out = io.StringIO()
-            with contextlib.redirect_stdout(out):
+            with (
+                contextlib.redirect_stdout(out),
+                mock.patch.object(pm, "read_anchor", return_value=anchor),
+            ):
                 code = pm.main(
                     [
                         "--repo",
@@ -468,6 +570,22 @@ class Settle(SettledCase):
         code, out = self.run_settle_from(report)
         self.assertEqual((code, out["settled"], out["warnings"]), (0, [NUMBER], []))
         self.assertEqual(len(self.comment_posts()), 1)
+
+    def test_settle_from_marks_only_merges_the_anchor_passed(self) -> None:
+        # #7336: a marker on a merge the anchor has not passed would hold the
+        # anchor for good, since a settled-only merge never moves it.
+        self.lane_dispatch()
+        report = self.settled_check(now=SOON).report()
+        merged_at = datetime.fromisoformat(report["autoMerges"][0]["mergedAt"])
+        for name, anchor, settled in (
+            ("no anchor", None, []),
+            ("anchor before the merge", pm.Anchor(merged_at - timedelta(seconds=1)), []),
+            ("anchor at the merge", pm.Anchor(merged_at), [NUMBER]),
+        ):
+            with self.subTest(name):
+                code, out = self.run_settle_from(report, anchor)
+                self.assertEqual((code, out["settled"]), (0, settled))
+                self.assertEqual(len(self.comment_posts()), len(settled))
 
     def test_settle_from_warns_and_exits_0_when_the_post_fails(self) -> None:
         self.gh.fail_reads = {f"issues/{NUMBER}/comments"}

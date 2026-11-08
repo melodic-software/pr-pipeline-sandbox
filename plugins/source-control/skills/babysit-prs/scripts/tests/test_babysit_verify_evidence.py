@@ -235,6 +235,12 @@ class FakeGitHub:
         # Each closing issue's comments now, and a totalCount that cuts them.
         self.closing_comments: dict[int, list[dict[str, Any]]] = {}
         self.comments_total: dict[int, int] = {}
+        # Each closing issue's comments as GraphQL pages of up to 100, the
+        # first in the closing read and the rest behind cursors "p1", "p2"...
+        self.comment_pages: dict[int, list[list[dict[str, Any]]]] = {}
+        # How a later comment page answers instead: "error" (gh fails) or
+        # "empty" (a page with no comments).
+        self.comment_page_fail: str | None = None
         # The pull requests, open or closed, that close each issue:
         # (number, repository), and a totalCount that cuts them.
         self.closers: dict[int, list[tuple[int, str]]] = {}
@@ -337,6 +343,35 @@ class FakeGitHub:
                         args, 1, "", "gh: boom (HTTP 502)"
                     )
                 return ok({"data": {"repository": {"pullRequest": self.relink}}})
+            cursor = next((a[6:] for a in args if a.startswith("after=")), None)
+            if cursor is not None:
+                n = int(next(a for a in args if a.startswith("n="))[2:])
+                if self.comment_page_fail == "error":
+                    return subprocess.CompletedProcess(
+                        args, 1, "", "gh: boom (HTTP 502)"
+                    )
+                if self.comment_page_fail == "empty":
+                    return ok(
+                        {
+                            "data": {
+                                "repository": {
+                                    "issue": {"number": n, "comments": {"nodes": []}}
+                                }
+                            }
+                        }
+                    )
+                return ok(
+                    {
+                        "data": {
+                            "repository": {
+                                "issue": {
+                                    "number": n,
+                                    "comments": self.comment_page(n, int(cursor[1:])),
+                                }
+                            }
+                        }
+                    }
+                )
             if any("issueOrPullRequest" in a for a in args):
                 n = int(next(a for a in args if a.startswith("n="))[2:])
                 if n not in self.refs:
@@ -383,6 +418,19 @@ class FakeGitHub:
             return ok({"data": {"repository": {"pullRequest": pull}}})
         return self.rest(args, ok, missing, kwargs)
 
+    def comment_page(self, n: int, index: int) -> dict[str, Any]:
+        """Page `index` of issue `n`'s `comment_pages`, as GitHub returns a
+        comments connection: its cursor names the next page."""
+        pages = self.comment_pages[n]
+        return {
+            "totalCount": sum(map(len, pages)),
+            "pageInfo": {
+                "hasNextPage": index + 1 < len(pages),
+                "endCursor": f"p{index + 1}",
+            },
+            "nodes": pages[index],
+        }
+
     def issue(self, n: int, repo: str) -> dict[str, Any]:
         return {
             "number": n,
@@ -392,7 +440,9 @@ class FakeGitHub:
                 "totalCount": self.labels_total.get(n, len(self.labels.get(n, []))),
                 "nodes": [{"name": name} for name in self.labels.get(n, [])],
             },
-            "comments": {
+            "comments": self.comment_page(n, 0)
+            if n in self.comment_pages
+            else {
                 "totalCount": self.comments_total.get(
                     n, len(self.closing_comments.get(n, []))
                 ),
@@ -1283,6 +1333,13 @@ class ARelinkByPeopleSupersedesAFailAtItsHead(unittest.TestCase):
         self.assertEqual(
             read(self.merge_only(superseded=False)).refusal, "verify:earlier-fail"
         )
+
+    def test_an_earlier_fail_refusal_names_the_failed_head(self) -> None:
+        # pr-unblock verify-cap.mjs hands these heads to address-feedback,
+        # which works their notes from the verdict artifacts.
+        evidence = read(self.merge_only(superseded=False))
+        self.assertEqual(evidence.refusal, "verify:earlier-fail")
+        self.assertEqual(evidence.report()["earlierFails"], [EARLIER])
 
     def test_a_merge_only_head_with_no_pass_at_the_failed_head_carries_it(
         self,
@@ -2659,6 +2716,57 @@ class TheSpecCommentsMustBeTheJudgedOnes(unittest.TestCase):
             self.judge([comment(1, HUMAN)], [], user=user), "verify:spec-changed"
         )
 
+    def paged(self, recorded: list[dict[str, Any]]) -> FakeGitHub:
+        """#9867's shape: 144 comments over two pages, a trusted human's
+        comment 1 on the first and 144 on the second, Bot noise between."""
+        fake = passing()
+        fake.records[named(HEAD, "pass")] = record(
+            linked_issues=[{**TRUSTED_ISSUE, "spec_comments": recorded}]
+        )
+        fake.comment_pages = {
+            7: [
+                [comment(1, HUMAN), *(comment(i, LANES_ACTOR) for i in range(2, 101))],
+                [
+                    *(comment(i, LANES_ACTOR) for i in range(101, 144)),
+                    comment(144, HUMAN),
+                ],
+            ]
+        }
+        return fake
+
+    def test_comments_over_one_page_are_read_whole(self) -> None:
+        both = [*self.RECORDED, {"id": 144, "updated_at": "2026-10-12T00:00:00Z"}]
+        fake = self.paged(both)
+        self.assertIsNone(read(fake).refusal)
+        self.assertTrue(any("after=p1" in c for c in fake.calls))
+        # A pass that recorded only the first page's comment missed one.
+        self.assertEqual(read(self.paged(self.RECORDED)).refusal, "verify:spec-changed")
+
+    def test_a_comment_page_that_never_comes_or_fails_refuses(self) -> None:
+        both = [*self.RECORDED, {"id": 144, "updated_at": "2026-10-12T00:00:00Z"}]
+        for answer in ("empty", "error"):
+            with self.subTest(answer):
+                fake = self.paged(both)
+                fake.comment_page_fail = answer
+                self.assertEqual(read(fake).refusal, "verify:unreadable")
+
+    def test_comments_past_the_page_cap_refuse_and_say_so(self) -> None:
+        fake = passing()
+        fake.records[named(HEAD, "pass")] = record(
+            linked_issues=[{**TRUSTED_ISSUE, "spec_comments": self.RECORDED}]
+        )
+        fake.closing_comments = {7: [comment(1, HUMAN)]}
+        fake.comments_total = {7: 1001}
+        reader = ve.Reader(REPO, "main")
+        with mock.patch.object(postmerge, "gh_capture", side_effect=fake):
+            with self.assertRaises(ve._Unreadable) as raised:
+                reader._closing_issues(PR)
+        self.assertEqual(
+            str(raised.exception),
+            "#7: the issue has 1001 comments, more than the 1000 (10 pages) this read takes",
+        )
+        self.assertEqual(read(fake).refusal, "verify:unreadable")
+
     def test_a_partial_comment_read_or_a_malformed_record_refuses(self) -> None:
         fake = passing()
         fake.records[named(HEAD, "pass")] = record(
@@ -2810,6 +2918,23 @@ class TheSpecMustBeTheJudgedOne(unittest.TestCase):
             any("issueOrPullRequest" in " ".join(c) for c in fake.calls), fake.calls
         )
 
+    def test_a_closing_pass_that_credited_siblings_counts_as_any_closing_one(
+        self,
+    ) -> None:
+        # pr-verify credits the merged `Refs:` siblings a `Siblings:` line
+        # names in the spec text it judges (resolve-pr.mjs creditedSiblings),
+        # which the record does not carry: the gate weighs such a pass by its
+        # closing issues and spec comments alone, and reads no sibling.
+        fake = passing()
+        fake.body = "Closes #7\n\nSiblings: #12917, #12937"
+        fake.records[named(HEAD, "pass")] = record(spec_kind="closes")
+        self.assertIsNone(read(fake).refusal)
+        self.assertFalse(any("12917" in " ".join(c) for c in fake.calls), fake.calls)
+        fake = passing()
+        fake.body = "Closes #7\n\nSiblings: #12917, #12937"
+        fake.closing_edited = {7: "2026-10-15T00:00:01Z"}
+        self.assertEqual(read(fake).refusal, "verify:spec-changed")
+
     def test_an_issue_edited_after_the_judgment_started_refuses(self) -> None:
         fake = passing()
         fake.closing_edited = {7: "2026-10-15T00:00:01Z"}
@@ -2882,6 +3007,49 @@ class TheSpecMustBeTheJudgedOne(unittest.TestCase):
         fake = passing()
         fake.records[named(HEAD, "pass")] = record(linked_issues=None)
         self.assertEqual(read(fake).refusal, "verify:unreadable")
+
+
+class AnUnreadableQueuedLanesEntryIsLeftToTheQueue(unittest.TestCase):
+    """An unreadable verdict on a queued lanes App entry is `QUEUE_READS`,
+    since the merge queue's ci-status reads that entry's verdict itself; on
+    any other author, or when the App's id cannot be read, it stays a hold."""
+
+    APP = 4242
+
+    def hold(self, user: dict[str, Any], app: Any = APP) -> str | None:
+        unreadable = ve.Evidence(ve.UNREADABLE, HEAD, (), 0)
+        lane_id = (
+            mock.patch.object(ve.Reader, "_lane_app_id", side_effect=app)
+            if isinstance(app, BaseException)
+            else mock.patch.object(ve.Reader, "_lane_app_id", return_value=app)
+        )
+        with (
+            mock.patch.object(policy, "pull_request", return_value=pull(user=user)),
+            mock.patch.object(ve.Reader, "evidence", return_value=unreadable),
+            lane_id,
+        ):
+            return ve.Reader(REPO, "main", now=NOW).queued_hold(PR)
+
+    def test_only_the_lanes_apps_entry_is_left_to_the_queue(self) -> None:
+        cases: dict[str, tuple[dict[str, Any], Any, str]] = {
+            "lanes App": ({"id": self.APP, "type": "Bot"}, self.APP, ve.QUEUE_READS),
+            "owner": ({"id": 7, "type": "User"}, self.APP, ve.UNREADABLE),
+            "same id, not a Bot": (
+                {"id": self.APP, "type": "User"},
+                self.APP,
+                ve.UNREADABLE,
+            ),
+            "other App": ({"id": 99, "type": "Bot"}, self.APP, ve.UNREADABLE),
+            "no App id": ({"id": self.APP, "type": "Bot"}, None, ve.UNREADABLE),
+            "App id unreadable": (
+                {"id": self.APP, "type": "Bot"},
+                RuntimeError("trusted list"),
+                ve.UNREADABLE,
+            ),
+        }
+        for label, (user, app, want) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self.hold(user, app), want)
 
 
 class AQueuedDependabotEntryNeedsNoVerdict(unittest.TestCase):
@@ -3894,6 +4062,14 @@ class TheWholeListingTimeoutGrowsWithItsPages(unittest.TestCase):
     refuses before paging, with the reason in the detail, rather than
     running into a reader's step timeout as a bare `verify:unreadable`."""
 
+    def setUp(self) -> None:
+        # `evidence` requires --base-sha and reads the config there.
+        config = policy.PipelineConfig(EARLIER, "C2", "pr-merge", None, None, (), None)
+        for name in ("read_config_at", "_default_branch_config"):
+            patcher = mock.patch.object(policy, name, return_value=config)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def first_timeout(self, total: int) -> float | None:
         fake = FlakyListing([])
         fake.live_total = total
@@ -3926,7 +4102,10 @@ class TheWholeListingTimeoutGrowsWithItsPages(unittest.TestCase):
             mock.patch.object(postmerge, "gh_capture", side_effect=fake),
             contextlib.redirect_stdout(out),
         ):
-            ve.main(["evidence", "--repo", REPO, str(PR), HEAD], now=NOW)
+            ve.main(
+                ["evidence", "--base-sha", EARLIER, "--repo", REPO, str(PR), HEAD],
+                now=NOW,
+            )
         report = json.loads(out.getvalue())
         self.assertEqual(report["refusal"], "verify:unreadable")
         self.assertIn(
@@ -4072,7 +4251,7 @@ def verify_cap_env(reads: int = 1) -> dict[str, str]:
     }};
     const read = verifyCapReader({{}}, {{ spawn, log: () => {{}} }});
     for (let number = 1; number <= {reads}; number += 1) {{
-      await read({{ number, head }});
+      await read({{ number, head, base: "b".repeat(40) }});
     }}
     """
     out = subprocess.run(
@@ -4085,23 +4264,27 @@ def verify_cap_env(reads: int = 1) -> dict[str, str]:
     return {k: v for k, v in env.items() if k.startswith("BABYSIT_VERIFY_")}
 
 
-class TheListingBuildsOnACarriedOne(unittest.TestCase):
-    """A listing a trusted pr-merge run saved (`BABYSIT_VERIFY_LISTING_CARRY`)
+class TheListingBuildsOnASavedOne(unittest.TestCase):
+    """A listing saved for the run (`BABYSIT_VERIFY_LISTING`)
     is a base: the reader pages only down past it, keeps the result only when
     it holds the first page's live `total_count`, and lists every page on any
     doubt."""
 
     def setUp(self) -> None:
+        # `evidence` requires --base-sha and reads the config there.
+        _config = policy.PipelineConfig(EARLIER, "C2", "pr-merge", None, None, (), None)
+        for _name in ("read_config_at", "_default_branch_config"):
+            _patcher = mock.patch.object(policy, _name, return_value=_config)
+            _patcher.start()
+            self.addCleanup(_patcher.stop)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.carry = pathlib.Path(tmp.name, "verify-listing-carry.json")
         self.saved = pathlib.Path(tmp.name, "verify-listing.json")
         self.failed = pathlib.Path(f"{self.saved}{ve.FAILED_LISTING_SUFFIX}")
         for patcher in (
             mock.patch.dict(
                 "os.environ",
                 {
-                    "BABYSIT_VERIFY_LISTING_CARRY": str(self.carry),
                     "BABYSIT_VERIFY_LISTING": str(self.saved),
                 },
             ),
@@ -4124,8 +4307,8 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
             dated("pr-merge-gate-cursor", 3, 700, old),
         ]
 
-    def write_carry(self, artifacts: list[Any], at: datetime | None = None) -> None:
-        self.carry.write_text(
+    def write_saved(self, artifacts: list[Any], at: datetime | None = None) -> None:
+        self.saved.write_text(
             json.dumps(
                 {"fetchedAt": (at or self.base_at).isoformat(), "artifacts": artifacts}
             )
@@ -4151,7 +4334,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
             return reader, reader.evidence(PR, HEAD, pull())
 
     def test_a_fail_uploaded_since_is_read_from_the_first_page_alone(self) -> None:
-        self.write_carry(self.base)
+        self.write_saved(self.base)
         fake = self.fake(dated(named(HEAD, "fail"), 2, 1100, LISTED_AT))
         reader, evidence = self.judge(fake)
         self.assertEqual(evidence.refusal, "verify:fail")
@@ -4175,7 +4358,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
             dated("pr-merge-gate-cursor", 3, 990, self.base_at - timedelta(minutes=30)),
             *self.base[1:],
         ]
-        self.write_carry(base)
+        self.write_saved(base)
         fake = self.fake(dated(named(HEAD, "fail"), 2, 950, LISTED_AT), base=base)
         reader, evidence = self.judge(fake)
         self.assertEqual(evidence.refusal, "verify:fail")
@@ -4194,7 +4377,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
             expires=LISTED_AT + timedelta(seconds=2),
         )
         gone = dated("pr-merge-gate-cursor", 3, 700, self.base_at, expired=True)
-        self.write_carry([*self.base[:2], lapsed, gone])
+        self.write_saved([*self.base[:2], lapsed, gone])
         fake = self.fake(base=self.base[:2])
         reader, evidence = self.judge(fake)
         self.assertIsNone(evidence.refusal)
@@ -4205,7 +4388,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
 
     def test_a_carried_entry_the_pages_no_longer_hold_is_dropped(self) -> None:
         # An overwrite deletes 1000's artifact and uploads 1050 in its place.
-        self.write_carry(self.base)
+        self.write_saved(self.base)
         fake = self.fake(
             dated(named(HEAD, "pass"), 1, 1050, LISTED_AT), base=self.base[1:]
         )
@@ -4244,7 +4427,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # so first page and base hold one more than the live count. The pages
         # around the entries near expiry decide them instead of a full listing.
         base = self.tail((500, 30), (400, 40))
-        self.write_carry(base)
+        self.write_saved(base)
         fake = self.fake(base=[a for a in base if a["id"] != 500])
         reader, evidence = self.judge(fake)
         self.assertIsNone(evidence.refusal)
@@ -4260,7 +4443,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # 400 expires before 500 but GitHub deleted only 400: the pages, not
         # the expiry order, decide which entry went.
         base = self.tail((500, 30), (400, 20))
-        self.write_carry(base)
+        self.write_saved(base)
         fake = self.fake(base=[a for a in base if a["id"] != 400])
         reader, _ = self.judge(fake)
         self.assertEqual(reader.listing_mode, "incremental")
@@ -4276,7 +4459,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # A forged carry leaves out the FAIL 450 GitHub lists between 500 and
         # 400, both deleted early: the region's pages bring the FAIL back.
         base = self.tail((500, 30), (400, 40))
-        self.write_carry(base)
+        self.write_saved(base)
         fail = dated(named(EARLIER, "fail"), 2, 450, self.base_at - timedelta(days=2))
         live = [a for a in base if a["id"] not in (500, 400)]
         fake = self.fake(fail, base=live)
@@ -4294,7 +4477,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # The top-up's count is exact, but 400 is near expiry, so it reads
         # page 3 too and refuses as transient: nothing noted for the job.
         base = self.tail((500, 30), (400, 40))
-        self.write_carry(base)
+        self.write_saved(base)
         fake = self.fake(base=[a for a in base if a["id"] != 500])
 
         def page(args: list[str], **kwargs: Any) -> Any:
@@ -4321,7 +4504,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # 300 expires in 90 days but GitHub no longer lists it, and nothing
         # in the base is near expiry: no region to read, so every page.
         base = self.tail()
-        self.write_carry(base)
+        self.write_saved(base)
         fake = self.fake(base=[a for a in base if a["id"] != 300])
         reader, _ = self.judge(fake)
         self.assertEqual(reader.listing_mode, "full")
@@ -4356,7 +4539,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
             fail,
             *(dated("pr-merge-gate-cursor", 3, i, old) for i in (400, 300)),
         ]
-        self.write_carry(carry)
+        self.write_saved(carry)
         fake = self.fake(base=[a for a in carry if a["id"] not in (800, 500)])
         shifted = [False]
 
@@ -4397,7 +4580,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
                     missing_ok=True
                 )
                 base = self.tail((500, 30), (400, 40))
-                self.write_carry(base)
+                self.write_saved(base)
                 fake = self.fake(base=[a for a in base if a["id"] != 500])
                 fake.fail = fail
                 blipped = [label != "502-404"]
@@ -4430,8 +4613,10 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         re-read starts below 500's page and walks up."""
         old = self.base_at - timedelta(hours=3)
         near = LISTED_AT + timedelta(minutes=30)
-        phantoms = (850, 750, 650, 550, 450) if missing == 4 else (
-            875, 850, 825, 775, 750, 650, 550
+        phantoms = (
+            (850, 750, 650, 550, 450)
+            if missing == 4
+            else (875, 850, 825, 775, 750, 650, 550)
         )
         held = [
             *self.base,
@@ -4439,7 +4624,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
             dated("pr-merge-gate-cursor", 3, 500, old, expires=near),
             *(dated("pr-merge-gate-cursor", 3, i, old) for i in (400, 300)),
         ]
-        self.write_carry(
+        self.write_saved(
             [*held, *(dated("pr-merge-gate-cursor", 3, i, old) for i in phantoms)]
         )
         below = [250, 240, 230, 220, 210, 200][:missing]
@@ -4473,7 +4658,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # keeps 500, near expiry, and reads its page under a cap of its own,
         # which the incremental read did not spend: it settles and allows.
         base = self.tail((500, 30), (400, 20))
-        self.write_carry(base)
+        self.write_saved(base)
         fake = self.fake(base=[a for a in base if a["id"] != 400])
         with mock.patch.object(ve, "NEAR_EXPIRY_PAGE_CAP", 1):
             reader, evidence = self.judge(fake)
@@ -4515,7 +4700,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         page read skips once: the first read holds the live count, 500's
         own read answers 404, and it is one short."""
         base = self.tail((500, 30))
-        self.write_carry(base)
+        self.write_saved(base)
         fail = dated(named(HEAD, "fail"), 2, 1100, LISTED_AT)
         fake = self.fake(fail, base=[a for a in base if a["id"] != 500])
         self.skips_once(fake, 1100)
@@ -4546,7 +4731,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # skipped. Read again after one wait, it holds the count: no whole
         # listing, so the job's over-count slot and failure note stay unused.
         base = self.tail((500, 30), (400, 40))
-        self.write_carry(base)
+        self.write_saved(base)
         fail = dated(named(HEAD, "fail"), 2, 1100, LISTED_AT)
         fake = self.fake(fail, base=[a for a in base if a["id"] not in (500, 400)])
         self.skips_once(fake, 1100)
@@ -4615,14 +4800,14 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # GitHub dropped 300, 90 days from expiry, so both Readers' pages over
         # the carry hold one more than the live count. The first takes the
         # whole listing, which holds the count, and allows. The second, its
-        # saved listing gone (as past its age), refuses without another.
+        # saved listing back at the old base, refuses without another.
         base = self.tail()
-        self.write_carry(base)
+        self.write_saved(base)
         fake = self.fake(base=[a for a in base if a["id"] != 300])
         _, first = self.judge(fake)
         self.assertIsNone(first.refusal, first.detail)
         self.assertEqual(fake.full_listings(), 1)
-        self.saved.unlink()
+        self.write_saved(base)
         reader, second = self.judge(fake)
         self.assertEqual(second.refusal, "verify:unreadable")
         self.assertIn("already took its whole listing", second.detail or "")
@@ -4638,7 +4823,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # verify-cap's limit, and its whole listing does not fit, so it
         # refuses before paging. PR B's Reader, with the time, takes it.
         base = self.tail()
-        self.write_carry(base)
+        self.write_saved(base)
         fake = self.fake(base=[a for a in base if a["id"] != 300])
         first = self.against_the_clock(fake, 0.0, limit="20")
         self.assertEqual(first.refusal, "verify:unreadable")
@@ -4655,7 +4840,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # time. B's Reader takes no second whole listing, and its refusal
         # keeps the caller-limit prefix, so verify-cap skips B's round too.
         base = self.tail()
-        self.write_carry(base)
+        self.write_saved(base)
         fake = self.fake(base=[a for a in base if a["id"] != 300])
         first = self.against_the_clock(fake, 50.0, limit="60")
         self.assertTrue(first.detail.startswith(ve.DEADLINE_UNREADABLE))
@@ -4675,7 +4860,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # another whole listing would restore 700, but an over-count takes
         # one a job, and the refusal is noted for the job's later Readers.
         base = self.tail((500, 30))
-        self.write_carry(base)
+        self.write_saved(base)
         fake = self.fake(base=[a for a in base if a["id"] not in (500, 300)])
         fake.full_skips = [{700}]
         reader, evidence = self.judge(fake)
@@ -4694,7 +4879,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # A forged carry drops an old FAIL (600): the live count holds it, so
         # the merged listing is one short and every page is read.
         fail = dated(named(EARLIER, "fail"), 2, 600, self.base_at - timedelta(days=2))
-        self.write_carry(self.base)
+        self.write_saved(self.base)
         fake = self.fake(fail)
         reader, evidence = self.judge(fake)
         self.assertEqual(evidence.refusal, "verify:earlier-fail")
@@ -4711,7 +4896,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # incremental first page, no wait, then the whole listing, which still
         # holds the dropped FAIL.
         fail = dated(named(EARLIER, "fail"), 2, 600, self.base_at - timedelta(days=2))
-        self.write_carry(self.base)
+        self.write_saved(self.base)
         fake = self.fake(fail)
         with mock.patch.dict(
             "os.environ", {"BABYSIT_VERIFY_NO_INCREMENTAL_WAITS": "1"}
@@ -4721,8 +4906,8 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         self.assertEqual(reader.listing_mode, "full")
         self.assertEqual((fake.pages(), fake.full_listings()), (1 + 1, 1))
         self.sleep.assert_not_called()
-        # Any other value keeps the waits (with no listing saved by the first).
-        self.saved.unlink()
+        # Any other value keeps the waits (the base saved again).
+        self.write_saved(self.base)
         self.sleep.reset_mock()
         with mock.patch.dict(
             "os.environ", {"BABYSIT_VERIFY_NO_INCREMENTAL_WAITS": "true"}
@@ -4737,7 +4922,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         whose pages miss GitHub's live count, a count no whole listing fits in
         the 105 s its 120 s kill limit leaves. The miss outlasts the waits
         unless a test ends it."""
-        self.write_carry(self.base)
+        self.write_saved(self.base)
         fake = self.miss = self.fake()
         fake.live_total = 12_000
         with (
@@ -4787,7 +4972,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         for label, failure in failures.items():
             with self.subTest(label):
                 self.saved.unlink(missing_ok=True)
-                self.write_carry(self.base)
+                self.write_saved(self.base)
                 fake = self.fake(dated(named(HEAD, "fail"), 2, 1100, LISTED_AT))
                 first = [True]
 
@@ -4817,7 +5002,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         self, times: int, failure: Any
     ) -> tuple[ve.Reader, ve.Evidence, FakeGitHub]:
         """The first incremental page fails with `failure` `times` times."""
-        self.write_carry(self.base)
+        self.write_saved(self.base)
         fake = self.fake(dated(named(HEAD, "fail"), 2, 1100, LISTED_AT))
         left = [times]
 
@@ -4872,7 +5057,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # The first read's live count is one more than its pages hold, as
         # when a page boundary moves during the read; the next read holds it
         # and no page is listed whole.
-        self.write_carry(self.base)
+        self.write_saved(self.base)
         fake = self.fake(dated(named(HEAD, "fail"), 2, 1100, LISTED_AT))
         rest, off = fake.rest, [len(self.base) + 2]
 
@@ -4890,7 +5075,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
     def misses_then_reads(self, misses: int) -> tuple[FakeGitHub, str]:
         """GitHub's live count one more than the pages hold on the first
         `misses` incremental reads, then right; the judge's stderr."""
-        self.write_carry(self.base)
+        self.write_saved(self.base)
         fake = self.fake(dated(named(HEAD, "fail"), 2, 1100, LISTED_AT))
         rest, off = fake.rest, [len(self.base) + 2] * misses
 
@@ -4953,7 +5138,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         with mock.patch.object(
             ve, "_listing_clock", side_effect=lambda: next(clock, 300.0)
         ):
-            self.write_carry(self.base)
+            self.write_saved(self.base)
             fake = self.fake(dated(named(HEAD, "fail"), 2, 1100, LISTED_AT))
             fake.live_total = len(self.base) + 2
             reader, _ = self.judge(fake)
@@ -4965,17 +5150,17 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # an entry GitHub no longer counts, which no further listing drops.
         for delta, reads in ((-1, 1), (1, ve.LISTING_READS)):
             with self.subTest(delta):
-                self.write_carry(self.base)
-                self.saved.unlink(missing_ok=True)
+                self.write_saved(self.base)
                 self.failed.unlink(missing_ok=True)
                 fake = self.fake()
                 fake.live_total = len(self.base) + delta
+                base_text = self.saved.read_text()
                 reader, evidence = self.judge(fake)
                 self.assertEqual(evidence.refusal, "verify:unreadable")
                 self.assertIn("live artifact count", evidence.detail or "")
                 self.assertEqual(reader.listing_mode, "full")
                 self.assertEqual(fake.full_listings(), reads)
-                self.assertFalse(self.saved.exists())
+                self.assertEqual(self.saved.read_text(), base_text)
 
     def skewed(self, lead: timedelta = timedelta(minutes=30)) -> FakeGitHub:
         """GitHub as on 2026-11-01 08:00-09:00Z: its count drops artifacts up
@@ -4991,7 +5176,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         ]
         dropping = dated("pr-merge-gate-cursor", 3, 650, old, expires=soon)
         ahead = dated("pr-merge-gate-cursor", 3, 1100, LISTED_AT + timedelta(hours=1))
-        self.write_carry([*self.base, *dropped])
+        self.write_saved([*self.base, *dropped])
         fake = self.fake(ahead, dropping)
         listed = fake.listed
 
@@ -5023,13 +5208,14 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # Dropped three hours before expiry, past EARLY_DELETION_LEAD: no page
         # near expiry is read, and the over-count goes to one whole listing.
         fake = self.skewed(timedelta(hours=3))
+        base_text = self.saved.read_text()
         reader, evidence = self.judge(fake)
         self.assertEqual(evidence.refusal, "verify:unreadable")
         self.assertIn("held more artifacts than", evidence.detail or "")
         self.assertEqual(reader.listing_mode, "full")
         # Another whole listing only adds ids, so it would hold 650 too.
         self.assertEqual(fake.full_listings(), 1)
-        self.assertFalse(self.saved.exists())
+        self.assertEqual(self.saved.read_text(), base_text)
         self.assertIn("held more artifacts than", self.failed.read_text())
         # The job's next Reader, in this process or another, pages nothing.
         listed = (fake.pages(), fake.full_listings())
@@ -5224,7 +5410,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
     ) -> None:
         # After the skew: a FAIL and another upload stamped an hour ahead of
         # the runner's clock, and a count that holds.
-        self.write_carry(self.base)
+        self.write_saved(self.base)
         ahead = LISTED_AT + timedelta(hours=1)
         fake = self.fake(
             dated(named(HEAD, "fail"), 2, 1100, ahead),
@@ -5243,8 +5429,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
             (timedelta(hours=3, seconds=1), "full"),
         ):
             with self.subTest(age):
-                self.write_carry(self.base, LISTED_AT - age)
-                self.saved.unlink(missing_ok=True)
+                self.write_saved(self.base, LISTED_AT - age)
                 fake = self.fake()
                 reader, _ = self.judge(fake)
                 self.assertEqual(reader.listing_mode, mode)
@@ -5267,8 +5452,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
             ),
         ):
             with self.subTest(text[:60]):
-                self.carry.write_text(text)
-                self.saved.unlink(missing_ok=True)
+                self.saved.write_text(text)
                 fake = self.fake()
                 reader, _ = self.judge(fake)
                 self.assertEqual(reader.listing_mode, "full")
@@ -5284,8 +5468,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
     def test_a_failed_page_read_lists_every_page(self) -> None:
         for error in ("gh: Bad Gateway (HTTP 502)", "gh: Not Found (HTTP 404)"):
             with self.subTest(error):
-                self.write_carry(self.base)
-                self.saved.unlink(missing_ok=True)
+                self.write_saved(self.base)
                 self.failed.unlink(missing_ok=True)
                 fake = self.fake(dated(named(HEAD, "fail"), 2, 1100, LISTED_AT))
                 fake.page_fail = error
@@ -5297,7 +5480,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
                 self.assertEqual(fake.full_listings(), 1)
 
     def test_a_page_with_no_date_or_an_odd_entry_lists_every_page(self) -> None:
-        self.write_carry(self.base)
+        self.write_saved(self.base)
         fake = self.fake()
 
         def undated(args: list[str], **kwargs: Any) -> Any:
@@ -5344,7 +5527,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
         # The carry holds an undated FAIL below the pages read now: no date
         # prunes it, and the incremental listing still holds the live count.
         fail = self.undated(named(HEAD, "fail"), 2, 850)
-        self.write_carry([*self.base[:2], fail, *self.base[2:]])
+        self.write_saved([*self.base[:2], fail, *self.base[2:]])
         fake = self.fake(fail)
         reader, evidence = self.judge(fake)
         self.assertEqual(evidence.refusal, "verify:fail")
@@ -5354,7 +5537,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
     def test_an_undated_upload_since_is_read_and_paging_stops_on_dated_ones(
         self,
     ) -> None:
-        self.write_carry(self.base)
+        self.write_saved(self.base)
         fake = self.fake(self.undated(named(HEAD, "fail"), 2, 1100))
         reader, evidence = self.judge(fake)
         self.assertEqual(evidence.refusal, "verify:fail")
@@ -5364,7 +5547,7 @@ class TheListingBuildsOnACarriedOne(unittest.TestCase):
     def test_a_refresh_builds_on_the_listing_it_drops(self) -> None:
         # The gate's re-list before an allow (babysit_merge.py `refresh`)
         # pages only past the run's own listing.
-        self.write_carry(self.base)
+        self.write_saved(self.base)
         fake = self.fake()
         page = lambda args, **kwargs: (fake(args, **kwargs), {"date": DATE})  # noqa: E731
         with (
@@ -5480,10 +5663,10 @@ class AnExactCountChecksItsEntriesNearExpiry(unittest.TestCase):
     do not settle is refused, and a listing with none near expiry reads
     nothing more."""
 
-    setUp = TheListingBuildsOnACarriedOne.setUp
-    write_carry = TheListingBuildsOnACarriedOne.write_carry
-    fake = TheListingBuildsOnACarriedOne.fake
-    judge = TheListingBuildsOnACarriedOne.judge
+    setUp = TheListingBuildsOnASavedOne.setUp
+    write_saved = TheListingBuildsOnASavedOne.write_saved
+    fake = TheListingBuildsOnASavedOne.fake
+    judge = TheListingBuildsOnASavedOne.judge
 
     def entry(self, artifact_id: int, expires: timedelta | None = None) -> Any:
         """An old gate cursor, expiring `expires` after the runner's clock."""
@@ -5548,7 +5731,7 @@ class AnExactCountChecksItsEntriesNearExpiry(unittest.TestCase):
         # so the count is one short. A short count reads again after each
         # wait, as for a skip in the fresh pages; this one is the carry's, so
         # every read stays short and the whole listing holds the FAIL.
-        self.write_carry([*self.base, self.entry(600, timedelta(minutes=30))])
+        self.write_saved([*self.base, self.entry(600, timedelta(minutes=30))])
         fake = self.fake(self.earlier_fail(750))
         reader, evidence = self.judge(fake)
         self.assertEqual(evidence.refusal, "verify:earlier-fail", evidence.detail)
@@ -5580,7 +5763,7 @@ class AnExactCountChecksItsEntriesNearExpiry(unittest.TestCase):
         # whole listing's top-up, which keeps 650, takes page 3 again under a
         # cap of its own, and settles.
         near = self.entry(650, timedelta(minutes=30))
-        self.write_carry([*self.base, near, self.entry(600, timedelta(minutes=30))])
+        self.write_saved([*self.base, near, self.entry(600, timedelta(minutes=30))])
         fake = self.fake(self.earlier_fail(750), near)
         with mock.patch.object(ve, "NEAR_EXPIRY_PAGE_CAP", 6):
             reader, evidence = self.judge(fake)
@@ -5596,7 +5779,7 @@ class AnExactCountChecksItsEntriesNearExpiry(unittest.TestCase):
         # A short count is never kept, so it waits and reads again as before;
         # only the whole listing's exact top-up reads 600's page.
         near = self.entry(600, timedelta(minutes=30))
-        self.write_carry([*self.base, near])
+        self.write_saved([*self.base, near])
         fake = self.fake(self.earlier_fail(750), near)
         reader, evidence = self.judge(fake)
         self.assertEqual(evidence.refusal, "verify:earlier-fail", evidence.detail)
@@ -5608,7 +5791,7 @@ class AnExactCountChecksItsEntriesNearExpiry(unittest.TestCase):
 
     def test_an_exact_count_with_none_near_expiry_reads_nothing_more(self) -> None:
         # 600 expires three hours on, past EARLY_DELETION_LEAD: page 1 alone.
-        self.write_carry([*self.base, self.entry(600, timedelta(hours=3))])
+        self.write_saved([*self.base, self.entry(600, timedelta(hours=3))])
         fake = self.fake(self.entry(600, timedelta(hours=3)))
         reader, evidence = self.judge(fake)
         self.assertIsNone(evidence.refusal, evidence.detail)
@@ -5625,7 +5808,7 @@ class AnExactCountChecksItsEntriesNearExpiry(unittest.TestCase):
         # caps alone left it unsettled, so nothing is noted for the job and
         # the next Reader, its caps fresh, settles the count and allows.
         near = self.entry(600, timedelta(minutes=30))
-        self.write_carry([*self.base, near])
+        self.write_saved([*self.base, near])
         fake = self.fake(near)
         stderr = io.StringIO()
         with (
@@ -5691,9 +5874,7 @@ class AnExactCountChecksItsEntriesNearExpiry(unittest.TestCase):
                     mock.patch.object(ve, "NEAR_EXPIRY_PAGE_CAP", 1000),
                     mock.patch.object(ve, "NEAR_EXPIRY_ID_READ_CAP", 1000),
                     mock.patch.object(ve, "_elapsed", return_value=0.0),
-                    mock.patch.object(
-                        ve, "_listing_clock", side_effect=lambda: now[0]
-                    ),
+                    mock.patch.object(ve, "_listing_clock", side_effect=lambda: now[0]),
                     mock.patch.object(postmerge, "gh_capture", side_effect=listing),
                     mock.patch.object(ve, "gh_api_with_headers", side_effect=page),
                     contextlib.redirect_stderr(stderr),
@@ -7182,9 +7363,8 @@ class TheHeadRefMapSparesASweepItsDownloads(unittest.TestCase):
 class APrMergeTickListsOnlyBeforeAnAllowOrAKeep(unittest.TestCase):
     """Artifact listings and requests per pr-merge tick, each job's printed as
     a `babysit-gh-calls` line, in a repository shaped like 2026-10-27's: 6,240
-    artifacts uploaded four a minute, and the listing the last tick saved 15
-    minutes before as the carried base. The merge job's skip filter lists
-    first; then 17 gate candidates 20 seconds apart while uploads go on:
+    artifacts uploaded four a minute, and each job starting with no saved
+    listing. The merge job's skip filter lists first; then 17 gate candidates 20 seconds apart while uploads go on:
     eight refused by a FAIL at their head, seven whose verdict allows and
     whose risk score then refuses, two allowed; with one queued entry that
     each gate judges again once its keep is over `run_cache.MAX_AGE` old, or
@@ -7220,21 +7400,6 @@ class APrMergeTickListsOnlyBeforeAnAllowOrAKeep(unittest.TestCase):
             fake.records[fail] = record(n, sha, verdict="fail", head_ref=f"b{n}")
             self.upload(fake, fail, run_id, self.START - timedelta(minutes=40))
         self.fake = fake
-        # The last tick's listing, read 15 minutes before this one.
-        carried_at = self.START - timedelta(minutes=15)
-        self.carry = self.dir / "carry.json"
-        self.carry.write_text(
-            json.dumps(
-                {
-                    "fetchedAt": carried_at.isoformat(),
-                    "artifacts": [
-                        a
-                        for a in fake.artifacts
-                        if ve._when(a["created_at"]) <= carried_at
-                    ],
-                }
-            )
-        )
         for patcher in (
             mock.patch.object(ve, "_wall_clock", side_effect=lambda: self.clock[0]),
             mock.patch.object(run_cache, "now", side_effect=lambda: self.clock[0]),
@@ -7315,7 +7480,6 @@ class APrMergeTickListsOnlyBeforeAnAllowOrAKeep(unittest.TestCase):
             {
                 "BABYSIT_RUN_CACHE": str(self.dir / f"{job}-run.json"),
                 ve.LISTING_ENV: str(self.dir / f"{job}-listing.json"),
-                ve.LISTING_CARRY_ENV: str(self.carry),
                 ve.TOKEN_ENV: "job-token",
             },
         )
@@ -7336,10 +7500,10 @@ class APrMergeTickListsOnlyBeforeAnAllowOrAKeep(unittest.TestCase):
             mock.patch.object(gh, "run_command", side_effect=self.answer),
         ):
             # The skip filter (babysit_merge_skip.py filter) lists first, on
-            # the carried listing, and saves it for the gate.
+            # an empty job listing, and saves it for the gate.
             skip = ve.Reader(REPO, "main")
             skip.listing()
-            self.assertEqual(skip.listing_mode, "incremental")
+            self.assertEqual(skip.listing_mode, "full")
             self.skip_calls = gh.gh_call_counts()
             refused = iter(self.refused())
             for i, kind in enumerate(kinds):
@@ -7402,9 +7566,10 @@ class APrMergeTickListsOnlyBeforeAnAllowOrAKeep(unittest.TestCase):
         self.assertEqual(
             refusals.count(None), len(self.KINDS) - self.KINDS.count("fail")
         )
-        # The skip filter's listing and each allowed candidate's own: no
-        # refused candidate lists, whatever the saved listing's age.
-        self.assertEqual(self.listings, 1 + self.KINDS.count("allow"))
+        # The skip filter's whole listing and its top-up's first page, and
+        # each allowed candidate's own: no refused candidate lists, whatever
+        # the saved listing's age.
+        self.assertEqual(self.listings, 2 + self.KINDS.count("allow"))
 
     def test_the_merge_job_with_a_queued_entry(self) -> None:
         counts, refusals = self.merge_job(queued=True)
@@ -7422,24 +7587,34 @@ class APrMergeTickListsOnlyBeforeAnAllowOrAKeep(unittest.TestCase):
         return self.listings
 
     def test_a_slow_merge_job_with_an_empty_queue(self) -> None:
-        # The skip filter's listing, and the allowed candidate's own.
-        self.assertEqual(self.slow_merge_job(False), 2)
+        # The skip filter's whole listing and its top-up, and the allowed
+        # candidate's own.
+        self.assertEqual(self.slow_merge_job(False), 3)
 
     def test_a_slow_merge_job_with_a_queued_entry(self) -> None:
         # The queued keeps at 6 and 10 minutes find the listing past the
         # bound and list again; the allow at 12 lists on its own.
-        self.assertEqual(self.slow_merge_job(True), 4)
+        self.assertEqual(self.slow_merge_job(True), 5)
 
     def test_enable_auto_merge(self) -> None:
         counts, refusals = self.arm_job()
         self.report("enable-auto-merge", counts)
         self.assertEqual(refusals, [None, *["verify:fail"] * 4])
-        self.assertEqual(self.listings, 1)
+        # One whole listing for the five Readers, and its top-up's first page.
+        self.assertEqual(self.listings, 2)
 
 
 class EvidenceCommandTest(unittest.TestCase):
     """`evidence <number> <head>` prints the gate's judgment for
     enable-auto-merge.mjs, which arms only on a null refusal."""
+
+    def setUp(self) -> None:
+        # `evidence` requires --base-sha and reads the config there.
+        config = policy.PipelineConfig(EARLIER, "C2", "pr-merge", None, None, (), None)
+        for name in ("read_config_at", "_default_branch_config"):
+            patcher = mock.patch.object(policy, name, return_value=config)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def run_main(
         self, argv: list[str], evidence: ve.Evidence
@@ -7461,19 +7636,20 @@ class EvidenceCommandTest(unittest.TestCase):
             self.assertEqual(ve.main(argv), 0)
         return json.loads(out.getvalue()), seen[0]
 
-    def test_a_pass_prints_a_null_refusal_under_the_given_cap(self) -> None:
+    def test_a_pass_prints_a_null_refusal_under_the_base_cap(self) -> None:
         report, reader = self.run_main(
-            ["evidence", "--repo", REPO, "--max-fails", "2", str(PR), HEAD],
+            ["evidence", "--base-sha", EARLIER, "--repo", REPO, str(PR), HEAD],
             ve.Evidence(None, HEAD, (ve.Verdict(HEAD, "pass", 1),), 0),
         )
         self.assertEqual((report["refusal"], report["head"]), (None, HEAD))
         self.assertEqual(
-            (reader.repo, reader.branch, reader.max_fails), (REPO, "main", 2)
+            (reader.repo, reader.branch, reader.max_fails),
+            (REPO, "main", policy.MAX_VERIFY_FAILS),
         )
 
     def test_a_repeated_fail_prints_its_refusal(self) -> None:
         report, _ = self.run_main(
-            ["evidence", "--repo", REPO, str(PR), HEAD],
+            ["evidence", "--base-sha", EARLIER, "--repo", REPO, str(PR), HEAD],
             ve.Evidence(ve.REPEATED_FAIL, HEAD, (), 0, "fails at 3 heads"),
         )
         self.assertEqual(report["refusal"], ve.REPEATED_FAIL)
@@ -7493,10 +7669,10 @@ class EvidenceCommandTest(unittest.TestCase):
             with self.subTest(refusal):
                 self.assertIs(ve.Evidence(refusal, HEAD, (), 0).needs_human, person)
 
-    def test_a_short_head_or_a_zero_cap_is_refused(self) -> None:
+    def test_a_short_head_or_no_base_is_refused(self) -> None:
         for argv in (
-            ["evidence", "--repo", REPO, str(PR), "abc"],
-            ["evidence", "--repo", REPO, "--max-fails", "0", str(PR), HEAD],
+            ["evidence", "--base-sha", EARLIER, "--repo", REPO, str(PR), "abc"],
+            ["evidence", "--repo", REPO, str(PR), HEAD],
         ):
             with (
                 contextlib.redirect_stderr(io.StringIO()),
@@ -7511,6 +7687,12 @@ class EvidenceCommandReadsAsTheGateDoes(unittest.TestCase):
     FAIL cap is the lower of the base's and the default branch head's."""
 
     def setUp(self) -> None:
+        # `evidence` requires --base-sha and reads the config there.
+        _config = policy.PipelineConfig(EARLIER, "C2", "pr-merge", None, None, (), None)
+        for _name in ("read_config_at", "_default_branch_config"):
+            _patcher = mock.patch.object(policy, _name, return_value=_config)
+            _patcher.start()
+            self.addCleanup(_patcher.stop)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.path = str(pathlib.Path(tmp.name, "verify-listing.json"))
@@ -7525,7 +7707,16 @@ class EvidenceCommandReadsAsTheGateDoes(unittest.TestCase):
             mock.patch.object(postmerge, "gh_capture", side_effect=fake),
             contextlib.redirect_stdout(out),
         ):
-            argv = ["evidence", "--repo", REPO, *extra, str(PR), HEAD]
+            argv = [
+                "evidence",
+                "--base-sha",
+                EARLIER,
+                "--repo",
+                REPO,
+                *extra,
+                str(PR),
+                HEAD,
+            ]
             self.assertEqual(ve.main(argv, now=NOW), 0)
         return json.loads(out.getvalue())
 
@@ -7604,8 +7795,6 @@ class EvidenceCommandReadsAsTheGateDoes(unittest.TestCase):
                     "evidence",
                     "--repo",
                     REPO,
-                    "--max-fails",
-                    "9",
                     "--base-sha",
                     EARLIER,
                     str(PR),
@@ -7647,6 +7836,14 @@ class EvidenceCommandReadsTheLaneLink(unittest.TestCase):
     `refs-not-an-issue`, and a failed read refuses. A refused link reads no
     verdict."""
 
+    def setUp(self) -> None:
+        # `evidence` requires --base-sha and reads the config there.
+        config = policy.PipelineConfig(EARLIER, "C2", "pr-merge", None, None, (), None)
+        for name in ("read_config_at", "_default_branch_config"):
+            patcher = mock.patch.object(policy, name, return_value=config)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def cli(self, fake: FakeGitHub) -> dict[str, Any]:
         out = io.StringIO()
         with (
@@ -7655,7 +7852,16 @@ class EvidenceCommandReadsTheLaneLink(unittest.TestCase):
             mock.patch.object(policy, "gh_capture", side_effect=fake),
             contextlib.redirect_stdout(out),
         ):
-            argv = ["evidence", "--lane-link", "--repo", REPO, str(PR), HEAD]
+            argv = [
+                "evidence",
+                "--base-sha",
+                EARLIER,
+                "--lane-link",
+                "--repo",
+                REPO,
+                str(PR),
+                HEAD,
+            ]
             self.assertEqual(ve.main(argv, now=NOW), 0)
         return json.loads(out.getvalue())
 
@@ -7814,7 +8020,10 @@ class EvidenceCommandReadsTheLaneLink(unittest.TestCase):
             mock.patch.object(postmerge, "gh_capture", side_effect=fake),
             contextlib.redirect_stdout(out),
         ):
-            ve.main(["evidence", "--repo", REPO, str(PR), HEAD], now=NOW)
+            ve.main(
+                ["evidence", "--base-sha", EARLIER, "--repo", REPO, str(PR), HEAD],
+                now=NOW,
+            )
         self.assertNotIn("ineligible", json.loads(out.getvalue()))
 
 
