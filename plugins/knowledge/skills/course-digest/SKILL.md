@@ -1,0 +1,272 @@
+---
+description: "Online video course (Dometrain, Teachable) extracted lesson by lesson and synthesized into recommendations for the current repository; Pluralsight and Udemy URLs are recognized but have no adapter yet. Use when the user gives a course URL or asks to digest a course, to analyze an already extracted course, or to check or resume a course digest in progress. One public video goes to /knowledge:video-digest."
+argument-hint: "[extract|analyze|status|resume|continue] [url|slug]"
+user-invocable: true
+disable-model-invocation: false
+shell: bash
+---
+
+**Arguments.** `[extract|analyze|status|resume|continue] [url|slug]`. e.g., /knowledge:course-digest <url>, /knowledge:course-digest extract <url>, /knowledge:course-digest resume <slug>, /knowledge:course-digest status
+
+## Pre-computed context
+
+```!
+printf 'course-extraction deps: '; node -e "const fs=require('fs'),path=require('path'),p=process.argv[1];console.log(p&&fs.existsSync(path.join(p,'node_modules','@melodic','video-digestion'))?'installed':'MISSING - run setup-deps.mjs (see Prerequisites)')" "${CLAUDE_PLUGIN_DATA}" 2>/dev/null || echo "MISSING - node not found (see Prerequisites)"
+printf 'Playwright Chromium: '; node -e "const fs=require('fs'),path=require('path');const b=process.env.PLAYWRIGHT_BROWSERS_PATH||(process.argv[1]&&path.join(process.argv[1],'ms-playwright'));const ok=b&&fs.existsSync(b)&&fs.readdirSync(b).some(n=>n.startsWith('chromium'));console.log(ok?'installed':'MISSING - run setup-deps.mjs (see Prerequisites)')" "${CLAUDE_PLUGIN_DATA}" 2>/dev/null || echo "MISSING - node not found (see Prerequisites)"
+printf 'ffmpeg: '; command -v ffmpeg >/dev/null 2>&1 && ffmpeg -version 2>/dev/null | head -1 || command -v ffmpeg >/dev/null 2>&1 || echo "MISSING — install ffmpeg (see Prerequisites)"
+printf 'ImageMagick: '; command -v magick >/dev/null 2>&1 && magick -version 2>/dev/null | head -1 || command -v magick >/dev/null 2>&1 || echo "MISSING — install ImageMagick 7 (see Prerequisites)"
+```
+
+# Course Digest
+
+Transform online video courses into structured knowledge and actionable repo recommendations, without watching a single video.
+
+## How it works
+
+Uses browser automation (claude-in-chrome) to navigate course platforms, extract transcripts, capture screenshots of code/slides, and collect downloadable resources. Synthesizes raw content into analysis focused on what applies to the current repository.
+
+Where this skill says "deeper research," use whatever external-research capability your project provides. Repo conventions override course claims. Surface convention conflicts explicitly; never silently adopt a course's shortcut over team rules.
+
+## Emit checklist
+
+For any course digest run (multi-phase content acquisition + distillation + repo-applicability analysis), copy `templates/checklist.md` into `.work/<slug>/course-digest-checklist.md`. Tick each phase as completed.
+
+This skill's `.work/` root resolves through the knowledge plugin's own `library_dir` seam; slug conformance is form-only (kebab-case `[a-z0-9-]`, ≤ 40 chars, Windows-reserved base names take an `-x` suffix); and nested `<epic>/<slug>/` sub-slices are sanctioned. The root still self-ignores (a `.gitignore` containing `*`) and is never committed.
+
+## Prerequisites (verify before starting)
+
+1. **course-extraction deps**. `node "${CLAUDE_PLUGIN_ROOT}/skills/course-digest/extraction/setup-deps.mjs" --data-dir "${CLAUDE_PLUGIN_DATA}"`. Installs the pipeline's node dependencies into `${CLAUDE_PLUGIN_DATA}` (persists across plugin updates) and provisions Playwright's Chromium into `${CLAUDE_PLUGIN_DATA}/ms-playwright`. Idempotent. Safe to re-run, and re-run after a plugin update.
+2. **Platform auth**. Set `COURSE_EMAIL`/`COURSE_PASSWORD` (Dometrain → Clerk) or `TEACHABLE_EMAIL`/`TEACHABLE_PASSWORD` (Teachable) in your shell before invoking; they inherit into the pipeline's node subprocess. The env-var prefix is course-config-driven via `platformConfig.authEnvPrefix`. Session cookies persist under `${CLAUDE_PLUGIN_DATA}/auth/<platform>.auth-state.json` and are reused across runs. **Interactive manual login is the fallback** when no credentials are set. It opens a browser window for you to log in. NOTE: the manual-login prompt (`node:readline` + headed browser) may not function under headless plugin execution; env-var + cookie-reuse carry the skill regardless, and manual login is a known limitation there, not a blocker. These credentials live in shell environment variables, not in plugin `userConfig`: this plugin's `userConfig` options are non-secret scalars, and a stored option value is not a secret store.
+3. **ffmpeg**, required for video frame extraction (scene detection, interval capture). Check: `ffmpeg -version`. Install: `winget install Gyan.FFmpeg` (Windows), `brew install ffmpeg` (macOS), `sudo apt install ffmpeg` (Linux). Floor 7.1+ (newer codecs, AV1, Opus, degrade or fail below this).
+4. **ImageMagick 7**, required by `classify-frames.js` for contact sheet generation (`magick montage`). Check: `magick -version`. Install: `winget install ImageMagick.ImageMagick` (Windows), `brew install imagemagick` (macOS), `sudo apt install imagemagick` (Linux). Ubuntu <26.04 ships v6. V7 may require building from source.
+5. **claude-in-chrome MCP**. Needed for Phase 1 (course discovery) and frame extraction HLS URL retrieval. Run `tabs_context_mcp` as preflight.
+
+If any prerequisite fails, stop and inform the user. Re-run `setup-deps.mjs` for the node dependencies + Chromium; the media binaries (ffmpeg, ImageMagick) are OS-level installs via your platform's package manager per the commands above.
+
+## Running the pipeline scripts
+
+Every extraction script runs through the launcher, which resolves the vendored node dependencies from the data directory its leading `--data-dir` names and pins Playwright's browser path:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/skills/course-digest/extraction/run.mjs" --data-dir "${CLAUDE_PLUGIN_DATA}" <script.js> [args…]
+```
+
+Gate on `setup-deps.mjs` first (Prerequisites above).
+
+### Consolidated extraction (Phases 1-2)
+
+The Playwright batch script handles transcripts, video frame extraction, and course metadata in a single run:
+
+```bash
+# Full extraction: transcripts + frames + metadata
+node "${CLAUDE_PLUGIN_ROOT}/skills/course-digest/extraction/run.mjs" --data-dir "${CLAUDE_PLUGIN_DATA}" extract-course.js --course-dir <path-to-course-data> --extract-frames
+
+# Transcripts only (faster, no ffmpeg needed)
+node "${CLAUDE_PLUGIN_ROOT}/skills/course-digest/extraction/run.mjs" --data-dir "${CLAUDE_PLUGIN_DATA}" extract-course.js --course-dir <path-to-course-data>
+
+# Frames only (skip transcripts already extracted)
+node "${CLAUDE_PLUGIN_ROOT}/skills/course-digest/extraction/run.mjs" --data-dir "${CLAUDE_PLUGIN_DATA}" extract-course.js --course-dir <path-to-course-data> --extract-frames --skip-transcripts
+
+# Course metadata only
+node "${CLAUDE_PLUGIN_ROOT}/skills/course-digest/extraction/run.mjs" --data-dir "${CLAUDE_PLUGIN_DATA}" extract-course.js --course-dir <path-to-course-data> --metadata-only
+```
+
+Script uses Playwright's bundled Chromium with a fresh temp context (not Chrome itself. Chrome 136+ blocks CDP on default profiles). Auth handled via `addCookies()` after context launch: with credentials set it logs in and saves state; subsequent runs inject cached cookies automatically. Skips already-extracted lessons (crash-safe, resumable). Runs headless by default (`--show-browser` to show the browser).
+
+**Key technical details:**
+
+- Uses `--disable-blink-features=AutomationControlled` to bypass automation detection on course platform logins
+- Chrome profiles are NOT used. Playwright's own Chromium with a dedicated temp context dir in the OS temp directory
+- Auth state saved to `${CLAUDE_PLUGIN_DATA}/auth/<platform>.auth-state.json` (session expiry depends on the platform's auth provider, configured in `platformConfig.authWarnDays`)
+- HLS video URLs captured via DOM read from the video player element (selector from `platformConfig.videoPlayerSelector`). No claude-in-chrome needed
+- Frame extraction via ffmpeg scene detection (threshold 0.1), with interval fallback for sparse results
+- Content type derived from extraction results (scene detection = code, interval + high dup = talking head). No manual tagging
+- Progress tracking with per-lesson elapsed time, ETA, structured `run-report.json` output
+- SIGINT handler saves progress on Ctrl+C. No work lost on interruption
+
+**Long-running extractions (50+ lessons):** a large course can outlast a single Bash call, so run the
+extraction in the background; it resumes by rerunning the same command:
+
+```bash
+# Run in the background so the extraction does not hold a foreground call
+nohup node "${CLAUDE_PLUGIN_ROOT}/skills/course-digest/extraction/run.mjs" --data-dir "${CLAUDE_PLUGIN_DATA}" extract-course.js --course-dir <path> > extraction.log 2>&1 &
+echo $!  # save PID
+
+# Monitor progress periodically
+tail -20 extraction.log
+
+# Check run report after completion
+cat <course-dir>/run-report.json
+```
+
+If the run is stopped, start the same command again: it skips lessons already extracted.
+
+- **Pointer**: for the current foreground timeout and background time limits, fetch
+  <https://code.claude.com/docs/en/tools-reference#timeout-and-output-limits> live.
+- **As of**: 2026-10-18
+- **Recheck trigger**: that section or its background-command time-limit section changes.
+
+## Platform detection and adapter architecture
+
+Extraction pipeline uses a **provider adapter pattern**. Platform-specific code lives in adapter modules (`extraction/adapters/{platform}.js`). The orchestrator (`extract-course.js`) delegates to adapters via a contract. Zero platform-specific code in the orchestrator.
+
+**Architecture:**
+
+```text
+extraction/
+  adapters/
+    adapter-contract.js       # JSDoc interface + validation + factory
+    dometrain.js              # Thin adapter: composes mux (player) + clerk (auth)
+    teachable.js              # Thin adapter: composes hotmart (player) + teachable-sso (auth)
+  lib/
+    players/
+      hotmart.js              # Hotmart HLS: intercept, iframe subtitle fetch, canvas frames
+      mux.js                  # Mux: DOM src read from mux-player element
+    auth/
+      clerk.js                # Clerk two-step login flow
+      teachable-sso.js        # Teachable simple form login flow
+    auth-store.js             # Resolves per-platform auth-state path under ${CLAUDE_PLUGIN_DATA}
+    browser.js                # Shared Playwright launch, cookie injection, auth age check
+    validators.js             # extraction validators
+    config.js                 # platformConfig validation, adapter resolution
+  # shared kernel + transcript: @melodic/video-digestion (vendored plugin-wide under ../../vendor/)
+  extract-course.js           # Orchestrator only — delegates to adapter + lib
+  discover-resources.js       # Discovery tool — uses adapter.detectResources()
+  download-resources.js       # Download lesson resources (ZIPs, PDFs) from resources.json
+  build-course-json.js        # Teachable-specific: scaffold course.json from curriculum page
+  classify-frames.js          # Frame classification (provider-agnostic, no adapter needed)
+  generate-manifests.js       # Manifest generation (provider-agnostic, no adapter needed)
+  utils.js                    # Provider-agnostic utilities only
+```
+
+Adapters are thin composition layers. Delegate to shared `lib/players/` and `lib/auth/` modules for reusable tech-layer concerns, keeping only platform-specific DOM selectors, URL patterns, and orchestration logic.
+
+**Every adapter method returns `Result`** (`ok`/`fail` from `@melodic/video-digestion/shared/result`). Explicit success/failure with timing, operation name, context. No silent catches, no null returns.
+
+| URL pattern | Platform | Adapter | Reference |
+|---|---|---|---|
+| `dometrain.com` | Dometrain | `adapters/dometrain.js` | [reference/adapters/dometrain.md](reference/adapters/dometrain.md) |
+| `*.teachable.com`, `courses.*.tech` | Teachable (Hotmart video) | `adapters/teachable.js` | [reference/adapters/teachable.md](reference/adapters/teachable.md) |
+| Single public YouTube videos | | use /knowledge:video-digest | |
+| `pluralsight.com` | Pluralsight | no adapter | Report that no adapter exists and stop; adding one starts at [reference/adapters/discovery-checklist.md](reference/adapters/discovery-checklist.md) |
+| `udemy.com` | Udemy | no adapter | Report that no adapter exists and stop; adding one starts at [reference/adapters/discovery-checklist.md](reference/adapters/discovery-checklist.md) |
+
+**To add a new platform adapter:** follow [Provider Discovery Checklist](reference/adapters/discovery-checklist.md) to explore the platform systematically, then create `adapters/{platform}.js` implementing the 5 required methods (`extractTranscript`, `extractHlsUrl`, `detectResources`, `deriveLandingUrl`, `buildLessonUrl`). Compose from shared modules where the tech stack matches, e.g., a new platform using Hotmart video + Clerk auth would `import * as hotmart from "../lib/players/hotmart.js"` and `import * as clerk from "../lib/auth/clerk.js"`, then delegate player/auth methods while implementing only platform-specific DOM selectors and URL patterns. Add the platform to `course.json` `platform` field; the factory auto-discovers it via dynamic import. The discovery checklist also serves as regression guide when existing adapters break.
+
+## The pipeline
+
+Follow the 8-phase workflow in [context/workflow.md](context/workflow.md), each building on the previous. Discover → Extract → Process Frames → Analyze Code Repo → Validate → Synthesize → Analyze → Recommend (phases 1, 2, 2b, 2c, 2d, 3, 4, 5). Phases 1-2d are extraction (browser + CLI); 3-5 are analysis (LLM-heavy, parallelizable across modules). Storage runs continuously throughout.
+
+All context (transcripts + frames + code repo) must be gathered before Phase 3.
+Module summaries note their context level: `[transcript-only]`, `[transcript+frames]`, `[full-context]`.
+
+### Phase 3 modalities (`[full-context]` requires all three)
+
+Synthesis combines three modalities. Transcript (`transcript.md`), visual frames (PNG files + `manifest.json`), and companion code (`code/repo/<section>/`). Each module gets parallel agents (transcript + visual + code exploration), then a synthesis pass. Full modality table + multi-agent approach: [context/workflow.md](context/workflow.md) Phase 3.
+
+Multi-modal extraction gaps beyond these three (code OCR from frames, slide-text extraction, audio re-transcription) are evaluated with priority and effort in [context/multimodal-evaluation.md](context/multimodal-evaluation.md).
+
+### Dedup semantics
+
+Dedup phase (`classify-frames.js --phase dedup`) **reports** near-duplicates but does NOT
+delete frame files. Actual frame curation happens in `generate-manifests.js` which sets
+`keep: true/false` per frame. Frame PNG files remain on disk. Manifests define which frames to use
+during synthesis.
+
+### Phase tracking
+
+`course.json` includes a `phases` object recording which pipeline phases have completed and
+when. Each phase is `null` (not started) or an object with `completedAt` timestamp and
+phase-specific metrics. On resume, check which phases are non-null to skip completed work.
+
+### Repo freshness caveat
+
+Companion GitHub repos may be updated after course publication; classify transcript/code discrepancies per [context/workflow.md](context/workflow.md) "Freshness verification". **All course action items require external research verification before adoption**. Course content is a starting point for research, not a final answer.
+
+## Invocation patterns
+
+Skill supports different scopes:
+
+| User says | Action |
+|---|---|
+| `/knowledge:course-digest <url>` | Full pipeline. Discover + extract all + analyze |
+| `/knowledge:course-digest extract <url>` | Phases 1-2 only. Extract raw content, skip analysis |
+| `/knowledge:course-digest analyze <slug>` | Phases 3-5 only. Analyze previously extracted content |
+| `/knowledge:course-digest status` | Show all digested courses and their completion state |
+| `/knowledge:course-digest resume <slug>` | Resume extraction from where it left off (reads course.json phases) |
+| `/knowledge:course-digest continue <slug>` | Continue from a prior session. Reads continuation prompt file |
+| `/knowledge:course-digest` (no args) | Auto-detect: check for in-progress courses, resume the most recent |
+
+### Session continuation protocol
+
+After every module, and whenever a session ends mid-pipeline:
+
+1. **Write a continuation prompt** to `<course-dir>/continuation-prompt.md`
+2. Include: what was completed, what remains, task-by-task breakdown, known issues, quality notes
+3. Update `course.json` phase markers with timestamps
+
+At a module boundary, route the next step with `/session-flow:workflow`. Give it the facts a
+compaction focus needs: the course slug, the next module, and the `course.json` path. A new
+session resumes with `/knowledge:course-digest continue <slug>`.
+
+Without session-flow, the user picks the next step from the docs.
+
+- **Pointer**: for when context fills up, see
+  <https://code.claude.com/docs/en/context-window#when-your-context-fills-up>.
+- **As of**: 2026-10-02
+- **Recheck trigger**: that section moves, or changes its `/compact` or `/clear` guidance.
+
+The `continue` action reads the continuation prompt and reconstructs task context. No args defaults to checking `course.json` for the most recent in-progress course.
+
+## Pacing and user interaction
+
+Courses can have 60+ lessons. Processing all in one session may hit context limits.
+
+- **After discovering course structure** (Phase 1): present module/lesson list and ask user which modules to process, or confirm "all"
+- **After each module completes**: save progress immediately, a crash shouldn't lose work
+- **At a module boundary**: follow the [session continuation protocol](#session-continuation-protocol)
+
+## Analysis output format
+
+Repo-applicability analysis follows the template in [reference/analysis-template.md](reference/analysis-template.md). Key deliverables:
+
+- **`repo-candidates.md`**. Specific patterns/practices from the course that could improve the repository, with references to where in the course they're taught
+- **`action-items.md`**. Concrete next steps: rule candidates, skill suggestions, architecture patterns, testing practices, work-item candidates
+
+## Reference index. Load on demand
+
+| File | Load when |
+|------|-----------|
+| [reference/screenshot-strategy.md](reference/screenshot-strategy.md) | Before capturing frames in Phase 2 or curating them in Phase 2b. What earns a screenshot and what never does, the ffmpeg scene-detection pipeline with its threshold calibration, vision classification, and manifest generation |
+| [reference/analysis-template.md](reference/analysis-template.md) | Writing the Phase 5 repo-applicability analysis |
+| [reference/adapters/discovery-checklist.md](reference/adapters/discovery-checklist.md) | Adding a platform adapter, or an existing adapter broke and needs the same systematic walk as a regression guide |
+| [reference/adapters/dometrain.md](reference/adapters/dometrain.md) | Working on Dometrain extraction: selectors, auth, player specifics |
+| [reference/adapters/teachable.md](reference/adapters/teachable.md) | Working on Teachable or Hotmart-video extraction: selectors, auth, player specifics |
+
+## Spoke paths
+
+The `context/` files write this skill's directory as `<skill-dir>`, which is `${CLAUDE_SKILL_DIR}`,
+and the plugin data directory as `<plugin-data>`, which is `${CLAUDE_PLUGIN_DATA}`. Put those paths
+in place of the placeholders before running a command. Those files arrive through the Read tool as
+plain bytes, so a `${…}` token in them would reach the Bash tool unsubstituted, and the Bash tool's
+environment has no `CLAUDE_SKILL_DIR` to expand it from.
+
+Every `run.mjs` and `setup-deps.mjs` command takes the leading `--data-dir` flag shown above.
+The Bash tool's environment does not carry this plugin's `CLAUDE_PLUGIN_DATA`, and another
+plugin's SessionStart hook can put its own data directory there under that name. The scripts
+therefore take the directory from the flag, and accept an inherited value only when it names this
+plugin. Basis: the plugins reference,
+<https://code.claude.com/docs/en/plugins/manifest-reference#where-each-variable-resolves>, verified
+2026-10-07; recheck when that table adds supporting files to where a `${…}` reference resolves, or
+lists the Bash tool among the processes that receive the variables.
+
+## Storage
+
+Generated course output lands under the invoking project's `library_dir` seam (or `${CLAUDE_PLUGIN_DATA}` when no library dir is configured), one self-contained directory per course slug. See [context/storage-schema.md](context/storage-schema.md) for the full directory structure.
+
+Rules:
+
+- No video or audio files. Transcripts and screenshots capture the content
+- Screenshots are PNG files. Keep small (resize to 1280px wide max)
+- Save progress incrementally, never buffer an entire course in memory
+- Each course is self-contained under its own slug directory

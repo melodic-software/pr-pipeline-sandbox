@@ -15,7 +15,7 @@ import { dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { main } from "./resolve-config.mjs";
+import { issueLaneWebHostsFromBase, main, resolveFromBase } from "./resolve-config.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = join(HERE, "resolve-config.mjs");
@@ -190,14 +190,19 @@ test("a valid config writes ResolvedConfig and the selected activity's outputs",
     gating: "gate",
     skill: "",
     script: "scripts/run-tests.sh",
-    model: "",
+    profile: "",
+    "claude-args": "",
+    "settings-json": "",
     "max-turns": "",
+    model: "",
+    effort: "",
     "reads-untrusted": "false",
     applies: "true",
     "skip-reason": "",
     contents: "read",
     "pull-requests": "read",
     issues: "read",
+    actions: "",
     "can-commit": "false",
   });
 });
@@ -205,7 +210,7 @@ test("a valid config writes ResolvedConfig and the selected activity's outputs",
 test("a mutate-branch activity can commit; args stay in the file only", async () => {
   const { env } = workspace();
   env.LANE = "pr-refine";
-  env.ACTIVITY = "fix-docs";
+  env.ACTIVITY = "fix-prose";
   assert.equal(await main({ env, github: noApi }), 0);
   const outputs = readOutputs(env.GITHUB_OUTPUT);
   assert.deepEqual(
@@ -214,6 +219,36 @@ test("a mutate-branch activity can commit; args stay in the file only", async ()
   );
   assert.equal(Object.hasOwn(outputs, "args"), false);
 });
+
+// A skill's launcher permission mode: dontAsk unless the leaf sets auto; a
+// script has none; any other value fails the schema.
+const withPermissionMode = (mode) => {
+  const { env } = workspace();
+  env.LANE = "pr-refine";
+  env.ACTIVITY = "fix-prose";
+  const path = join(env.BASE_PATH, CONFIG_PATH);
+  if (mode !== undefined) {
+    const config = readFileSync(path, "utf8");
+    const set = config.replace("    reads-untrusted: false\nlanes:", `    reads-untrusted: false\n    permission-mode: ${mode}\nlanes:`);
+    assert.notEqual(set, config);
+    writeFileSync(path, set);
+  }
+  return env;
+};
+
+test("a skill's permission-mode output is dontAsk unless the leaf sets auto", async () => {
+  for (const [mode, expected] of [[undefined, "dontAsk"], ["dontAsk", "dontAsk"], ["auto", "auto"]]) {
+    const env = withPermissionMode(mode);
+    assert.equal(await main({ env, github: noApi }), 0, String(mode));
+    assert.equal(readOutputs(env.GITHUB_OUTPUT)["permission-mode"], expected, String(mode));
+  }
+});
+
+for (const mode of ["bypassPermissions", "acceptEdits", "default", "plan"]) {
+  test(`permission-mode ${mode} fails the schema`, async (t) => {
+    await assertFailsRed(t, withPermissionMode(mode), /permission-mode/);
+  });
+}
 
 test("without an activity only enabled and slots are output", async () => {
   const { env } = workspace();
@@ -338,7 +373,7 @@ const REJECTIONS = [
     "rejection 7: a requested activity absent from the lane",
     /0 slots for activity/,
     {},
-    { ACTIVITY: "fix-docs" },
+    { ACTIVITY: "fix-prose" },
   ],
   [
     "rejection 7: a requested lane absent from the config",
@@ -467,7 +502,7 @@ test("changed-paths holds the head's changed files minus removed ones and the ba
     "/plugins/ai-slop/** @owner\n",
   );
   env.LANE = "pr-refine";
-  env.ACTIVITY = "fix-docs";
+  env.ACTIVITY = "fix-prose";
   const files = [
     { filename: "docs/kept.md", status: "modified" },
     { filename: "docs/gone.md", status: "removed" },
@@ -558,7 +593,7 @@ test("a config with no predicate makes no API call", async () => {
 
 // Labels, events and work classes
 
-// Gives valid.yaml's fix-docs activity (lane pr-refine) a predicate.
+// Gives valid.yaml's fix-prose activity (lane pr-refine) a predicate.
 function withPredicate(env, predicate) {
   const config = join(env.BASE_PATH, CONFIG_PATH);
   writeFileSync(
@@ -569,7 +604,7 @@ function withPredicate(env, predicate) {
     ),
   );
   env.LANE = "pr-refine";
-  env.ACTIVITY = "fix-docs";
+  env.ACTIVITY = "fix-prose";
 }
 
 test("labels come from the pull_request payload without an API call", async () => {
@@ -627,28 +662,11 @@ test("on an issues event, a missing label skips with not-applicable", async () =
   assert.equal(outputs["skip-reason"], "not-applicable");
 });
 
-test("labeled-after applies to an issue labeled after the cutover", async () => {
+test("labeled-after is not a predicate key: a config that sets it fails the schema", async (t) => {
   const { env } = workspace();
   issueEvent(env, { number: 7, labels: [], updated_at: "2026-10-20T00:00:01Z" });
   withPredicate(env, { "labeled-after": "2026-10-20T00:00:00Z" });
-  assert.equal(await main({ env, github: noApi }), 0);
-  assert.equal(readOutputs(env.GITHUB_OUTPUT).applies, "true");
-});
-
-test("labeled-after skips an issue labeled before the cutover with not-applicable", async () => {
-  const { env } = workspace();
-  issueEvent(env, { number: 7, labels: [], updated_at: "2026-10-19T23:59:59Z" });
-  withPredicate(env, { "labeled-after": "2026-10-20T00:00:00Z" });
-  assert.equal(await main({ env, github: noApi }), 0);
-  const outputs = readOutputs(env.GITHUB_OUTPUT);
-  assert.equal(outputs.applies, "false");
-  assert.equal(outputs["skip-reason"], "not-applicable");
-});
-
-test("labeled-after fails red off an issues event, which carries no label time", async (t) => {
-  const { env } = workspace();
-  withPredicate(env, { "labeled-after": "2026-10-20T00:00:00Z" });
-  await assertFailsRed(t, env, /needs labeledAt/);
+  await assertFailsRed(t, env, /fails the schema/);
 });
 
 test("on an issues event, labels-absent reads the issue's labels now", async () => {
@@ -663,13 +681,36 @@ test("on an issues event, labels-absent reads the issue's labels now", async () 
   assert.deepEqual(calls, ["GET /repos/melodic-software/claude-code-plugins/issues/7"]);
 });
 
-test("a work-classes predicate fails red: no run supplies work classes yet", async (t) => {
-  const { env } = workspace();
-  withPredicate(env, { "work-classes": ["C2"] });
-  await assertFailsRed(t, env, /needs workClasses/);
+// No predicate reads a work class: an agent-ready issue with no class and
+// one with a structural class both apply, read now from the issue.
+test("an agent-ready issue applies whatever work class it carries, or none", async () => {
+  for (const labelsNow of [["agent-ready"], ["agent-ready", "work-class: structural"]]) {
+    const { env } = workspace();
+    issueEvent(env, { number: 7, labels: [{ name: "agent-ready" }], updated_at: "2026-10-20T00:00:00Z" });
+    withPredicate(env, { events: ["labeled"], labels: ["agent-ready"], "labels-absent": ["needs-human"] });
+    const { github } = fakeGitHub({
+      "/repos/melodic-software/claude-code-plugins/issues/7": () => ({ number: 7, labels: labelsNow.map((name) => ({ name })) }),
+    });
+    assert.equal(await main({ env, github }), 0);
+    assert.equal(readOutputs(env.GITHUB_OUTPUT).applies, "true", labelsNow.join());
+  }
 });
 
-// valid.yaml's fix-docs (lane pr-refine) with prepare: merge-base and `extra`.
+// The work-class keys are gone, so a config that still gates on a class fails
+// the schema rather than gating nothing in silence.
+test("an admission or work-classes predicate fails the schema", async (t) => {
+  for (const predicate of [
+    { admission: { classes: ["work-class: read-only"] } },
+    { admission: { ratified: true } },
+    { "work-classes": ["C2"] },
+  ]) {
+    const { env } = workspace();
+    withPredicate(env, predicate);
+    await assertFailsRed(t, env, /fails the schema/);
+  }
+});
+
+// valid.yaml's fix-prose (lane pr-refine) with prepare: merge-base and `extra`.
 function withPrepare(env, extra = "") {
   const config = join(env.BASE_PATH, CONFIG_PATH);
   writeFileSync(
@@ -680,7 +721,7 @@ function withPrepare(env, extra = "") {
     ),
   );
   env.LANE = "pr-refine";
-  env.ACTIVITY = "fix-docs";
+  env.ACTIVITY = "fix-prose";
 }
 
 test("a leaf's prepare mode is a step output, set only when the leaf declares one", async () => {
@@ -918,4 +959,88 @@ test("on a pull_request event, draft comes from the payload without an API call"
   assert.equal(await main({ env, github, sleep: noSleep }), 0);
   assert.equal(readOutputs(env.GITHUB_OUTPUT)["skip-reason"], "not-applicable");
   assert.deepEqual(calls, []);
+});
+
+// applied-by and the patch rules (README.md, Activities and Patch rules). The
+// producer is fix-ci in pr-unblock, whose apply-patch slot needs it; the live
+// vocabulary, since the fixture lacks the verb "apply".
+const LIVE_VOCABULARY = join(HERE, "../../standards/github-actions-conventions/vocabulary.json");
+function withAppliedBy(env) {
+  writeFileSync(
+    join(env.BASE_PATH, CONFIG_PATH),
+    readFileSync(join(FIXTURES, "invalid-applied-by-missing-needs.yaml"), "utf8").replace(
+      "      - activity: apply-patch\n",
+      "      - activity: apply-patch\n        needs: [fix-ci]\n",
+    ),
+  );
+  copyFileSync(LIVE_VOCABULARY, join(env.BASE_PATH, VOCABULARY_PATH));
+  env.LANE = "pr-unblock";
+  env.ACTIVITY = "fix-ci";
+  env.PREPARE_SUPPORTED = "true";
+}
+
+test("an applying leaf with applied-by resolves on a runner that names its keys, and the file carries the map", async () => {
+  const { env } = workspace();
+  withAppliedBy(env);
+  env.APPLIED_BY_SUPPORTED = "patch";
+  assert.equal(await main({ env, github: noApi }), 0);
+  assert.deepEqual(JSON.parse(readFileSync(env.OUTPUT_PATH, "utf8")).selected["applied-by"], { patch: "apply-patch" });
+});
+
+test("an applying leaf with applied-by fails red unless the runner names every key it sets", async (t) => {
+  for (const supported of [undefined, "", "feedback-replies", "PATCH"]) {
+    const { env } = workspace();
+    withAppliedBy(env);
+    if (supported !== undefined) {
+      env.APPLIED_BY_SUPPORTED = supported;
+    }
+    await assertFailsRed(t, env, /applied-by-supported/);
+  }
+});
+
+test("a leaf without applied-by resolves whatever applied-by-supported says", async () => {
+  const { env } = workspace();
+  env.APPLIED_BY_SUPPORTED = "";
+  assert.equal(await main({ env, github: noApi }), 0);
+});
+
+// The rule files the run reads beside resolve-config.mjs, with one replaced.
+const rulesWith = (name, value) => (relative) =>
+  relative === name ? value : JSON.parse(readFileSync(join(HERE, relative), "utf8"));
+
+test("a lane run fails closed without the patch rules or their schema, even for a leaf that hands on nothing", async () => {
+  for (const name of ["./patch-rules.json", "./patch-rules.schema.json"]) {
+    const { env } = workspace();
+    await assert.rejects(
+      resolveFromBase({ env, github: noApi, readRules: rulesWith(name, undefined) }),
+      (error) => error.code === "patch-rules" && /must be present/.test(error.message),
+    );
+  }
+});
+
+test("a lane run fails closed on patch rules a row of which does not refuse the universal set", async () => {
+  const { env } = workspace();
+  const broken = JSON.parse(readFileSync(join(FIXTURES, "patch-rules-missing-universal.json"), "utf8"));
+  await assert.rejects(
+    resolveFromBase({ env, github: noApi, readRules: rulesWith("./patch-rules.json", broken) }),
+    (error) => error.code === "patch-rules" && /does not refuse codeowners/.test(error.message),
+  );
+});
+
+test("MODEL_RUNG empty, 0 or 1 resolves; any other value is refused as invalid-rung", async () => {
+  for (const rung of ["", "0"]) {
+    const { env } = workspace();
+    env.MODEL_RUNG = rung;
+    assert.ok(await resolveFromBase({ env, github: noApi }), rung);
+  }
+  for (const rung of ["2", "01", "up", "-1"]) {
+    const { env } = workspace();
+    env.MODEL_RUNG = rung;
+    await assert.rejects(resolveFromBase({ env, github: noApi }), (error) => error.code === "invalid-rung", rung);
+  }
+});
+
+test("issueLaneWebHostsFromBase: resolve-issue's web-access domains from the base config, none when it reads no web", () => {
+  assert.equal(issueLaneWebHostsFromBase({ BASE_PATH: join(HERE, "../../..") }), "any");
+  assert.deepEqual(issueLaneWebHostsFromBase(workspace().env), []);
 });

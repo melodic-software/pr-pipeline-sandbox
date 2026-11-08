@@ -1,3 +1,4 @@
+# test-scope: plugins/source-control/lib/parse-concern-value.sh
 """Per-target-repository resolution of the babysit repository-policy keys.
 
 Covers each merge mode, the fail-closed fetch contract (only a gh-reported 404
@@ -19,9 +20,14 @@ import tempfile
 import types
 import unittest
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import babysit_repo_config as rc
+from repo_config_fake import RepoConfigFake
+
+YAML_CALL = ["api", f"repos/o/r/contents/{rc.YAML_CONFIG_PATH}"]
+LEGACY_CALL = ["api", f"repos/o/r/contents/{rc.CONFIG_PATH}"]
 
 
 def _ok(text: str) -> subprocess.CompletedProcess[str]:
@@ -38,6 +44,9 @@ def _fail(stderr: str, stdout: str = "") -> subprocess.CompletedProcess[str]:
 
 
 class FakeGh:
+    """`responses` answers for `.claude/source-control.md`; the team YAML is
+    absent (a 404 with a readable root) for every repository."""
+
     def __init__(
         self,
         responses: dict[str, subprocess.CompletedProcess[str]],
@@ -52,6 +61,8 @@ class FakeGh:
         repo = "/".join(args[1].split("/")[1:3])
         if args[1].endswith("/contents"):
             return self.roots.get(repo, subprocess.CompletedProcess([], 0, "[]", ""))
+        if args[1].endswith(rc.YAML_CONFIG_PATH):
+            return _fail("gh: Not Found (HTTP 404)")
         return self.responses[repo]
 
 
@@ -250,7 +261,7 @@ class ResolveTests(unittest.TestCase):
                 os.chdir(cwd)
         self.assertEqual(eff.merge_method, "rebase")
         self.assertEqual(
-            gh.calls, [["api", "repos/o/r/contents/.claude/source-control.md"]]
+            gh.calls, [YAML_CALL, ["api", "repos/o/r/contents"], LEGACY_CALL]
         )
 
     def test_injected_repo_raises_without_calling_gh(self) -> None:
@@ -328,8 +339,9 @@ class ResolveTests(unittest.TestCase):
     def test_fetch_is_cached_per_repo(self) -> None:
         gh = FakeGh({"o/r": _ok("## babysit_merge_method\nrebase\n")})
         _resolve("o/r", {}, gh)
+        first = len(gh.calls)
         _resolve("O/R", {}, gh)
-        self.assertEqual(len(gh.calls), 1)
+        self.assertEqual(len(gh.calls), first)
 
     def test_deprecation_note_once_per_key_per_process(self) -> None:
         gh = FakeGh({"o/a": _fail("(HTTP 404)"), "o/b": _fail("(HTTP 404)")})
@@ -360,6 +372,272 @@ class ResolveTests(unittest.TestCase):
             (a.merge_method, a.merge_block_labels), ("rebase", {"hold", "a-hold"})
         )
         self.assertEqual((b.merge_method, b.merge_block_labels), ("merge", {"hold"}))
+
+
+class PolicyYamlTests(unittest.TestCase):
+    """The seven repository-policy keys: the YAML first, the legacy file for a
+    key the YAML lacks, both read from the default branch."""
+
+    def fake(
+        self, legacy: str | int | None = None, yaml: str | int | None = None
+    ) -> RepoConfigFake:
+        return RepoConfigFake(
+            {} if legacy is None else {"o/r": legacy},
+            {} if yaml is None else {"o/r": yaml},
+        ).install(self)
+
+    def resolve(self, fallback: dict[str, str | None]) -> rc.EffectiveConfig:
+        with contextlib.redirect_stderr(io.StringIO()):
+            return rc.resolve("o/r", fallback)
+
+    def test_a_remote_yaml_value_wins_over_the_legacy_h2(self) -> None:
+        gh = self.fake(
+            legacy="## babysit_merge_method\nmerge\n\n"
+            "## babysit_review_gate_context\nlegacy-gate\n\n"
+            "## babysit_ci_gateway_context\nlegacy-gateway\n",
+            yaml="babysit_merge_method: rebase\n"
+            "babysit_review_gate_context: yaml-gate\n",
+        )
+        eff = self.resolve({})
+        self.assertEqual(
+            (eff.merge_method, eff.review_gate_context, eff.ci_gateway_context),
+            ("rebase", "yaml-gate", "legacy-gateway"),
+        )
+        self.assertEqual(gh.calls, [YAML_CALL, LEGACY_CALL])
+
+    def test_a_repo_with_only_the_legacy_file_still_resolves(self) -> None:
+        self.fake(
+            legacy="## babysit_merge_method\nsquash\n\n"
+            "## babysit_merge_block_labels\n- legacy-hold\n"
+        )
+        eff = self.resolve({})
+        self.assertEqual(eff.merge_method, "squash")
+        self.assertEqual(eff.merge_block_labels, {"legacy-hold"})
+
+    def test_a_yaml_carrying_every_key_reads_no_legacy_file(self) -> None:
+        gh = self.fake(
+            legacy="## babysit_merge_method\nmerge\n",
+            yaml="babysit_merge_method: rebase\n"
+            "babysit_merge_block_labels: [hold]\n"
+            "babysit_extra_dependency_manager_logins: [dep-bot]\n"
+            "babysit_approval_downgrade_logins: [reviewer]\n"
+            "babysit_skip_downgrade_logins: [skipper]\n"
+            "babysit_review_gate_context: gate\n"
+            "babysit_ci_gateway_context: gateway\n",
+        )
+        self.assertEqual(self.resolve({}).merge_method, "rebase")
+        self.assertEqual(gh.calls, [YAML_CALL])
+
+    def test_a_yaml_hold_list_unions_with_the_userconfig_hold_list(self) -> None:
+        self.fake(
+            legacy="## babysit_merge_block_labels\n- legacy-hold\n",
+            yaml="babysit_merge_block_labels:\n  - yaml-hold\n"
+            "babysit_extra_dependency_manager_logins:\n  - Dep-Bot[bot]\n",
+        )
+        eff = self.resolve(
+            {
+                "babysit_merge_block_labels": "do-not-merge",
+                "babysit_extra_dependency_manager_logins": "mine",
+            }
+        )
+        self.assertEqual(eff.merge_block_labels, {"do-not-merge", "yaml-hold"})
+        self.assertEqual(eff.extra_dependency_manager_logins, {"mine", "dep-bot"})
+
+    def test_a_yaml_skip_downgrade_list_only_narrows_the_fallback_set(self) -> None:
+        self.fake(yaml="babysit_skip_downgrade_logins:\n  - Keep[bot]\n  - intruder\n")
+        eff = self.resolve({"babysit_skip_downgrade_logins": "keep,drop"})
+        self.assertEqual(eff.skip_downgrade_logins, {"keep"})
+        rc.reset_cache()
+        self.assertEqual(self.resolve({}).skip_downgrade_logins, frozenset())
+
+    def test_a_yaml_policy_string_keeps_its_trailing_slash(self) -> None:
+        self.fake(
+            yaml="babysit_ci_gateway_context: ci/\n"
+            "babysit_review_gate_context: 'review/'\n"
+            "babysit_merge_block_labels: [hold/]\n"
+        )
+        eff = self.resolve({})
+        self.assertEqual(
+            (eff.ci_gateway_context, eff.review_gate_context, eff.merge_block_labels),
+            ("ci/", "review/", {"hold/"}),
+        )
+
+    def test_a_rejected_yaml_is_an_error_with_no_legacy_fallback(self) -> None:
+        gh = self.fake(
+            legacy="## babysit_merge_method\nsquash\n",
+            yaml="babysit_merge_method: squash\n",
+        )
+        with self.assertRaises(rc.RepoConfigError):
+            rc.resolve("o/r", {}, yaml_values=lambda text, keys: None)
+        self.assertEqual(gh.calls, [YAML_CALL])
+
+    def test_an_invalid_yaml_value_is_an_error(self) -> None:
+        for yaml in (
+            "babysit_merge_method: fast-forward\n",
+            "babysit_merge_method:\n",
+            "babysit_merge_block_labels: hold\n",
+            "babysit_review_gate_context:\n  - gate\n",
+        ):
+            with self.subTest(yaml=yaml):
+                self.fake(legacy="## babysit_merge_method\nsquash\n", yaml=yaml)
+                with self.assertRaises(rc.RepoConfigError):
+                    self.resolve({})
+
+
+class LoopKeyTests(unittest.TestCase):
+    """The four loop keys: the YAML first, the legacy file for a key the YAML
+    lacks, then the defaults, all read from the default branch."""
+
+    def fake(
+        self, legacy: str | int | None = None, yaml: str | int | None = None
+    ) -> RepoConfigFake:
+        return RepoConfigFake(
+            {} if legacy is None else {"o/r": legacy},
+            {} if yaml is None else {"o/r": yaml},
+        ).install(self)
+
+    def test_a_remote_yaml_value_wins_over_the_legacy_file(self) -> None:
+        gh = self.fake(
+            legacy="## babysit_loop_merge\n\nc3-autonomous\n\n"
+            "## babysit_loop_stop_mode\n\ndrain\n",
+            yaml="babysit_loop_merge: human-only\nbabysit_loop_tier: autopilot\n",
+        )
+        loop = rc.resolve_loop_keys("o/r")
+        self.assertEqual(
+            dict(loop.values),
+            {
+                "babysit_loop_stop_mode": "drain",
+                "babysit_loop_tier": "autopilot",
+                "babysit_loop_merge": "human-only",
+                "babysit_loop_grace_window_minutes": "30",
+            },
+        )
+        self.assertEqual(
+            dict(loop.sources),
+            {
+                "babysit_loop_stop_mode": rc.LEGACY_LAYER,
+                "babysit_loop_tier": rc.YAML_CONFIG_PATH,
+                "babysit_loop_merge": rc.YAML_CONFIG_PATH,
+                "babysit_loop_grace_window_minutes": rc.DEFAULT_LAYER,
+            },
+        )
+        self.assertTrue(loop.adopted)
+        self.assertEqual(gh.calls, [YAML_CALL, LEGACY_CALL])
+
+    def test_a_remote_repo_with_only_the_legacy_file_still_resolves(self) -> None:
+        self.fake(
+            legacy="# source-control configuration\n\n"
+            "## pr_body_required_sections\n\n- Summary\n\n"
+            "## babysit_loop_stop_mode\n\nstanding\n\n"
+            "## babysit_loop_tier\n\nworker\n\n"
+            "## babysit_loop_merge\n\nc2-mechanical\n\n"
+            "## babysit_loop_grace_window_minutes\n\n45\n"
+        )
+        loop = rc.resolve_loop_keys("o/r")
+        self.assertEqual(
+            dict(loop.values),
+            {
+                "babysit_loop_stop_mode": "standing",
+                "babysit_loop_tier": "worker",
+                "babysit_loop_merge": "c2-mechanical",
+                "babysit_loop_grace_window_minutes": "45",
+            },
+        )
+        self.assertEqual(set(loop.sources.values()), {rc.LEGACY_LAYER})
+        self.assertTrue(loop.adopted)
+
+    def test_neither_file_yields_the_defaults(self) -> None:
+        self.fake()
+        loop = rc.resolve_loop_keys("o/r")
+        self.assertEqual(
+            dict(loop.values),
+            {
+                "babysit_loop_stop_mode": "standing",
+                "babysit_loop_tier": "safe",
+                "babysit_loop_merge": "human-only",
+                "babysit_loop_grace_window_minutes": "30",
+            },
+        )
+        self.assertEqual(set(loop.sources.values()), {rc.DEFAULT_LAYER})
+        self.assertFalse(loop.adopted)
+
+    def test_a_yaml_carrying_every_key_reads_no_legacy_file(self) -> None:
+        gh = self.fake(
+            legacy="## babysit_loop_merge\n\nc3-autonomous\n",
+            yaml="babysit_loop_stop_mode: drain\nbabysit_loop_tier: worker\n"
+            "babysit_loop_merge: c2-mechanical\n"
+            "babysit_loop_grace_window_minutes: 15\n",
+        )
+        loop = rc.resolve_loop_keys("o/r")
+        self.assertEqual(loop.values["babysit_loop_merge"], "c2-mechanical")
+        self.assertEqual(loop.values["babysit_loop_grace_window_minutes"], "15")
+        self.assertEqual(set(loop.sources.values()), {rc.YAML_CONFIG_PATH})
+        self.assertEqual(gh.calls, [YAML_CALL])
+
+    def test_adoption_without_a_merge_key_defaults_to_the_baseline(self) -> None:
+        for legacy, yaml in (
+            ("## babysit_loop_fixing\n\nworker\n", None),
+            (None, "babysit_loop_tier: worker\n"),
+            # One of the nine keys outside `LOOP_KEYS` is adoption too.
+            (None, "babysit_loop_fixing: worker\n"),
+            (None, "babysit_loop_trusted_internal_bot_logins:\n  - lane[bot]\n"),
+        ):
+            with self.subTest(legacy=legacy, yaml=yaml):
+                loop = rc.resolve_loop_keys("o/r", self.fake(legacy, yaml))
+                self.assertEqual(loop.values["babysit_loop_merge"], "c2-mechanical")
+                self.assertEqual(loop.sources["babysit_loop_merge"], rc.DEFAULT_LAYER)
+                self.assertTrue(loop.adopted)
+
+    def test_a_rejected_yaml_stops_instead_of_reading_the_legacy_file(self) -> None:
+        gh = self.fake(
+            legacy="## babysit_loop_merge\n\nc2-mechanical\n",
+            yaml="babysit_loop_merge: c2-mechanical\n",
+        )
+        with self.assertRaises(rc.RepoConfigError):
+            rc.resolve_loop_keys("o/r", yaml_values=lambda text, keys: None)
+        self.assertEqual(gh.calls, [YAML_CALL])
+
+    def test_an_invalid_value_or_section_raises(self) -> None:
+        for legacy, yaml in (
+            (None, "babysit_loop_merge: c3-this-run\n"),
+            (None, "babysit_loop_grace_window_minutes: 0\n"),
+            ("## babysit_loop_merge\n\nc3-autonomous\n", "babysit_loop_merge:\n"),
+            (None, "babysit_loop_tier:\n  - worker\n"),
+            ("## babysit_loop_stop_mode\n\npause\n", None),
+            ("## babysit_loop_tier\n\n", None),
+            ("## babysit_loop_tier\n\nsafe\n\n## babysit_loop_tier\n\nworker\n", None),
+        ):
+            with self.subTest(legacy=legacy, yaml=yaml):
+                self.fake(legacy, yaml)
+                with self.assertRaises(rc.RepoConfigError):
+                    rc.resolve_loop_keys("o/r")
+
+    def test_a_legacy_value_the_yaml_overrides_is_not_checked(self) -> None:
+        self.fake(
+            legacy="## babysit_loop_tier\n\nturbo\n",
+            yaml="babysit_loop_tier: safe\n",
+        )
+        self.assertEqual(rc.resolve_loop_keys("o/r").values["babysit_loop_tier"], "safe")
+
+    def test_a_failed_yaml_fetch_raises(self) -> None:
+        self.fake(legacy="## babysit_loop_merge\n\nc2-mechanical\n", yaml=502)
+        with self.assertRaises(rc.RepoConfigError):
+            rc.resolve_loop_keys("o/r")
+
+    def test_cli_prints_values_and_layers_or_exits_one(self) -> None:
+        self.fake(yaml="babysit_loop_tier: worker\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(rc.main(["loop-keys", "o/r"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["values"]["babysit_loop_tier"], "worker")
+        self.assertEqual(report["sources"]["babysit_loop_tier"], rc.YAML_CONFIG_PATH)
+        self.assertTrue(report["adopted"])
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(rc.main(["loop-keys", "o/.."]), 1)
+        self.assertIn("not an owner/repo pair", err.getvalue())
 
 
 if __name__ == "__main__":

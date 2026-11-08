@@ -1,7 +1,6 @@
 // `applies-when` over the facts of one run: every listed key must match, and
 // within a key any listed value matches, except `labels-absent`, which matches
-// only when none of its labels is on the PR or issue, and `labeled-after`, one
-// time an issue's label event must come after.
+// only when none of its labels is on the PR or issue. No key reads a work class.
 import { posix } from "node:path";
 
 export class MissingFact extends Error {
@@ -29,13 +28,7 @@ const KEYS = [
     "labels",
     (listed, labels) => !listed.some((label) => labels.includes(label)),
   ],
-  ["work-classes", "workClasses", any((cls, classes) => classes.includes(cls))],
   ["events", "event", any((event, current) => event === current)],
-  [
-    "labeled-after",
-    "labeledAt",
-    (after, labeledAt) => Date.parse(labeledAt) > Date.parse(after),
-  ],
   // null is unknown mergeability, which never matches.
   ["mergeable", "mergeable", any((state, current) => state === current)],
   ["draft", "draft", any((draft, current) => draft === current)],

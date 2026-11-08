@@ -3,11 +3,19 @@ description: >
   Copy what an activity runs out of the base checkout before the PR head
   replaces it: a script's whole directory to $RUNNER_TEMP/base-script, or for
   a skill the base plugins/ and .claude-plugin/ to
-  $RUNNER_TEMP/base-marketplace, plus the skill's plugin, prompt (with its
+  $RUNNER_TEMP/base-marketplace, plus the plugins to install, prompt (with its
   changed-paths) and claude_args (with read access to the marketplace copy,
-  and for any effect but read the write tool set, a scratch directory and,
-  unless the runner commits for it, the instruction to commit). Contract: docs/conventions/pr-pipeline/pr-run-activity.md, run job
-  step 8 and Skill activities.
+  and for an activity that edits, the write tool set, a scratch directory,
+  the web tools when the activity sets web-access and, when it commits, the
+  instruction to commit). An activity edits when its effect is not read, or
+  when its applied-by sets patch: it then leaves its change uncommitted for
+  the runner to collect as a patch. With launcher run-claude-cli, a read
+  skill's plugin, CI context, scratch directory, prompt file and check and
+  verify-script wrappers are staged in $RUNNER_TEMP/lane-stage for the
+  runner to copy to .lane/, with the launcher's tool lists and preamble in
+  place of claude_args. Contract:
+  docs/conventions/pr-pipeline/pr-run-activity.md, run job step 8 and Skill
+  activities.
 
 inputs:
   kind:
@@ -21,22 +29,15 @@ inputs:
     description: "`<plugin>:<skill>`, for a skill activity."
     required: false
     default: ""
-  model:
-    description: The model; empty omits --model.
-    required: false
-    default: ""
-  max-turns:
-    description: The turn budget.
-    required: false
-    default: ""
   gating:
     description: "`gate` or `advisory`."
     required: false
     default: ""
   effect:
     description: >
-      The activity's effect, from resolve-config. Any effect but `read` gets
-      the write tool set below.
+      The activity's effect, from resolve-config. Any effect but `read`, or
+      `read` with applied-by.patch in the resolved file, gets the write tool
+      set below.
     required: true
   can-commit:
     description: >
@@ -47,8 +48,22 @@ inputs:
   prepare:
     description: >
       The activity's prepare mode from resolve-config, empty for none. With
-      `merge-base` the runner commits the staged merge after the skill, so
-      the skill gets neither the commit tool nor the instruction to commit.
+      `merge-base` (run-claude-cli only, a read skill that hands on a patch)
+      the skill gets Edit and Write but no Bash, and reads the conflicts the
+      runner writes to .lane/merge/ after the merge, read-only and denied to
+      the file tools; a later job commits the merge.
+      With `review-threads` (run-claude-cli only) the skill also gets the
+      review-thread tool, a read-only wrapper over the base's
+      feedback-thread.sh staged under .lane/feedback/ with the thread file the
+      runner checked in $RUNNER_TEMP/lane-feedback. With `dependency-review`
+      (run-claude-cli only) the skill gets the context file the runner
+      checked in $RUNNER_TEMP/lane-dependency, staged read-only under
+      .lane/dependency/, Edit and Write but no Bash, and the verdict JSON
+      schema, written to $RUNNER_TEMP/lane-dependency-schema for the
+      launcher's json-schema-file. With `ci-context`
+      (effect read only) the skill gets Bash, Edit and Write and read access
+      to the context file the runner wrote to $RUNNER_TEMP/lane-ci, made
+      read-only.
     required: false
     default: ""
   resolved-path:
@@ -64,17 +79,47 @@ inputs:
     description: The base-SHA checkout.
     required: false
     default: .base
+  launcher:
+    description: >
+      `claude-code-action` (the default) or `run-claude-cli`. run-claude-cli
+      runs the CLI with --restricted in the checkout, so the skill's plugin,
+      the CI context, a scratch directory and the prompt file are staged in
+      $RUNNER_TEMP/lane-stage for the runner to copy to .lane/ after the head
+      checkout, and the tool rules name them there. It takes a read skill
+      only (ci-context included, and one that hands on a patch with no
+      prepare mode, review-threads, dependency-review or merge-base), never
+      a gate; checks, self-checks and verify-scripts only in a skill that
+      hands on a patch with no prepare mode, such as an issue lane's.
+    required: false
+    default: claude-code-action
 
 outputs:
-  plugin:
-    description: "`<plugin>@<marketplace>`, for a skill."
-    value: ${{ steps.skill.outputs.plugin }}
+  plugins:
+    description: >
+      The plugins to install for a skill, one `<plugin>@<marketplace>` per
+      line: the skill's own, plus the research plugins under web-access.
+    value: ${{ steps.skill.outputs.plugins }}
   claude-args:
     description: The skill's claude_args after the fixed ones.
     value: ${{ steps.skill.outputs.claude-args }}
   prompt:
     description: The skill's prompt.
     value: ${{ steps.skill.outputs.prompt }}
+  tools:
+    description: run-claude-cli only, its `tools` input, one per line.
+    value: ${{ steps.skill.outputs.tools }}
+  allowed-tools:
+    description: run-claude-cli only, its `allowed-tools` input, one rule per line.
+    value: ${{ steps.skill.outputs.allowed-tools }}
+  disallowed-tools:
+    description: run-claude-cli only, its `disallowed-tools` input, one rule per line.
+    value: ${{ steps.skill.outputs.disallowed-tools }}
+  plugin-dirs:
+    description: run-claude-cli only, its `plugin-dirs` input, under .lane/.
+    value: ${{ steps.skill.outputs.plugin-dirs }}
+  preamble:
+    description: run-claude-cli only, its `preamble` input, which stands in for the system prompt.
+    value: ${{ steps.skill.outputs.preamble }}
 
 runs:
   using: composite
@@ -107,21 +152,159 @@ runs:
       shell: bash
       env:
         MARKETPLACE: ${{ runner.temp }}/base-marketplace
+        DOCS_DIR: ${{ runner.temp }}/lane-docs
         BASE_PATH: ${{ inputs.base-path }}
         RESOLVED: ${{ inputs.resolved-path }}
         SKILL: ${{ inputs.skill }}
-        MODEL: ${{ inputs.model }}
-        MAX_TURNS: ${{ inputs.max-turns }}
         GATING: ${{ inputs.gating }}
         EFFECT: ${{ inputs.effect }}
         CAN_COMMIT: ${{ inputs.can-commit }}
         PREPARE: ${{ inputs.prepare }}
         SCRATCH: ${{ runner.temp }}/lane-scratch
+        CHECKS_DIR: ${{ runner.temp }}/lane-checks
+        VERIFY_DIR: ${{ runner.temp }}/lane-verify
+        FEEDBACK_DIR: ${{ runner.temp }}/lane-feedback
+        DEPENDENCY_DIR: ${{ runner.temp }}/lane-dependency
+        SCHEMA_DIR: ${{ runner.temp }}/lane-dependency-schema
+        CI_DIR: ${{ runner.temp }}/lane-ci
+        WORKSPACE: ${{ github.workspace }}
         ISSUE_NUMBER: ${{ inputs.issue-number }}
+        LAUNCHER: ${{ inputs.launcher }}
+        STAGE: ${{ runner.temp }}/lane-stage
       run: |
         fail() {
           echo "::error::$1"
           exit 1
+        }
+        # The activity's checks run from a base copy of scripts/ the skill
+        # cannot edit, against the checkout, through a wrapper with the flags
+        # fixed: the Bash rule allows the wrapper alone, with no arguments.
+        # The skill runs checks and self-checks alike; only checks does the
+        # runner run again. Each wrapper is written under <dir>/bin and names
+        # the copy at <at>, where the runner leaves it. Sets check_wrappers
+        # (their paths at <at>) and check_prompt.
+        stage_checks() {
+          local dir=$1 at=$2 check script flags wrapper config
+          check_wrappers=()
+          [[ $at =~ ^/[A-Za-z0-9_./-]+$ && $WORKSPACE =~ ^/[A-Za-z0-9_./-]+$ ]] ||
+            fail "the checks directory or workspace has a name a rule cannot carry"
+          for check in "${checks[@]}"; do
+            [[ $check =~ ^scripts/[A-Za-z0-9_-]+\.sh( --[a-z][a-z-]*)*$ ]] || fail "a check must be a scripts/ script with fixed flags"
+          done
+          mkdir -p "$dir/bin"
+          cp -R "$BASE_PATH/scripts" "$dir/"
+          # check-affected.sh lints with the configs beside its copy, and
+          # run-ruff.sh reads its version pin there.
+          for config in .shellcheckrc .markdownlint-cli2.jsonc .github/requirements-ci.txt; do
+            [ ! -f "$BASE_PATH/$config" ] || { mkdir -p "$dir/$(dirname "$config")" && cp "$BASE_PATH/$config" "$dir/$config"; }
+          done
+          for check in "${checks[@]}"; do
+            script=${check%% *}
+            flags=${check#"$script"}
+            wrapper=bin/$(basename "$script" .sh)
+            [ ! -e "$dir/$wrapper" ] || fail "two checks run the same script"
+            # The same environment as a verify-script's wrapper below: no
+            # GitHub token, and no system, global, hook or fsmonitor git
+            # config.
+            {
+              printf '#!/usr/bin/env bash\ncd %q || exit 2\n' "$WORKSPACE"
+              printf '%s\n' \
+                'unset GH_TOKEN GITHUB_TOKEN' \
+                'export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=2' \
+                'export GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null'
+              # An issue lane's patch lands through the issue row, whose
+              # script-exec-bit makes each new or changed script executable,
+              # so the checks judge the tree with that bit.
+              if [ "$edits" = patch ] && [ -n "${ISSUE_NUMBER:-}" ]; then
+                echo 'export CHECK_AFFECTED_SCRIPT_EXEC_BIT=1'
+              fi
+              printf 'CHECK_DATA_ROOT=%q exec %q%s\n' "$WORKSPACE" "$at/$script" "$flags"
+            } >"$dir/$wrapper"
+            chmod +x "$dir/$wrapper"
+            check_wrappers+=("$at/$wrapper")
+          done
+          check_prompt="Before you report done, run each of these repository checks as written, with no arguments: ${check_wrappers[*]}. Fix each failure a check reports in the working tree and run the check again; name any failure you could not fix in your report."
+        }
+        # The activity's verify-scripts run with any arguments from a base
+        # copy of the script's plugin (or of scripts/) the skill cannot edit,
+        # so the files a script reads beside itself come along. Each runs
+        # through a wrapper that starts in the checkout, refuses an argument
+        # naming a path outside it (a script may print what it reads), unsets
+        # GH_TOKEN and GITHUB_TOKEN in the script's own environment (an
+        # ancestor's /proc/<pid>/environ still holds them), and keeps git from
+        # loading system, global or hook and fsmonitor programs. As for the
+        # checks, <dir> is where the copy is written and <at> where it runs.
+        # Sets verify_wrappers and verify_prompt.
+        stage_verify() {
+          local dir=$1 at=$2 script unit rest verifier commands=""
+          verify_wrappers=()
+          [[ $at =~ ^/[A-Za-z0-9_./-]+$ && $WORKSPACE =~ ^/[A-Za-z0-9_./-]+$ ]] ||
+            fail "the verify-scripts copy or workspace has a name a rule cannot carry"
+          mkdir -p "$dir/bin"
+          for script in "${verify[@]}"; do
+            [[ $script =~ ^(scripts|plugins/[a-z0-9-]+/(skills/[a-z0-9-]+/)?scripts)/[A-Za-z0-9_-]+\.sh$ ]] ||
+              fail "a verify-script must be the exact path of a scripts/ script"
+            [ -f "$BASE_PATH/$script" ] || fail "a verify-script is not in the base"
+            unit=scripts
+            if [[ $script == plugins/* ]]; then
+              rest=${script#plugins/}
+              unit=plugins/${rest%%/*}
+            fi
+            if [ ! -e "$dir/$unit" ]; then
+              mkdir -p "$dir/$(dirname "$unit")"
+              cp -R "$BASE_PATH/$unit" "$dir/$unit"
+              # chmod does not follow a link, so its target would stay writable.
+              [ -z "$(find "$dir/$unit" -type l -print -quit)" ] || fail "a verify-script's directory holds a symbolic link"
+            fi
+            verifier=bin/$(basename "$script" .sh)
+            [ ! -e "$dir/$verifier" ] || fail "two verify-scripts share a file name"
+            {
+              printf '#!/usr/bin/env bash\nworkspace=%q\ncopy=%q\n' "$WORKSPACE" "$at/$script"
+              printf '%s\n' \
+                'cd "$workspace" && workspace=$(pwd -P) || exit 2' \
+                'for arg in "$@"; do' \
+                '  for path in "$arg" "${arg#*=}"; do' \
+                '    [ -e "$path" ] || [ -L "$path" ] || continue' \
+                '    real=$(realpath -e -- "$path") || exit 2' \
+                '    case $real in' \
+                '      "$workspace" | "$workspace"/*) ;;' \
+                '      *) echo "refused: $path is outside the checkout" >&2 && exit 2 ;;' \
+                '    esac' \
+                '  done' \
+                'done' \
+                'unset GH_TOKEN GITHUB_TOKEN' \
+                'export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=2' \
+                'export GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null'
+              # check-skill.sh runs each skill's scripts/*.test.sh, and the
+              # runner's ~/.claude is read-only, so it gets a fresh, writable
+              # HOME and CLAUDE_CONFIG_DIR.
+              if [ "$script" = plugins/skill-quality/scripts/check-skill.sh ]; then
+                printf '%s\n' \
+                  'HOME=$(mktemp -d) && mkdir "$HOME/.claude" || exit 2' \
+                  'export HOME CLAUDE_CONFIG_DIR="$HOME/.claude"'
+              fi
+              printf '%s\n' \
+                'bash "$copy" "$@"' \
+                'status=$?' \
+                'echo "exit status: $status" >&2' \
+                'exit "$status"'
+            } >"$dir/$verifier"
+            chmod +x "$dir/$verifier"
+            verify_wrappers+=("$at/$verifier")
+            commands="$commands $at/$verifier <arguments>;"
+          done
+          # A Bash allow rule must match each subcommand of a compound command
+          # (https://code.claude.com/docs/en/permissions, "Compound
+          # commands"), so under dontAsk a chained, piped or interpreter
+          # command is denied; Read, Grep and Glob need no rule in a working
+          # directory (same page, "Permission modes").
+          verify_prompt="To run one of these repository verification scripts, run its wrapper by exactly this path, with the script's own arguments and paths inside the checkout:${commands%;}. Bash runs only the wrappers named in these instructions, each as its own command (a verification wrapper prints the script's exit status): use Read, Grep and Glob to inspect files and Edit or Write to change them, never cd, ;, &&, a pipe or an interpreter one-liner."
+          if [ -e "$dir/bin/git-mv-rm" ]; then
+            verify_prompt="$verify_prompt Rename or delete a file with $at/bin/git-mv-rm."
+          fi
+          if [ -e "$dir/bin/run-test-file" ]; then
+            verify_prompt="$verify_prompt Run a test file only through $at/bin/run-test-file <test file>, with the path from the checkout root: it picks the runner, vitest included, and a compound command such as cd <dir>; <command> is refused."
+          fi
         }
         [[ -z ${ISSUE_NUMBER:-} || $ISSUE_NUMBER =~ ^[1-9][0-9]{0,9}$ ]] || fail "the issue number is malformed"
         subject="a pull request"
@@ -130,13 +313,22 @@ runs:
         fi
         mkdir -p "$MARKETPLACE"
         cp -R "$BASE_PATH/plugins" "$BASE_PATH/.claude-plugin" "$MARKETPLACE/"
+        # The plugin loads in place from this copy, so its hooks run from
+        # here: no process the skill starts may rewrite them.
+        chmod -R a-w "$MARKETPLACE"
         marketplace=$(jq -r '.name' "$MARKETPLACE/.claude-plugin/marketplace.json")
         name='^[a-z0-9][a-z0-9-]*$'
         [[ $marketplace =~ $name ]] || fail "the base marketplace name is malformed"
         [[ $SKILL =~ ^[a-z0-9-]+:[a-z0-9-]+$ ]] || fail "the skill must be <plugin>:<skill>"
-        [[ $MAX_TURNS =~ ^[1-9][0-9]*$ ]] || fail "max-turns must be a positive integer"
         case "$PREPARE" in
-          "" | merge-base) ;;
+          "") ;;
+          merge-base) [ "$LAUNCHER" = run-claude-cli ] || fail "merge-base: the skill runs on run-claude-cli, in the read runner" ;;
+          review-threads) [ "$LAUNCHER" = run-claude-cli ] || fail "review-threads: the skill runs on run-claude-cli, in the read runner" ;;
+          dependency-review)
+            [ "$LAUNCHER" = run-claude-cli ] || fail "dependency-review: the skill runs on run-claude-cli, in the read runner"
+            [ "$GATING" = advisory ] || fail "dependency-review: the activity must be advisory, since its verdict is the structured output"
+            ;;
+          ci-context) [ "$EFFECT" = read ] || fail "ci-context: the activity's effect must be read, since it runs head code" ;;
           *) fail "the activity's prepare mode is not a known mode" ;;
         esac
         # resolve-config already filtered these; a name outside this set
@@ -152,46 +344,458 @@ runs:
         # where an unlisted read is denied, so the skill could not read its
         # own reference files. A rule path starting `//` is absolute.
         allowed="Skill($SKILL),Read(/$MARKETPLACE/**)"
+        plugins="${SKILL%%:*}@$marketplace"
         disallowed=""
         system_prompt=""
-        case "$EFFECT" in
-          read) ;;
-          mutate-branch | mutate-tracker | publish-artifact | merge)
+        # A read skill that hands on a patch edits like a write skill, but
+        # commits nothing: the runner collects its change. ci-context keeps
+        # its own tool set.
+        edits=$EFFECT
+        if [ "$EFFECT" = read ] && [ "$PREPARE" != ci-context ] &&
+          jq -e '.selected["applied-by"].patch // empty' "$RESOLVED" >/dev/null; then
+          edits=patch
+        fi
+        mapfile -t checks < <(jq -r '(.selected.checks // []) + (.selected["self-checks"] // []) | .[]' "$RESOLVED")
+        mapfile -t verify < <(jq -r '.selected["verify-scripts"] // [] | .[]' "$RESOLVED")
+        # Read-only commands such as cat, echo and diff run with no allow
+        # rule in every mode, until a deny rule names them
+        # (https://code.claude.com/docs/en/permissions#read-only-commands).
+        # A skill that edits reads files with Read, Grep and Glob, so these
+        # deny every command that can print a file or the environment,
+        # read-only or a text filter.
+        shell_denied=("Bash(echo *)" "Bash(printf *)" "Bash(cat *)" "Bash(head *)" "Bash(tail *)" "Bash(grep *)" "Bash(find *)" "Bash(env *)" "Bash(printenv *)" "Bash(strings *)" "Bash(od *)" "Bash(xxd *)" "Bash(diff *)" "Bash(sed *)" "Bash(awk *)" "Bash(sort *)" "Bash(cut *)" "Bash(tr *)" "Bash(base64 *)" "Bash(nl *)" "Bash(tac *)" "Bash(rev *)" "Bash(uniq *)" "Bash(fold *)" "Bash(column *)" "Bash(jq *)" "Bash(xargs *)" "Bash(more *)" "Bash(less *)" "Bash(wc *)")
+        # run-claude-cli: the CLI runs with --restricted in the checkout and
+        # reads nothing outside it, so everything the skill reads is staged
+        # here and copied to .lane/ after the head checkout, where the rules
+        # below name it; the runner leaves .lane/ out of the patch. The
+        # launcher has no system prompt, so the preamble carries it, and the
+        # prompt asks for the Skill tool, since a slash command after the
+        # preamble would not expand. An issue lane's skill reads issue.json
+        # from the scratch directory, where the runner writes it.
+        if [ "$LAUNCHER" = run-claude-cli ]; then
+          { [ "$edits" = read ] && { [ -z "$PREPARE" ] || [ "$PREPARE" = ci-context ]; }; } ||
+            { [ "$edits" = patch ] && { [ -z "$PREPARE" ] || [ "$PREPARE" = review-threads ] || [ "$PREPARE" = dependency-review ] || [ "$PREPARE" = merge-base ]; }; } ||
+            fail "run-claude-cli: only a read skill runs on the launcher, ci-context included, or one that hands on a patch with no prepare mode, review-threads, dependency-review or merge-base"
+          [ "$GATING" = advisory ] || fail "run-claude-cli: a gate skill's verdict is not read from the launcher"
+          # Their wrappers run through Bash, which only the patch skill with
+          # no prepare mode gets with rules of its own.
+          if ((${#checks[@]} + ${#verify[@]})) && { [ "$edits" != patch ] || [ -n "$PREPARE" ]; }; then
+            fail "run-claude-cli: checks, self-checks and verify-scripts run only in a skill that hands on a patch with no prepare mode"
+          fi
+          [[ $WORKSPACE =~ ^/[A-Za-z0-9_./-]+$ && $STAGE =~ ^/[A-Za-z0-9_./-]+$ ]] ||
+            fail "the workspace or the stage directory has a name a rule cannot carry"
+          plugin=${SKILL%%:*}
+          [ -d "$BASE_PATH/plugins/$plugin" ] || fail "the skill's plugin is not in the base"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/plugins" "$STAGE/scratch"
+          cp -R "$BASE_PATH/plugins/$plugin" "$STAGE/plugins/"
+          # The CLI's Bash sandbox, under run-claude-cli's environment scrub,
+          # holds its write denial on .mcp.json in each --add-dir by creating
+          # an empty one, which fails once the copy is read-only.
+          mcp=$STAGE/plugins/$plugin/.mcp.json
+          [ -e "$mcp" ] || [ -L "$mcp" ] || printf '{"mcpServers":{}}\n' >"$mcp"
+          # The runner makes the copy read-only, and chmod does not follow a link.
+          [ -z "$(find "$STAGE/plugins" -type l -print -quit)" ] || fail "the skill's plugin holds a symbolic link"
+          lane=$WORKSPACE/.lane
+          tools=(Read Glob Grep Skill)
+          allowed=("Skill($SKILL)" Grep Glob)
+          # Read in the working directory needs no rule; the staged copies
+          # stay unedited, process files unread, and the checkout's .git
+          # untouched by the file tools (Bash still reaches it, so the patch
+          # collector and the leak scan never read its config).
+          denied=(WebFetch WebSearch "Edit(./.lane/plugins/**)" "Write(./.lane/plugins/**)" "Edit(./.lane/trusted-context.json)" "Write(./.lane/trusted-context.json)" "Read(//proc/**)"
+            "Read(./.git/**)" "Edit(./.git/**)" "Write(./.git/**)")
+          preamble="You run unattended as a CI lane activity on $subject, and no one can answer a question."
+          if [ "$PREPARE" = ci-context ]; then
+            [ -f "$CI_DIR/context.json" ] || fail "ci-context: the runner wrote no context file"
+            mkdir -p "$STAGE/ci"
+            cp "$CI_DIR/context.json" "$STAGE/ci/context.json"
+            tools+=(Bash Edit Write Agent)
+            allowed+=(Bash Edit Write Agent)
+            denied+=("Edit(./.lane/ci/**)" "Write(./.lane/ci/**)")
+            preamble="$preamble Run every step the skill instructions name. Your scratchpad directory is $lane/scratch: put every temporary or state file there. The context file is $lane/ci/context.json. Leave every fix uncommitted in the working tree: the runner turns it into a patch that a later job pushes."
+          fi
+          # A skill that hands on a patch with no prepare mode (fix-docs) gets
+          # Bash, which runs only what an allow rule below names: the lane
+          # does not rely on the skill's allowed-tools frontmatter, and a deny
+          # rule beats a frontmatter grant. The scripts run from the read-only
+          # base copy under .lane/plugins, denied to the file tools.
+          plugin_dirs=(".lane/plugins/$plugin")
+          if [ "$edits" = patch ] && [ "$PREPARE" = dependency-review ]; then
+            # dependency-review: the skill reads the context file the runner
+            # checked and edits manifests, and runs nothing, so it gets Edit
+            # and Write but no Bash; the git and shell rules are denied all
+            # the same. The context copy is read-only and denied to the file
+            # tools. Its verdict is the launcher's structured output, held to
+            # the schema below, which apply-dependency-verdict.mjs validates
+            # again; the runner reads it from the execution file.
+            [ -f "$DEPENDENCY_DIR/dependency.json" ] || fail "dependency-review: the runner wrote no context file"
+            [[ $SCHEMA_DIR =~ ^/[A-Za-z0-9_./-]+$ ]] || fail "the verdict schema directory has a name a rule cannot carry"
+            mkdir -p "$STAGE/dependency" "$SCHEMA_DIR"
+            cp "$DEPENDENCY_DIR/dependency.json" "$STAGE/dependency/dependency.json"
+            # The verdict job validates the same shape (apply-dependency-verdict.mjs).
+            printf '%s\n' '{"type":"object","properties":{"verdict":{"enum":["merge","fix","close","escalate"]},"reasons":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"string","minLength":1,"maxLength":500}},"evidence":{"type":"array","maxItems":20,"items":{"type":"string","minLength":1,"maxLength":300}}},"required":["verdict","reasons","evidence"],"additionalProperties":false}' \
+              >"$SCHEMA_DIR/verdict.schema.json"
+            tools+=(Edit Write Agent)
+            allowed+=(Edit Write Agent "Edit(./.lane/scratch/**)")
+            denied+=("NotebookEdit(./.lane/plugins/**)" "Bash(git *)" "${shell_denied[@]}"
+              "Edit(./.lane/dependency/**)" "Write(./.lane/dependency/**)" "NotebookEdit(./.lane/dependency/**)")
+            preamble="$preamble Run every step the skill instructions name. Your scratchpad directory is $lane/scratch: put every temporary or state file there. The dependency context file is $lane/dependency/dependency.json. Leave a fix uncommitted in the working tree: the runner turns it into a patch that a later job pushes only on a fix verdict. Your verdict is your structured output; a later job acts on it, and you post nothing."
+          elif [ "$edits" = patch ] && [ "$PREPARE" = merge-base ]; then
+            # merge-base: the runner merges the pinned base before the skill
+            # and writes each conflicted path's versions and history to
+            # .lane/merge/; the skill resolves the conflicted files in place
+            # and runs nothing, so it gets Edit and Write but no Bash, and
+            # git and the shell rules are denied all the same. The merge
+            # context is read-only and denied to the file tools. The runner
+            # measures its edits from the conflict tree, and the push job
+            # admits only marker-free resolutions of the conflicted paths.
+            tools+=(Edit Write Agent)
+            allowed+=(Edit Write Agent "Edit(./.lane/scratch/**)")
+            denied+=("NotebookEdit(./.lane/plugins/**)" "Bash(git *)" "${shell_denied[@]}"
+              "Edit(./.lane/merge/**)" "Write(./.lane/merge/**)" "NotebookEdit(./.lane/merge/**)")
+            preamble="$preamble Run every step the skill instructions name. Your scratchpad directory is $lane/scratch: put every temporary or state file there. The runner has merged the default branch into this checkout without committing; the merge context is $lane/merge/conflicts.json, which lists each conflicted path with the directory under $lane/merge/ holding its base, ours and theirs versions and both sides' history. Resolve each conflicted file in place, leave a path you cannot resolve with its conflict markers, and edit no other file: the runner turns your edits into a patch that a later job commits as the merge. You run no command and post nothing."
+          elif [ "$edits" = patch ]; then
+            tools+=(Bash Edit Write Agent)
+            # A shell redirect is checked against Edit rules for its target
+            # path (https://code.claude.com/docs/en/permissions#redirections),
+            # and the bare Edit rule does not approve one into the scratch
+            # directory, so that directory gets its own.
+            allowed+=(Edit Write Agent "Edit(./.lane/scratch/**)")
+            denied+=("NotebookEdit(./.lane/plugins/**)" "Bash(git *)" "${shell_denied[@]}")
+            # Each script the skill runs gets a rule for its absolute path,
+            # bare and double-quoted (its `!` line runs the quoted form), since
+            # a rule matches the words before its `*` as written. Its shebang
+            # fixes the interpreter, so no `bash <path>` rule.
+            case "$SKILL" in
+              ai-slop:audit)
+                scripts=$lane/plugins/$plugin/skills/audit/scripts
+                for script in detect.sh rubric-fanout.sh emit-findings.sh emit-fix-record.sh cross-check.sh; do
+                  allowed+=("Bash($scripts/$script *)" "Bash(\"$scripts/$script\" *)")
+                done
+                # The fix flow's concurrent-edit guard digests each file into
+                # a state file under the scratch directory.
+                allowed+=("Bash(sha256sum *)" "Bash(mkdir -p $lane/scratch/*)")
+                # The user-scope target reads the runner's own config.
+                denied+=("Bash($scripts/user-scope.sh *)" "Bash(\"$scripts/user-scope.sh\" *)")
+                ;;
+            esac
+            preamble="$preamble Run every step the skill instructions name. Your scratchpad directory is $lane/scratch: put every temporary or state file there. Leave every change uncommitted in the working tree: the runner turns it into a patch that a later job pushes. Run each shell command as one plain command per call, a script by the absolute path the skill names: no variables, cd, ;, &&, a pipe, a command substitution or an interpreter, and redirect output only into $lane/scratch."
+            # An issue lane's skill reads the work it resumes and checks its
+            # own change with git, through git-read, a wrapper staged under
+            # .lane/git that runs only git status, diff, log and show, with
+            # no system, global, fsmonitor, hook, pager, external-diff or
+            # textconv program. It refuses the options that write a file or
+            # read one outside the checkout (--output, --no-index, --orderfile,
+            # their prefixes, and -O alone or in a bundle of short options),
+            # status --verbose (it runs textconv), and any path argument that
+            # resolves outside the checkout, since git diff on such a path
+            # reads it as --no-index.
+            # Bash(git *) stays denied, so git runs only through it.
+            if [ -n "${ISSUE_NUMBER:-}" ]; then
+              mkdir -p "$STAGE/git"
+              {
+                printf '#!/usr/bin/env bash\nworkspace=%q\n' "$WORKSPACE"
+                printf '%s\n' \
+                  'cd "$workspace" && workspace=$(pwd -P) || exit 2' \
+                  'case ${1:-} in status | diff | log | show) ;; *) echo "refused: git-read runs git status, diff, log or show" >&2 && exit 2 ;; esac' \
+                  'for arg in "${@:2}"; do' \
+                  '  [ "$1" != status ] || case $arg in -v* | -[!-]*v* | --v*) echo "refused: $arg" >&2 && exit 2 ;; esac' \
+                  '  case $arg in' \
+                  '    -O* | -[!-]*O*) echo "refused: $arg" >&2 && exit 2 ;;' \
+                  '    --?*)' \
+                  '      name=${arg%%=*}' \
+                  '      name=${name#--}' \
+                  '      for bad in output no-index orderfile ext-diff textconv open-files-in-pager paginate exec-path git-dir work-tree; do' \
+                  '        if [ "${#name}" -ge 2 ] && [ "${bad#"$name"}" != "$bad" ] || [ "${name#"$bad"}" != "$name" ]; then' \
+                  '          echo "refused: $arg" >&2 && exit 2' \
+                  '        fi' \
+                  '      done' \
+                  '      ;;' \
+                  '  esac' \
+                  '  for path in "$arg" "${arg#*=}" "${arg#*:}"; do' \
+                  '    [ -e "$path" ] || [ -L "$path" ] || continue' \
+                  '    real=$(realpath -e -- "$path") || exit 2' \
+                  '    case $real in' \
+                  '      "$workspace" | "$workspace"/*) ;;' \
+                  '      *) echo "refused: $path is outside the checkout" >&2 && exit 2 ;;' \
+                  '    esac' \
+                  '  done' \
+                  'done' \
+                  'unset GH_TOKEN GITHUB_TOKEN' \
+                  'export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_PAGER=cat PAGER=cat GIT_EXTERNAL_DIFF=' \
+                  'export GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null GIT_CONFIG_KEY_2=core.pager GIT_CONFIG_VALUE_2=cat' \
+                  'command=$1' \
+                  'shift' \
+                  'case $command in' \
+                  '  status) exec git --no-pager status "$@" ;;' \
+                  '  *) exec git --no-pager "$command" --no-ext-diff --no-textconv "$@" ;;' \
+                  'esac'
+              } >"$STAGE/git/git-read"
+              chmod +x "$STAGE/git/git-read"
+              allowed+=("Bash($lane/git/git-read *)")
+              denied+=("Edit(./.lane/git/**)" "Write(./.lane/git/**)" "NotebookEdit(./.lane/git/**)")
+              preamble="$preamble Read the repository's state and history only with $lane/git/git-read status, diff, log or show and their arguments, each as one plain command; it refuses --output, --no-index and a path outside the checkout, and no other git command runs."
+            fi
+            # The check and verify-script copies go to .lane/checks and
+            # .lane/verify, which the runner makes read-only, and are denied
+            # to the file tools.
+            if ((${#checks[@]})); then
+              stage_checks "$STAGE/checks" "$lane/checks"
+              for wrapper in "${check_wrappers[@]}"; do
+                allowed+=("Bash($wrapper)")
+              done
+              denied+=("Edit(./.lane/checks/**)" "Write(./.lane/checks/**)" "NotebookEdit(./.lane/checks/**)")
+              preamble="$preamble $check_prompt"
+            fi
+            if ((${#verify[@]})); then
+              stage_verify "$STAGE/verify" "$lane/verify"
+              for wrapper in "${verify_wrappers[@]}"; do
+                allowed+=("Bash($wrapper *)")
+              done
+              denied+=("Edit(./.lane/verify/**)" "Write(./.lane/verify/**)" "NotebookEdit(./.lane/verify/**)")
+              preamble="$preamble $verify_prompt"
+            fi
+            # review-threads: the skill reads the thread file the runner
+            # checked, and records its replies to those threads, only through
+            # the review-thread tool: a base copy of feedback-thread.sh behind
+            # a wrapper that fixes its environment. The runner makes the
+            # copies under .lane/feedback/ read-only except state/, where the
+            # tool writes the replies file the runner seals for the scan job;
+            # all of .lane/feedback/, state/ included, is denied to the file
+            # tools, since the tool writes through Bash. publish-feedback.mjs
+            # holds the replies file to the template. run.json is staged for the record:
+            # nothing in this job reads it.
+            if [ "$PREPARE" = review-threads ]; then
+              { [ -f "$FEEDBACK_DIR/threads.json" ] && [ -f "$FEEDBACK_DIR/run.json" ]; } || fail "review-threads: the runner wrote no thread file"
+              mkdir -p "$STAGE/feedback/bin" "$STAGE/feedback/state"
+              cp "$FEEDBACK_DIR/threads.json" "$FEEDBACK_DIR/run.json" "$STAGE/feedback/"
+              cp "$BASE_PATH/plugins/source-control/skills/pull-request/scripts/feedback-thread.sh" "$STAGE/feedback/feedback-thread.sh"
+              tool=$lane/feedback/bin/feedback-thread
+              printf '#!/usr/bin/env bash\nexport FEEDBACK_THREADS=%q FEEDBACK_LOG=%q FEEDBACK_SCRATCH=%q FEEDBACK_WORKSPACE=%q\nexec bash %q "$@"\n' \
+                "$lane/feedback/threads.json" "$lane/feedback/state/replies.jsonl" "$lane/scratch" "$WORKSPACE" "$lane/feedback/feedback-thread.sh" >"$STAGE/feedback/bin/feedback-thread"
+              chmod +x "$STAGE/feedback/bin/feedback-thread"
+              allowed+=("Bash($tool *)" "Bash(\"$tool\" *)")
+              for file in threads.json run.json feedback-thread.sh "bin/**" "state/**"; do
+                denied+=("Edit(./.lane/feedback/$file)" "Write(./.lane/feedback/$file)" "NotebookEdit(./.lane/feedback/$file)")
+              done
+              preamble="$preamble The review-thread tool is $tool: run it by exactly this path as $tool list, $tool check-paths <path>... and $tool record <thread-id> <file>, with each disposition file in $lane/scratch. The tool posts and commits nothing: a later job pushes your uncommitted fix and posts what you record."
+            fi
+          fi
+          # web-access with `any`: the research plugins load from .lane/ too,
+          # read-only like the skill's own. The docs scripts are not staged,
+          # so the run reads pages with WebFetch. With a list of hosts, one
+          # WebFetch(domain:) rule each and no research plugins, whose docs
+          # scripts would reach any host.
+          if [ "$edits" = patch ] && [ "$(jq -r '.selected["web-access"].enabled // false' "$RESOLVED")" = true ]; then
+            tools+=(WebFetch WebSearch)
+            if jq -e '.selected["web-access"].domains == "any"' "$RESOLVED" >/dev/null; then
+              for research in discovery knowledge; do
+                [ -d "$BASE_PATH/plugins/$research" ] || fail "web-access: the $research plugin is not in the base"
+                [ -d "$STAGE/plugins/$research" ] || cp -R "$BASE_PATH/plugins/$research" "$STAGE/plugins/"
+                # Each plugin dir is an --add-dir too, so it gets the empty
+                # server list the skill's own copy gets.
+                mcp=$STAGE/plugins/$research/.mcp.json
+                [ -e "$mcp" ] || [ -L "$mcp" ] || printf '{"mcpServers":{}}\n' >"$mcp"
+                [ "$research" = "$plugin" ] || plugin_dirs+=(".lane/plugins/$research")
+              done
+              [ -z "$(find "$STAGE/plugins" -type l -print -quit)" ] || fail "a research plugin holds a symbolic link"
+              allowed+=("WebFetch(domain:*)" WebSearch "Skill(discovery:read-docs)" "Skill(discovery:research)" "Skill(knowledge:docpage-digest)" "Skill(knowledge:map-corpus)")
+              preamble="$preamble This run may search the web and read any page with WebFetch; the docs scripts the research skills use are not available, so read each page with WebFetch, and cite each page you read."
+            else
+              domains=$(jq -r '.selected["web-access"].domains
+                | if type == "array" and length > 0 and all(type == "string") then .[]
+                  else error("bad") end' "$RESOLVED") ||
+                fail "web-access: domains must be any or a list of host names"
+              host='^(\*\.)?([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+              while IFS= read -r domain; do
+                [[ $domain =~ $host ]] || fail "web-access: a domain is not a host name"
+                allowed+=("WebFetch(domain:$domain)")
+              done <<<"$domains"
+              allowed+=(WebSearch)
+              preamble="$preamble This run may search the web and read pages only on these hosts: $(paste -sd ' ' <<<"$domains"). Read each page with WebFetch, and cite each page you read."
+            fi
+            # A deny rule beats an allow rule.
+            kept=()
+            for rule in "${denied[@]}"; do
+              [[ $rule == WebFetch || $rule == WebSearch ]] || kept+=("$rule")
+            done
+            denied=("${kept[@]}")
+          fi
+          skill_args=$(jq -r '.selected.args // ""' "$RESOLVED")
+          [ -z "${ISSUE_NUMBER:-}" ] || skill_args="--issue $ISSUE_NUMBER${skill_args:+ $skill_args}"
+          for target in "${targets[@]}"; do
+            skill_args="${skill_args:+$skill_args }$target"
+          done
+          {
+            printf 'Call the Skill tool with skill %s' "$SKILL"
+            [ -z "$skill_args" ] || printf ' and args %s' "$skill_args"
+            printf ', then follow the skill instructions to the end.\n'
+          } >"$STAGE/prompt.md"
+          delimiter="stage_$(openssl rand -hex 16)"
+          {
+            echo "tools<<$delimiter"
+            printf '%s\n' "${tools[@]}" "$delimiter"
+            echo "allowed-tools<<$delimiter"
+            printf '%s\n' "${allowed[@]}" "$delimiter"
+            echo "disallowed-tools<<$delimiter"
+            printf '%s\n' "${denied[@]}" "$delimiter"
+            echo "plugin-dirs<<$delimiter"
+            printf '%s\n' "${plugin_dirs[@]}" "$delimiter"
+            echo "preamble=$preamble"
+          } >>"$GITHUB_OUTPUT"
+          exit 0
+        fi
+        case "$edits" in
+          read)
+            # ci-context: the job holds no write token, so the skill gets the
+            # tools to rerun the failing checks and fix them (Bash, Edit,
+            # Write), and read access to the context file the runner wrote,
+            # which its Edit and Write cannot reach. The runner turns its
+            # uncommitted edits into a patch.
+            if [ "$PREPARE" = ci-context ]; then
+              [[ $CI_DIR =~ ^/[A-Za-z0-9_./-]+$ ]] || fail "the CI context directory has a name a rule cannot carry"
+              [ -f "$CI_DIR/context.json" ] || fail "ci-context: the runner wrote no context file"
+              chmod -R a-w "$CI_DIR"
+              mkdir -p "$SCRATCH"
+              allowed="$allowed,Bash,Edit,Write,Agent,Read(/$CI_DIR/**),Edit(/$SCRATCH/**)"
+              disallowed="WebFetch,WebSearch,Edit(/$CI_DIR/**),Write(/$CI_DIR/**)"
+              system_prompt="You run unattended as a CI lane activity on $subject, and no one can answer a question. Run every step the skill instructions name. Your scratchpad directory is $SCRATCH: put every temporary or state file there. The context file is $CI_DIR/context.json. Leave every fix uncommitted in the working tree: the runner turns it into a patch that a later job pushes."
+            fi
+            ;;
+          patch | mutate-branch | mutate-tracker | publish-artifact | merge)
             # What a write skill needs to do its job unattended: edit files,
             # run subagents, keep state files in a scratch directory (added
-            # as a working directory, which also makes it writable from its
-            # sandboxed Bash) and commit through the action's signed tool.
-            # Its Bash comes from its own allowed-tools. The PR is the review
-            # step; no tool here limits which files it changes.
-            # In merge-base mode the runner commits what the skill staged,
-            # so the skill gets no commit tool and no instruction to commit.
+            # as a working directory) and commit through the action's signed
+            # tool. The lane does not rely on the skill's allowed-tools
+            # frontmatter: Bash runs what a rule in this list allows. The PR
+            # is the review step; no tool here limits which files it changes.
+            # On Linux the Grep and Glob tools exist only when --allowedTools
+            # names them (https://code.claude.com/docs/en/tools-reference,
+            # "Glob tool behavior"), and the Bash deny list below removes grep
+            # and find, so without them the skill has no way to search.
             mkdir -p "$SCRATCH"
-            allowed="$allowed,Edit,Write,Agent"
-            if [ "$PREPARE" != merge-base ]; then
-              allowed="$allowed,mcp__github_file_ops__commit_files"
+            allowed="$allowed,Edit,Write,Agent,Grep,Glob"
+            # delete_files carries a rename's old path or a removal to the
+            # branch, which commit_files cannot.
+            if [ "$edits" != patch ]; then
+              allowed="$allowed,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files"
             fi
             allowed="$allowed,Edit(/$SCRATCH/**)"
-            disallowed="WebFetch,WebSearch"
             system_prompt="You run unattended as a CI lane activity on $subject, and no one can answer a question. Run every step the skill instructions name. Your scratchpad directory is $SCRATCH: put every temporary or state file there."
-            if [ "$CAN_COMMIT" = true ] && [ "$PREPARE" != merge-base ]; then
+            if [ "$edits" = patch ]; then
+              system_prompt="$system_prompt Leave every change uncommitted in the working tree: the runner turns it into a patch that a later job applies."
+            elif [ "$CAN_COMMIT" = true ]; then
               # The slash command never says the edits reach the PR only as
-              # commits on CLAUDE_BRANCH.
-              system_prompt="$system_prompt A change to a repository file reaches the branch only as a commit: before you finish, commit every repository file you changed with the mcp__github_file_ops__commit_files tool. An uncommitted change is discarded when the run ends."
+              # commits on CLAUDE_BRANCH. commit_files takes each file's mode
+              # from disk, and Write creates a file without the executable bit.
+              allowed="$allowed,Bash(chmod +x *)"
+              system_prompt="$system_prompt A change to a repository file reaches the branch only as a commit: before you finish, run chmod +x on every new or changed file that starts with #! or ends in .sh, because the commit takes each file's mode from disk, then commit every repository file you changed with the mcp__github_file_ops__commit_files tool, and delete every committed path you renamed or removed with the mcp__github_file_ops__delete_files tool. An uncommitted change is discarded when the run ends."
             fi
+            # The web stays off unless the activity sets web-access. On, the
+            # skill may search, fetch the listed domains (`any`: every one)
+            # and run the research skills, whose plugins are installed too.
+            # No sandbox is enabled, so a domain list limits WebFetch alone;
+            # a shell command such as curl is not held to it.
+            disallowed="WebFetch,WebSearch"
+            if [ "$(jq -r '.selected["web-access"].enabled // false' "$RESOLVED")" = true ]; then
+              # `any` is tested on its own, so no list entry can stand for it.
+              if jq -e '.selected["web-access"].domains == "any"' "$RESOLVED" >/dev/null; then
+                allowed="$allowed,WebFetch(domain:*)"
+                # The docs skills fetch through fetch-docs.sh and
+                # docs-cache.sh. Granted for `any` only: they curl any host,
+                # so a domain list keeps them denied. The skill's bare Edit
+                # and Write could rewrite a script the rule then runs, so the
+                # rules name a read-only copy, denied to Edit and Write below.
+                # The prompt puts the cache and the page files in the scratch
+                # directory.
+                [[ $DOCS_DIR =~ ^/[A-Za-z0-9_./-]+$ ]] || fail "the docs script copy has a name a rule cannot carry"
+                mkdir -p "$DOCS_DIR"
+                cp "$BASE_PATH"/plugins/discovery/scripts/{fetch-docs.sh,docs-cache.sh,html2md.py} "$DOCS_DIR/"
+                chmod -R a-w "$DOCS_DIR"
+                # A Bash rule matches the words before its `*` as written, so
+                # each script gets a rule for the bare path and one for the
+                # double-quoted path the skills' examples use. The guard above
+                # keeps quotes and spaces out of the path. `\"` survives the
+                # claude_args quoting as a literal quote.
+                for script in fetch-docs.sh docs-cache.sh; do
+                  allowed="$allowed,Bash(bash $DOCS_DIR/$script *),Bash(bash \\\"$DOCS_DIR/$script\\\" *)"
+                done
+                system_prompt="$system_prompt Any skill that runs fetch-docs.sh or docs-cache.sh runs this copy, by exactly this path, bare or in double quotes: bash $DOCS_DIR/fetch-docs.sh --cache --cache-dir $SCRATCH/docs-cache --out $SCRATCH/docs-<n> <other arguments>, a new <n> per fetch and no mktemp, and bash $DOCS_DIR/docs-cache.sh --cache-dir $SCRATCH/docs-cache <subcommand> <arguments>. Quote the arguments after the path as the skill shows them."
+              else
+                domains=$(jq -r '.selected["web-access"].domains
+                  | if type == "array" and length > 0 and all(type == "string") then .[]
+                    else error("bad") end' "$RESOLVED") ||
+                  fail "web-access: domains must be any or a list of host names"
+                host='^(\*\.)?([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+                while IFS= read -r domain; do
+                  [[ $domain =~ $host ]] || fail "web-access: a domain is not a host name"
+                  allowed="$allowed,WebFetch(domain:$domain)"
+                done <<<"$domains"
+                # The docs scripts stay denied here, so /discovery:read-docs
+                # cannot run its lookup: the run reads a listed host's page
+                # with WebFetch itself.
+                web_hosts=$(paste -sd ' ' <<<"$domains")
+              fi
+              allowed="$allowed,WebSearch,Skill(discovery:read-docs),Skill(discovery:research),Skill(knowledge:docpage-digest),Skill(knowledge:map-corpus)"
+              plugins="$plugins"$'\n'"discovery@$marketplace"$'\n'"knowledge@$marketplace"
+              disallowed=""
+              if [ -d "$DOCS_DIR" ]; then
+                disallowed="Edit(/$DOCS_DIR/**),Write(/$DOCS_DIR/**)"
+              fi
+              if [ -n "${web_hosts:-}" ]; then
+                system_prompt="$system_prompt This run may search the web and read pages only on these hosts: $web_hosts. The docs scripts /discovery:read-docs runs are not available in this run, so read a page on one of those hosts with WebFetch, and cite each page you read."
+              else
+                system_prompt="$system_prompt This run may read web pages: read each external source through /discovery:read-docs, /discovery:research, /knowledge:docpage-digest or /knowledge:map-corpus."
+              fi
+            fi
+            # The checks run from a base copy outside the working directory.
+            if ((${#checks[@]})); then
+              stage_checks "$CHECKS_DIR" "$CHECKS_DIR"
+              for wrapper in "${check_wrappers[@]}"; do
+                allowed="$allowed,Bash($wrapper)"
+              done
+              # The skill's bare Edit and Write must not reach the copy it runs.
+              chmod -R a-w "$CHECKS_DIR"
+              disallowed="${disallowed:+$disallowed,}Edit(/$CHECKS_DIR/**),Write(/$CHECKS_DIR/**)"
+              system_prompt="$system_prompt $check_prompt"
+              # The checks read the working tree, so a run that commits runs
+              # them first and commits after, or its fixes stay uncommitted.
+              if [ "$CAN_COMMIT" = true ]; then
+                system_prompt="$system_prompt Run the checks before you commit: run them, fix, run them again, then commit your changes and the fixes."
+              fi
+            fi
+            if ((${#verify[@]})); then
+              stage_verify "$VERIFY_DIR" "$VERIFY_DIR"
+              for verifier in "${verify_wrappers[@]}"; do
+                allowed="$allowed,Bash($verifier *)"
+              done
+              chmod -R a-w "$VERIFY_DIR"
+              disallowed="${disallowed:+$disallowed,}Edit(/$VERIFY_DIR/**),Write(/$VERIFY_DIR/**)"
+              system_prompt="$system_prompt $verify_prompt"
+            fi
+            # The skill's bare Edit and Write must not reach the plugin copy.
+            # An Edit rule covers every built-in file tool and the Bash file
+            # writes Claude Code recognizes; a Write path rule is never
+            # consulted (https://code.claude.com/docs/en/permissions#read-and-edit).
+            disallowed="${disallowed:+$disallowed,}Edit(/$MARKETPLACE/**)"
+            # The shell deny set above; the Read rules keep the skill out of
+            # process files and out of the checkout's git config, where the
+            # action stores its token.
+            [[ $WORKSPACE =~ ^/[A-Za-z0-9_./-]+$ ]] || fail "the workspace path is missing or has a name a rule cannot carry"
+            # A write skill reaches git only through the base wrappers, so its
+            # Bash runs no git command.
+            disallowed="${disallowed:+$disallowed,}Bash(git *)"
+            disallowed="${disallowed:+$disallowed,}$(IFS=,; echo "${shell_denied[*]}"),Read(//proc/**),Read(/$WORKSPACE/.git/**)"
             ;;
           *) fail "the activity's effect is not a known effect" ;;
         esac
-        claude_args="--max-turns $MAX_TURNS --allowedTools \"$allowed\""
+        claude_args="--allowedTools \"$allowed\""
         if [ -n "$disallowed" ]; then
           claude_args="$claude_args --disallowedTools \"$disallowed\""
         fi
         if [ -n "$system_prompt" ]; then
           claude_args="$claude_args --add-dir \"$SCRATCH\" --append-system-prompt \"$system_prompt\""
-        fi
-        if [ -n "$MODEL" ]; then
-          model='^[A-Za-z0-9][]A-Za-z0-9._[-]*$'
-          [[ $MODEL =~ $model ]] || fail "the model name is malformed"
-          claude_args="$claude_args --model $MODEL"
         fi
         # A gate skill must end with a verdict the next steps can fail on;
         # the action fails its step when no structured output returns.
@@ -212,7 +816,9 @@ runs:
         done
         delimiter="prompt_$(openssl rand -hex 16)"
         {
-          echo "plugin=${SKILL%%:*}@$marketplace"
+          echo "plugins<<$delimiter"
+          printf '%s\n' "$plugins"
+          echo "$delimiter"
           echo "claude-args=$claude_args"
           echo "prompt<<$delimiter"
           printf '%s\n' "$command_line"

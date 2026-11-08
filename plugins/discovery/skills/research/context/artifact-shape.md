@@ -1,0 +1,359 @@
+# Artifact shape: index plus sidecars
+
+The on-disk shape of a `/discovery:research` run's output. `SKILL.md` carries the mandate ("always
+an index"); this file carries the schema and the reasoning. `EXPLORE.md` follows the same shape with
+`EXPLORE-<section>.md` sidecars.
+
+## Why an index at every size, not past a threshold
+
+A size threshold makes the artifact's shape depend on how much the run happened to write, so a
+consumer cannot know what it is holding without opening it. Worse, the threshold arrives exactly when
+the artifact is already too big to skim. The reader pays the full cost once, then the shape changes
+under them on the next run. Committing to the index shape from the first line makes the contract
+stable and the reading cost proportional to what the consumer actually needs.
+
+The unit of progressive disclosure is a **section**, and the consumer decides which sections it
+wants. A planning step chasing one settled fact should read one sidecar, not the whole stage.
+
+## The index: `RESEARCH.md`
+
+Always the entry point. A consumer handed that filename must get a readable document.
+
+The index opens with a YAML frontmatter block carrying at least `abstract:` (ONE unwrapped line
+naming what the run covered; the same one-line rule the sidecar headers already follow). This is the
+indexable-artifact hook: a slice whose sole artifact is this index
+is an index-less leaf, and the parent slice's `INDEX.md` regeneration mirrors this header's abstract
+verbatim, so the header is part of the artifact's public shape, not decoration. It applies to all
+three of this plugin's index families (`RESEARCH.md`, `EXPLORE.md`, `INTENT.md`). `RESEARCH.md`
+also carries `evidence_use:` (see the sidecar header below), `verification:`, and `accepted:`.
+
+**`accepted:` is the number of accepted claims**, an integer the final write sets: the claims the
+run accepts, so neither the claims listed under Gaps nor those left unresolved in Conflicts. Both
+stay in the sidecar headers and do not count.
+A claim recorded under Conflicts counts only when its entry resolves in the claim's favor, as when
+the primary wins over blog consensus. A claim recorded there in place of acceptance does not: a
+refuted engine finding, or a criterion-12 failure filed as a Conflicts entry, which the discipline
+file's "Joint-inference check" says is not accepted.
+`accepted: 0` is a valid result, an inconclusive run, and the Summary then opens with
+`Inconclusive: no claim accepted.` and names the Gaps or Conflicts that blocked one. Without the
+field, an artifact whose every claim is a Gap or an unresolved Conflicts entry passes every row
+quantified over accepted claims and reads like an answer. The verifier grades the count and the
+line under outcome-gate criterion 14, and a parent that later files an accepted claim as a Gap or
+Conflicts entry lowers the count to match.
+
+**`verification:` takes one of the values** defined in
+[`../../../reference/parent-contract.md`](../../../reference/parent-contract.md),
+"The `verification:` values": `pending`, `pass (research-verifier, <date>)`,
+`fail rows <n>[,<n>…] (research-verifier, <date>)`, `skipped (cost)`, `unverified (none, <date>)`.
+The run writes `pending` in its first write, because it may not grade the verifier rows itself; the
+parent replaces it when it closes the post-dispatch boundary. `pending` left in place after that is
+the one wrong value: a later reader cannot tell it from a run still waiting. The acceptance gate
+prints this value as `verification=<value>` after a usable verdict.
+
+Body sections, after the frontmatter:
+
+1. **Task restatement**: what was asked, in the run's own words.
+2. **One-line abstract per sidecar**, copied verbatim from that sidecar's `abstract` header field.
+   Verbatim matters: an abstract paraphrased into the index drifts from the sidecar it describes, and
+   the reader picks a file on the strength of a summary that no longer matches its contents.
+3. **Section → file + anchor table**, so an abstract that looks relevant resolves to a path without
+   opening anything.
+4. **Next-stage-handoff**: settled facts vs. open decisions for the planning step.
+
+## The sidecars: `RESEARCH-<section>.md`
+
+Siblings of the index, inside the same slice directory. Each carries the Output Format's content for
+one section, opening with a machine-readable YAML header so a consumer can grep headers rather than
+prose.
+
+**The filename is keyed on the SECTION, not the topic or scope.** A run has exactly one topic and
+many sections, so a topic-keyed name gives every sidecar in the run the same filename: later sections
+silently overwrite earlier ones, or the worker invents an undocumented name and the index's
+section → file table stops resolving. Use the same stable kebab-case id that the header's `section`
+field carries, so the filename, the header, and the index anchor are one identifier rather than three
+that have to be kept in agreement.
+
+```yaml
+---
+topic: <topic-slug>
+section: <stable kebab-case id, matches the index anchor>
+abstract: <one line, mirrored verbatim into the index>
+claims:
+  - claim: "<one-line claim>"
+    confidence: HIGH          # HIGH | HIGH (single source) | MEDIUM | LOW
+    single_source: "<why only one publisher exists>"   # only at HIGH (single source); omit otherwise
+    tiers: [0, 1]             # source tiers backing this claim
+    applies_to: "<product> <version range>"   # the claim's target, or version-independent
+    subject_pool: "<publisher>"   # single-publisher claims only: equals the one pool their Tier 0/1 sources share
+    sources:                  # what makes gate criterion 4 gradeable off the artifact
+      - url: "<url fetched this turn>"
+        tier: 1
+        pool: "<publisher/org — two sources sharing a pool are NOT independent>"
+        measures: "<variable, population, era, and the claim's scenario or only the general mechanism>"
+        role: primary          # primary | corroborator
+        published: 2025-11-11  # YYYY, YYYY-MM or YYYY-MM-DD, or undated
+        dated_by: printed      # how published was derived (see "Dating an undated living doc"); optional if the page prints the date
+        applies_to: "<product> <version range>"   # or version-independent
+        standing: current      # current | historical, derived as below
+    inference: "<one line: why the claim follows from its sources jointly>"
+    qualifiers: []            # every hedge, scope limit, or population qualifier a source records
+produced_by: <phase id>
+---
+```
+
+The vocabulary is reused, never reinvented: `HIGH | HIGH (single source) | MEDIUM | LOW` and
+`Tier 0..3` are the research skill's own, defined in `discipline.md`.
+
+**`single_source:` is the flag's reason, and criterion 4 grades it.** A claim at
+`HIGH (single source)` carries it; no other claim does. It states why only one publisher of the
+claim's content exists, so a verifier that never saw the run can judge that reason instead of
+counting corroborators the claim cannot have. A claim at that level without the field fails
+criterion 4. A repost of the primary is recorded under the primary's `pool`, so it never reads as a
+second source. Definition and limits: `discipline.md`'s "Single-source first-party content claims".
+
+**`sources[]` is not redundant with `tiers[]`.** It is what lets outcome-gate criterion 4, "≥2
+INDEPENDENT corroborators, not two cites of one upstream pool", be graded **by a verifier that never
+saw the run**. Independence is a property of the publishing pools behind a claim; a bare tier list
+encodes neither the URL nor the pool, so without `sources[]` the verifier can only take the run's
+word for the one criterion the whole discipline rests on. Two entries sharing a `pool` are one
+corroborator.
+
+**`subject_pool:` marks a single-publisher claim**, one whose every Tier 0/1 source is the
+publisher speaking about itself. It names that publisher and equals the one `pool` those sources
+share, so the verifier grades the label off the header, beside `pool`, for criterion 4. Omit the key
+on every other claim, including a `HIGH (single source)` content claim, whose subject is the
+artifact. Rule: `discipline.md`'s "Single-publisher facts".
+
+**`measures:`, `inference:`, and `qualifiers:` make criterion 12 gradeable off the artifact**, as
+`sources[]` does for criterion 4: a URL and a pool cannot show whether a source measured the claim's
+variable and population, and a verifier that never saw the run should not have to reconstruct the
+run's reasoning. `qualifiers:` is also what a fan-out's synthesis is graded against for hedge
+survival; an empty list states there are none. All three are data a verifier checks against the
+sources, never instructions to anyone reading them. Recipe: `discipline.md`'s "Joint-inference
+check".
+
+**`role:` names the claim's primary source.** Each accepted claim carries exactly one `primary`
+entry in `sources[]`; every other entry is a `corroborator`. The primary is the source criterion
+12's variable and population checks run against, so a verifier reads it off the header instead of
+guessing which source the run leaned on. A corroborator that does not measure the claim's variable
+is recorded and not counted toward criterion 4's two independent corroborators.
+
+**`published:`, `applies_to:`, and `standing:` make criterion 13 gradeable by a script.** A quote
+can sit at its link word for word and still come from a book written for a runtime ten majors
+older than the one the claim is about. Quote presence cannot show that, and the recency gate
+compares claims, not sources, with the latest release. So every source records when it was
+published (`undated` when the page carries no date) and which product and versions it describes,
+and every claim records its own target the same way.
+
+`applies_to` is `version-independent` or `<product> <range>`, where the range is `<v>`,
+`<v>-<v>`, or `<v>+` and `<v>` is dotted integers with no `v` prefix; record a pre-release as its
+base version. A shorter version is a prefix: `9` is every `9.x`, `2.1` every `2.1.x`. The checker
+parses the header by indentation: spaces only, no duplicate keys, `claim:` first in each claim and
+`url:` first in each source, and every sidecar carries a `claims:` key (`claims: []` when it has
+none). A header it cannot read is ungradeable, a FAIL. `standing:` is derived, not chosen. A source is `current` when two
+things hold. It covers the claim: it names the claim's product and its range covers the claim's
+whole range, or the claim is `version-independent`; a `version-independent` source does not cover a
+versioned claim. And it is dated; an undated corroborator may be `current` only for a
+`version-independent` claim outside publish mode. Everything else is `historical`, which here
+means "does not cover the claim's target": an older major, another product line, a newer major, or
+part of the claim's range. Split a claim that spans ranges no single source covers. An accepted
+claim's primary is always dated and `current`; a Gap claim (`MEDIUM` or `LOW`) keeps whatever
+primary it has, or none, and the checker skips the primary rules for it. A `historical` source is recorded, labeled wherever the artifact shows
+it, and never counted toward criterion 4. `scripts/check-source-applicability.py` recomputes each
+`standing:` and fails any mismatch, so the label is never the run's own word. Whether the product
+string names the right product line, and whether a source describes the claim's scenario, stays
+with the verifier under criterion 12.
+
+**The index frontmatter carries `evidence_use: internal | publish`**, copied from the envelope's
+`Evidence use:` line; when the line is absent the run writes `internal` and says the default was
+taken. The verifier holds no envelope, so this field is how it learns the stricter bar applies.
+
+**The header set is closed; the sidecar set is open.** Adding a sidecar needs no schema change.
+Adding a header *field* does, so keep the header small enough that widening it stays cheap.
+
+### Dating an undated living doc
+
+Many living vendor pages print no date, and under `evidence_use: publish` an undated primary fails
+criterion 13. **Rule: `published:` records a date the publisher, or the publisher's source
+repository, attaches to that page's content.** A serve-time HTTP header (`Last-Modified`, `Date`,
+`ETag`) records when the page was served, so it is never a publication date. When a page prints no
+date, the researcher derives one by the method below for its family and records that method in the
+source entry as `dated_by:`. `dated_by:` is optional where the page itself prints the date (write
+`printed` or omit it) and expected wherever the date was derived. The verifier re-derives the date
+by the recorded method and grades the method (criterion 13's dispatch brief says so); it does not
+pick its own. `scripts/check-source-applicability.py` rejects a `dated_by:` that names a serve-time
+header. A family with no row, and no public source repository, records `published: undated`.
+
+| Family | Method (`dated_by:`) | Pointer | As of | Recheck trigger |
+|---|---|---|---|---|
+| code.claude.com `/docs/en/` pages | `sitemap-lastmod`: the `<lastmod>` beside that page's `<loc>` | [docs sitemap](https://code.claude.com/docs/sitemap.xml) | 2026-10-11 | the docs host changes how it builds the sitemap, or a spot check finds a `lastmod` that moved with no content change |
+| Microsoft Learn | `ms-date`: the page's `ms.date` metadata; else `source-commit`, the last commit on its source file | [Learn metadata reference, required metadata](https://learn.microsoft.com/en-us/contribute/content/metadata#required-metadata) | 2026-10-11 | the metadata reference changes what `ms.date` means |
+| any other family | `source-commit` when the source repository is public, else `undated` | the page's own repository | n/a | the vendor starts printing a date |
+
+The code.claude.com row covers `/docs/en/` pages only; a localized page is `undated` by this
+method. If a spot check shows `lastmod` tracking regeneration instead of edits, the row becomes
+`undated`. A researcher who uses the Microsoft Learn row, or `source-commit` for docs.github.com,
+confirms the method on the page it cites and records the result in `measures:`.
+
+## The fetch log: the written record criteria 6 and 9 are graded against
+
+`SKILL.md`'s Output Format names the fetch log and its columns. This is its full specification,
+because it is a **schema a verifier parses**, not a narrative, and because two outcome values that
+look interchangeable are not.
+
+**One entry per fetch, PER CLAIM:** `Claim | URL or command | artifact-ladder rung | tool used |
+outcome`. The claim key is not decoration. Criterion 9 is evaluated per accepted claim, and one
+artifact routinely carries claim A while lacking claim B, so an unkeyed outcome cannot show which
+claim it answers.
+
+**Each accepted claim carries the entry for the rung it came from AND one for every rung above it.**
+Each of those states its outcome as exactly one of five:
+
+| Outcome | Means | Earned by |
+|---|---|---|
+| carries the claim | the claim came from this rung | the fetch |
+| **does not exist** for this claim class | the normal result for rung 1 | the full first-party surface sweep criterion 9 specifies, never one clean surface |
+| **unresolved** | the sweep fell short, so absence is unproven | this is the **DEFAULT** whenever the sweep was not completed. A Gap row naming surfaces checked and unchecked, and never a license to source from below the rung |
+| fetched and searched, does not carry the claim | settled only by the fetch | the artifact itself retrieved and searched, never a title, index entry, or snippet standing in for it |
+| unreachable after escalation | also a Gap row | the escalation ladder in `discipline.md` walked and failed |
+
+**The middle three are not interchangeable.** Nonexistence is what an exhaustive multi-surface sweep
+settles and one clean surface does not; unresolved is where a short sweep lands; lacking-the-claim is
+only ever settled by the fetch. Collapsing lacks-the-claim into a probe is what would let a probe
+stand in for reading the artifact. Collapsing unresolved into nonexistence is the substitution the
+absence rule names as the worse one, and it is the likelier of the two here, because `unresolved` is
+the default whenever the sweep was not completed.
+
+**The changelog rung is required on top of that walk, not by it.** For a claim criterion 6 applies
+to, meaning one whose subject ships releases, the recency cross-check is unconditional at every rung,
+so such a claim sourced from a rung *above* the changelog still carries its own latest-release entry. That
+entry's outcome is **composite**, because one changelog fetch can serve the ladder walk and the
+cross-check at once:
+
+```text
+<ladder outcome> — <confirmed-latest version> (<release date>) — <verdict>
+```
+
+- The **ladder half** is the five-value vocabulary above, present exactly when the walk reaches this
+  rung, meaning the claim came from the changelog itself or from a rung below it. A claim sourced
+  from a rung above the changelog has no ladder half, and its entry opens at the version.
+- The **verdict half** is `current` (the claim holds as of that release), `invalidated` (a major bump
+  or a superseding change since the cited doc, so the claim returns to Phase 2), or `unresolved` (the
+  latest release could not be confirmed, or its bearing on the claim could not be settled, so a Gap
+  row, exactly as an unreachable rung is).
+
+Criterion 9 reads the ladder half and criterion 6 the verdict; **neither half stands in for the
+other**, and a rung recorded as fetched without its verdict leaves the recency gate graded from
+recollection, which is exactly what this log exists to prevent.
+
+A claim criterion 6 does not reach, meaning foundational doctrine and anything else with no upstream
+release stream, carries the ladder walk alone. There is no changelog artifact to cite and none is
+expected.
+
+## Two placement rules, both required
+
+1. **Sidecars stay inside `<memory_dir>/<slug>/`.** A sidecar root anywhere else is a placement
+   change governed by the lifecycle artifact protocol, not by this skill, and it would strand the sidecars
+   for any consumer that resolves the slice and finds only the index.
+2. **`RESEARCH.md` stays the entry point.** Renaming it, or demoting it to one sidecar among several,
+   breaks every consumer that was handed the declared filename.
+
+**A sub-slice satisfies both, and is the only sanctioned way to put two runs in one slice.** When a
+slice root is already occupied, or a parent is fanning out over several topics, each run writes its
+whole set, index and sidecars under their normal names, into `<memory_dir>/<slug>/<topic-slug>/`.
+That is still inside the slice, so rule 1 holds; and the index inside it is still `RESEARCH.md`, so
+rule 2 holds. What is **not** sanctioned is renaming the index to dodge a collision: `RESEARCH-*.md`
+is the sidecar pattern, so a renamed index collides with its own sidecars and every consumer handed
+the declared filename gets the *other* run's artifact. The parent assigns sub-slices in both
+families, statting the slice root pre-dispatch and putting any collision or fan-out sub-slice in
+the envelope, and a worker never picks one: two workers choosing independently can choose the same
+one, and the acceptance gate grades exactly the assigned path, so a self-chosen sub-slice holds an
+artifact no gate ever grades. A worker that finds its assigned path unexpectedly occupied reports
+the occupancy rather than relocating.
+
+A worktree that carries the index without its sidecars is strictly worse than a self-contained
+artifact, so any glob that ships `RESEARCH.md` must also ship `RESEARCH-*.md` and `*-checklist.md`.
+
+## The `EXPLORE.md` sidecar header: a different evidence kind
+
+The index shape, the section-keyed filenames, the sub-slice rule, and both placement rules are
+identical for exploration. **The header is not**, and pointing an exploration run at the research
+header is a real defect rather than a shortcut: that header's fields are `confidence`, source
+`tier`, and publishing `pool`, which describe *external* evidence. Local exploration evidence is a
+repository path and whether the file was actually Read. A run handed the research header either
+fabricates URL and pool values it has none of, or improvises a shape no consumer can parse. The
+fabrication is worse, because it launders "I grepped a filename" into the same field a fetched
+primary source would occupy.
+
+```yaml
+---
+topic: <topic-slug>
+section: <stable kebab-case id, matches the index anchor and the filename>
+abstract: <one line, mirrored verbatim into the index>
+dimension: codebase        # which of the six exploration dimensions produced this
+findings:
+  - finding: "<one-line finding>"
+    verified: read         # read | ran | grep | inferred — see below
+    paths:                 # repo-relative, never absolute; the outcome gate checks this
+      - "src/payments/rounding.ts:112-140"
+  - finding: "tests/payments/test_rounding.py passes"
+    verified: ran
+    command: "python -m pytest tests/payments/test_rounding.py -q"   # only with verified: ran
+    result: "4 passed"     # the observed output, quoted, not a reading of it
+    paths:
+      - "tests/payments/test_rounding.py"
+produced_by: <phase or dimension id>
+---
+```
+
+**`verified` is the whole point of the header**, and it is the local analogue of the source tier:
+
+- **`read`**: the file was opened and the finding comes from its contents. A conclusion-driving
+  claim carries `read` or `ran`, per the outcome gate's Read-verified criterion.
+- **`ran`**: a command was executed and the finding is its observed result, recorded in `command:`
+  and `result:`. A claim that a test or check passes, fails, or builds carries `ran` and nothing
+  else: a test that was only opened supports what it asserts (`read`), never that it passes. A
+  command that executes the explored repository's code (a test runner, a build, a project
+  script) is outside a dispatched explorer's read-only boundary whether or not it writes, so
+  there the pass/fail question becomes a numbered gap instead of a claim.
+- **`grep`**: a search hit located it and nothing was opened. Discovery only. A `grep`-verified
+  finding is a lead, not a conclusion.
+- **`inferred`**: drawn from a filename, a directory layout, or a convention rather than from
+  content. Always suspect; name it so a reader can discount it.
+
+Keeping these distinct is what lets a verifier grade "conclusion-driving claims are
+Read-verified, not inferred from a filename or grep hit" off the artifact instead of taking the
+run's word for it, the same job `sources[]` does for the research side.
+
+**Abstracts state the finding, not the coverage.** For exploration, the index's `abstract:` and
+each sidecar's `abstract` assert what is true ("Rounding happens once, in `rounding.ts`, after
+currency conversion"), never what was looked at ("Rounding module overview"). A reader picks one
+sidecar by its abstract, and a coverage label gives them nothing to pick on. The `section` id and
+the filename stay the fixed section names: the gate and the section → file table key on them.
+
+### `EXPLORE.md` index additions
+
+The index frontmatter also carries the commit each explored repository was read at:
+
+```yaml
+repos:
+  - name: <repository name, e.g. owner/repo or its directory name; never an absolute path>
+    sha: <full 40-character `git rev-parse HEAD` taken before the first file read>
+    dirty: false           # true when `git --no-optional-locks status --porcelain` was non-empty before the first read or at the final write, or HEAD at the final write no longer equals sha
+```
+
+Every `path:line` citation in the set is only as good as the commit it was read at, so the sha is
+taken before any file is read and checked again at the final write. `dirty: true` says some
+citations may point at content the sha cannot reproduce: uncommitted changes, or a commit that
+landed mid-run. Outside a repository the list is `repos: []`.
+
+The index body adds a **`## Code references`** section after the section → file table: the
+repo-relative paths the findings cite, grouped by area, each with a few words on its role. Its first
+line is `coverage: exhaustive` (every file in the scope that bears on the task is listed) or
+`coverage: key-files` (the entry points and load-bearing files only), so a reader knows whether a
+file missing from the list was ruled out or simply not listed. Its second line is the staleness
+check, carried in the artifact because a later session may read nothing else:
+
+```markdown
+Before relying on a citation: compare each `repos[].sha` with `git rev-parse HEAD`. On a mismatch, or `dirty: true`, run `git diff --stat <sha> -- <paths below>` and re-read every listed path that changed.
+```

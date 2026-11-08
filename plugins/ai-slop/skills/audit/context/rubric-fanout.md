@@ -1,0 +1,171 @@
+# Rubric fan-out: how a repo-wide rubric pass runs
+
+The judgment rubric is applied by reading, so its cost scales with the words in scope. A
+repo-wide audit over a large corpus is hundreds of thousands of words, which is more than one
+context can read and more than one session can afford to lose to a rate limit or a crash. The
+pass therefore fans out, persists as it goes, and resumes from the last completed batch.
+
+`${CLAUDE_SKILL_DIR}/scripts/rubric-fanout.sh` does every counting, ordering, digest and
+merge step. The orchestrator runs it and reads its output; it never packs, digests or totals
+by hand.
+
+## Batching
+
+1. Start from the list file the audit's step 2 wrote with `detect.sh --list-targets`. Its keys
+   are the detector's `file=` spelling, so script and rubric findings for one file share a key.
+2. Run `rubric-fanout.sh plan --out <rubric dir> <list>`. It orders the files (impact class,
+   then 90-day change count, then key inside a repository; newest modification time first,
+   then key, outside one; `--order repo|mtime` overrides the choice), packs them into batches
+   of up to 50,000 words by `wc -w` (`--budget N` changes it; a larger file is its own
+   batch), and writes `batch-NN.txt`, one key per line, beside `batch-NN.paths`, each listed
+   file's absolute path in the same order. It prints one line per batch:
+   `batch=NN list=<path> files=N words=W digest=<digest>`, where the digest covers the list
+   and the contents of the files its `.paths` sidecar names. It also writes `cues.txt` in the
+   batch directory, the corpus-wide counts for the saturation cues: `scope_files=<S>`, one
+   `cue=<c> occurrences=<O> files=<F> saturated=yes|no` line per cue over the whole scope,
+   and one `batch=NN cue=<c> occurrences=<O> files=<F>` line per batch and cue with
+   occurrences, plus a `scope_digest=<sha>` line over the batch digests it was counted from.
+   The catalog entry `rule-abstract-metaphor-jargon` defines the cues, the unit and the
+   threshold.
+3. The batch directory is the rubric working directory (below), so a later session can resume
+   from it. `plan` refuses a directory that already holds batch lists, so a new scope gets a
+   new working directory. A resume keeps the existing one and skips `plan`: re-planning can
+   reorder the files (a new commit moves the change counts), which changes every list's
+   digest. A batch directory planned before `plan` wrote `cues.txt` has none. A resume from it
+   dispatches without the cue counts, its batches treat both cues as unsaturated, and `merge`
+   runs no consistency check.
+
+## Rubric working directory
+
+One directory holds every rubric artifact of a run: the batch lists (`batch-NN.txt`,
+`batch-NN.paths`), `cues.txt`, the extracted rubric file, the `rubric-batch-NN.md` results, and
+the merged `<TS>-ai-slop-rubric.md`. Resolve it before step 3, from the target alone: no remote
+fetch, and no dependence on the findings home, which the persist contract resolves only at
+step 5 after fetching the producer contract. The fan-out can therefore start before that
+contract is reachable.
+
+- Repository target: `<repo top level>/.work/ai-slop-rubric/<TS>/`, with
+  `TS="$(date -u +%Y%m%dT%H%M%SZ)"`. Create `.work/ai-slop-rubric/` with `mkdir -p`, then the run directory with a plain `mkdir`, which
+  fails on an existing path; on failure retry with `<TS>-2`, `<TS>-3`, and so on, so two runs in
+  one second never share a workspace (an explicit resume reuses its known path). Confirm it is ignored with
+  `git -C <repo top level> check-ignore -q .work/ai-slop-rubric/<TS>/`. When the check fails or
+  the directory cannot be created, use the session scratchpad, else the system temp directory.
+- Non-repository target: the session scratchpad, else the system temp directory.
+
+These files carry no `type: review-findings` frontmatter, so `review:fanout fix` never reads
+them. That is why they need not sit beside the findings file.
+
+## Dispatch
+
+Run `rubric-fanout.sh extract --out <rubric file>` once. It writes the catalog's `v1: rubric`
+entries plus the "Signs of human writing" section to that file.
+
+One fresh-context subagent per batch, all dispatched in one message so they run concurrently.
+Dispatch each with `model: sonnet` on the Agent call itself. Which model that alias resolves to,
+and how the per-call value ranks against the agent definition and the session model, is in
+[Choose a model](https://code.claude.com/docs/en/sub-agents#choose-a-model). As of: 2026-10-11.
+Recheck trigger: that section changes the accepted aliases, the resolution order, or how a
+family alias resolves. Each subagent receives:
+
+- the path of the extracted rubric file, and nothing else from the catalog;
+- the path of its batch list and the digest the batch's `status` row printed (`status` runs
+  before every dispatch, below), which the subagent copies verbatim into its result;
+- the path of `<batch dir>/cues.txt`, whose `saturated=` verdicts the subagent applies instead
+  of judging saturation from its own batch, and whose `batch=NN` lines give its own cue
+  counts;
+- the result path it must write to (below);
+- the declined-line shape, `declined: <rule-id> <cue> reason=saturated|boundary|cap`, zero or
+  more header lines, one per rule, cue and reason in the batch (`cap` marks a hit dropped by
+  the finding caps below), and the rule that every occurrence of a `cues.txt` cue in its
+  batch ends as a finding or is covered by a `declined:` line, never silently dropped;
+- the finding shape: `- L<line> rule-<id>: "<verbatim quote, max 25 words>" -- <reason, max 20
+  words>`, grouped under `## <path>` headings in the batch list's spelling, files without
+  findings omitted, with `batch: <digest>`, `files_reviewed:`, and `files_with_findings:`
+  lines at the top;
+- the boundary rules: skip fenced code, blockquotes, double-quoted spans, inline code, YAML
+  frontmatter, generated regions (a standalone `<!-- BEGIN GENERATED: ... -->` line through its
+  `<!-- END GENERATED: ... -->` line, which a script owns), and table cell literals except for
+  `rule-unusual-tables`; a file that quotes a
+  tell to document it is not a finding; cap 6 findings per file and 30 per batch, worst first.
+  For a non-repository target, add that `rule-style-shift` is not evaluable, because there is
+  no history to compare against, and is never reported as a finding.
+
+The subagent writes its result file before it replies, and replies with counts and its three
+strongest findings only. The orchestrator never reads the batch's source files itself.
+
+## Persistence and resume
+
+Result files live in the rubric working directory, as `<rubric dir>/rubric-batch-NN.md`, beside
+the batch lists. The directory is gitignored or outside the checkout, so nothing here is ever
+committed. A later session reuses the existing directory and skips `plan`.
+
+A result file belongs to one batch list, not to a batch number: a leftover
+`rubric-batch-03.md` from an earlier scope can sit exactly where the current third batch will
+write. Before dispatching, and on every resume, run
+`rubric-fanout.sh status --batches <rubric dir> --results <rubric dir>`. It prints one row
+per batch:
+
+- `status=complete`: the result carries exactly one of each header line: `batch:` equal to
+  the batch's current digest, `files_reviewed:` equal to the list's length, and
+  `files_with_findings:` equal to its `## <path>` headings, none of which is outside the
+  list. Skip the batch. The digest binds a result to the batch list and to the listed files'
+  contents: a file edited after its batch completed turns that batch stale, and a listed
+  path that can no longer be read keeps it stale until the batch is planned again. A batch
+  directory with no `.paths` sidecars keeps its digests bound to the list only.
+- `status=missing digest=<digest>`, or `status=stale
+  reason=digest|files_reviewed|foreign-heading|files_with_findings digest=<digest>`:
+  dispatch the batch again with that row's `digest=` value and let the subagent overwrite the
+  file. A header line written more than once is stale under that header's reason (`digest`
+  for `batch:`).
+- `status=missing reason=paths digest=<digest>` or `status=stale reason=paths
+  digest=<digest>`: the `.paths` sidecar is not a readable regular file, its length differs
+  from the list's, or one of its paths is not a readable regular file (a moved checkout, a
+  deleted file, a FIFO). Re-plan into a fresh directory rather than dispatching. `status` and
+  `plan` never open a path that is not a regular file, so a FIFO cannot stall them.
+
+A terminated subagent therefore costs one batch, a rerun after a limit resets dispatches only
+the batches that did not finish, and a run over a changed scope never inherits a result from
+the scope it replaced. `status` exits 0 only when every batch is complete.
+
+## Merge
+
+When `status` reports every batch complete, check each batch's evidence before accepting it:
+spot-check a sample of its findings against the cited file and line, and dispatch the batch again
+when a quoted span is not there. Then run `rubric-fanout.sh merge --batches <rubric dir>
+--results <rubric dir> --out <rubric dir>/<TS>-ai-slop-rubric.md`. It refuses while any
+batch is incomplete, and otherwise writes summed `files_reviewed` and `files_with_findings`,
+one `rule_total:` line per rule, and each result body in batch order. Well-formed `declined:`
+lines are stripped from the bodies and summed into
+`declined_total: <rule-id> <cue> reason=<r> batches=<NN,...>` lines; a `declined:` line with
+any other shape stays in its body where a reader sees it.
+
+When `cues.txt` is present, `merge` also checks that the batches agreed and prints, after the
+`rule_total:` lines, one `consistency:` line per disagreement:
+
+- `consistency: rule-abstract-metaphor-jargon cue=<c> saturated=yes reported_in=<NN,...>`: a
+  batch quoted a saturated cue in a finding of that rule.
+- `consistency: <rule-id> cue=<c> saturated=no declined_in=<NN,...>`: a batch declined an
+  unsaturated cue, or a word `cues.txt` does not count, with `reason=saturated`.
+- `consistency: rule-abstract-metaphor-jargon cue=<c> unaccounted_in=<NN,...>`: a batch whose
+  `cues.txt` line shows occurrences neither quoted the cue in a finding of that rule nor
+  declined it. A finding with no double-quoted span accounts for nothing. A quote may wrap
+  onto indented continuation lines. A declined cue is matched in any case and in plural
+  (`seams` is `seam`).
+- `consistency: cues.txt stale reason=digest`: a listed file changed after `plan`, so the
+  counts no longer describe the scope. It replaces the three checks above; plan the scope
+  again into a fresh directory to get current verdicts.
+
+The `rule_total:` line of any rule named on a `consistency:` line ends with `consistency=flagged`.
+A flagged rule's total is an artifact of batch assignment until the named batches are
+dispatched again. With no `cues.txt`, `merge` runs none of these checks and prints nothing
+extra. `rule-colon-crutch` and the other rules without cue words get no merge check; their
+consistency rests on the catalog's reported and declined examples. The merged file is the rubric
+half of the human report. Rubric findings never enter the detector's findings file: they have
+no crosswalk row and no relay.
+
+## What this is not
+
+- Not a budget mechanism. Every file in scope gets its rubric read; the fan-out changes how the
+  reading is paid for, never whether it happens.
+- Not a substitute for the detector. The two layers run over the same scope and report
+  separately.

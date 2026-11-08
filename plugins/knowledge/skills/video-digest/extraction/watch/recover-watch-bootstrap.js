@@ -1,0 +1,423 @@
+#!/usr/bin/env node
+/**
+ * Recover run-watch bootstrap from an interrupted session when temp dirs still exist.
+ *
+ * Usage:
+ *   node watch/recover-watch-bootstrap.js <slice-dir> <workDir> <framesDir> <contactSheetsDir>
+ */
+
+import fs from "node:fs";
+import fsPromises from "node:fs/promises";
+import path from "node:path";
+
+import { readFrameTimes } from "@melodic/video-digestion/frames/scene-detect";
+import { probeVideoDuration } from "@melodic/video-digestion/media/ffprobe-duration";
+import { isMainModule } from "@melodic/video-digestion/shared/main-module";
+import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/terminal";
+
+import { resolveSourceAdapter } from "../adapters/registry.js";
+import { selectCaptionFile } from "../acquisition/select-caption.js";
+import { parseVideoMetadata } from "../acquisition/video-metadata.js";
+import { LANES, lanePath } from "../lib/slice-lanes.js";
+import { MAX_FRAME_GAP_SEC, planFrameCoverage } from "../watching/compute-coverage-plan.js";
+import { normalizeVttCues } from "../watching/cue-normalize.js";
+import { isHighVolume, selectFramesForCoverage } from "../watching/frame-budget.js";
+import { mergeFrameCandidates } from "../watching/merge-frame-candidates.js";
+import {
+  batchFramesForContactSheets,
+  interleaveTranscriptAndFrames,
+} from "../watching/timestamp-interleave.js";
+import { writeWatchingManifest } from "../watching/write-watching-manifest.js";
+import { recordDurationMismatch } from "./duration-mismatch.js";
+import {
+  createWatchState,
+  markPhaseComplete,
+  readWatchState,
+  writeContinuationPrompt,
+  writeWatchState,
+} from "./watch-state.js";
+
+/**
+ * Recovery's source of truth for the slice's origin URL: the `sourceUrl` the
+ * original watch run persisted in `watch.json`. Never synthesized from
+ * metadata — a synthesized URL would stamp the wrong source (and route harvest
+ * to the wrong adapter) for any non-YouTube slice.
+ *
+ * @param {string} sliceDir
+ * @returns {Promise<string|null>}
+ */
+export async function resolveRecoverySourceUrl(sliceDir) {
+  const state = await readWatchState(sliceDir);
+  const sourceUrl = state?.sourceUrl;
+  return typeof sourceUrl === "string" && sourceUrl.length > 0 ? sourceUrl : null;
+}
+
+/**
+ * The maximum frame gap the original run recorded in `watch.json`, or the
+ * default for a slice recorded before the field existed.
+ *
+ * @param {string} sliceDir
+ * @returns {Promise<number>}
+ */
+async function resolveRecoveryMaxFrameGapSec(sliceDir) {
+  const recorded = (await readWatchState(sliceDir))?.maxFrameGapSec;
+  return typeof recorded === "number" && recorded > 0 ? recorded : MAX_FRAME_GAP_SEC;
+}
+
+/**
+ * Frames on disk with the times they were captured at: an anchor's exact seek
+ * time from its file name, a scene or interval frame's from `frame-times.json`.
+ * A frame with neither stays untimed; no time is invented.
+ *
+ * @param {string} framesDir
+ * @returns {import('@melodic/video-digestion/frames/models').FrameCandidate[]}
+ */
+function loadFramesFromDir(framesDir) {
+  const frameTimes = readFrameTimes(framesDir);
+  const files = fs
+    .readdirSync(framesDir)
+    .filter((name) => name.endsWith(".png"))
+    .sort();
+  return files.map((file) => {
+    const framePath = path.join(framesDir, file);
+    const anchorMatch = file.match(/^anchor_(\d+)_/);
+    if (anchorMatch) {
+      return {
+        path: framePath,
+        file,
+        timestampSec: Number(anchorMatch[1]) / 1000,
+        timestampSource: /** @type {const} */ ("anchor"),
+      };
+    }
+    return { timestampSec: null, ...frameTimes[file], path: framePath, file };
+  });
+}
+
+/**
+ * @param {string} contactSheetsDir
+ * @returns {string[]} sorted `sheet_NNN.jpg` names already on disk
+ */
+function listExistingSheetFiles(contactSheetsDir) {
+  return fs
+    .readdirSync(contactSheetsDir)
+    .filter((name) => /^sheet_\d+\.jpg$/i.test(name))
+    .sort();
+}
+
+/**
+ * @param {string} contactSheetsDir
+ * @param {string[]} sheetFiles
+ * @param {import('../watching/models.js').SelectedFrame[][]} batches
+ * @returns {import('@melodic/video-digestion/frames/models').ContactSheet[]}
+ */
+function loadExistingContactSheets(contactSheetsDir, sheetFiles, batches) {
+  return sheetFiles.map((file, index) => {
+    const batch = batches[index] ?? [];
+    return {
+      outputPath: path.join(contactSheetsDir, file),
+      frameCount: batch.length,
+      inputPaths: batch.map((frame) => frame.path),
+    };
+  });
+}
+
+/**
+ * The manual caption languages info.json lists, the signal acquisition feeds
+ * `selectCaptionFile`. `undefined` when the file is unreadable or carries no
+ * `subtitles` object, which leaves the filename classification in force.
+ *
+ * @param {string} infoPath
+ * @returns {string[] | undefined}
+ */
+function readManualLanguages(infoPath) {
+  try {
+    const subtitles = JSON.parse(fs.readFileSync(infoPath, "utf8"))?.subtitles;
+    return subtitles && typeof subtitles === "object" ? Object.keys(subtitles) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolve the caption through the selector acquisition uses, so recovery
+ * rebuilds the transcript from the track the original run chose: a bare
+ * `.en.vtt` that info.json does not list as manual may be YouTube's machine
+ * translation and ranks below `.en-orig.vtt`. A `.vtt` the ladder does not
+ * classify (another language) is still taken, as before.
+ *
+ * @param {string[]} vttNames
+ * @param {string} infoPath
+ * @param {import('../acquisition/select-caption.js').CaptionClass} captionClass
+ * @returns {string}
+ */
+function pickCaptionName(vttNames, infoPath, captionClass) {
+  const selected = selectCaptionFile(vttNames, captionClass, {
+    manualLanguages: readManualLanguages(infoPath),
+  });
+  if (selected.success) return selected.selection.path;
+  return vttNames.find((name) => !name.includes("-orig")) ?? vttNames[0];
+}
+
+/**
+ * The names belonging to the media entry `videoName` (`<id>.mp4`) heads, by
+ * yt-dlp's `%(id)s.%(ext)s` template, so a multi-video work dir (an X post)
+ * never pairs one entry's video with another entry's caption or info.json.
+ * All `names` only when the work dir is not entry-named (no info.json stem
+ * prefixes another file), so an entry whose own files are missing gets none
+ * rather than a sibling's.
+ *
+ * @param {string[]} names
+ * @param {string} videoName
+ * @param {boolean} entryNamed
+ * @returns {string[]}
+ */
+function scopeToEntry(names, videoName, entryNamed) {
+  if (!entryNamed) return names;
+  const prefix = `${videoName.slice(0, -".mp4".length)}.`;
+  return names.filter((name) => name.startsWith(prefix));
+}
+
+/**
+ * @param {string} workDir
+ * @param {import('../acquisition/select-caption.js').CaptionClass} [captionClass] the source adapter's declared class
+ * @returns {{ videoPath: string, vttPath: string, infoPath: string }}
+ */
+export function resolveWorkArtifacts(workDir, captionClass = "manual-and-auto") {
+  const entries = fs.readdirSync(workDir);
+  const videoPath = entries.find((name) => name.endsWith(".mp4"));
+  const infoNames = entries.filter((name) => name.endsWith(".info.json"));
+  const vttNames = entries.filter((name) => name.endsWith(".vtt"));
+  if (!videoPath || vttNames.length === 0 || infoNames.length === 0) {
+    throw new Error(`Missing mp4/vtt/info.json in ${workDir}`);
+  }
+  const entryNamed = infoNames.some((info) => {
+    const prefix = `${info.slice(0, -".info.json".length)}.`;
+    return entries.some((name) => name !== info && name.startsWith(prefix));
+  });
+  const [infoPath] = scopeToEntry(infoNames, videoPath, entryNamed);
+  const entryVttNames = scopeToEntry(vttNames, videoPath, entryNamed);
+  if (!infoPath || entryVttNames.length === 0) {
+    throw new Error(`Missing vtt/info.json for ${videoPath} in ${workDir}`);
+  }
+  const vttPath = pickCaptionName(entryVttNames, path.join(workDir, infoPath), captionClass);
+  return {
+    videoPath: path.join(workDir, videoPath),
+    vttPath: path.join(workDir, vttPath),
+    infoPath: path.join(workDir, infoPath),
+  };
+}
+
+export const RECOVER_USAGE =
+  "Usage: node watch/recover-watch-bootstrap.js <slice-dir> <workDir> <framesDir> <contactSheetsDir>";
+
+/** Frames per contact sheet, matching the 4x4 cell grid the sheets on disk were built with. */
+const FRAMES_PER_CONTACT_SHEET = 16;
+
+/**
+ * Stratified downsample of a frame selection to the frame count the contact
+ * sheets already on disk can hold.
+ *
+ * Split out so the WARN can report the count it downsampled FROM: the caller
+ * reassigns `selection` only after this has returned both counts.
+ *
+ * @param {import('../watching/models.js').SelectedFrame[]} selected
+ * @param {number} targetFrameCount
+ * @returns {{ selected: import('../watching/models.js').SelectedFrame[], droppedCount: number, warning: string|null }}
+ */
+export function downsampleSelectedFrames(selected, targetFrameCount) {
+  const beforeCount = selected.length;
+  if (beforeCount <= targetFrameCount) {
+    return { selected, droppedCount: 0, warning: null };
+  }
+  const step = beforeCount / targetFrameCount;
+  const downsampled = [];
+  for (let i = 0; i < targetFrameCount; i++) {
+    downsampled.push(selected[Math.floor(i * step)]);
+  }
+  const droppedCount = beforeCount - downsampled.length;
+  return {
+    selected: downsampled,
+    droppedCount,
+    warning: `WARN: downsampled ${beforeCount} → ${downsampled.length} frames (stratified, ${droppedCount} dropped)`,
+  };
+}
+
+/**
+ * @param {string[]} argv
+ */
+export async function recoverWatchBootstrapCli(argv) {
+  // Validate BEFORE resolving: `path.resolve(undefined)` throws a TypeError,
+  // so resolving first would make this usage branch unreachable.
+  const [sliceDirArg, workDirArg, framesDirArg, contactSheetsDirArg] = argv.slice(2, 6);
+  if (!sliceDirArg || !workDirArg || !framesDirArg || !contactSheetsDirArg) {
+    writeStderr(RECOVER_USAGE);
+    return 1;
+  }
+
+  const sliceDir = path.resolve(sliceDirArg);
+  const workDir = path.resolve(workDirArg);
+  const framesDir = path.resolve(framesDirArg);
+  const contactSheetsDir = path.resolve(contactSheetsDirArg);
+
+  const sourceUrl = await resolveRecoverySourceUrl(sliceDir);
+  if (!sourceUrl) {
+    writeStderr(
+      `Cannot recover: no sourceUrl in ${path.join(sliceDir, "run-state", "watch.json")} — re-run the watch from its original URL instead`,
+    );
+    return 1;
+  }
+  const adapter = resolveSourceAdapter(sourceUrl);
+
+  const { videoPath, vttPath, infoPath } = resolveWorkArtifacts(workDir, adapter.captionClass);
+  const metadata = parseVideoMetadata(JSON.parse(fs.readFileSync(infoPath, "utf8")));
+  const vttText = fs.readFileSync(vttPath, "utf8");
+  const cues = normalizeVttCues(vttText);
+
+  const probe = await probeVideoDuration(videoPath);
+  const durationSec = probe?.durationSec ?? cues.at(-1)?.endSec ?? 0;
+
+  const rawFrames = loadFramesFromDir(framesDir);
+  const merged = mergeFrameCandidates(rawFrames);
+
+  const maxFrameGapSec = await resolveRecoveryMaxFrameGapSec(sliceDir);
+  const { windows, coveragePlan } = planFrameCoverage(cues, {
+    durationSec,
+    sceneCandidateCount: merged.length,
+    maxFrameGapSec,
+  });
+
+  let selection = selectFramesForCoverage(merged, {
+    windows,
+    targetMinFrames: coveragePlan.targetMinFrames,
+    durationSec,
+  });
+
+  const sheetFiles = listExistingSheetFiles(contactSheetsDir);
+  const expectedSheetCount = sheetFiles.length;
+  const expectedFrameCount = expectedSheetCount * FRAMES_PER_CONTACT_SHEET;
+
+  const downsample = downsampleSelectedFrames(selection.selected, expectedFrameCount);
+  if (downsample.warning) {
+    selection = {
+      ...selection,
+      selected: downsample.selected,
+      candidateCount: merged.length,
+    };
+    writeStderr(`${downsample.warning} to match ${expectedSheetCount} contact sheets`);
+  }
+
+  const batches = batchFramesForContactSheets(selection.selected, FRAMES_PER_CONTACT_SHEET);
+  const contactSheets = loadExistingContactSheets(contactSheetsDir, sheetFiles, batches);
+
+  const highVolume = isHighVolume({
+    candidateCount: selection.selected.length,
+    targetMinFrames: coveragePlan.targetMinFrames,
+    contactSheetCount: contactSheets.length,
+    durationSec,
+    densificationWindowCount: windows.length,
+  });
+
+  const watching = {
+    sceneFrames: [],
+    uniqueFrames: merged,
+    densificationWindows: windows,
+    coveragePlan,
+    selectedFrames: selection.selected,
+    contactSheets,
+    interleavedTimeline: interleaveTranscriptAndFrames(cues, selection.selected),
+    targetMinFrames: selection.targetMinFrames,
+    highVolume,
+    durationSec,
+    overCap: false,
+    candidateCount: selection.candidateCount,
+  };
+
+  const tempSession = {
+    workDir,
+    framesDir,
+    contactSheetsDir,
+    acquiredAt: new Date().toISOString(),
+  };
+
+  let state = createWatchState({
+    videoId: metadata.id,
+    videoSlug: path.basename(sliceDir),
+    sourceUrl,
+    title: metadata.title,
+    maxFrameGapSec,
+  });
+  state.tempSession = tempSession;
+  state.status = "vision";
+  state = markPhaseComplete(state, "acquire", { videoDownloaded: true, recovered: true });
+  state = markPhaseComplete(state, "transcript", { recovered: true });
+  state.frameSelection = {
+    selectedCount: watching.selectedFrames.length,
+    targetMinFrames: watching.targetMinFrames ?? 0,
+    highVolume,
+    overCap: false,
+    candidateCount: watching.candidateCount,
+  };
+
+  state = await recordDurationMismatch(state, sliceDir, {
+    metadataDurationSec: metadata.durationSec,
+    probedDurationSec: probe?.durationSec,
+  });
+
+  const manifest = await writeWatchingManifest(sliceDir, watching, tempSession);
+  state.artifactPaths = {
+    selectionPath: manifest.selectionPath,
+    coveragePlanPath: manifest.coveragePlanPath,
+    frameCount: manifest.frameCount,
+    contactSheetCount: manifest.contactSheetCount,
+  };
+  state = markPhaseComplete(state, "watching", {
+    selectedCount: watching.selectedFrames.length,
+    highVolume,
+    densificationWindows: windows.length,
+    frameCount: manifest.frameCount,
+    contactSheetCount: manifest.contactSheetCount,
+    targetMinFrames: watching.targetMinFrames ?? 0,
+    recovered: true,
+  });
+
+  const harvestedLinks = adapter.harvestLinks(metadata);
+  await fsPromises.mkdir(lanePath(sliceDir, LANES.source), { recursive: true });
+  const harvestPath = lanePath(sliceDir, LANES.source, "harvested-links.json");
+  await fsPromises.writeFile(harvestPath, `${JSON.stringify(harvestedLinks, null, 2)}\n`, "utf8");
+  state = markPhaseComplete(state, "harvest", {
+    linkCount: harvestedLinks.length,
+    recovered: true,
+  });
+
+  await writeWatchState(sliceDir, state);
+  await writeContinuationPrompt(sliceDir, state);
+
+  writeStdout(
+    JSON.stringify(
+      {
+        recovered: true,
+        sliceDir,
+        selectedCount: watching.selectedFrames.length,
+        contactSheetCount: contactSheets.length,
+        highVolume,
+        durationSec,
+        harvestPath,
+      },
+      null,
+      2,
+    ),
+  );
+
+  return 0;
+}
+
+if (isMainModule(import.meta.url)) {
+  recoverWatchBootstrapCli(process.argv)
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((error) => {
+      writeStderr(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    });
+}

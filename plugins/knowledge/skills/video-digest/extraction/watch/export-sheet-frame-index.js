@@ -1,0 +1,68 @@
+#!/usr/bin/env node
+/**
+ * Export contact-sheet cell → frame mapping for vision triage.
+ *
+ * Usage: node watch/export-sheet-frame-index.js <slice-dir>
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+
+import { isMainModule } from "@melodic/video-digestion/shared/main-module";
+import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/terminal";
+
+import { LANES, lanePath } from "../lib/slice-lanes.js";
+import { resolveTempSession, serializeTempPath } from "../lib/temp-session-paths.js";
+import { indexSelectedFrames, readJsonFile, readLaneJson } from "../lib/watch-frame-index.js";
+import { CELL_IDS } from "../lib/watch-vision-validation.js";
+import { watchStatePath } from "./watch-state.js";
+
+const MID_CELL_INDEX = Math.floor(CELL_IDS.length / 2);
+
+/**
+ * @param {string} sliceDir
+ * @returns {string}
+ */
+export function exportSheetFrameIndex(sliceDir) {
+  const absSlice = path.resolve(sliceDir);
+  const watchPath = watchStatePath(absSlice);
+  const selection = readLaneJson(absSlice, LANES.keyFrames, "selection.json");
+  const watch = fs.existsSync(watchPath) ? readJsonFile(watchPath) : {};
+
+  const byFile = indexSelectedFrames(selection);
+
+  const sheets = selection.contactSheets.map((sheet, index) => ({
+    sheetId: `sheet_${String(index + 1).padStart(3, "0")}`,
+    file: sheet.file,
+    path: sheet.path ? serializeTempPath(sheet.path) : undefined,
+    midTimestampSec: byFile[sheet.inputFiles[MID_CELL_INDEX]]?.timestampSec ?? null,
+    cells: sheet.inputFiles.map((file, cellIndex) => ({
+      cell: CELL_IDS[cellIndex],
+      frame: file,
+      timestampSec: byFile[file]?.timestampSec ?? null,
+      timestampSource: byFile[file]?.timestampSource ?? null,
+      textDense: byFile[file]?.textDense ?? false,
+    })),
+  }));
+
+  const resolvedSession = resolveTempSession(watch.tempSession ?? {});
+  const sheetsDir = resolvedSession.contactSheetsDir
+    ? serializeTempPath(resolvedSession.contactSheetsDir)
+    : "{tmp}/video-sheets-unknown";
+  const framesDir = resolvedSession.framesDir ? serializeTempPath(resolvedSession.framesDir) : null;
+
+  const payload = { sheetsDir, framesDir, sheets };
+  const outPath = lanePath(absSlice, LANES.keyFrames, "sheet-frame-index.json");
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  return outPath;
+}
+
+if (isMainModule(import.meta.url)) {
+  const sliceDir = process.argv[2];
+  if (!sliceDir) {
+    writeStderr("Usage: node watch/export-sheet-frame-index.js <slice-dir>");
+    process.exit(2);
+  }
+  writeStdout(exportSheetFrameIndex(sliceDir));
+}

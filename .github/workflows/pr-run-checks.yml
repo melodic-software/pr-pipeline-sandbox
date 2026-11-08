@@ -2,7 +2,8 @@ name: pr-run-checks
 
 # Lane caller for pr-run-checks: its file stem is the lane, so the lanes token
 # broker's check endpoint accepts its read activity (a caller whose stem
-# differs is denied lane-mismatch). No secret. Runs only on PRs that touch
+# differs is denied lane-mismatch). No Claude secret; only the scan-carrier
+# key the read runner requires. Runs only on PRs that touch
 # sandbox/kill-switch/**.
 
 on:
@@ -24,6 +25,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      issues: write
       id-token: write
     concurrency:
       group: ${{ github.workflow }}-check-read-token-${{ github.event.pull_request.number || inputs.pr-number }}
@@ -33,3 +35,5 @@ jobs:
       lane: pr-run-checks
       activity: check-read-token
       pr-number: ${{ inputs.pr-number }}
+    secrets:
+      scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}

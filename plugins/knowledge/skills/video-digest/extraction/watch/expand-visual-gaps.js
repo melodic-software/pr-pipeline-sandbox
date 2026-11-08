@@ -1,0 +1,62 @@
+#!/usr/bin/env node
+/**
+ * Expand visual-gaps.md for densification windows without promoted frames.
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+
+import { isMainModule } from "@melodic/video-digestion/shared/main-module";
+import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/terminal";
+
+import {
+  loadPromotedTimestampsSec,
+  parsePromotedTimestampsSec,
+} from "../evals/check-watch-outcomes.js";
+import { LANES, lanePath } from "../lib/slice-lanes.js";
+import { readLaneJson } from "../lib/watch-frame-index.js";
+
+/**
+ * @param {string} sliceDir
+ */
+export function expandVisualGaps(sliceDir) {
+  const absSlice = path.resolve(sliceDir);
+  const sel = readLaneJson(absSlice, LANES.keyFrames, "selection.json");
+  const visualFramesPath = lanePath(absSlice, LANES.keyFrames, "visual-frames.md");
+  const exact = loadPromotedTimestampsSec(absSlice);
+  // Minute labels are the fallback for slices with no promoted frames on disk.
+  const promoted =
+    exact.length > 0 || !fs.existsSync(visualFramesPath)
+      ? exact
+      : parsePromotedTimestampsSec(fs.readFileSync(visualFramesPath, "utf8"));
+
+  const gapRows = sel.densificationWindows
+    .filter((window) => !promoted.some((ts) => ts >= window.startSec && ts <= window.endSec))
+    .map(
+      (window) =>
+        `| ~${Math.round(window.startSec / 60)}m (${window.startSec.toFixed(1)}-${window.endSec.toFixed(1)}s) | ${window.reason} | No synthesis frame in window; transcript-only |`,
+    );
+
+  const body = `# Visual gaps — densification alignment
+
+Pass 3: windows without a promoted synthesis frame (gap-logged per quality gates).
+
+| Region | Trigger | Status |
+| --- | --- | --- |
+${gapRows.join("\n")}
+`;
+
+  const outPath = lanePath(absSlice, LANES.keyFrames, "visual-gaps.md");
+  fs.writeFileSync(outPath, body, "utf8");
+  return { outPath, gapCount: gapRows.length, total: sel.densificationWindows.length };
+}
+
+if (isMainModule(import.meta.url)) {
+  const sliceDir = process.argv[2];
+  if (!sliceDir) {
+    writeStderr("Usage: node watch/expand-visual-gaps.js <slice-dir>");
+    process.exit(2);
+  }
+  const result = expandVisualGaps(sliceDir);
+  writeStdout(JSON.stringify(result));
+}

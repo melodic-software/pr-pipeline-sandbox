@@ -4,7 +4,9 @@ Expected request fields, statuses, and HTTP semantics come from GitHub's
 "Merge a pull request asynchronously" and "Get the result of an asynchronous
 merge" REST docs: `sha` pins the head, `merge_method` is direct-only,
 `merge_action` is `direct_merge` or `merge_queue`, 409 returns the pending
-request's UUID, and `enqueued` means queued, not merged. Stack membership and
+request's UUID, and `enqueued` means queued, not merged. A merge-queue base is
+enqueued through GraphQL `enqueuePullRequest` (`pullRequestId`,
+`expectedHeadOid`), per GitHub's GraphQL "Pulls" reference. Stack membership and
 the trunk rule come from "About stacked pull requests" and the stacks REST
 endpoints. Every gh seam is stubbed; no real gh process is spawned.
 """
@@ -15,6 +17,7 @@ import contextlib
 import io
 import json
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -58,6 +61,7 @@ def _queue(
     required: bool = True,
     merged: bool = False,
     armed: bool = False,
+    timeline: list[Any] | None = None,
 ) -> dict[str, Any]:
     """A GraphQL `PullRequest` merge-queue read; a position puts the PR in the queue."""
     in_queue = position is not None
@@ -67,11 +71,32 @@ def _queue(
         "isMergeQueueEnabled": required,
         "mergeQueueEntry": {"state": state, "position": position} if in_queue else None,
         "autoMergeRequest": {"enabledAt": "2026-10-04T00:00:00Z"} if armed else None,
+        "timelineItems": {"nodes": timeline or []},
     }
     return {"data": {"repository": {"pullRequest": pull_request}}}
 
 
+LIMIT = merge.merge_policy.MAX_QUEUE_EJECTIONS_LIMIT
+COMMIT = {"__typename": "PullRequestCommit"}
+FORCE_PUSH = {"__typename": "HeadRefForcePushedEvent"}
+
+
+def _removed(reason: str = "failed_checks") -> dict[str, Any]:
+    return {"__typename": "RemovedFromMergeQueueEvent", "reason": reason}
+
+
 NO_QUEUE = _queue(required=False, merged=True)
+NODE_ID = "PR_kwDOnode0001"
+
+
+def _enqueued(state: str = "QUEUED", position: int = 1) -> dict[str, Any]:
+    """An `enqueuePullRequest` answer carrying the new `MergeQueueEntry`."""
+    entry = {"state": state, "position": position}
+    return {"data": {"enqueuePullRequest": {"mergeQueueEntry": entry}}}
+
+
+def _graphql_error(message: str) -> dict[str, Any]:
+    return {"data": {"enqueuePullRequest": None}, "errors": [{"message": message}]}
 
 
 class AsyncMergeHarness(unittest.TestCase):
@@ -79,6 +104,15 @@ class AsyncMergeHarness(unittest.TestCase):
 
     def setUp(self) -> None:
         RepoConfigFake().install(self)
+        self.enterContext(
+            mock.patch.object(
+                merge.merge_policy,
+                "resolve",
+                return_value=merge.merge_policy.UnattendedPolicy(
+                    reason="authority-unconfigured"
+                ),
+            )
+        )
         self.captures: list[list[str]] = []
         self.polls: list[list[str]] = []
         self.sleeps: list[float] = []
@@ -104,6 +138,8 @@ class AsyncMergeHarness(unittest.TestCase):
         blockers: list[str] | None = None,
         stack_member: bool = False,
         queue: list[dict[str, Any] | Exception] | None = None,
+        report: dict[str, Any] | None = None,
+        node: dict[str, Any] | Exception | None = None,
     ) -> int:
         if blockers is not None:
             ready = not blockers
@@ -131,6 +167,7 @@ class AsyncMergeHarness(unittest.TestCase):
                 ),
             },
             "autoMerge": {"ready": ready, "blockers": []},
+            **(report or {}),
         }
         puts = list(put) if isinstance(put, list) else [put]
         poll_answers = list(polls or [])
@@ -139,7 +176,8 @@ class AsyncMergeHarness(unittest.TestCase):
 
         def capture(cmd: list[str]) -> Any:
             self.captures.append(cmd)
-            if "merge-async" in " ".join(cmd):
+            joined = " ".join(cmd)
+            if "merge-async" in joined or "enqueuePullRequest" in joined:
                 return puts.pop(0)
             return _proc()
 
@@ -149,6 +187,12 @@ class AsyncMergeHarness(unittest.TestCase):
             if "merge-async/" in args[1]:
                 self.polls.append(args)
                 answer = poll_answers.pop(0)
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+            if args[1] == "repos/owner/repo/pulls/1":
+                self.node_reads += 1
+                answer = {"id": NODE_ID} if node is None else node
                 if isinstance(answer, Exception):
                     raise answer
                 return answer
@@ -168,6 +212,7 @@ class AsyncMergeHarness(unittest.TestCase):
 
         self.stack_reads = 0
         self.queue_reads = 0
+        self.node_reads = 0
         ticks = iter(clock or [0.0] * 50)
         argv = [
             "babysit_merge.py",
@@ -213,6 +258,9 @@ class AsyncMergeHarness(unittest.TestCase):
     def _put(self) -> list[str]:
         [cmd] = [c for c in self.captures if "merge-async" in " ".join(c)]
         return cmd
+
+    def _enqueue_commands(self) -> list[list[str]]:
+        return [c for c in self.captures if "enqueuePullRequest" in " ".join(c)]
 
     def _fields(self, cmd: list[str]) -> dict[str, str]:
         pairs = [cmd[i + 1] for i, arg in enumerate(cmd) if arg in ("-f", "-F")]
@@ -472,36 +520,93 @@ class UnpinnedMergeStillPinsTheEvaluatedHead(AsyncMergeHarness):
 
 
 class MergeQueueIsEnqueued(AsyncMergeHarness):
-    def test_queue_branch_enqueues_without_a_merge_method(self) -> None:
-        code = self._run(
-            _proc(_async("pending")), [_async("enqueued")], merge_action="merge_queue"
-        )
+    """A merge-queue base is enqueued through GraphQL `enqueuePullRequest`,
+    never REST `merge-async`."""
+
+    def test_queue_branch_enqueues_through_graphql_at_the_vetted_head(self) -> None:
+        code = self._run(_proc(_enqueued(position=2)), merge_action="merge_queue")
         self.assertEqual(code, 0)
         self.assertEqual(self.output["action"], "enqueue")
         self.assertFalse(self.output["merged"])
         self.assertTrue(self.output["enqueued"])
+        self.assertFalse(any("merge-async" in " ".join(c) for c in self.captures))
+        [cmd] = self._enqueue_commands()
+        self.assertEqual(cmd[:2], ["api", "graphql"])
+        fields = self._fields(cmd)
+        self.assertEqual((fields["id"], fields["head"]), (NODE_ID, HEAD))
+        self.assertIn("pullRequestId:$id", fields["query"])
+        self.assertIn("expectedHeadOid:$head", fields["query"])
+        self.assertNotIn("jump", fields["query"])
+        self.assertEqual(self.output["merge"]["api"], "graphql")
         self.assertEqual(
-            self._fields(self._put()),
-            {"merge_action": "merge_queue", "bypass_rules": "false", "sha": HEAD},
+            self.output["merge"]["mergeQueue"], {"state": "QUEUED", "position": 2}
         )
-
-    def test_already_queued_answer_is_still_queued(self) -> None:
-        code = self._run(_proc(_async("enqueued")), merge_action="merge_queue")
-        self.assertEqual(code, 0)
-        self.assertTrue(self.output["enqueued"])
         self.assertEqual(self.polls, [])
 
-    def test_queue_without_the_endpoint_is_held(self) -> None:
+    def test_a_refused_enqueue_is_held_and_tries_no_other_api(self) -> None:
+        refusal = "Enqueuer is not authorized to merge"
         code = self._run(
-            _proc(
-                {"message": "Not Found"},
-                returncode=1,
-                stderr="gh: Not Found (HTTP 404)",
-            ),
+            _proc(_graphql_error(refusal), returncode=1, stderr=f"gh: {refusal}"),
             merge_action="merge_queue",
         )
         self.assertEqual(code, 10)
+        self.assertFalse(self.output["enqueued"])
+        self.assertIn(refusal, self.output["merge"]["message"])
+        self.assertEqual(len(self._enqueue_commands()), 1)
+        self.assertFalse(any("merge-async" in " ".join(c) for c in self.captures))
         self.assertFalse(any(c[:2] == ["pr", "merge"] for c in self.captures))
+
+    def test_an_entry_returned_beside_errors_is_still_enqueued_and_recorded(
+        self,
+    ) -> None:
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        answer = {**_enqueued(), "errors": [{"message": "partial"}]}
+        code = self._run(
+            _proc(answer, returncode=1, stderr="gh: partial"),
+            merge_action="merge_queue",
+            extra=("--state-dir", state.name),
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(self.output["enqueued"])
+        path = pathlib.Path(state.name) / merge.PENDING_MERGES_FILE
+        record = json.loads(path.read_text(encoding="utf-8"))["requests"][
+            "owner/repo#1"
+        ]
+        self.assertEqual((record["queued"], record["head"]), (True, HEAD))
+
+    def test_an_answer_without_a_queue_entry_is_not_enqueued(self) -> None:
+        answer = {"data": {"enqueuePullRequest": {"mergeQueueEntry": None}}}
+        code = self._run(_proc(answer), merge_action="merge_queue")
+        self.assertEqual(code, 10)
+        self.assertFalse(self.output["enqueued"])
+
+    def test_an_unreadable_pull_request_id_sends_no_enqueue(self) -> None:
+        code = self._run(
+            [],
+            merge_action="merge_queue",
+            node=RuntimeError("gh: Server Error (HTTP 502)"),
+        )
+        self.assertEqual(code, 10)
+        self.assertFalse(self.output["enqueued"])
+        self.assertEqual(self._enqueue_commands(), [])
+        self.assertFalse(any(c[:2] == ["pr", "merge"] for c in self.captures))
+
+    def test_a_refused_enqueue_records_nothing_for_later_runs(self) -> None:
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        self._run(
+            _proc(_graphql_error("refused"), returncode=1, stderr="gh: refused"),
+            merge_action="merge_queue",
+            extra=("--state-dir", state.name),
+        )
+        path = pathlib.Path(state.name) / merge.PENDING_MERGES_FILE
+        records = (
+            json.loads(path.read_text(encoding="utf-8"))["requests"]
+            if path.exists()
+            else {}
+        )
+        self.assertEqual(records, {})
 
 
 class GhPrMergeOntoAQueueIsReportedQueued(AsyncMergeHarness):
@@ -561,8 +666,7 @@ class AnUnseenQueueResultIsHeldUntilConfirmed(AsyncMergeHarness):
         )
 
     def _unseen_merge(self) -> None:
-        unseen = [_queue()] * merge.QUEUE_READ_BACK_ATTEMPTS
-        code = self._merge(unseen)
+        code = self._merge([_queue()])
         self.assertEqual((code, self.output["action"]), (10, "merge-pending"))
         self.captures.clear()
         self.sleeps.clear()
@@ -583,44 +687,21 @@ class AnUnseenQueueResultIsHeldUntilConfirmed(AsyncMergeHarness):
     def _merge_commands(self) -> list[list[str]]:
         return [c for c in self.captures if c[:2] == ["pr", "merge"]]
 
-    def test_an_unseen_result_is_re_read_then_held_and_recorded(self) -> None:
-        unseen = [_queue()] * merge.QUEUE_READ_BACK_ATTEMPTS
-        code = self._merge(unseen)
+    def test_an_unseen_result_is_read_once_then_held_and_recorded(self) -> None:
+        code = self._merge([_queue()])
         self.assertEqual((code, self.output["action"]), (10, "merge-pending"))
         self.assertFalse(self.output["ready"])
         self.assertFalse(self.output["merged"])
         self.assertNotIn("enqueued", self.output)
         self.assertTrue(self.output["mergeQueue"]["unconfirmed"])
         self.assertIn("merge pending, unconfirmed", self.output["blockers"][0])
-        self.assertEqual(self.queue_reads, merge.QUEUE_READ_BACK_ATTEMPTS)
-        self.assertEqual(
-            self.sleeps,
-            [merge.ASYNC_MERGE_POLL_INTERVAL_SECONDS]
-            * (merge.QUEUE_READ_BACK_ATTEMPTS - 1),
-        )
+        self.assertEqual(self.queue_reads, 1)
+        self.assertEqual(self.sleeps, [])
         record = self._records()["owner/repo#1"]
         self.assertEqual(
             (record["queued"], record["unconfirmed"], record["head"]),
             (True, True, HEAD),
         )
-
-    def test_a_re_read_that_finds_the_entry_reports_it_queued(self) -> None:
-        code = self._merge([_queue(), _queue(position=1)])
-        self.assertEqual((code, self.output["action"]), (0, "enqueue"))
-        self.assertTrue(self.output["enqueued"])
-        self.assertEqual(self.sleeps, [merge.ASYNC_MERGE_POLL_INTERVAL_SECONDS])
-        self.assertNotIn("unconfirmed", self._records()["owner/repo#1"])
-
-    def test_a_failed_re_read_never_turns_an_unseen_result_into_a_merge(
-        self,
-    ) -> None:
-        failures = [RuntimeError("gh: (HTTP 502)")] * (
-            merge.QUEUE_READ_BACK_ATTEMPTS - 1
-        )
-        code = self._merge([_queue(), *failures])
-        self.assertEqual((code, self.output["action"]), (10, "merge-pending"))
-        self.assertFalse(self.output["merged"])
-        self.assertTrue(self._records()["owner/repo#1"]["unconfirmed"])
 
     def test_the_next_run_holds_without_sending_another_merge(self) -> None:
         self._unseen_merge()
@@ -703,7 +784,7 @@ class QueuedPullRequestIsConfirmedLater(AsyncMergeHarness):
 
     def _enqueue(self) -> None:
         code = self._run(
-            _proc(_async("enqueued")),
+            _proc(_enqueued()),
             merge_action="merge_queue",
             extra=("--state-dir", self.state.name),
         )
@@ -712,7 +793,7 @@ class QueuedPullRequestIsConfirmedLater(AsyncMergeHarness):
 
     def _later_run(self, answer: dict[str, Any] | Exception, **kwargs: Any) -> int:
         return self._run(
-            _proc(_async("enqueued")),
+            _proc(_enqueued()),
             merge_action="merge_queue",
             queue=[answer],
             extra=("--state-dir", self.state.name),
@@ -723,7 +804,7 @@ class QueuedPullRequestIsConfirmedLater(AsyncMergeHarness):
         path = pathlib.Path(self.state.name) / merge.PENDING_MERGES_FILE
         return json.loads(path.read_text(encoding="utf-8"))["requests"]
 
-    def test_an_async_enqueue_is_recorded(self) -> None:
+    def test_an_enqueue_is_recorded(self) -> None:
         self._enqueue()
         record = self._records()["owner/repo#1"]
         self.assertEqual((record["queued"], record["head"]), (True, HEAD))
@@ -772,6 +853,25 @@ class QueuedPullRequestIsConfirmedLater(AsyncMergeHarness):
         self.assertEqual(self.captures, [])
         self.assertEqual(self._records(), {})
 
+    def test_a_dequeue_names_the_queue_removal_reason(self) -> None:
+        self._enqueue()
+        code = self._later_run(_queue(timeline=[COMMIT, _removed("failed_checks")]))
+        self.assertEqual(code, 10)
+        self.assertTrue(self.output["dequeued"])
+        self.assertIn("removed it as 'failed_checks'", self.output["blockers"][0])
+        self.assertNotIn("signature", self.output["blockers"][0])
+
+    def test_a_branch_protection_dequeue_names_the_squash_signature_cause(
+        self,
+    ) -> None:
+        self._enqueue()
+        code = self._later_run(_queue(timeline=[_removed("branch_protection_failure")]))
+        self.assertEqual(code, 10)
+        blocker = self.output["blockers"][0]
+        self.assertIn("removed it as 'branch_protection_failure'", blocker)
+        self.assertIn("committer", blocker)
+        self.assertIn("reword the body", blocker)
+
     def test_an_unreadable_queue_keeps_the_record_and_holds(self) -> None:
         self._enqueue()
         code = self._later_run(RuntimeError("gh: Server Error (HTTP 502)"))
@@ -818,6 +918,127 @@ class MergeQueueReadBack(unittest.TestCase):
         ):
             result = merge.read_merge_queue("owner/repo", 5)
         self.assertIn("gh: boom", result["readError"])
+
+    def test_failed_check_removals_count_since_the_newest_head_change(self) -> None:
+        for timeline, expected in (
+            ([], 0),
+            ([COMMIT, _removed(), _removed()], 2),
+            ([_removed(), _removed(), _removed()], 3),
+            # A head change inside a full window still bounds the count.
+            ([COMMIT] + [_removed("manually_removed")] * (LIMIT - 1), 0),
+            ([_removed(), _removed(), COMMIT], 0),
+            ([_removed(), _removed(), FORCE_PUSH, _removed()], 1),
+            ([COMMIT, _removed("manually_removed"), _removed()], 1),
+        ):
+            with self.subTest(timeline=timeline):
+                result = self._read(_queue(timeline=timeline))
+                self.assertEqual(result["failedEjections"], expected)
+
+    def test_the_newest_removal_reason_is_read_until_a_head_change(self) -> None:
+        for timeline, expected in (
+            ([], None),
+            (
+                [_removed("failed_checks"), _removed("branch_protection_failure")],
+                "branch_protection_failure",
+            ),
+            ([_removed("branch_protection_failure"), COMMIT], None),
+            ([FORCE_PUSH, _removed("manually_removed")], "manually_removed"),
+            ([_removed("")], None),
+        ):
+            with self.subTest(timeline=timeline):
+                result = self._read(_queue(timeline=timeline))
+                self.assertEqual(result["lastRemovalReason"], expected)
+
+    def test_the_enqueue_a_failed_checks_removal_ended_is_read(self) -> None:
+        added = {
+            "__typename": "AddedToMergeQueueEvent",
+            "createdAt": "2026-10-25T16:59:28Z",
+            "actor": {"__typename": "User", "databaseId": 5},
+            "enqueuer": {"databaseId": 5},
+        }
+        lane = {**added, "actor": {"__typename": "Bot", "databaseId": 9}}
+        at = "2026-10-25T17:03:28Z"
+        out = {**_removed(), "createdAt": at}
+
+        def found(enqueue: dict[str, Any], requeued: bool = False) -> dict[str, Any]:
+            return {"enqueue": enqueue, "removedAt": at, "requeued": requeued}
+
+        for events, expected in (
+            ([COMMIT, added, out], found(added)),
+            ([added, out, lane], found(added, True)),
+            ([added, _removed("merge_conflict")], None),
+            ([added, _removed("manually_removed")], None),
+            ([_removed(), added, _removed("merged")], None),
+            ([added, _removed(), COMMIT], None),
+            ([added, _removed(), FORCE_PUSH], None),
+            ([added, COMMIT, _removed()], None),
+            # The lane's retry ejected: its own enqueue, which no person made.
+            (
+                [added, _removed(), lane, out],
+                found(lane),
+            ),
+            ([_removed()], None),
+            ([added], None),
+            ([], None),
+            ([None, added, out], found(added)),
+            ([added, None, _removed()], None),
+            (None, None),
+        ):
+            with self.subTest(events=events):
+                payload = _queue()
+                pr = payload["data"]["repository"]["pullRequest"]
+                pr["queueEvents"] = None if events is None else {"nodes": events}
+                result = self._read(payload)
+                self.assertEqual(result["ejectedEnqueue"], expected)
+        # The extra read leaves the ejection count and removal reason alone.
+        payload = _queue(timeline=[COMMIT, _removed()])
+        payload["data"]["repository"]["pullRequest"]["queueEvents"] = {
+            "nodes": [added, _removed()]
+        }
+        result = self._read(payload)
+        self.assertEqual(
+            (result["failedEjections"], result["lastRemovalReason"]),
+            (1, "failed_checks"),
+        )
+        self.assertIn("ADDED_TO_MERGE_QUEUE_EVENT", merge.MERGE_QUEUE_QUERY)
+        queue_events = merge.MERGE_QUEUE_QUERY.split("queueEvents:", 1)[1]
+        self.assertIn("RemovedFromMergeQueueEvent{reason createdAt}", queue_events)
+
+    def test_failed_merge_group_runs_are_the_pull_requests_own(self) -> None:
+        runs = {
+            "workflow_runs": [
+                {"head_branch": "gh-readonly-queue/main/pr-5-abc", "html_url": "u1"},
+                {"head_branch": "gh-readonly-queue/main/pr-55-abc", "html_url": "u2"},
+                {"head_branch": "gh-readonly-queue/main/pr-5-def", "html_url": "u3"},
+            ]
+        }
+        ok = subprocess.CompletedProcess([], 0, json.dumps(runs), "")
+        with mock.patch.object(merge, "gh_capture", return_value=ok) as gh:
+            self.assertEqual(
+                merge._failed_merge_group_runs("owner/repo", "main", 5), ["u1", "u3"]
+            )
+        self.assertIn("event=merge_group&status=failure", gh.call_args.args[0][1])
+        failed = subprocess.CompletedProcess([], 1, "", "HTTP 403")
+        with mock.patch.object(merge, "gh_capture", return_value=failed):
+            self.assertIsNone(merge._failed_merge_group_runs("owner/repo", "main", 5))
+
+    def test_an_unreadable_timeline_counts_nothing(self) -> None:
+        # A full window with no head change in it: older failed-check
+        # removals may lie beyond it, so the count is unreadable.
+        full = [_removed("manually_removed")] * (LIMIT - 1) + [_removed()]
+        for timeline in (
+            None,
+            [{"__typename": "IssueComment"}, _removed()],
+            [None],
+            full,
+        ):
+            with self.subTest(timeline=timeline):
+                payload = _queue()
+                pr = payload["data"]["repository"]["pullRequest"]
+                pr["timelineItems"] = None if timeline is None else {"nodes": timeline}
+                result = self._read(payload)
+                self.assertIsNone(result["readError"])
+                self.assertIsNone(result["failedEjections"])
 
 
 def _listed(number: int, sha: str, *, merged: bool = False) -> dict[str, Any]:

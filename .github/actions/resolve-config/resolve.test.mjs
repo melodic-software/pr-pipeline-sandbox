@@ -4,13 +4,17 @@ import { test } from "node:test";
 
 import { parse, stringify } from "yaml";
 
+import { WIP_DEFAULTS, resolveWip } from "../../scripts/work-resolve-issue/limits.mjs";
+
 import {
+  checkAppliedBySupported,
   checkConfigPath,
   neededFacts,
   Rejection,
   resolve,
   resolveGrant,
 } from "./resolve.mjs";
+import { checkPatchRules } from "./patch-rules.mjs";
 
 const read = (relative) =>
   readFileSync(new URL(relative, import.meta.url), "utf8");
@@ -34,7 +38,6 @@ const FACTS = {
   event: "synchronize",
   changedPaths: ["src/app.js"],
   labels: [],
-  workClasses: [],
 };
 
 const files = (config, overrides = {}) => ({
@@ -80,7 +83,7 @@ test("rejection 1: no file at the config path is rejected", () => {
 test("rejection 1: unparsable YAML and duplicate keys are rejected", () => {
   assertRejected(() => run("version: [1\n"), "invalid-config");
   assertRejected(
-    () => run(`${fixture("valid.yaml")}version: 1\n`),
+    () => run(`${fixture("valid.yaml")}version: 2\n`),
     "invalid-config",
   );
 });
@@ -137,7 +140,7 @@ test("rejection 3: a gate activity in pr-explain is rejected", () => {
 
 test("rejection 3: a merge effect outside pr-merge is rejected in a lane the run did not ask for", () => {
   const config = edited((doc) => {
-    doc.activities["fix-docs"].effect = "merge";
+    doc.activities["fix-prose"].effect = "merge";
   });
   assertRejected(() => run(config), "forbidden-by-lane");
 });
@@ -217,7 +220,7 @@ test("rejection 7: a requested lane the config lacks is rejected", () => {
 
 test("rejection 7: a requested activity the lane has no slot for is rejected", () => {
   assertRejected(
-    () => run(fixture("valid.yaml"), { activity: "fix-docs" }),
+    () => run(fixture("valid.yaml"), { activity: "fix-prose" }),
     "undefined-activity",
   );
 });
@@ -298,7 +301,7 @@ const TRUSTED_ACTORS = ".github/standards/trusted-actors/trusted-actors.json";
 test("forced denied paths are added when the config sets no merge section", () => {
   assert.deepEqual(
     run(fixture("valid.yaml")).merge["diff-check"]["denied-paths"],
-    [CONFIG_PATH, ".github/**", TRUSTED_ACTORS],
+    [CONFIG_PATH, TRUSTED_ACTORS],
   );
 });
 
@@ -307,14 +310,14 @@ test("forced denied paths are added after the config's own, once each", () => {
     doc.merge = {
       rung: "C2",
       "diff-check": {
-        "denied-paths": [".claude/**", ".github/**"],
+        "denied-paths": [".claude/**", CONFIG_PATH],
         "max-changed-lines": 400,
       },
     };
   });
   const resolved = run(config);
   assert.deepEqual(resolved.merge["diff-check"], {
-    "denied-paths": [".claude/**", ".github/**", CONFIG_PATH, TRUSTED_ACTORS],
+    "denied-paths": [".claude/**", CONFIG_PATH, TRUSTED_ACTORS],
     "max-changed-lines": 400,
   });
 });
@@ -330,11 +333,114 @@ test("the denied config path is the one the run read", () => {
 
 // Defaults
 
-test("defaults are materialized: loop 2/3, merge off and manual, slot scope diff and enabled", () => {
+// The values the lanes must keep with no limits leaf, as the request for the
+// leaf states them: a 5-hour fallback reset, a 1-hour to 7-day clamp, 5
+// restarts per sweep, 3 limit stops per head and per issue; and no restart
+// after a turn cap, the lane's behavior before the leaf existed.
+const LIMITS = {
+  "fallback-reset": 5,
+  "reset-clamp-min": 1,
+  "reset-clamp-max": 168,
+  "restarts-per-run": 5,
+  "limit-stops-per-head": 3,
+  "limit-stops-per-issue": 3,
+  "wip-cap": 60,
+  "turn-cap-restarts": 0,
+  // The fix-ci defaults the owner chose (2026-10-18 interview).
+  "fix-ci-per-run": 2,
+  "fix-ci-restarts": 1,
+  "fix-docs-per-run": 2,
+  // The queued cap's pace the owner chose (2026-10-19).
+  "admission-factor": 0.8,
+  // The release-point floor the owner chose (2026-10-21 interview).
+  "admission-min-per-hour": 1,
+  // Passed through as set; rate-guard.mjs fills it from the schema's defaults.
+  api: {},
+};
+
+test("limits: a config with no limits leaf resolves today's thirteen values", () => {
+  assert.deepEqual(run(fixture("valid.yaml")).limits, LIMITS);
+});
+
+test("limits: a set leaf overrides its default and leaves the others", () => {
+  const config = edited((doc) => {
+    doc.limits = { "fallback-reset": 2, "limit-stops-per-issue": 4, "turn-cap-restarts": 1, "admission-factor": 0.5 };
+  });
+  assert.deepEqual(run(config).limits, { ...LIMITS, "fallback-reset": 2, "limit-stops-per-issue": 4, "turn-cap-restarts": 1, "admission-factor": 0.5 });
+});
+
+test("limits: api passes through as set, and an unknown pool or field, or a share past 1, is rejected", () => {
+  const api = { "lanes-app": { "read-floor": 0.3 }, "content-creation": { "per-minute": 40 } };
+  const config = edited((doc) => {
+    doc.limits = { api };
+  });
+  assert.deepEqual(run(config).limits.api, api);
+  for (const bad of [{ search: {} }, { graphql: { floor: 0.1 } }, { graphql: { breaker: 1.5 } }, { "github-token": { "per-hour": 10 } }]) {
+    const rejected = edited((doc) => {
+      doc.limits = { api: bad };
+    });
+    assertRejected(() => run(rejected), "invalid-config");
+  }
+});
+
+test("limits: an unknown key, a value that is not an integer, or one out of its range is rejected", () => {
+  for (const limits of [{ "fallback-resets": 5 }, { "fallback-reset": 0 }, { "restarts-per-run": -1 }, { "reset-clamp-max": 1.5 }, { "limit-stops-per-head": "3" }, { "limit-stops-per-head": 11 }, { "limit-stops-per-issue": 11 }, { "restarts-per-run": 51 }, { "fallback-reset": 721 }, { "reset-clamp-max": 721 }, { "wip-cap": 0 }, { "wip-cap": 501 }, { "turn-cap-restarts": -1 }, { "turn-cap-restarts": 6 }, { "fix-ci-per-run": 0 }, { "fix-ci-per-run": 21 }, { "fix-ci-restarts": -1 }, { "fix-ci-restarts": 6 }, { "fix-docs-per-run": 0 }, { "fix-docs-per-run": 21 }, { "admission-window-hours": 24 }, { "admission-factor": 0 }, { "admission-factor": 1.1 }, { "admission-min-per-hour": -1 }, { "admission-min-per-hour": 101 }]) {
+    const config = edited((doc) => {
+      doc.limits = limits;
+    });
+    assertRejected(() => run(config), "invalid-config");
+  }
+});
+
+// The owner-set WIP values: a 2-hour target lead time over a 24-hour window,
+// admissions at 0.8 of merges, a held buffer of 60 with a 24-hour alarm, and
+// no pause date. The resolver passes the leaf through as set; its readers
+// apply these defaults.
+const WIP = {
+  "target-lead-time-hours": 2,
+  "min-cap": 1,
+  "merge-rate-window-hours": 24,
+  "opened-to-merged-ratio": 0.8,
+  "held-cap": 60,
+  "held-alarm-hours": 24,
+  "pause-from": "",
+};
+
+test("wip: a config with no wip leaf resolves to the readers' defaults", () => {
+  assert.deepEqual(run(fixture("valid.yaml")).wip, {});
+  assert.deepEqual(resolveWip(run(fixture("valid.yaml")).wip), WIP);
+});
+
+test("wip: a set leaf overrides its default and leaves the others", () => {
+  const set = { "held-cap": 30, "opened-to-merged-ratio": 0.5, "pause-from": "2026-11-01" };
+  const config = edited((doc) => {
+    doc.wip = set;
+  });
+  assert.deepEqual(run(config).wip, set);
+  assert.deepEqual(resolveWip(run(config).wip), { ...WIP, ...set });
+});
+
+test("wip: an unknown key, a wrong type, or a value out of range is rejected", () => {
+  for (const wip of [{ "held-caps": 30 }, { "target-lead-time-hours": 0 }, { "min-cap": 0 }, { "min-cap": 2.5 }, { "min-cap": 501 }, { "opened-to-merged-ratio": 1.5 }, { "opened-to-merged-ratio": 0 }, { "held-cap": 0 }, { "held-cap": 2.5 }, { "merge-rate-window-hours": 1.5 }, { "pause-from": "soon" }, { "pause-from": 20261101 }]) {
+    const config = edited((doc) => {
+      doc.wip = wip;
+    });
+    assertRejected(() => run(config), "invalid-config");
+  }
+});
+
+test("wip: the schema's defaults are the readers' defaults", () => {
+  const schema = JSON.parse(readFileSync(new URL("../../../docs/conventions/pr-pipeline/pr-pipeline.schema.json", import.meta.url), "utf8"));
+  assert.deepEqual(Object.fromEntries(Object.entries(schema.properties.wip.properties).map(([key, value]) => [key, value.default])), WIP_DEFAULTS);
+  assert.deepEqual(WIP_DEFAULTS, WIP);
+});
+
+test("defaults are materialized: loop 2/3/2/3, merge off, manual and native, slot scope diff and enabled", () => {
   const resolved = run(fixture("valid.yaml"), { activity: "run-tests" });
-  assert.deepEqual(resolved.loop, { "review-rounds": 2, "no-progress": 3 });
+  assert.deepEqual(resolved.loop, { "review-rounds": 2, "no-progress": 3, "dependency-review-rounds": 2, "fix-ci-rounds": 3 });
   assert.equal(resolved.merge.rung, "off");
   assert.equal(resolved.merge["stack-landing"], "manual");
+  assert.equal(resolved.merge["lane-prs"], "native");
   assert.equal(resolved.version, 1);
   assert.deepEqual(resolved.source, {
     "base-path": ".base",
@@ -357,8 +463,7 @@ test("defaults are materialized: loop 2/3, merge off and manual, slot scope diff
     inputs: [],
     needs: [],
     enabled: true,
-    model: null,
-    "max-turns": null,
+    models: null,
     grant: { contents: "read", "pull-requests": "read", issues: "read" },
     applies: true,
     "skip-reason": null,
@@ -433,11 +538,10 @@ test("a paths miss gives not-applicable-paths", () => {
   );
 });
 
-test("a label, event or work-class miss gives not-applicable", () => {
+test("a label or event miss gives not-applicable", () => {
   for (const predicate of [
     { labels: ["security"] },
     { events: ["push"] },
-    { "work-classes": ["C3"] },
   ]) {
     const config = edited((doc) => {
       doc.activities["run-tests"]["applies-when"] = predicate;
@@ -492,11 +596,10 @@ test("with an activity, neededFacts names only what the selected slot reads", ()
 test("with an activity, another slot's undecidable predicate leaves that slot undecided", () => {
   const config = edited((doc) => {
     doc.activities["measure-coverage"]["applies-when"] = {
-      "work-classes": ["C1"],
+      draft: [false],
     };
   });
   const facts = { ...FACTS };
-  delete facts.workClasses;
   const resolved = run(config, { activity: "run-tests", facts });
   assert.deepEqual(
     [resolved.selected.applies, resolved.selected["skip-reason"]],
@@ -506,11 +609,21 @@ test("with an activity, another slot's undecidable predicate leaves that slot un
   assert.deepEqual([other.applies, other["skip-reason"]], [null, null]);
   assert.throws(
     () => run(config, { activity: "measure-coverage", facts }),
-    /work/i,
+    /needs draft/,
   );
 });
 
 // Effect grants (contract-spec.md EffectGrant)
+
+// Owner rule (#7032 amendment): a token with contents: write and
+// pull-requests: write can enqueue a pull request, so only merge holds both;
+// the broker refuses any other such grant.
+test("no effect but merge grants both contents: write and pull-requests: write", () => {
+  const both = Object.entries(EFFECT_GRANTS)
+    .filter(([, grant]) => grant.contents === "write" && grant["pull-requests"] === "write")
+    .map(([effect]) => effect);
+  assert.deepEqual(both, ["merge"]);
+});
 
 test("each effect resolves to its App grant", () => {
   const expected = {
@@ -533,7 +646,7 @@ test("each effect resolves to its App grant", () => {
     merge: { contents: "write", "pull-requests": "write", issues: "write" },
   };
   for (const [effect, grant] of Object.entries(expected)) {
-    const config = `version: 1
+    const config = `version: 2
 activities:
   merge:
     script: scripts/merge.sh
@@ -580,7 +693,7 @@ test("resolveGrant returns the selected slot's effect and grant", () => {
     grant: READ_GRANT,
   });
   assert.deepEqual(
-    grantOf(fixture("valid.yaml"), { lane: "pr-refine", activity: "fix-docs" }),
+    grantOf(fixture("valid.yaml"), { lane: "pr-refine", activity: "fix-prose" }),
     {
       effect: "mutate-branch",
       grant: { contents: "write", "pull-requests": "read", issues: "read" },
@@ -628,7 +741,7 @@ test("resolveGrant rejects an unknown lane", () => {
 
 test("resolveGrant rejects an activity outside the lane, or none", () => {
   assertRejected(
-    () => grantOf(fixture("valid.yaml"), { activity: "fix-docs" }),
+    () => grantOf(fixture("valid.yaml"), { activity: "fix-prose" }),
     "undefined-activity",
   );
   for (const activity of [undefined, ""]) {
@@ -705,6 +818,66 @@ test("a resolved grant is frozen and leaves effect-grants.json untouched", () =>
   assert.ok(Object.isFrozen(selected.grant));
 });
 
+const withActivityGrants = (activityGrants, lane = "pr-run-checks") => ({
+  laneRules: {
+    ...LANE_RULES,
+    [lane]: { ...LANE_RULES[lane], "activity-grants": activityGrants },
+  },
+});
+
+test("a lane-rules.json activity grant adds actions read to that activity alone", () => {
+  const overrides = withActivityGrants({ "run-tests": { actions: "read" } });
+  const widened = { ...READ_GRANT, actions: "read" };
+  assert.deepEqual(
+    grantOf(fixture("valid.yaml"), { activity: "run-tests" }, overrides),
+    { effect: "read", grant: widened },
+  );
+  assert.deepEqual(
+    grantOf(fixture("valid.yaml"), { activity: "measure-coverage" }, overrides),
+    { effect: "read", grant: READ_GRANT },
+  );
+  const { selected, lane } = run(fixture("valid.yaml"), { activity: "run-tests" }, overrides);
+  assert.deepEqual(selected.grant, widened);
+  assert.ok(Object.isFrozen(selected.grant));
+  assert.deepEqual(lane.slots.find((slot) => slot.name === "measure-coverage").grant, READ_GRANT);
+  assert.deepEqual(EFFECT_GRANTS.read, READ_GRANT);
+});
+
+test("an activity grant other than exactly actions read is rejected", () => {
+  const grants = [
+    null,
+    [],
+    "actions",
+    { "run-tests": { actions: "write" } },
+    { "run-tests": { contents: "write" } },
+    { "run-tests": { actions: "read", contents: "write" } },
+    { "run-tests": {} },
+    { "run-tests": null },
+    { "no-such-activity": { actions: "write" } },
+  ];
+  for (const activityGrants of grants) {
+    const overrides = withActivityGrants(activityGrants);
+    assertRejected(
+      () => grantOf(fixture("valid.yaml"), { activity: "measure-coverage" }, overrides),
+      "lane-grant",
+    );
+    assertRejected(
+      () => run(fixture("valid.yaml"), { activity: "measure-coverage" }, overrides),
+      "lane-grant",
+    );
+  }
+});
+
+test("an activity grant naming an activity the lane does not hold adds nothing", () => {
+  const overrides = withActivityGrants({ "fix-prose": { actions: "read" }, constructor: { actions: "read" } });
+  for (const activity of ["run-tests", "measure-coverage"]) {
+    assert.deepEqual(
+      grantOf(fixture("valid.yaml"), { activity }, overrides),
+      { effect: "read", grant: READ_GRANT },
+    );
+  }
+});
+
 test("a non-string effect is rejected even when the schema lets it through", () => {
   const schema = structuredClone(SCHEMA);
   schema.$defs.leaf.properties.effect = {};
@@ -746,8 +919,8 @@ const CODEOWNERS = `# owned and unowned entries
 
 const withChangedPaths = (edit = () => {}) =>
   edited((doc) => {
-    doc.activities["fix-docs"].inputs = ["changed-paths"];
-    doc.activities["fix-docs"]["applies-when"] = { paths: ["**/*.md"] };
+    doc.activities["fix-prose"].inputs = ["changed-paths"];
+    doc.activities["fix-prose"]["applies-when"] = { paths: ["**/*.md"] };
     edit(doc);
   });
 
@@ -756,7 +929,7 @@ const targetsOf = (changedTargets, config = withChangedPaths()) =>
     config,
     {
       lane: "pr-refine",
-      activity: "fix-docs",
+      activity: "fix-prose",
       facts: { ...FACTS, changedPaths: changedTargets, changedTargets },
     },
     { codeowners: CODEOWNERS },
@@ -810,7 +983,7 @@ test("changed-paths with nothing left skips the activity as not-applicable-paths
 
 test("a read activity's changed-paths keeps instruction surfaces and owned paths", () => {
   const config = withChangedPaths((doc) => {
-    doc.activities["fix-docs"].effect = "read";
+    doc.activities["fix-prose"].effect = "read";
   });
   assert.deepEqual(
     targetsOf(["CLAUDE.md", "plugins/ai-slop/README.md"], config)[
@@ -822,12 +995,12 @@ test("a read activity's changed-paths keeps instruction surfaces and owned paths
 
 test("an activity with the changed-paths input needs the changed files even without a paths predicate", () => {
   const config = edited((doc) => {
-    doc.activities["fix-docs"].inputs = ["changed-paths"];
+    doc.activities["fix-prose"].inputs = ["changed-paths"];
   });
   assert.deepEqual(
     neededFacts(files(config), {
       lane: "pr-refine",
-      activity: "fix-docs",
+      activity: "fix-prose",
       configPath: CONFIG_PATH,
     }),
     ["changedPaths"],
@@ -836,7 +1009,7 @@ test("an activity with the changed-paths input needs the changed files even with
 
 // Composite activities
 
-const COMPOSITE = `version: 1
+const COMPOSITE = `version: 2
 activities:
   simplify:
     skill: code-tidying:batch-simplify
@@ -1172,11 +1345,20 @@ test("prepare on a non-read skill leaf resolves and is carried on the slot", () 
   );
 });
 
-test("prepare on a read skill leaf is rejected", () => {
+test("prepare: review-threads on a non-read skill leaf resolves and is carried on the slot", () => {
+  const config = withPrepare((doc) => {
+    doc.activities.simplify.prepare = "review-threads";
+  });
+  assert.equal(runRefine(config, { activity: "simplify", facts: LINT_FACTS }).selected.prepare, "review-threads");
+});
+
+// A read merge-base skill must hand its resolutions on as a patch: the schema
+// requires applied-by.patch of it.
+test("prepare on a read skill leaf with no applied-by.patch is rejected", () => {
   const config = withPrepare((doc) => {
     doc.activities.simplify.effect = "read";
   });
-  assertRejected(() => runRefine(config), "invalid-prepare");
+  assertRejected(() => runRefine(config), "invalid-config");
 });
 
 test("prepare on a script leaf, or a value other than merge-base, fails the schema", () => {
@@ -1188,6 +1370,35 @@ test("prepare on a script leaf, or a value other than merge-base, fails the sche
     doc.activities.simplify.prepare = "rebase";
   });
   assertRejected(() => runRefine(otherMode), "invalid-config");
+});
+
+// A read ci-context skill that hands on its patch resolves: the live fix-ci
+// (live-config.test.mjs). Without applied-by.patch its edits would leave nowhere.
+test("prepare: ci-context needs effect read, and a read one needs applied-by.patch", () => {
+  const read = withPrepare((doc) => {
+    doc.activities.simplify.prepare = "ci-context";
+    doc.activities.simplify.effect = "read";
+  });
+  assertRejected(() => runRefine(read), "invalid-config");
+  const write = withPrepare((doc) => {
+    doc.activities.simplify.prepare = "ci-context";
+  });
+  assertRejected(() => runRefine(write), "invalid-prepare");
+});
+
+test("prepare: apply-patch is the one mode a script may set, and it needs effect mutate-branch", () => {
+  const onScript = (effect) =>
+    composite((doc) => {
+      doc.activities["fix-lint"].prepare = "apply-patch";
+      doc.activities["fix-lint"].effect = effect;
+    });
+  assert.equal(runRefine(onScript("mutate-branch"), { activity: "fix-lint", facts: LINT_FACTS }).selected.prepare, "apply-patch");
+  assertRejected(() => runRefine(onScript("read")), "invalid-prepare");
+  assertRejected(() => runRefine(onScript("publish-artifact")), "invalid-prepare");
+  const onSkill = withPrepare((doc) => {
+    doc.activities.simplify.prepare = "apply-patch";
+  });
+  assertRejected(() => runRefine(onSkill), "invalid-config");
 });
 
 // Activity rules (trust root, beside lane-rules.json)
@@ -1258,7 +1469,7 @@ test("a forbidden effect that is not an effect-grants.json key is rejected", () 
 });
 
 test("the shipped activity rules keep report-escalation off the branch", () => {
-  const config = `version: 1
+  const config = `version: 2
 activities:
   report-escalation:
     script: .github/scripts/pr-unblock/report-escalation.sh
@@ -1277,10 +1488,41 @@ lanes:
   );
 });
 
+// Owner shape (#7032 amendment): the model job only pushes, the reply job
+// only posts.
+const feedbackLeaf = (activity, effect) => `version: 2
+activities:
+  ${activity}:
+    ${activity === "address-feedback" ? "skill: source-control:pull-request" : "script: .github/scripts/pr-unblock/publish-feedback.mjs"}
+    effect: ${effect}
+    gating: advisory
+    reads-untrusted: true
+lanes:
+  pr-unblock:
+    stage: unblock
+    slots:
+      - activity: ${activity}
+`;
+
+// address-feedback runs on the read runner: it neither pushes nor posts.
+for (const [activity, allowed, forbidden] of [
+  ["address-feedback", "read", ["mutate-branch", "publish-artifact", "mutate-tracker", "merge"]],
+  ["publish-feedback", "publish-artifact", ["mutate-branch", "mutate-tracker", "merge"]],
+]) {
+  test(`the shipped activity rules give ${activity} ${allowed} and nothing that ${allowed === "read" ? "pushes or posts" : "pushes"}`, () => {
+    // The live vocabulary: the fixture lacks the verb "publish".
+    const live = { vocabulary: JSON.parse(readFileSync(LIVE_VOCABULARY, "utf8")) };
+    assert.equal(run(feedbackLeaf(activity, allowed), { lane: "pr-unblock", activity }, live).selected.effect, allowed);
+    for (const effect of forbidden) {
+      assertRejected(() => run(feedbackLeaf(activity, effect), { lane: "pr-unblock", activity }, live), "forbidden-by-activity");
+    }
+  });
+}
+
 // Stages
 
 test("the respond stage is gone; pr-unblock has stage unblock", () => {
-  const lane = (stage) => `version: 1
+  const lane = (stage) => `version: 2
 activities:
   report-escalation:
     script: .github/scripts/pr-unblock/report-escalation.sh
@@ -1310,7 +1552,6 @@ const EXAMPLE_FACTS = {
   changedPaths: ["README.md"],
   changedTargets: ["README.md"],
   labels: [],
-  workClasses: [],
   mergeable: "conflicting",
   draft: false,
 };
@@ -1331,16 +1572,20 @@ function resolveEveryExampleSlot(vocabulary) {
 
 test("the README example validates and resolves for each of its lanes", () => {
   const results = resolveEveryExampleSlot(VOCABULARY);
-  assert.equal(Object.keys(results).length, 14);
-  assert.deepEqual(
-    [
-      results["pr-review / claude"].model,
-      results["pr-review / claude"]["max-turns"],
-    ],
-    ["opus", 100],
-  );
-  assert.equal(results["pr-refine / fix-docs"].applies, true);
-  assert.deepEqual(results["pr-refine / fix-docs"]["changed-paths"], [
+  assert.equal(Object.keys(results).length, 16);
+  // The example's models block routes claude to review and leaves the rest
+  // on default-profile standard.
+  assert.deepEqual(results["pr-review / claude"].models, {
+    profile: "review",
+    model: "opus",
+    effort: null,
+    "subagent-model": "inherit",
+    "max-turns": 100,
+  });
+  assert.equal(results["pr-unblock / fix-docs"].models.profile, "standard");
+  assert.equal(results["pr-require-checks / require-checks"].models, null);
+  assert.equal(results["pr-unblock / fix-docs"].applies, true);
+  assert.deepEqual(results["pr-unblock / fix-docs"]["changed-paths"], [
     "README.md",
   ]);
   const resolveConflicts = results["pr-unblock / resolve-conflicts"];
@@ -1351,15 +1596,16 @@ test("the README example validates and resolves for each of its lanes", () => {
       resolveConflicts["reads-untrusted"],
       resolveConflicts.effect,
     ],
-    [true, "merge-base", true, "mutate-branch"],
+    [true, "merge-base", true, "read"],
   );
   assert.deepEqual(resolveConflicts["applies-when"], {
     mergeable: ["conflicting"],
-    "labels-absent": ["do-not-merge", "needs-human"],
+    "labels-absent": ["do-not-merge"],
     draft: [false],
   });
   assert.deepEqual(results["pr-unblock / report-escalation"].needs, [
     "resolve-conflicts",
+    "apply-conflict-patch",
   ]);
   assert.equal(
     results["post-merge-sweep-comments / sweep-comments"]["skip-reason"],
@@ -1376,5 +1622,239 @@ test("integration: the README example resolves against the synced standards voca
   const results = resolveEveryExampleSlot(
     JSON.parse(readFileSync(LIVE_VOCABULARY, "utf8")),
   );
-  assert.equal(Object.keys(results).length, 14);
+  assert.equal(Object.keys(results).length, 16);
+});
+
+// applied-by: a read skill names the script activity that applies each thing
+// it hands on (README.md, Activities). The live vocabulary: the fixture lacks
+// the verb "apply".
+
+const liveVocabulary = () => ({ vocabulary: JSON.parse(readFileSync(LIVE_VOCABULARY, "utf8")) });
+const APPLIED_BY = fixture("invalid-applied-by-missing-needs.yaml").replace(
+  "      - activity: apply-patch\n",
+  "      - activity: apply-patch\n        needs: [fix-ci]\n",
+);
+const unblock = (config, activity = "fix-ci", facts = {}) =>
+  run(config, { lane: "pr-unblock", activity, facts: { ...FACTS, ...facts } }, liveVocabulary()).selected;
+const appliedByEdit = (edit) => {
+  const doc = parse(APPLIED_BY);
+  edit(doc);
+  return stringify(doc);
+};
+
+// review-threads also hands on its replies, which the schema requires: the
+// reply job is the only way they reach the pull request.
+test("prepare: a read skill that hands on a patch may set a writing skill's prepare mode; without applied-by.patch it may not", () => {
+  for (const prepare of ["review-threads", "dependency-review", "merge-base"]) {
+    const handsOn = appliedByEdit((doc) => {
+      doc.activities["fix-ci"].prepare = prepare;
+      if (prepare === "review-threads") doc.activities["fix-ci"]["applied-by"]["feedback-replies"] = "apply-patch";
+      if (prepare === "dependency-review") doc.activities["fix-ci"]["applied-by"]["dependency-verdict"] = "apply-patch";
+    });
+    assert.equal(unblock(handsOn).prepare, prepare, prepare);
+    const noPatch = appliedByEdit((doc) => {
+      doc.activities["fix-ci"].prepare = prepare;
+      delete doc.activities["fix-ci"]["applied-by"];
+    });
+    // The schema requires applied-by.patch of a read skill in each mode.
+    assertRejected(() => unblock(noPatch), "invalid-config");
+  }
+  const noReplies = appliedByEdit((doc) => {
+    doc.activities["fix-ci"].prepare = "review-threads";
+  });
+  assertRejected(() => unblock(noReplies), "invalid-config");
+  // A read dependency-review skill hands on its verdict too.
+  const noVerdict = appliedByEdit((doc) => {
+    doc.activities["fix-ci"].prepare = "dependency-review";
+  });
+  assertRejected(() => unblock(noVerdict), "invalid-config");
+});
+
+test("applied-by: a read skill whose patch an apply-patch script in its lane needs resolves and carries the map", () => {
+  assert.deepEqual(unblock(APPLIED_BY)["applied-by"], { patch: "apply-patch" });
+  assert.equal(Object.hasOwn(unblock(APPLIED_BY, "apply-patch"), "applied-by"), false);
+});
+
+// Each fixture breaks one rule, and the message names that rule.
+const assertAppliedByRejected = (fn, message) =>
+  assert.throws(fn, (error) => {
+    assert.ok(error instanceof Rejection, `expected a Rejection, got ${error}`);
+    assert.equal(error.code, "invalid-applied-by", error.message);
+    assert.match(error.message, message);
+    return true;
+  });
+
+for (const [name, why, message] of [
+  ["invalid-applied-by-not-script.yaml", "a target that is a skill", /`review-patch`, which is not a script activity/],
+  ["invalid-applied-by-outside-lane.yaml", "a target outside the producer's lane", /`apply-patch` is not in the lane/],
+  [
+    "invalid-applied-by-apply-patch-prepare.yaml",
+    "an apply-patch target without prepare: apply-patch",
+    /`apply-patch`, which does not set prepare: apply-patch/,
+  ],
+  ["invalid-applied-by-missing-needs.yaml", "a target whose slot does not need the producer", /slot `apply-patch` .* does not need it/],
+]) {
+  test(`applied-by: ${why} is rejected (${name})`, () => {
+    assertAppliedByRejected(() => unblock(fixture(name)), message);
+  });
+}
+
+test("applied-by: an apply-issue-patch target without prepare: apply-patch is rejected", () => {
+  assertAppliedByRejected(
+    () =>
+      run(
+        fixture("invalid-applied-by-apply-issue-patch-prepare.yaml"),
+        { lane: "work-resolve-issue", activity: "resolve-issue" },
+        liveVocabulary(),
+      ),
+    /`apply-issue-patch`, which does not set prepare: apply-patch/,
+  );
+});
+
+test("applied-by: a target no activity defines is rejected", () => {
+  const config = appliedByEdit((doc) => {
+    doc.activities["fix-ci"]["applied-by"]["feedback-replies"] = "publish-feedback";
+  });
+  assertAppliedByRejected(() => unblock(config), /`publish-feedback`, which is not a script activity/);
+});
+
+test("applied-by: a non-patch target needs no prepare mode", () => {
+  const config = appliedByEdit((doc) => {
+    doc.activities["fix-ci"]["applied-by"]["feedback-replies"] = "publish-feedback";
+    doc.activities["publish-feedback"] = {
+      script: ".github/scripts/pr-unblock/publish-feedback.mjs",
+      effect: "publish-artifact",
+      gating: "advisory",
+      "reads-untrusted": true,
+    };
+    doc.lanes["pr-unblock"].slots.push({ activity: "publish-feedback", needs: ["fix-ci"] });
+  });
+  assert.deepEqual(unblock(config)["applied-by"], { patch: "apply-patch", "feedback-replies": "publish-feedback" });
+});
+
+for (const [why, edit] of [
+  ["on a script", (doc) => (doc.activities["apply-patch"]["applied-by"] = { patch: "apply-patch" })],
+  ["with effect mutate-branch", (doc) => (doc.activities["fix-ci"].effect = "mutate-branch")],
+  ["with gating gate", (doc) => (doc.activities["fix-ci"].gating = "gate")],
+  ["with a key outside the closed set", (doc) => (doc.activities["fix-ci"]["applied-by"].verdict = "apply-patch")],
+  ["empty", (doc) => (doc.activities["fix-ci"]["applied-by"] = {})],
+]) {
+  test(`applied-by ${why} fails the schema`, () => {
+    assertRejected(() => unblock(appliedByEdit(edit)), "invalid-config");
+  });
+}
+
+// Only the runner that stages a skill's edit tools grants these, and the read
+// runner does so only for applied-by.patch without ci-context.
+for (const [key, value] of [
+  ["checks", ["scripts/check-x.sh"]],
+  ["self-checks", ["scripts/check-x.sh"]],
+  ["verify-scripts", ["scripts/check-x.sh"]],
+  ["web-access", { enabled: true, domains: "any" }],
+]) {
+  test(`${key} on a read skill that hands on a patch resolves and is carried`, () => {
+    const config = appliedByEdit((doc) => {
+      delete doc.activities["fix-ci"].prepare;
+      doc.activities["fix-ci"][key] = value;
+    });
+    assert.deepEqual(unblock(config)[key], value);
+  });
+
+  test(`${key} on a read skill with prepare: ci-context fails the schema`, () => {
+    assertRejected(() => unblock(appliedByEdit((doc) => (doc.activities["fix-ci"][key] = value))), "invalid-config");
+  });
+}
+
+test("applied-by-supported: an applying leaf fails on a key its runner does not name", () => {
+  const selected = unblock(APPLIED_BY);
+  assert.doesNotThrow(() => checkAppliedBySupported(selected, "patch"));
+  assert.doesNotThrow(() => checkAppliedBySupported(selected, "feedback-replies, patch"));
+  for (const supported of ["", "feedback-replies", "patches"]) {
+    assertRejected(() => checkAppliedBySupported(selected, supported), "applied-by-unsupported");
+  }
+});
+
+test("applied-by-supported: a leaf with no applied-by, or one that does not apply, passes on any runner", () => {
+  assert.doesNotThrow(() => checkAppliedBySupported(unblock(APPLIED_BY, "apply-patch"), ""));
+  assert.doesNotThrow(() => checkAppliedBySupported({ ...unblock(APPLIED_BY), applies: false }, ""));
+});
+
+test("changed-paths: a read skill that hands on a patch is not asked to fix instruction surfaces or owned paths", () => {
+  const config = appliedByEdit((doc) => {
+    doc.activities["fix-ci"].inputs = ["changed-paths"];
+  });
+  const changed = ["docs/guide.md", "CLAUDE.md", "plugins/ai-slop/README.md"];
+  const selected = run(
+    config,
+    { lane: "pr-unblock", activity: "fix-ci", facts: { ...FACTS, changedPaths: changed, changedTargets: changed } },
+    { ...liveVocabulary(), codeowners: CODEOWNERS },
+  ).selected;
+  assert.deepEqual(selected["changed-paths"], ["docs/guide.md"]);
+});
+
+// patch-rules.json: apply-patch's registry, one row per prepare mode
+// (README.md, Patch rules).
+
+const PATCH_RULES = JSON.parse(read("./patch-rules.json"));
+const PATCH_RULES_SCHEMA = JSON.parse(read("./patch-rules.schema.json"));
+const patchRules = (name) => JSON.parse(fixture(name));
+
+test("patch rules: the shipped registry passes, with a row for each prepare mode and the default and issue targets", () => {
+  assert.equal(checkPatchRules(PATCH_RULES, PATCH_RULES_SCHEMA), PATCH_RULES);
+  assert.deepEqual(Object.keys(PATCH_RULES).sort(), [
+    "ci-context",
+    "default",
+    "dependency-review",
+    "issue",
+    "merge-base",
+    "review-threads",
+  ]);
+});
+
+for (const [name, why, message] of [
+  ["patch-rules-missing-universal.json", "a row that does not refuse the universal set", /row `issue` does not refuse codeowners$/],
+  ["patch-rules-unknown-predicate.json", "an allow rule apply-patch does not know", /fails its schema: \/default\/allow\/0/],
+  [
+    "patch-rules-merge-parents.json",
+    "a two-parent commit without allow merge-result",
+    /row `merge-base` commits with the base as a parent, so its allow must be exactly \[merge-result\]/,
+  ],
+  [
+    "patch-rules-merge-allow-any.json",
+    "a two-parent commit that also allows any path",
+    /row `merge-base` commits with the base as a parent, so its allow must be exactly \[merge-result\]/,
+  ],
+]) {
+  test(`patch rules: ${why} is rejected (${name})`, () => {
+    assert.throws(
+      () => checkPatchRules(patchRules(name), PATCH_RULES_SCHEMA),
+      (error) => error instanceof Rejection && error.code === "patch-rules" && message.test(error.message),
+    );
+  });
+}
+
+test("patch rules: a missing registry or schema is rejected", () => {
+  assertRejected(() => checkPatchRules(undefined, PATCH_RULES_SCHEMA), "patch-rules");
+  assertRejected(() => checkPatchRules(PATCH_RULES, undefined), "patch-rules");
+});
+
+test("patch rules: a row with an unknown key, or a registry without the default or issue row, fails its schema", () => {
+  assertRejected(
+    () => checkPatchRules({ ...PATCH_RULES, default: { ...PATCH_RULES.default, paths: ["**"] } }, PATCH_RULES_SCHEMA),
+    "patch-rules",
+  );
+  for (const row of ["default", "issue"]) {
+    const { [row]: _dropped, ...rest } = PATCH_RULES;
+    assertRejected(() => checkPatchRules(rest, PATCH_RULES_SCHEMA), "patch-rules");
+  }
+});
+
+test("patch rules: a patch producer whose prepare mode has no row is rejected; one with no prepare mode takes default", () => {
+  const { "ci-context": _dropped, ...withoutCiContext } = PATCH_RULES;
+  const producer = { skill: "source-control:pull-request", effect: "read", "applied-by": { patch: "apply-patch" } };
+  assertRejected(
+    () => checkPatchRules(withoutCiContext, PATCH_RULES_SCHEMA, { "fix-ci": { ...producer, prepare: "ci-context" } }),
+    "patch-rules",
+  );
+  assert.doesNotThrow(() => checkPatchRules(withoutCiContext, PATCH_RULES_SCHEMA, { "fix-docs": producer }));
 });

@@ -42,10 +42,16 @@ LEASE_CLI = "skills/babysit-prs/scripts/manage_babysit_lease.py"
 LEDGER_CLI = "skills/babysit-prs/scripts/manage_feedback_ledger.py"
 PRUNE_CLI = "skills/babysit-prs/scripts/prune_babysit_worktrees.py"
 REFRESH_CLI = "skills/babysit-prs/scripts/refresh_pr_branch.py"
+POSTMERGE_CLI = "skills/babysit-prs/scripts/babysit_postmerge.py"
 REVIEW_CLI = "skills/babysit-prs/scripts/request_review.py"
 SNAPSHOT_CLI = "skills/babysit-prs/scripts/pr_queue_snapshot.py"
 FINDINGS_CLI = "skills/babysit-prs/scripts/babysit_findings.py"
+PREFILTER_CLI = "skills/babysit-prs/scripts/babysit_merge_prefilter.py"
+SKIP_CLI = "skills/babysit-prs/scripts/babysit_merge_skip.py"
+VERIFY_EVIDENCE_CLI = "skills/babysit-prs/scripts/babysit_verify_evidence.py"
+WHOLE_REVIEW_CLI = "skills/babysit-prs/scripts/babysit_whole_review.py"
 THREADS_CLI = "skills/babysit-prs/scripts/pr_review_threads.py"
+REPO_CONFIG_CLI = "skills/babysit-prs/scripts/babysit_repo_config.py"
 READINESS_GATE = "scripts/babysit-readiness-gate.sh"
 MERGE_WRAPPER = "scripts/source-control-babysit-merge"
 RESOLVE_WRAPPER = "scripts/source-control-babysit-resolve-thread"
@@ -635,6 +641,26 @@ REFUSALS: tuple[Refusal, ...] = (
         enforced_at="babysit_resolve_thread.py::main",
     ),
     Refusal(
+        id="resolve.own-pr-lane-logins-requires-autonomous",
+        claim=(
+            "--own-pr-lane-logins is the worker tier's own-PR exception and nothing "
+            "else: outside --autonomous it is refused at exit 2, so it can never widen "
+            "the explicit or independent-resolver modes."
+        ),
+        entry_point=RESOLVE_CLI,
+        argv=(
+            "owner/repo#1",
+            "--allowed-owners",
+            "owner",
+            "--own-pr-lane-logins",
+            "lane",
+        ),
+        exit_code=2,
+        error_contains=("--autonomous",),
+        refused_by=PYTHON_CLI,
+        enforced_at="babysit_resolve_thread.py::main",
+    ),
+    Refusal(
         id="resolve.wrapper-reaches-failclosed-cli",
         claim=(
             "The resolve wrapper is a pure passthrough: no --allowed-owners refuses at "
@@ -750,6 +776,81 @@ REFUSALS: tuple[Refusal, ...] = (
         enforced_at="manage_feedback_ledger.py::main",
     ),
     Refusal(
+        id="ledger.rerun-requires-check-id",
+        claim=(
+            "A check rerun is recorded against one identified check: record-rerun "
+            "without --check-id refuses at exit 2. The flake cap counts reruns per PR, "
+            "head and check, so a rerun recorded with no check would count against "
+            "nothing and the cap could never fire."
+        ),
+        entry_point=LEDGER_CLI,
+        argv=(
+            "record-rerun",
+            "--pr",
+            "owner/repo#1",
+            "--expected-head-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--state-dir",
+            "{state_dir}",
+            "--lease-token",
+            "contract-row",
+            "--apply",
+        ),
+        exit_code=2,
+        error_contains=("--check-id",),
+        refused_by=PYTHON_CLI,
+        enforced_at="manage_feedback_ledger.py::main",
+    ),
+    Refusal(
+        id="ledger.check-id-must-be-hex",
+        claim=(
+            "--check-id accepts only the snapshot's lowercase hex rerun id and refuses "
+            "anything else at exit 2. Check and workflow names are attacker text on a "
+            "fork PR, so the command names a check by an id with no shell "
+            "metacharacters and the helper resolves the name from stored state."
+        ),
+        entry_point=LEDGER_CLI,
+        argv=(
+            "record-rerun",
+            "--pr",
+            "owner/repo#1",
+            "--expected-head-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--state-dir",
+            "{state_dir}",
+            "--check-id",
+            "build",
+        ),
+        exit_code=2,
+        error_contains=("--check-id must be",),
+        refused_by=PYTHON_CLI,
+        enforced_at="manage_feedback_ledger.py::main",
+    ),
+    Refusal(
+        id="ledger.check-id-requires-a-rerun",
+        claim=(
+            "--check-id is refused at exit 2 on any other action rather than "
+            "accepted and ignored, so a caller cannot believe it recorded a rerun "
+            "when it recorded a check-in."
+        ),
+        entry_point=LEDGER_CLI,
+        argv=(
+            "record-worker-checkin",
+            "--pr",
+            "owner/repo#1",
+            "--expected-head-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--state-dir",
+            "{state_dir}",
+            "--check-id",
+            "0123456789abcdef0123456789abcdef",
+        ),
+        exit_code=2,
+        error_contains=("--check-id is only valid",),
+        refused_by=PYTHON_CLI,
+        enforced_at="manage_feedback_ledger.py::main",
+    ),
+    Refusal(
         id="prune.root-is-required",
         claim=(
             "prune_babysit_worktrees.py has no default root: omitting --root is a usage "
@@ -809,6 +910,7 @@ def _thread(
     severity_flagged: bool | None = None,
     finding_count: object = _OMITTED,
     human_deferred: bool = False,
+    lane_answered: bool | None = None,
 ) -> dict[str, object]:
     thread: dict[str, object] = {
         "isResolved": resolved,
@@ -826,6 +928,10 @@ def _thread(
         # MEANINGFUL value here (the projection reports it for a truncated
         # comment page), which is why omission needs its own sentinel.
         thread["findingCount"] = finding_count
+    if lane_answered is not None:
+        # Omitted by default, so the own-PR rows keep exercising the guard's
+        # fail-closed `.get(..., False)` default.
+        thread["laneAnswered"] = lane_answered
     return thread
 
 
@@ -1065,6 +1171,70 @@ PREDICATES: tuple[Predicate, ...] = (
         expected="eligible",
     ),
     Predicate(
+        id="classify.own-pr-requires-a-lane-answer",
+        claim=(
+            "On a PR whose author is a self login, an outdated clean bot thread is "
+            "still refused unless a lane login answered it: the resolver is the PR's "
+            "author, so the 'handled' claim must come from another actor. An absent "
+            "signal fails closed."
+        ),
+        enforced_at=CLASSIFY_ANCHOR,
+        thread=_thread(
+            resolved=False, bot_only=True, outdated=True, severity_flagged=False
+        ),
+        flags={
+            "autonomous": True,
+            "only_outdated": False,
+            "include_human": False,
+            "own_pr": True,
+        },
+        expected="skipped-own-pr-not-lane-answered",
+    ),
+    Predicate(
+        id="classify.own-pr-keeps-the-severity-line",
+        claim=(
+            "A lane answer never buys past the severity line: a CRITICAL or security "
+            "thread on an own PR stays with a person."
+        ),
+        enforced_at=CLASSIFY_ANCHOR,
+        thread=_thread(
+            resolved=False,
+            bot_only=True,
+            outdated=True,
+            severity_flagged=True,
+            lane_answered=True,
+        ),
+        flags={
+            "autonomous": True,
+            "only_outdated": False,
+            "include_human": False,
+            "own_pr": True,
+        },
+        expected="skipped-severity-marked",
+    ),
+    Predicate(
+        id="classify.own-pr-lane-answered-is-eligible",
+        claim=(
+            "The own-PR exception admits exactly an outdated, bot-opened, unflagged "
+            "thread a lane already answered."
+        ),
+        enforced_at=CLASSIFY_ANCHOR,
+        thread=_thread(
+            resolved=False,
+            bot_only=True,
+            outdated=True,
+            severity_flagged=False,
+            lane_answered=True,
+        ),
+        flags={
+            "autonomous": True,
+            "only_outdated": False,
+            "include_human": False,
+            "own_pr": True,
+        },
+        expected="eligible",
+    ),
+    Predicate(
         id="classify.already-resolved-precedes-every-guard",
         claim=(
             "An already-resolved thread is skipped before any other guard is consulted, "
@@ -1164,6 +1334,24 @@ MECHANISMS: tuple[Mechanism, ...] = (
         must_not_contain=('"push"', "'push'"),
     ),
     Mechanism(
+        id="whole-review.marks-ready",
+        claim=(
+            "babysit_whole_review.py recover performs a GitHub write: it marks a "
+            "draft pull request ready for review through GraphQL."
+        ),
+        entry_point=WHOLE_REVIEW_CLI,
+        must_contain=("markPullRequestReadyForReview",),
+    ),
+    Mechanism(
+        id="whole-review.toggles-draft",
+        claim=(
+            "babysit_whole_review.py toggle performs GitHub writes: it converts a "
+            "pull request to a draft and marks it ready again through GraphQL."
+        ),
+        entry_point=WHOLE_REVIEW_CLI,
+        must_contain=("convertPullRequestToDraft", "markPullRequestReadyForReview"),
+    ),
+    Mechanism(
         id="review.posts-a-comment",
         claim=(
             "request_review.py --apply performs a GitHub write: it POSTs an issue comment "
@@ -1239,6 +1427,39 @@ MECHANISMS: tuple[Mechanism, ...] = (
         must_contain=("babysit_python",),
         must_not_contain=('for arg in "$@"',),
     ),
+    Mechanism(
+        id="postmerge.remediate-gates-every-write",
+        claim=(
+            "babysit_postmerge.py calls its writers (the attribution re-run, the "
+            "full-run dispatch, the disarm, the dequeue and the demotion issue) only "
+            "inside one "
+            "branch of main() that needs --remediate, a readable verdict and a known "
+            "branch. Without the flag it reads GitHub and prints the verdict, whatever "
+            "the verdict says."
+        ),
+        entry_point=POSTMERGE_CLI,
+        must_contain=("elif args.remediate and verdict.readable and branch:",),
+    ),
+    Mechanism(
+        id="postmerge.file-quarantine-gates-its-writes",
+        claim=(
+            "babysit_postmerge.py --judge-run files or comments on a quarantine "
+            "issue only inside one branch of its --judge-run path that needs "
+            "--file-quarantine; without it --judge-run reads GitHub and prints its "
+            "judgment."
+        ),
+        entry_point=POSTMERGE_CLI,
+        must_contain=("if args.file_quarantine and quarantines:",),
+    ),
+    Mechanism(
+        id="postmerge.parser-refuses-abbreviation",
+        claim=(
+            "babysit_postmerge.py sets allow_abbrev=False, so a permission rule written "
+            "against the exact spelling --remediate also covers every prefix of it."
+        ),
+        entry_point=POSTMERGE_CLI,
+        must_contain=("allow_abbrev=False",),
+    ),
 )
 
 
@@ -1257,12 +1478,18 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         mutation=CONDITIONAL,
         mutates_what=(
             "merges the PR on GitHub, or with --auto arms auto-merge; with --state-dir "
-            "it also keeps a local pending-merge record"
+            "it also keeps a local pending-merge record. With --unattended --merge, "
+            "under the agent identity only: enqueues at the pinned head after a pin "
+            "comment, dequeues the identity's queue entries, disarms an armed "
+            "auto-merge, upserts the reasons comment, and dispatches the full run "
+            "once a queued entry reads back merged"
         ),
         gate="--merge (absent: readiness check only, exit 0 ready / 10 not ready)",
         claim=(
             "Without --merge this is a readiness reporter on GitHub; with --state-dir it "
-            "may still clear a finished pending-merge record locally. With --merge, the TOCTOU guard "
+            "may still clear a finished pending-merge record locally, except under "
+            "`merge.report-only`, which reads the record and leaves it as it was. "
+            "With --merge, the TOCTOU guard "
             "requires --expected-head unless --allow-unpinned-head is passed -- and the "
             "scripts/ wrapper refuses that override outright."
         ),
@@ -1316,7 +1543,9 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         path=LEDGER_CLI,
         wrapper=None,
         mutation=CONDITIONAL,
-        mutates_what="records feedback dispositions and fix rounds in queue state",
+        mutates_what=(
+            "records feedback dispositions, fix rounds, and check reruns in queue state"
+        ),
         gate="--apply, additionally requiring --lease-token",
         claim=(
             "Local state only, no GitHub write. The lease token requirement means an "
@@ -1326,6 +1555,9 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
             "ledger.apply-requires-lease-token",
             "ledger.advisory-round-requires-finding-class",
             "ledger.finding-class-requires-an-advisory-round",
+            "ledger.rerun-requires-check-id",
+            "ledger.check-id-must-be-hex",
+            "ledger.check-id-requires-a-rerun",
         ),
     ),
     EntryPoint(
@@ -1341,12 +1573,32 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         backed_by=("prune.root-is-required", "prune.removes-worktrees-via-git"),
     ),
     EntryPoint(
+        path=POSTMERGE_CLI,
+        wrapper=None,
+        mutation=CONDITIONAL,
+        mutates_what=(
+            "re-runs failed jobs of a red full run; dispatches a full run when none "
+            "covers an unverified auto-merge; turns off native auto-merge the agent "
+            "identity armed on its own pull requests; dequeues the agent identity's "
+            "merge-queue entries; files, reopens, or comments on the demotion issue; "
+            "files or comments on a quarantine issue"
+        ),
+        gate="--remediate, --file-quarantine",
+        claim="Read-only without --remediate or --file-quarantine.",
+        backed_by=(
+            "postmerge.remediate-gates-every-write",
+            "postmerge.file-quarantine-gates-its-writes",
+            "postmerge.parser-refuses-abbreviation",
+        ),
+    ),
+    EntryPoint(
         path=REFRESH_CLI,
         wrapper=None,
         mutation=CONDITIONAL,
         mutates_what=(
             "disables an armed auto-merge, then asks GitHub to update the PR branch "
-            "server-side; writes queue state"
+            "server-side, or for a Dependabot head posts one @dependabot rebase or "
+            "recreate comment per base tip; writes queue state"
         ),
         gate="--apply",
         claim=(
@@ -1386,6 +1638,69 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         backed_by=(),
     ),
     EntryPoint(
+        path=PREFILTER_CLI,
+        wrapper=None,
+        mutation=READ_ONLY,
+        mutates_what="nothing",
+        gate="n/a",
+        claim=(
+            "Pure classification of the candidate list on stdin into kept and "
+            "held, printed on stdout; no write of any kind and no GitHub call."
+        ),
+        backed_by=(),
+    ),
+    EntryPoint(
+        path=WHOLE_REVIEW_CLI,
+        wrapper=None,
+        mutation=MUTATING,
+        mutates_what="a pull request's draft state",
+        gate=(
+            "pr-merge.yml's merge job runs `recover`, and enable-auto-merge.mjs "
+            "runs `recover`, `request` and `toggle`, with the lane token, live "
+            "mode only"
+        ),
+        claim=(
+            "`recover` reads each listed draft's comments and newest "
+            "conversion to draft, and marks ready a draft whose newest "
+            "reasons comment (`<!-- babysit-merge-risk -->`) by the lane "
+            "identity records a whole-review request, when the lane identity "
+            "also made that conversion within ten minutes after a record. "
+            "`request` writes nothing; `toggle` converts the pull request to "
+            "a draft and marks it ready again."
+        ),
+        backed_by=("whole-review.marks-ready", "whole-review.toggles-draft"),
+    ),
+    EntryPoint(
+        path=SKIP_CLI,
+        wrapper=None,
+        mutation=READ_ONLY,
+        mutates_what="nothing on GitHub",
+        gate="n/a",
+        claim=(
+            "Reads GitHub (one GraphQL query per 20 candidates, the artifact "
+            "listing) and writes only the local files its arguments name: the "
+            "kept candidates, the skipped rows, the keys and the refusal store, "
+            "plus the artifact listing `BABYSIT_VERIFY_LISTING` names. "
+            "No GitHub write on any path."
+        ),
+        backed_by=(),
+    ),
+    EntryPoint(
+        path=VERIFY_EVIDENCE_CLI,
+        wrapper=None,
+        mutation=READ_ONLY,
+        mutates_what="nothing on GitHub",
+        gate="n/a",
+        claim=(
+            "`evidence` reads the pull request, its commits, the artifact "
+            "listing, run records, compares and verdict files, and prints the "
+            "gate's verifier evidence as one JSON line; it writes only the "
+            "local listing, head-ref and run-cache files the BABYSIT_* "
+            "variables name. No GitHub write on any path."
+        ),
+        backed_by=(),
+    ),
+    EntryPoint(
         path=THREADS_CLI,
         wrapper=THREADS_WRAPPER,
         mutation=READ_ONLY,
@@ -1395,6 +1710,20 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
             "The pull-request skill's readiness thread gate. It reads unresolved review "
             "threads and reports THREADS_OK / THREADS_BLOCKED / THREADS_UNPROVEN; "
             "it writes no file and performs no GitHub write."
+        ),
+        backed_by=(),
+    ),
+    EntryPoint(
+        path=REPO_CONFIG_CLI,
+        wrapper=None,
+        mutation=READ_ONLY,
+        mutates_what="nothing",
+        gate="n/a",
+        claim=(
+            "`loop-keys <owner/repo>` reads docs/conventions/source-control.yaml and "
+            ".claude/source-control.md from the target's default branch through the "
+            "contents API and prints the four babysit_loop_* values as JSON; it performs "
+            "no GitHub write and writes only a temporary file for the shared YAML reader."
         ),
         backed_by=(),
     ),

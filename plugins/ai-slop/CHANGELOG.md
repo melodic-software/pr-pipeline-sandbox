@@ -1,0 +1,1281 @@
+# Changelog
+
+## [0.14.4] - 2026-10-20
+
+### Fixed
+
+- `audit`: the effective-config line runs the detector alone, with no pipe into `head -40`, so it loads in a CI lane whose deny rules name `head`.
+
+## [0.14.3] - 2026-10-20
+
+### Fixed
+
+- Shared `prerequisites.mjs` synced: a `node-pkg` or `python-pkg` entry reads `CLAUDE_PLUGIN_DATA` only when its last path segment is this plugin's name or starts with `<plugin>-`, and treats a literal `${...}` value as unset, so another plugin's data directory reports `unverified` instead of `missing`.
+
+## [0.14.2] - 2026-10-17
+
+### Fixed
+
+- `audit` and `fix` skip generated regions, from a standalone `<!-- BEGIN GENERATED: ... -->` line through its `<!-- END GENERATED: ... -->` line. The detector, the closing cross-check and the rubric fan-out's cue counts no longer read them, rubric subagents are told to skip them, and the fix flow, rubric and voice rewrites included, no longer edits them, so the `pr-refine / fix-docs` lane stops hand-editing the plugin-options README block that `scripts/sync-plugin-options-docs.py` owns and failing `check-plugins` with `STALE options docs` (#7554). A region with no END line is reported on stderr.
+
+## [0.14.1] - 2026-10-16
+
+### Changed
+
+- Shared `prerequisites.mjs` synced: the SessionStart probe now also reports a drifted git-hook entry for a plugin that ships `git-hooks/entries.json`. This plugin ships none, so its behavior is unchanged.
+
+## [0.14.0] - 2026-10-13
+
+### Added
+
+- **Two rubric tells: `rule-over-compression` and `rule-figure-for-fact`.** Over-compression
+  reports prose for people cut so short that the reader cannot tell what team shorthand stands
+  for, how two steps connect, what a symbol means, or which thing is meant and who acts; tables,
+  references, code, commit subjects and terse agent-facing instruction lists are out of scope.
+  Figure-for-fact reports a comparison to an unrelated scene, a consequence told as a small
+  drama, a program credited with moods, or a slogan, where a literal sentence of about the same
+  length would tell the reader more; a sentence whose only figure is a noun listed by
+  `rule-abstract-metaphor-jargon` goes to that rule. The rewrite guide gains a fix for each, and
+  the catalog's general-prose additions count is 9.
+
+### Changed
+
+- **Shared `prerequisites.mjs` synced: its per-probe timeout is now 20 seconds, up from 5.** A version or `system-lib` probe that resolves a secret or calls a network API, such as `firecrawl --status` behind a key-injecting wrapper, no longer false-fails on a slow run. A fast probe is unaffected; a hung one now costs at most 20 seconds per entry. No change to this plugin's own entries.
+
+- **The README, catalog and rewrite guide no longer point at the upstream ledger.** The
+  provenance line in each is removed; where the general-prose additions came from is recorded only in the
+  marketplace's `docs/upstream/` pages. The rewrite guide's note on the left-out voice technique
+  now says not to re-add it.
+- **Rewrite guide and catalog reworded in their own terms.** The plain-speech questions and the
+  phrase replacements are tables with this repository's own examples, and the voice techniques
+  are grouped by where they apply. The colon-crutch, stacked-hedge and inline-header examples are
+  new; the false-range entry is reworded around its unchanged example. The catalog section that
+  holds the chat-residue, filler, hedging and other general-prose tells is renamed
+  "General-prose additions" (anchor `#general-prose-additions`; update any link to the old
+  anchor), and the detector test fixtures for those rules are renamed to match. No rule,
+  threshold or rule id changed. The README, catalog and guide record where that section's tells
+  came from by pointing at the marketplace's upstream ledger.
+- **The catalog's overlap-map row for plain speech and voice is reworded in our own words.** It now names the rewrite guide's "Plain speech" and "Adding voice" sections and still routes the mechanism-over-feeling case to `rule-mechanism-free-claims`. No rule changed.
+
+- The rubric fan-out's model note and the user-scope script's surface list point at the exact upstream sections, each with an as-of date and recheck trigger, instead of restating how a model alias resolves.
+
+- **`/ai-slop:audit` detection is much faster on a large tree.** `detect.sh` now extracts prose for every target in one awk pass and runs each rule as one grep over all files, instead of forking a pipeline per file per rule. Findings and summary output are unchanged, and stderr notes for NUL bytes and unreadable files are reworded; the process count no longer grows with the number of files.
+
+### Fixed
+
+- Shared library comments that restated Claude Code hook, plugin and managed-settings behavior now point at the live docs sections, and the prerequisites probe no longer gives a wrong reason for always exiting 0.
+
+- **The shared prerequisites checker now finds a `python-pkg` in the plugin's own installed Python
+  set.** A module that the interpreter cannot import on its own is looked up in the set a plugin
+  with a committed `requirements.txt` installs into its data directory
+  (`<data>/python/<lock hash>-<interpreter tag>/`), imported the way that plugin's launcher runs
+  it. Before, such a package was reported missing. When the data directory is unknown (no
+  `--data-dir`, no `CLAUDE_PLUGIN_DATA`), the entry reports `unverified` instead of failing.
+  Refs #6112.
+
+## [0.13.7] - 2026-10-10
+
+### Fixed
+
+- **`audit` ended before any model turn under `--permission-mode dontAsk`.** The effective-config pre-compute line chained `>/dev/null 2>&1 && { ...; :; } || echo "detector unavailable"`. Claude Code checks every command in a `!` line against the skill's `allowed-tools`, and `:` and `echo` match no grant, so a dontAsk session (the pr-refine fix-docs lane) denied the expansion, printed `Shell command permission check failed` as local-command stderr, and returned a `success` result with `num_turns: 0`. The line is now `detect.sh --show-config 2>&1 | head -40`, which the `detect.sh` and `head` grants cover; a failed detector shows its shell error in place of the config instead of `detector unavailable`.
+
+## [0.13.6] - 2026-10-04
+
+### Changed
+
+- The README's phrase-promotion steps name the repo's release record (a version bump plus CHANGELOG entry, or a changelog fragment where the repo uses them) instead of a version bump.
+
+## [0.13.5] - 2026-10-04
+
+### Changed
+
+- **Shared `prerequisites` checker copies synced ([#6225](https://github.com/melodic-software/claude-code-plugins/issues/6225)); no change to this plugin's behavior.**
+
+## [0.13.4] - 2026-10-04
+
+### Fixed
+
+- `cascade-read.test.sh` quotes the `rule-a` and `rule-b` slug-map keys, so a shfmt pass no longer respaces them into `rule - a` and `rule - b` and breaks the slug-map checks ([#5791](https://github.com/melodic-software/claude-code-plugins/issues/5791)).
+
+## [0.13.3] - 2026-10-03
+
+### Changed
+
+- **Shared `prerequisites.mjs` synced ([#6084](https://github.com/melodic-software/claude-code-plugins/issues/6084)); no change to this plugin's lib.**
+  The prerequisite check now counts a Windows App Execution Alias (a Store or winget install on PATH) as found,
+  except App Installer's Python install stub. A `cli` or `runtime` entry can set `reject_store_alias` to skip aliases instead; no entry in this plugin does.
+
+## [0.13.2] - 2026-10-03
+
+### Changed
+
+- Shared `prerequisites.sh`, `prerequisites.ps1` synced ([#5843](https://github.com/melodic-software/claude-code-plugins/issues/5843)); no change to this plugin's own behavior.
+
+## [0.13.1] - 2026-10-02
+
+### Changed
+
+- **Shared `config-root.sh` synced ([#5837](https://github.com/melodic-software/claude-code-plugins/issues/5837)); no change to this plugin's lib.**
+  It is now generated from the repository's canonical source by `scripts/sync-shared-copies.sh` and opens with a header saying so; edit
+  the canonical, not the copy.
+
+## [0.13.0] - 2026-10-02
+
+### Added
+
+- `prerequisites.json`, declaring the external tools this plugin runs and what stops working
+  without each, and the generated `lib/prerequisites.mjs` checker with its `.sh` and `.ps1`
+  stubs that read it ([#5841](https://github.com/melodic-software/claude-code-plugins/issues/5841)).
+
+## [0.12.6] - 2026-10-02
+
+### Fixed
+
+- `plugin.json` no longer sets `$schema`. claude.ai's marketplace sync stripped it with a warning, and Claude Code ignores it at load time.
+- The plugin description is 500 characters or fewer, the limit claude.ai's marketplace sync enforces.
+
+## [0.12.5] - 2026-10-02
+
+### Changed
+
+- **The `audit` catalog stores no text from its source page.** The attribution record now points at
+  the pinned Wikipedia revision for the source inventory, and the postures derived from the page's
+  Caveats section and the notes on the em-dash and similar rules are restated as this catalog's own
+  decisions. No rule, default or severity changes: the em-dash rule stays zero-tolerance by default.
+- The feeling-instead-of-mechanism rubric item is restated in our own example and tests, and the
+  archiewood/claudeisms ratios now sit behind a pointer to that repository instead of in the catalog.
+
+## [0.12.4] - 2026-10-02
+
+### Fixed
+
+- The `audit` `argument-hint` uses Claude Code's official bracket notation: it keeps alternatives
+  inside brackets with an unspaced `|`.
+- The `setup` `argument-hint` uses Claude Code's official bracket notation: it leads with its check
+  action and keeps alternatives inside brackets with an unspaced `|`.
+
+## [0.12.3] - 2026-10-01
+
+### Changed
+
+- References to the `claude-config`, `claude-memory` and `claude-ops` plugins now use their new
+  names, `harness-config`, `harness-memory` and `harness-ops`.
+
+## [0.12.2] - 2026-10-01
+
+### Changed
+
+- Dropped citations of the removed topic-docs convention and the `docs/specs` tree.
+
+## [0.12.1] - 2026-09-29
+
+### Fixed
+
+- **audit:** a config root that is the home directory (or an ancestor of it) or is not inside a git
+  working tree no longer reads `.claude/ai-slop.json` and `.claude/ai-slop.local.json` as team and
+  overlay layers, and a team or overlay path that is the user-global file is read once. The
+  classifier is `lib/config-root.sh`, a synced copy of the source-control resolver.
+
+## [0.12.0] - 2026-09-29
+
+### Added
+
+- **audit:** `scripts/emit-fix-record.sh` writes the `type: fix-pass-record` that names each
+  findings file a `fix` run consumed (name and 12-hex sha256), named by digest so an existing
+  record is never overwritten.
+
+### Changed
+
+- **audit:** the rubric working directory (batch lists, `cues.txt`, `rubric-batch-NN.md`
+  results, the merged rubric report) is resolved from the target alone before step 3: a
+  gitignored `.work/ai-slop-rubric/<TS>/` for a repository target, else the scratchpad or
+  system temp directory. The rubric fan-out no longer waits on the findings home.
+- **audit:** `persist-findings.md` states the common-case findings location inline and defers
+  to the producer contract on any other rung.
+
+### Fixed
+
+- **audit:** `fix` writes a `fix-pass-record` for the findings file it consumed before the
+  re-emit, so `review:fanout fix` no longer reapplies the pre-fix file. The claim that no stale
+  findings file survives remediation now matches that behavior.
+- **audit:** `emit-fix-record.sh` quotes a YAML-sensitive branch name (`true`, `123`, `#topic`)
+  the way `emit-findings.sh` does, so `review:fanout fix` matches the record's branch exactly.
+- **audit:** the rubric run directory is created with a plain `mkdir` and a numeric suffix on
+  collision, so two audits in one second get separate workspaces.
+
+## [0.11.4] - 2026-09-29
+
+### Changed
+
+- **audit:** the git-on-PATH, work-tree and `ls-files` checks behind a bare invocation and a
+  directory target live in one helper in `scripts/lib/resolve-targets.sh`. The stderr lines and
+  fallbacks are unchanged. Explicit file paths do not use the git listing.
+- **audit:** resolver-level target cases (untracked-only directory, failing `ls-files`, bare
+  invocation from outside the checkout or outside a checkout) live in `resolve-targets.test.sh`;
+  `detect.test.sh` keeps one end-to-end case per entry form.
+
+## [0.11.3] - 2026-09-28
+
+### Changed
+
+- **audit:** target resolution goes through `scripts/lib/resolve-targets.sh`. A bare
+  invocation, explicit paths, a directory, a paths file, and the offset window all use one
+  git listing (`core.quotePath=false`). A missing git binary and a directory outside a
+  checkout each keep their stderr line.
+
+## [0.11.2] - 2026-09-28
+
+### Changed
+
+- **audit:** config cascade reads go through `scripts/lib/cascade-read.sh`. Scalar override,
+  wholesale-replace lists, and per-slug maps each have one function. A layer jq refuses is
+  skipped whole, a CRLF-emitting jq yields the same value as LF, and an explicit empty list
+  clears the inherited list.
+
+## [0.11.1] - 2026-09-27
+
+### Changed
+
+- **`setup` resolves the effective config at load time.** The detector's `--show-config` runs as
+  pre-computed context, so `check` reads which layer supplies each value instead of spending a
+  Bash call. `apply`'s post-write re-run still calls the detector live, and a policy-disabled or
+  failed injection falls back to the Bash call.
+
+## [0.11.0] - 2026-09-26
+
+### Added
+
+- **Scope-wide cue counts.** `rubric-fanout.sh plan` writes `cues.txt` beside the batch lists:
+  for `load-bearing` and `seam`, the occurrence and file counts over the prose of every
+  readable file in scope (YAML frontmatter, fenced and indented code, code spans, straight and
+  curly double-quoted spans, blockquotes, HTML comment interiors, link destinations,
+  reference definitions and autolinks skipped, as the rubric skips them; the catalog lists
+  the remaining gaps), a `saturated=yes|no` verdict, and per-batch counts. A cue is saturated when it appears in at least 10 files and at least 10% of the
+  files in scope. Every batch receives the file, so no batch judges saturation from its own
+  slice.
+- **Cross-batch consistency flags.** Batch results may carry `declined: <rule> <cue>
+  reason=saturated|boundary|cap` lines. `merge` totals them as `declined_total:` lines and
+  prints a `consistency:` line when a saturated cue is still reported, when a word is declined
+  as saturated while `cues.txt` does not mark it so, or when a batch has occurrences of a cue and
+  neither reports nor declines it. Declined cues match in any case and in plural, and a
+  finding's quote may wrap onto continuation lines. The `rule_total:` line of a flagged rule gains
+  `consistency=flagged`. `cues.txt` carries a `scope_digest=` line; when a listed file
+  changed after `plan`, `merge` prints `consistency: cues.txt stale reason=digest` instead of
+  the cue checks.
+- Eval case `cross-batch-verdicts-agree` with two fixtures sharing one passage.
+
+### Changed
+
+- **Catalog rulings the batches disagreed on.** `rule-abstract-metaphor-jargon` defines
+  saturation with a number and a unit and gives a declined and a reported "seam" example.
+  `rule-colon-crutch` states one discriminator with a reported and a declined example, and
+  rules a terse `rule: reason` line in operative instructions out of scope. A leading
+  `U+26A0` on a caveat line stays in scope for `rule-emoji-formatting`, and "Signs of human
+  writing" says the rubric never counts it as a counter-sign.
+
+## [0.10.0] - 2026-09-25
+
+### Added
+
+- **`user-scope` target.** `/ai-slop:audit user-scope` and `fix user-scope` audit the
+  user-level Claude Code markdown: `CLAUDE.md`, `rules/`, skills holding `SKILL.md`,
+  `commands/`, `agents/` and top-level `output-styles/*.md`, under `CLAUDE_CONFIG_DIR` else
+  `~/.claude`, per the `.claude` directory docs page; `memory` adds auto memory and agent
+  memory. The new `scripts/user-scope.sh` prints the file list for
+  `detect.sh --list-targets --paths-file`, skipping FIFOs, directories, unreadable files and
+  paths holding a newline or tab. It follows a symlink only to a readable regular `.md`
+  file inside the config root whose resolved path holds no newline or tab, lists that file
+  once, never walks a symlinked directory, and names every skipped link on stderr. With
+  `--memory` it warns when the user `settings.json` sets `autoMemoryDirectory`, which it does
+  not list. Under MSYS it prints Windows-form paths (`C:/...`). A path target such as
+  `~/.claude` is unchanged.
+
+### Fixed
+
+- **A FIFO at a listed path hung `rubric-fanout.sh status` and `plan`.** `sha256sum` and
+  `wc -w` opened it and blocked. Only readable regular files are now hashed or counted, so
+  `status` reports the batch `reason=paths` and `plan` counts the path as 0 words. A
+  targets file that is not a regular file makes `plan` exit 2 instead of blocking.
+- **A missing row did not say its sidecar was unsound.** `status` now prints
+  `status=missing reason=paths digest=<d>` when the result file is absent and the sidecar
+  cannot bind the contents, so the batch is re-planned rather than dispatched. A missing row
+  with a sound sidecar is unchanged.
+- **A sidecar that is not a regular file** (a FIFO, a directory) was treated as absent. It is
+  never opened and now reads `reason=paths`.
+
+## [0.9.0] - 2026-09-25
+
+### Added
+
+- **`rubric-fanout.sh plan`** writes a `batch-NN.paths` sidecar beside each `batch-NN.txt`,
+  one absolute path per listed file (an absolute target path is kept as given; a relative one
+  resolves against the cwd, ignoring `CDPATH`), warns on stderr for a path it cannot read,
+  and the batch digest now covers the list plus those files' contents.
+- **`rubric-fanout.sh status`** ends every missing and stale row with `digest=<current
+  digest>`, which a re-dispatch hands the batch subagent, and reports `stale reason=paths`
+  when a sidecar's length differs from its list's or one of its paths is not a readable file (a
+  trailing CR on a sidecar line is ignored). Complete rows are unchanged.
+
+### Changed
+
+- **`cross-check.sh`** compares the set of em-dash line numbers per file, not only the count.
+  A `Disagree:` row keeps its `file= detector= cross_check=` fields and adds
+  `detector_only=` and `cross_check_only=`, the lines only one side counted, or `-`.
+- **Rubric batch subagents** are dispatched with `model: sonnet`, pinned in
+  `context/rubric-fanout.md`: the session's own model when it is Sonnet-family, otherwise the
+  alias's Sonnet version.
+
+### Fixed
+
+- **A header written twice could pass `status`.** Copies of `batch:`, `files_reviewed:` or
+  `files_with_findings:` joined into one value, so `files_reviewed: 1` twice read `11` and
+  passed an 11-file batch. Each header must now appear exactly once, and any other count is
+  stale under that header's reason.
+- **A listed file edited after its batch completed kept the batch complete.** The digest bound
+  the result to the list only; it now binds the listed files' contents too, so the batch reads
+  stale, and a listed path that can no longer be read (a moved checkout) reads stale
+  `reason=paths` rather than falling back to the list alone. A batch directory planned before
+  0.9.0 has no sidecars and stays bound to the list.
+- **`cross-check.sh` missed a disagreement with equal counts.** Detector lines {3,4} against
+  actual {3,5} printed no `Disagree:` row; it now names line 4 and line 5.
+
+## [0.8.1] - 2026-09-25
+
+### Changed
+
+- Comment-only pass with /code-tidying:dissolve-comments: restating comments, history narration and ticket back-references removed from scripts and tests, over-budget rationale shortened. Every edit is certified comment-only by a token-level proof, so behavior is unchanged; the removed text is recorded in the commit bodies.
+
+## [0.8.0] - 2026-09-23
+
+### Added
+
+- **`rubric-fanout.sh`** runs the rubric fan-out's deterministic steps: `plan` orders the target
+  list and packs batches by `wc -w`, printing each list's digest; `extract` writes the
+  catalog's rubric entries and "Signs of human writing" to one file, whose path is all a batch
+  subagent receives from the catalog; `status` reports each batch as complete, missing, or
+  stale with the failed check; `merge` refuses until every batch is complete, then writes
+  summed counts and per-rule totals. `context/rubric-fanout.md` now runs on these commands.
+- **`detect.sh --list-targets`** prints the files a scan would read, as `<key><TAB><path>`
+  after directory expansion and `excluded_paths`, keyed by the `file=` spelling. `--paths-file`
+  reads that format.
+- **`cross-check.sh`** counts em-dash lines per file with a parse separate from the detector's
+  (same fence rules, count only) and prints a `Disagree:` row for each file whose count differs from the detector's
+  `rule-em-dash` findings. The fix flow's closing step runs it and reports every disagreement.
+- **Fix flow concurrent-edit guard**: every fix run gets a run directory; before each write to a
+  file the flow checks the digest it last recorded (`sha256sum -c`) and stops that file on a
+  mismatch. A write that lands between the check and the re-record after the fixer's own write
+  is not detected.
+
+### Fixed
+
+- **An empty `--paths-file` scanned the repository.** A list with no paths fell back to the
+  repository's tracked markdown; it now scans nothing and says so on stderr.
+- **A backup that cannot be written now stops the edit** for a non-repository `fix` run, as when
+  a `\\?\` or UNC source mirrors to an invalid path.
+
+## [0.7.1] - 2026-09-23
+
+### Fixed
+
+- **`audit` defines a target outside any repository**: the skill had no rule for it, so the
+  orchestrator asked or improvised. It now checks the target with `git -C <dir> rev-parse
+  --is-inside-work-tree`, stops and asks for a path when an empty target has no repository, and
+  for such a run passes absolute paths, orders by modification time, writes no findings file,
+  keeps rubric batch files in the session scratchpad, and reports `rule-style-shift` as not
+  evaluable. A `fix` run backs each file up first, since no git history can undo the edit: the
+  backup path mirrors the file's absolute path under a per-run scratchpad directory, an
+  existing backup stops the edit, and a restore checks the backup's recorded source path. The skill also says config comes from the session, not the
+  target, and "does not scan" now names text outside markdown files instead of non-repo text.
+- **`catalog.md` "Known limitation"** said a double-quoted span wrapped across a line escaped
+  the exemption. The detector carries an open span across lines; the limit is a blank line or
+  a new block.
+- **Quote guidance matches the detector**: the rewrite guide said the exemption declined quotes
+  wherever blockquoted, double-quoted or backticked, and SKILL.md said typography rules scan
+  inline code. Every rule skips inline code; typography rules still scan blockquotes and double
+  quotes. The guide now says a quoted em dash needs a marker, and that `-start`/`-end` lines
+  prefixed with the blockquote `>` do not work. New `detect.test.sh` cases pin this existing behavior.
+
+## [0.7.0] - 2026-09-23
+
+### Added
+
+- **`audit`'s rubric fan-out checks each batch's evidence before merging**: it spot-checks a
+  sample of findings against the cited file and line and re-dispatches a batch whose quoted span
+  is not there.
+
+## [0.6.5] - 2026-09-22
+
+### Fixed
+
+- **`detect.test.sh`:** the suite reconciles its executed case total against a declared expected
+  total. The tally was its own only witness: a run that lost cases still printed `All N cases
+  passed` and exited 0, because nothing said how many cases N should have been. Measured on this
+  Windows host: a run lost three unconditional cases, which produced no `PASS`, `FAIL` or `SKIP`
+  line at all, and the run still reported green, so the line proved less than it claimed. A run
+  that aborts mid-file is a different shape and was already loud, since it exits nonzero and prints
+  no summary. The Result block now sums `PASS + FAIL + SKIP` and compares it to `EXPECTED_CASES`. A
+  total that disagrees writes a report to stderr naming both numbers and the breakdown, never prints
+  the green line, and exits nonzero even with zero failures; a failing run that also miscounted
+  prints both reports. The green line and the failure line are byte-identical to before.
+
+## [0.6.4] - 2026-09-21
+
+### Changed
+
+- American spellings throughout this plugin's prose, ahead of the `en-us` locale the
+  shared typos config adopts. Wording only: no behavior, option, default, or identifier
+  changes. Released sections were corrected in place on the same terms.
+
+## [0.6.3]
+
+### Fixed
+
+- **`detect.sh`:** a code fence that opens after a list marker is recognized. CommonMark opens a
+  fence on an ordered or bullet list line carrying the fence characters, and the parser matched an opener
+  only at the line start. It missed such an opener, read the indented closer as one instead, and
+  inverted every fence from there on, so whole stretches of a file were treated as code and never
+  scanned. Nothing said so: one measured file carried 24 em dashes through a full fix pass in
+  lines the parser believed were code. A closer is now measured against its own fence's container
+  indent, and such a fence also ends with that container: a non-blank line indented less than the
+  content column of the list item ends the item, and lazy continuation reaches a paragraph but
+  never a fenced block, so that line is judged on its own and may be prose or an opener of its
+  own. A blank line does not end an item, so a fence survives one. A fence still open at end of
+  file writes one line to stderr naming the file and the opening line number, so an inverted parse
+  is visible rather than silent.
+- **`detect.sh`:** a marker decline is charged only to the rules whose own expression matches the
+  exempted material. Every rule used to be charged the raw count of exempted prose lines, so a run
+  reported the same `declined` and `declined_marker` totals on every rule, including rules with no
+  candidate anywhere in the corpus, and the counts the audit tells the operator to report said
+  nothing about what the markers suppressed. A pattern rule now counts the exempted lines it would
+  have matched and a density rule the exempted occurrences, each against the stream that rule
+  actually scans, so quoted material a wording rule never reads is not charged to it. A whole-file
+  marker and an `excluded_paths` glob still charge one decline per file to every rule, because the
+  unit there is the file.
+- **`detect.sh`:** `rule-emoji-formatting` sees a glyph behind a blockquote prefix. The rule walked
+  a heading or bullet prefix but not a blockquote marker, so a callout written as a `>` marker plus
+  a glyph, or a `>` marker and a `###` heading plus a glyph, passed clean while the same glyph at
+  column zero fired. Up to three spaces
+  of indentation and any depth of blockquote marker now precede the optional heading or bullet
+  marker. The glyph must still follow the last prefix directly, so an emoji in content position
+  stays outside the rule, which the catalog scopes to emoji used as bullets, section markers, or
+  visual separators.
+
+## [0.6.2]
+
+### Changed
+
+- detect.sh and emit-findings.sh validate option values through one sourced helper instead of two identical copies; detect.sh also folds its threshold default and merges two rule loops. Diagnostics, exit codes and findings output are unchanged.
+
+## [0.6.1]
+
+### Changed
+
+- The ai-slop audit detector reads its phrase_add and phrase_remove config keys through one helper, its suite shares the branch-line and tier assertions, and the context7 updater drops a dead echo fallback, with identical output.
+
+## [0.6.0]
+
+### Fixed
+
+- **`detect.sh`:** the quotation exemption now carries an open double-quoted span across a
+  soft line break. A span whose closing quote sat on the next line inverted the pairing on that
+  line, so the quoted text was scanned and the prose between quotes was stripped; the
+  plugin's own CHANGELOG produced two false `rule-challenges-conclusion` findings that way. The
+  carried state resets at a blank line and at the start of a heading, list item, or table row.
+  A lone quote opens a span only where an opening quote sits (after the line start, whitespace,
+  or an opening bracket, and directly before a non-space character); an inch or second mark
+  such as `6"` and a stray closing quote are dropped so the prose around them stays scanned.
+- **`detect.sh`:** the bare singular `underscore` left the default vocabulary. The source entry
+  targets the verb, and in a programming-docs repository the singular is the `_` character in
+  a naming convention; a document about a leading-underscore convention fired the density
+  rule on six nouns. `underscores` stays.
+- **`emit-findings.sh`:** `--from` is repeatable, and per-rule counts are summed across the
+  chunk outputs a large run produces. Fed several chunks, the old script overwrote each
+  rule's declined count with the last chunk's and reported a rule as returning no result
+  whenever any single chunk had zero findings for it.
+- **`emit-findings.sh`:** the `## Surfaces` section now states the files scanned, the chunk
+  count, the whole files declined, and every rule the config disabled. The persist contract
+  asked for all four; the script wrote none of them.
+- **`audit`:** the pre-computed config block bounded `--show-config` at eight lines, which cut
+  off `disabled_rules` and every `rule_allowed_paths` entry. The bound is now forty lines and
+  the skill says why those trailing lines matter.
+
+### Changed
+
+- **`detect.sh`:** every `Summary` row splits its declined count by cause:
+  `declined_marker` (in-file ignore markers), `declined_quote` (the quotation exemption), and
+  `declined_config` (excluded paths and per-rule allowed paths), beside the unchanged
+  `declined` total. One number per rule told a reader nothing about what was exempted.
+- **`audit`:** the rubric pass covers every file in scope on a repo-wide run, and a new
+  `context/rubric-fanout.md` states how: word-budgeted batches, one fresh-context subagent per
+  batch, result files persisted in the findings home before the subagent reports, and a re-run
+  that skips completed batches. A result file is bound to its batch list by the list's digest
+  and file count, and every path it names must sit in that list, so a leftover result from an
+  earlier run with the same batch number is redone rather than accepted. The previous wording
+  let the rubric shrink to a priority subset "as budget allows", and an unbatched pass lost its
+  whole result to one rate limit.
+- **`persist-findings.md`:** the self-ignore guard file is created with the Write tool, because
+  a repository running the guardrails plugin blocks a shell redirect into the checkout, and the
+  `## Surfaces` description matches what the script now writes.
+- **README:** names `/ai-slop:audit` as the invocation and says a bare `/ai-slop` is not a
+  command.
+- **The plugin's own prose passes its own audit.** Every em dash in the plugin's authored
+  markdown (README, both skill bodies, the persist and rubric context files, the catalog, the
+  rewrite guide, and this changelog) is rewritten, and reflexive uses of `load-bearing` are
+  replaced by the concrete word. The whole-file ignore markers on `catalog.md` and
+  `rewrite-guide.md` are removed; the tells those files quote are already exempt under the
+  quotation exemption, and any example the exemption misses sits in a block marker with a
+  reason. The tree is declared in `scripts/em-dash-purged-paths.txt` so the purge gate defends
+  it. In-place corrections to released entries of this changelog, wording only, facts
+  unchanged: `0.5.3`, `0.5.0`, `0.4.1`, `0.4.0`, `0.3.7`, `0.3.4`, `0.3.3`, `0.3.2`, `0.3.1`,
+  `0.3.0`, `0.2.2`, `0.2.1`, `0.2.0`, `0.1.0`.
+
+## [0.5.13]
+
+### Changed
+
+- **`audit`:** the Boundary's excluded surfaces (commit messages, PR bodies, non-repo text) now
+  name their owner. Reshaping that prose for a human reader routes to `/writing:be-concise`,
+  presence-gated with a stated fallback. The exclusion itself is unchanged.
+
+## [0.5.12]
+
+### Changed
+
+- `detect.sh`: the comment explaining the two Git Bash spellings of one directory writes the
+  Windows form with a `<user>` placeholder. The org machine-specific-path detector reads a
+  literal user-home path as a leaked machine path whatever the surrounding prose says, and a
+  placeholder states the same thing without tripping it.
+
+## [0.5.11]
+
+### Changed
+
+- audit: the Purpose section keeps the two detection layers and leaves the relay-routing contract to audit step 6, which now also carries the rewrite-guide clause; the em-dash zero-tolerance rule is stated without the plan-approval provenance in SKILL.md and in the catalog entry, which carries the reason; the catalog's calibration record points at `detect.sh` for the shipped-rule count instead of a copied count, names the third pass without the pull-request number, and states the quotation exemption's input filter and tier rule as current facts; the rewrite guide drops the dogfood incident and the "now" from the quotation-exemption note.
+- setup: the `thresholds` key table lists the two density rules `detect.sh` reads; `rule_of_three` left the density table when it moved to the judgment rubric.
+- Applied from the 2026-09 prompt-audit against Claude Fable 5.1 (docs/specs/prompt-audit-skills-2026-09.md).
+
+## [0.5.10]
+
+### Fixed
+
+- **`audit`:** the git pre-compute lines moved out of `## Pre-computed context` into a "Repository
+  context. Gather first" body section of individual Bash calls, one command per call, each `head`
+  bound kept inside its command and a failure read as an unknown value. The harness composes a
+  skill's whole pre-compute block into one shell invocation, and a worktree-isolated session refuses
+  a git-bearing compound command, which blocked these skills from loading inside a worktree. Same
+  shape as the worktree skill's fix in #1619. Non-git pre-compute lines stay where they were.
+
+## [0.5.9]
+
+### Changed
+
+- **`detect.sh` drops a redundant intermediate array copy.** The old code built
+  a `TARGETS` array from `EXPANDED` and then re-read it; one `mapfile` now
+  sources directly from `EXPANDED`. The deleted line was a faithful copy rather
+  than a word-splitting step: the inner quotes in
+  `${EXPANDED[@]+"${EXPANDED[@]}"}` survive the unquoted outer expansion, which
+  was confirmed by probe against elements holding spaces and glob
+  metacharacters. Output was compared across 11 input shapes and 11 end-to-end
+  invocations, on bash 5.2 and again on bash 4.3.
+- **`emit-findings.sh` loses a history-narration tail.** The two retained
+  sentences state the whole contract, preference order and fail-open; the
+  deleted sentence carried only the fact that today's behavior was once a bug's.
+- **`detect.test.sh` fixes a count that had already drifted.** The comment said
+  "all 14"; the roster is 15, a number that survives three lines above inside a
+  test-enforced assertion, so a wrong literal is replaced by a phrase the loop
+  below it makes exact.
+
+### Known issues
+
+- **Two rule patterns lack word boundaries and fire on unrelated words.** Left
+  unfixed deliberately: this detector is the instrument a repo-wide sweep is
+  being measured with, and changing what it matches mid-run would make earlier
+  and later groups incomparable. `challenges (remain|ahead|persist)` has no
+  boundary on either side, so it fires on "challenges remained", "challenges
+  remainder", "challenges remaining", "challenges persisted", "challenges
+  persistence", "challenges aheadroom" and "subchallenges remain"; it does not
+  fire on "challenges-adjacent". `not (just|only|simply|merely) [^.]{0,80}but`
+  fires on any following word beginning "but": "button", "buttress",
+  "butterfly", "rebuttal".
+
+## [0.5.8]
+
+### Changed
+
+- **`audit`: the four git-absent cases report a host skip instead of failing where `ln -s` copies.**
+  They share a minimal git-less PATH built out of links to the real binaries. Under MSYS without
+  `winsymlinks`, `ln -s` copies instead, and a copied `bash.exe` cannot find `msys-2.0.dll` beside
+  it, so the shell under test never starts and `detect.sh` emits nothing. Every assertion failed
+  about a detector that was never reached. The suite now probes the link round trip and prints a
+  visible `SKIP (host: ...)` line for each, counted apart from the pass total. Both the directory
+  walk (0.5.5) and the bare invocation (0.5.6) are covered.
+
+## [0.5.7]
+
+### Changed
+
+- **setup:** after a team-layer write, re-run the tracked-file pair
+  (`git check-ignore -v` no match AND `git ls-files --error-unmatch` exit 0).
+  Non-zero `ls-files` means written but untracked: commit it to share with
+  the team, never success.
+
+## [0.5.6]
+
+### Fixed
+
+- **`audit`: a bare `detect.sh` dropped every tracked markdown file whose name held a non-ASCII
+  byte, and said nothing when the listing failed.** 0.3.9 fixed exactly this on the
+  directory-expansion path and left the no-paths path on
+  `git -C "$REPO_ROOT" ls-files '*.md' 2>/dev/null`. Per git-config, commands that output paths
+  quote bytes above 0x80 unless `core.quotePath` is false, so a tracked `notes-é.md` arrived as the
+  literal escape `"notes-\303\251.md"`, failed the scan loop's `[[ -f "$file" ]]` test, and produced
+  neither a finding nor a declined row. A bare invocation is the shape the audit skill uses to
+  sweep a whole repository, so the coverage loss was silent and repository-wide: the report claimed
+  every tracked markdown file and had never opened those.
+
+  The listing now runs with `-c core.quotePath=false`, and its failures are reported instead of
+  being swallowed. An empty target list from a failed `ls-files` is indistinguishable from a
+  repository with no tracked markdown, and both render as a clean audit. `--is-inside-work-tree`
+  picks the branch up front, matching the directory path, so a missing git binary
+  (`git is not on PATH`), a `REPO_ROOT` outside any checkout (`could not confirm a work tree`), and
+  a listing that fails inside one (`git ls-files failed in <root> (exit N)`) each say which one
+  happened, with git's own stderr left visible.
+
+  Nine new detect cases cover the bare invocation: a tracked non-ASCII-named file is scanned and no
+  C-quoted escape reaches the report, untracked markdown stays out, the same file is still reached
+  when the detector runs from outside the checkout (which pins the `REPO_ROOT` prefix, since
+  findings themselves are repo-relative), and each of the three listing-failure states is asserted
+  by its message and a zero scan count. The failing-listing case uses a `git` stub that fails only
+  `ls-files`, so the branch under test is the listing and not work-tree detection.
+
+## [0.5.5]
+
+### Fixed
+
+- **`audit`: the `detector unavailable` token fired on a healthy detector, from any directory, with
+  no configuration required.** 0.5.4 gave the effective-config probe a guard,
+  `detect.sh --show-config >/dev/null 2>&1 && detect.sh --show-config 2>/dev/null | head -8 || echo
+  "detector unavailable"`. Under `set -o pipefail` the `&&` list takes the pipeline's exit status,
+  and `detect.sh --show-config` emits 10 lines against a `head -8` cap while writing them one at a
+  time, so `head` closes the pipe mid-run every time and the script dies of SIGPIPE. Measured here:
+  `PIPESTATUS` is `141 0`. The probe rendered the full, correct eight-line config and then appended
+  `detector unavailable` under it. This was not latent and not a corner case: it was the observed
+  behavior of the shipped line in this repository, and unlike 0.5.4's defect it does not render an
+  empty value, it asserts a failure that did not happen.
+
+  Reproduced and fixed by execution in three states, each with and without `pipefail`. Skill
+  directory absent: both shapes render `detector unavailable` under both settings. A two-line
+  detector (under the cap): both shapes render the two lines, no token, under both settings. The
+  real detector (10 lines, over the cap): without `pipefail` both render eight lines and no token;
+  with `pipefail` the 0.5.4 shape renders nine lines, the ninth being `detector unavailable`, and
+  this one renders eight lines and no token.
+
+  The filter pipeline now sits in a brace group closed by `:`, a command that cannot fail, so the
+  `||` is reachable only by the guard short-circuiting. This is the shape `docs-hygiene` 0.21.23 and
+  `code-tidying` 0.14.13 established; the fleet gains no new idiom. No `$` expansion is introduced,
+  so the composed pre-compute block stays verifiable to the worktree-isolation guard, and the
+  command still begins `${CLAUDE_SKILL_DIR}/scripts/detect.sh`, so the existing
+  `Bash(${CLAUDE_SKILL_DIR}/scripts/detect.sh:*)` grant still matches its leading token.
+
+- **`audit`: the effective-config probe broke on any install path containing a space.**
+  Pre-existing, not introduced by the fix above, but the fix is what makes it visible: the
+  expansion was unquoted, so an install under a path with a space in it (a Windows profile
+  directory named `<First Last>`, a macOS `Application Support` tree) word-split into two
+  arguments, the script was never found, and the guard short-circuited. Before this release that
+  rendered an empty line; now it renders `detector unavailable` on a detector that is present and
+  working. Reproduced by copying the real `detect.sh` into a directory whose name contains a
+  space: unquoted renders `detector unavailable`, quoted renders the full config, and on a
+  space-free path both render it. Both the guard run and the data run are now quoted, matching the
+  form `firecrawl:update` already ships.
+
+  Quoting changes the literal command string, and Bash permission rules are globs over that literal
+  string, so `Bash(${CLAUDE_SKILL_DIR}/scripts/detect.sh:*)` no longer matches the quoted
+  invocation. A companion rule `Bash("${CLAUDE_SKILL_DIR}/scripts/detect.sh":*)` is added for it.
+  The existing unquoted rule is kept, because the skill body's own instructions still invoke the
+  script unquoted. Both rules name the same script under the same `${CLAUDE_SKILL_DIR}` anchor and
+  carry the same `:*` argument scope, so this authorizes nothing the plugin could not already run.
+
+## [0.5.4]
+
+### Fixed
+
+- **`audit`: the `detector unavailable` fallback could not render.** The effective-config probe was
+  `${CLAUDE_SKILL_DIR}/scripts/detect.sh --show-config 2>/dev/null | head -8 || echo "detector
+  unavailable"`. `head` exits 0 no matter how `detect.sh` exited, so a skill directory without the
+  script rendered a blank config line rather than saying the detector was missing, and the reader
+  had no way to tell a detector that reported no config from one that never ran. Verified by
+  execution: with the script absent the old shape rendered `[]` and the new one renders
+  `[detector unavailable]`; with the real script both render the seven-line effective config. The
+  probe now guards itself by running `--show-config` once to `/dev/null` and only then piping the
+  second run into `head`. The double run costs 72 ms measured on this repository. Both subcommands
+  still begin `${CLAUDE_SKILL_DIR}/scripts/detect.sh`, so the existing
+  `Bash(${CLAUDE_SKILL_DIR}/scripts/detect.sh:*)` grant covers each of them independently, as the
+  permissions docs require for a compound command; `head` keeps its own grant. Nothing was widened.
+
+## [0.5.3]
+
+### Changed
+
+- **Findings-file producer preamble normalized against its contract.** The four
+  `persist-findings.md` preambles this sweep touched now carry byte-identical text apart from the
+  run-name slot. `testing:audit` states the same contract as a numbered `apply` step, keeps that
+  form by design, and regains the three required clauses it had dropped, including that the
+  contract wins where the two disagree. `provenance:audit`'s preamble landed later and is outside
+  this set: it opens on "this plugin's read" rather than "this skill's" and carries a resolution
+  list the four do not, so it is a sixth surface, not a fifth copy. Whole-repo extract-ssot sweep.
+
+## [0.5.2]
+
+### Changed
+
+- **Authoring-doctrine pass over `README.md`.** Fixed sentences that parsed two ways. Every edit was verified against the file by an agent that did not propose it. Prose only; no behavior, contract, or trigger phrase changed.
+
+## [0.5.1]
+
+### Changed
+
+- **Comment-residue cleanup (`/code-tidying:audit-comment-residue`).** History narration, plan/session references, and stale back-references in code comments rewritten as present-tense rationale or removed. Comment-only, no behavior change.
+
+## [0.5.0]
+
+### Added
+
+- **The catalog gained a repo-owned "Model-era additions" section**: an evolving,
+  evidence-graded inventory of 2025-2026 model-vocabulary tells (the Claude-ism layer neither
+  Wikipedia's source page nor Cursor's unslop skill carries yet): four entries with era,
+  model-attribution, and evidence-grade fields, a dated model-era record in the
+  upstream-drift-record shape, and a placement gate the test suite enforces (a
+  `locally-observed` phrase can be `recorded-only` or a rubric cue, never a shipped script
+  rule). The judgment rubric's metaphor-cue list gained `load-bearing` and `seam` with
+  deliberately broad literal-sense boundaries; base rates on this repo's own corpus are
+  recorded in the calibration record's fourth pass.
+
+- **New script rule `rule-model-era-phrases`**: per-occurrence detection of distinctive
+  model stock constructions, shipped as three anchored ERE fragments (`the part most people
+  skip`, `(the|my) honest take`, `that.s the unlock`; the bare bigrams are recorded-only, one
+  on a measured domain-literal false positive). Measured 0 findings across this repo's 1,361
+  tracked markdown files; new findings will appear in corpora that carry the constructions.
+  The severity crosswalk gained the argued SUGGESTION row (detector-findings convention
+  2.7.0) and `emit-findings.sh` the rule's rewrite action.
+
+- **New config keys `phrase_add` / `phrase_remove`** tune the phrase roster per layer
+  (replace-wholesale, the `vocab_add` precedent). Fragments are whole EREs, so a space is
+  allowed and an apostrophe is spelled `.`. They are read through a separator-preserving
+  reader and validated at config-read time: an empty element is dropped (an empty alternation
+  branch would match
+  every line) and an invalid ERE is skipped with a stderr note naming it (an unbalanced
+  paren would otherwise error every grep for the rule into a `findings=0` row
+  indistinguishable from a clean corpus). Removing every phrase leaves the rule inert.
+  Replacement is keyed on the key being present (Codex review): an explicit
+  `"phrase_add": []` in a later layer clears an inherited list instead of reading as an
+  absent key, and a config layer that fails to parse whole (for example one caught
+  mid-write, a valid object followed by truncated bytes) is refused for these keys rather
+  than partially applied. jq's own exit status guards the read, the `cfg_scalar` posture.
+
+- **`pre-existing` joined the shipped vocabulary list** on the leverage precedent: 61 files
+  in this corpus contain the word and the density gate fired on none. The rest of the
+  measured frequency cluster (gating, dedup, verdict, drift, and kin) stays `recorded-only`
+  with the single-pool caveat; the README lists them as `vocab_add` candidates.
+
+### Fixed
+
+- **`rule_allowed_paths` exemptions no longer break when the detector runs from a directory
+  where the configured glob expands.** `rule_allowed()` passed its globs unquoted, so the
+  shell pathname-expanded them against the caller's cwd before matching. From a cwd with
+  matching files (the repo root being the worst case), the configured pattern was replaced by
+  a local file listing and the exemption silently failed. Behavior change to know about: the
+  fix applies to `em_dash_allowed_paths` too (same code path), and these are shell
+  case-match globs, where `*` and `**` both cross `/`, a rule now stated in the README and
+  pinned by regression tests.
+
+## [0.4.2]
+
+### Changed
+
+- **Long reference files carry a `## Contents` index.** 1 reference file in this plugin gained one.
+
+  The predicate is `audit-progressive-disclosure`'s own: a reference file over 300 lines with no
+  table of contents, which both official sources agree on by that length. Scope came from the
+  detector's tier classification rather than a line count, so `SKILL.md` files are excluded by
+  construction: they are invocation tier, not the on-demand reference tier the rule names. Files
+  with fewer than five H2s were held out, because a three-row index on a long file earns nothing and
+  the doctrine offers a grep recipe instead. Purely additive, with anchors generated from each
+  file's own headings and verified to resolve. Docs-hygiene sweep, L2-progressive-disclosure.
+
+## [0.4.1]
+
+- **Every configured array stopped applying under the Windows build of jq
+  (#3343).** `cfg_array` piped `jq -r` through `tr '\n' ' '`, which converts the
+  line feed and leaves the carriage return of a CRLF attached to the element, so
+  `excluded_paths`, `em_dash_allowed_paths` and `disabled_rules` arrived as
+  `plugins/*/skills/*/vendor/**<CR>` and matched nothing. The exclusion was not
+  reported as failing; it simply never fired, and the detector reported findings
+  on files the consuming repo had deliberately placed out of scope. The CR
+  originates in the detector's own jq invocation, so no caller could normalize
+  it away from the config it supplies. Every config reader now strips it. Two
+  more carried the same defect from the same source: `rule_allowed_paths`, the
+  per-rule exemption added in 0.4.0, reads jq through `read`, which splits on
+  the line feed, so the CR landed on the last glob of every entry and that key
+  never applied on Windows either; this suite's own `rule_allowed_paths` cases
+  already fail on a Windows workstation against the released 0.4.0, with no shim
+  involved, and go green here. The second is `cfg_scalar`. Git Bash masks it,
+  because its command substitution strips one trailing CRLF pair, but on a bash
+  that strips only the line feed it carries the CR into the emitted threshold text,
+  in `--show-config` and in the density finding's label. CI cannot observe any
+  of these conditions, because it runs on Linux, where jq emits LF, so the new
+  cases force them with a shim ahead of jq on PATH that appends a CR to every
+  output line, and a further assertion pins the shim itself so a runner that
+  failed to select it fails loudly instead of reporting vacuous passes. The
+  array and `rule_allowed_paths` cases reproduce on both platforms; the scalar
+  case discriminates on Linux only, and says so where it sits.
+  The strip is applied to `cfg_scalar`'s captured value rather than inside its
+  command substitution, so jq's exit status still reaches the guard that reads
+  it: a layer that parses to a value and then meets malformed trailing bytes
+  emits that value while exiting nonzero, and a pipeline would have handed the
+  guard `tr`'s unconditional success and let the half-read layer set the
+  threshold.
+
+## [0.4.0]
+
+Shaped by the first full repo-wide `fix` dogfood (PR 3359: 82 findings, 45 files, ~40 closed
+as markers), a plugin-quality audit of the skill, and three verified research runs against the
+catalog's Wikipedia source, prior-art suppression design, and humanization craft.
+
+### Added
+
+- **Policy-level quotation exemption.** Every detector rule now carries a `wording` or
+  `typography` class. Wording rules never scan blockquote lines or double-quoted spans (inline
+  code was already exempt); typography rules (em dash, curly artifacts, emoji formatting,
+  citation tokens, tracking parameters) still do, because byte residue is a defect wherever it
+  sits. The design follows Wikipedia's MOS minimal-change split for quoted material. Quoted
+  source text and mentions of a tell (style guides, forbidden-phrase lists, changelog entries
+  citing a removed phrase) are now marker-free by construction; on the dogfood corpus the
+  exemption replaced roughly thirty hand-written markers. Known limitation, recorded in the
+  catalog: the quoted-span exemption is per-line.
+- **`rule_allowed_paths` config key.** Per-rule path exemptions for every rule, generalizing
+  `em_dash_allowed_paths` (which stays as an alias): the proportionate closure for a density
+  verdict no line marker can quiet. Declines are counted per rule, never silent.
+- **Knowledge-cutoff rule covers its whole source section.** The ERE previously matched
+  roughly one of the six words-to-watch families and missed the source's own example "as of my
+  last knowledge update"; it now covers both the cutoff half and the source-gap (RAG-era)
+  half of the section's words-to-watch: the limited-details, not-widely-documented,
+  provided-sources, and available-information phrase families.
+- **Rewrite guide: non-evasion posture, legitimate-hit taxonomy, risky rewrite classes.** The
+  guide now states the honesty boundary (the source's own descriptive-not-prescriptive warning
+  plus the test "would this edit improve the prose if AI detection did not exist?"), names the
+  five legitimate-hit classes a fix pass must not rewrite, and requires disambiguation before
+  rewriting the three classes that produced or nearly produced semantic regressions in the
+  dogfood PR: negative parallelism ("X alone insufficient" vs "X excluded"), triad collapse
+  (survivors must entail deleted items), and quoted operative phrases (never edit inside).
+- **Voice pass wired into the fix flow.** The guide's "Adding voice" section is now an explicit
+  register-gated step of fix step 1, enriched with the researched craft constraints (Google's
+  global-audience limits on sentence-length variation and terminology drift) and an explicit
+  refusal of perplexity/burstiness as writing targets. The rationale for dropping Cursor's
+  "Let some mess in" bullet is recorded so it is not re-added.
+- **Catalog: source Caveats mined.** New false-positive-posture section (signs are descriptive;
+  the source's 1-in-10 expert false-positive figure; combination over isolation), the em-dash
+  spacing qualifier, and the recorded "in order to" divergence from the source's uncited
+  human-counter-sign bullet.
+
+### Changed
+
+- **`rule-rule-of-three` demoted from script to judgment rubric**, per its own calibration
+  clause: the dogfood pass ended with 18 of 18 residual findings on enumerations whose items
+  were each needed,
+  the ERE matched only single-word triads, and a verified survey of comparable prose linters
+  (Vale, textlint, proselint, write-good, alex, markdownlint) found no tricolon implementation
+  anywhere. The crosswalk row is now a no-row disposition; the script roster is 14.
+- **`rule-elegant-variation` demoted to recorded-only**, following the live source page moving
+  lexical diversity to its Historical indicators.
+- The audit flow states that the rubric pass is independent of detector hits (a file with zero
+  script findings still gets its rubric read when it is in the priority set), and the
+  semantic-diff verifier's contract names QUOTE CORRUPTION and the risky classes for
+  adversarial attention.
+
+## [0.3.9]
+
+- **Three directory-expansion defects survived 0.3.8.** A tracked file
+  whose name held a non-ASCII byte was dropped with no trace, because
+  `git ls-files` C-quotes those paths unless told otherwise; the listing
+  now sets `core.quotePath=false` and stays newline-delimited. A
+  filesystem walk still ran when git was missing or could not confirm a
+  work tree, while the comment claimed that case was gone; the walk
+  remains the fallback when tracked-files-only is not achievable, and
+  that fallback is now reported on stderr (`git is not on PATH`, or
+  `git could not confirm a work tree`). The new dir-target tests now
+  assert the emitted `file=` path, not only the scan count, so rebuilding
+  paths from `git rev-parse --show-toplevel` fails the suite; they also
+  pin subtree restriction and a non-ASCII filename. Drive-root slash
+  preservation from 0.3.8 is unchanged.
+
+## [0.3.8]
+
+- **Directory targets silently fell back to an untracked-inclusive filesystem
+  walk when git and the shell spelled the same checkout differently.**
+  `detect.sh` built its expansion prefix from `git rev-parse --show-toplevel`
+  and its filter from `pwd`. On Git Bash those disagree (`D:/repo` vs
+  `/d/repo`), so no prefixed candidate survived the filter, `grep` exited
+  non-zero, and `|| find` ran in place of the tracked-files listing it was
+  meant to back up. The walk returns untracked and ignored markdown, so a
+  directory target audited files the checkout does not track and said
+  nothing about it. Expansion now runs `git ls-files` with `-C <dir>`,
+  which is already restricted to that directory's subtree and answers in
+  paths relative to it. The caller's own spelling of the directory is the
+  only anchor. The branch is chosen up front from `--is-inside-work-tree`
+  rather than from an empty pipeline, so a filesystem walk is only ever
+  the answer for a directory genuinely outside a checkout; inside one, a
+  listing that fails reports on stderr instead of degrading into a
+  different set of files. A Windows drive-root target such as `C:/` keeps
+  its trailing slash: stripping it produced `C:`, which Windows treats as
+  drive-relative (the cwd on that drive), so `git -C` / `find` can scan
+  the wrong tree or nothing. Ordinary directory targets still lose one
+  trailing slash.
+
+## [0.3.7]
+
+- **A branch name beginning with a YAML indicator silently dropped every finding it emitted.**
+  `emit-findings.sh` interpolated the branch into its findings frontmatter as a bare plain scalar,
+  and `git check-ref-format --branch` accepts `@foo`, `!foo`, `#foo` and `&foo`. Emitted bare,
+  `#foo` and `&foo` parse to null and `@foo`/`!foo` are outright YAML parse errors, so the
+  `branch:` value a consumer reads is not the branch name. The consumer admits a findings file
+  only when that value matches the current branch exactly, so the whole file went unmatched, with
+  no error and nothing distinguishing it from "no findings". Frontmatter now goes through a
+  `yaml_scalar()` helper that quotes only when the plain form would misparse, so an ordinary branch
+  name stays a byte-identical unquoted scalar and the wire format for the common path does not
+  move. The predicate is deliberately identical to the one `claude-config`'s and `testing`'s
+  emitters use: three producers answer one frontmatter contract, and a consumer must not see three
+  shapes. Implicit YAML types (`true`, `null`, `123`, `yes`, dates) are quoted the same way, because
+  a bare scalar would type-coerce and the consumer's exact branch match would still drop the file.
+
+## [0.3.6]
+
+- **`emit-findings.sh` double-escaped a pipe the source already escaped, and left Location
+  absolute when git and `pwd` spelled the same repo root differently.** Both defects were
+  identified in #3180 and fixed for `docs-hygiene:audit-noise` in #3202; this copy was not
+  reached. A naive `gsub(/\|/, "\\|")` turns `a \| b` into `a \\| b`, which GFM reads as a
+  literal backslash followed by a live delimiter, so the row splits and the fix action
+  misreads it. `esc()` now walks each backslash run and adds a delimiter escape only when
+  the run length is even, so `a\\|b` (even) becomes a live-safe `a\\\|b` instead of
+  restoring the original. Separately,
+  `git rev-parse --show-toplevel` can answer Git's Windows-drive spelling while the caller is at `/tmp/…`
+  (Git Bash). This producer failed OPEN: Location stayed absolute and nothing reported it,
+  because an absolute path is still a well-formed cell. Root resolution now prefers the
+  caller's own `pwd` (minus git's `--show-prefix`) and keeps git's two spellings as
+  fallbacks. Shared code was considered and declined: plugins are portable and there is no
+  existing cross-plugin emit-findings library; the three copies now agree on the same two
+  helpers instead.
+
+## [0.3.4]
+
+- **The README now points back at the upstream ledger.** `docs/upstream/cursor-pstack.md` names
+  this plugin's catalog and rewrite guide as where the Cursor `unslop` skill landed, but nothing
+  under `plugins/ai-slop/` pointed the other way. It was the only derived plugin in the marketplace
+  with no citation of that file, so a reader who arrived at the catalog through the README had no route
+  to what the port took, deduplicated, or rejected, nor to the row that decides the next drift
+  recheck. The README's existing sentence naming Cursor's skill now carries that link. The pointer
+  belongs here rather than appended to the earlier entry that recorded the port, because a published
+  changelog entry is history and is not edited. Documentation only.
+
+## [0.3.3]
+
+Three corrections found by re-reading what 0.3.1 and the 2.4.0 contract release actually shipped.
+None changes what the detector finds or what the fix flow rewrites.
+
+- **`emit-findings.sh` stamped a `date:` that is ISO-8601 in neither profile.** The format string
+  was `%Y-%m-%dT%H-%M-%SZ`, an extended-form date joined to a hyphenated time, so every emitted
+  file carried `date: 2026-08-21T13-24-36Z`. The consumer parses this field:
+  `fix-pass-mode.md` "Step 1" reads a value only when it is a full ISO-8601 date-time with an
+  explicit UTC designator or numeric offset, and classes anything else UNREADABLE. Nothing was
+  dropped, because every clause on that path fails open: an unreadable `date:` keeps the candidate,
+  at a bounded cost of one extra pass. But the staleness note Step 4's cleanup route asks for was
+  degrading silently, since it judges age only from files that declare a readable one. Now
+  `%Y-%m-%dT%H:%M:%SZ`.
+- **The unit suite had pinned the malformed shape as the contract.** `detect.test.sh` asserted the
+  hyphenated time under the name "colon-free UTC date", so the bug was guarded rather than caught.
+  The colon-free rule is real but belongs to the FILE NAME, where it exists to keep the path
+  Windows-safe (`persist-findings.md` "Where the file goes"); it never bound this frontmatter field,
+  whose owner (`default-mode.md` "Findings-file shape") asks for `<ISO-8601 UTC>` plainly. The
+  assertion now pins the extended form and says which document it answers to.
+- **The Purpose section described the relay's cleanup route as `/simplify`-only.** Step 4 of
+  `fix-pass-mode.md` reads "Invoke the `/simplify` skill when available in the session; otherwise
+  apply the cleanup findings directly, one file at a time". That is two branches, and the Purpose
+  section named one. The paragraph's conclusion is unchanged and was never at risk: what makes routing these
+  rows to `/ai-slop:audit fix` correct is that *neither* branch loads this skill's rewrite guide, so
+  the omitted branch strengthens the argument rather than weakening it. This is a precision fix to
+  rationale, not a behavior change; the audit flow's step 6 already carried the two-branch wording,
+  and the Purpose section is now consistent with it.
+- **Eval case 2 graded persistence without stating the premise persistence needs.** Its fourth
+  expectation requires the findings file to be re-emitted after the last fixed file, but
+  `SKILL.md` step 5 gates persistence on the audit having "examined tracked files" and the prompt
+  asserted no such thing. 0.3.0 established the remedy for exactly this and applied it to cases 4
+  and 5: a case cannot verify real repository state, so a case that grades the persistence step
+  states the premise instead of constructing it. Case 2 is the third such case and was the one
+  missed. Its prompt now carries the same sentence, and the expectation names the premise it rests
+  on so a run that rewrites and re-runs but persists nothing no longer passes.
+
+  **The fix flow's re-emit wording is left alone here, and the question stays open.** It states
+  re-emission without repeating step 5's gate. `persist-findings.md` "Surfaces, and when the file is
+  written at all" enumerates when a file is written and tracked-ness is not on that list, which is
+  the reading under which the two never conflict. But that reading is not established, and this
+  entry does not claim it is. Against it: step 1 scopes "the repo's tracked markdown" to the
+  **empty-target** branch, while every eval case passes a path argument, so "examined tracked files"
+  and "nothing scanned" are not obviously the same condition; and cases 4 and 5 word tracked-ness as
+  gating ("since the audit examined a tracked file"), which an inert precondition would not need.
+  `persist-findings.md`'s precedence clause also names the convention README rather than this
+  `SKILL.md`, so its list is not authoritative over step 5.
+
+  What is settled is the eval: case 2 grades persistence and lacked the premise its siblings carry,
+  which is a gap under either reading. Whether tracked-ness is a substantive gate is a question about
+  this skill's own wording, and if it is, the fix belongs in `context/persist-findings.md` rather
+  than in the fix flow.
+
+## [0.3.2]
+
+The catalog's cited source page lists an **Ineffective indicators** section: signals that
+page's own editors consider unreliable for LLM detection. Until this release both that
+section and **Comment-specific indicators** were a recorded fetch gap (the catalog-time
+window ran out before those headings). That left a guardrail question unanswered: if a
+rule we ship appeared there, we would be shipping a tell our own source classifies as
+ineffective.
+
+- **Negative finding, 2026-08-21.** Retrieved
+  <https://en.wikipedia.org/wiki/Wikipedia:Signs_of_AI_writing> (live revision
+  [1370403579](https://en.wikipedia.org/w/index.php?title=Wikipedia:Signs_of_AI_writing&oldid=1370403579),
+  `2026-08-20T23:13:41Z`) and re-read the catalog pin (revision
+  [1369699198](https://en.wikipedia.org/w/index.php?title=Wikipedia:Signs_of_AI_writing&oldid=1369699198),
+  2026-08-16, parse section 80). Both revisions list the same eight ineffective
+  indicators: perfect grammar; mixed casual/formal registers; "bland"/"robotic" prose;
+  undifferentiated "fancy"/"academic"/"formal" prose; transition words in isolation;
+  unsourced content; bizarre wikitext; correct wikitext.
+- **None of the 15 shipped script rules appear in that list**, including the two
+  candidates the gap was filed to check (`rule-em-dash`, `rule-rule-of-three`). Those
+  two remain valid *Style* / *Language and grammar* signs on the source page. The
+  em-dash entry's "most useful […] in combination with other indicators, not by
+  itself" sentence is a corroboration qualifier on a kept tell, not an Ineffective
+  indicators listing; zero-tolerance stays the shipped house-style default.
+- **Comment-specific indicators** retrieved in the same visit (pin section 62).
+  Wikipedia talk-page scope. One of the seven tells already has a slug
+  (`rule-canned-policy-assurance`). The other six land as `recorded-only` /
+  `wikipedia-specific` entries so slug-based rechecks can track them:
+  `rule-misquoted-policies`, `rule-maintenance-banner-transclusion`,
+  `rule-sectioned-comments`, `rule-request-critic-input`,
+  `rule-dismiss-origin-speculation`, `rule-redirect-to-content`. Inventory count
+  59 → 65. No script-roster change.
+- The inventory pin stays `1369699198`. Detector, emitter, evals, and rewrite guide are
+  untouched: this is the fetch-gap close, not a roster change.
+
+## [0.3.1]
+
+The audit skill told operators to keep this plugin's findings away from the very relay route that
+now remediates them. Both statements were true when 0.2.0 wrote them and neither survives `review`
+0.26.0, which teaches the fix relay to honor a producer-declared remediation owner. But they fail
+differently, and the entry says which is which: step 6's steer is now **flatly false**, while the
+Purpose statement **draws a real distinction in the wrong place** rather than being false.
+
+<!-- ai-slop-ignore-start: verbatim quote of the retired step 6 wording, which carried an em dash -->
+- **Step 6 of the audit flow no longer steers users off the route.** It said: "Recommend
+  `review:fanout fix` only for `rule-utm-params` findings — it is the one rule the relay can apply
+  meaning-preservingly; routing prose rewrites there retires the findings without fixing them."
+  <!-- ai-slop-ignore-end -->
+  The second half is now flatly wrong. The crosswalk declares `/ai-slop:audit fix` as the
+  remediation owner for the other fourteen rules, so the relay hands those rows to this skill
+  instead of retiring them unfixed. This mattered more than an ordinary stale sentence because
+  **the audit flow is the normal entry point that recommends remediation**. Leaving it in place
+  would have made the new route unreachable through the documented flow while the contract
+  advertised it, and handed the model directly contradictory instructions.
+- Step 6 now recommends `review:fanout fix` for the whole file when the operator is already
+  running a fix pass, and this skill's own `fix` directly when they are not, and it names the one
+  condition that changes the answer: the relay can only hand the rows over when `/ai-slop:audit`
+  is available in that session, and surfaces them otherwise.
+- **The Purpose section's detection-layer paragraph** drew the same line in the wrong place:
+  "What the relay can actually apply is narrow… the findings file is how a consumer *sees* them,
+  not how they get rewritten". The narrowness is real but it is about what the relay **applies**,
+  not what it **routes**: `rule-utm-params` is still the only row the relay is *capable* of
+  applying meaning-preservingly. That row reaches the cleanup route, which prefers `/simplify`
+  and applies rows itself only when `/simplify` is absent, so nothing promises it lands. The
+  other fourteen are now handed to this skill rather than left unrouted. The paragraph says
+  that distinction explicitly, and keeps the true half: the cleanup route is a
+  code-simplification skill that never loads this skill's rewrite guide, which is exactly why the
+  declaration exists.
+
+No behavior, script, or rule changed: this is the producer half of a claim the consumer now
+honors. Detector, emitter, catalog, and evals are untouched.
+
+## [0.3.0]
+
+The audit eval cases described their input in prose. Nothing checked that the described input
+produced the finding the case graded, and it drifted from the detector three times in one PR
+(#3041), each time a golden answer the scenario could not produce. Seven of the nine cases now
+name a committed fixture instead.
+
+- **Six eval fixtures ship under `skills/audit/evals/fixtures/`**, referenced from each case's
+  `files` array: `report-only.md` (four rules on one file), `fix-guarded-rewrite.md` (two em dashes
+  and two filler phrases), `rubric-boundary.md` (one script finding, promotional register the
+  mechanical rules deliberately miss), `em-dash-substitution.md` (a single em dash),
+  `triads.md` (rule-of-three at 3 hits in 69 words) and `knowledge-cutoff-prose.md` (the recorded
+  false-positive class). Every case's `expected_output` now names the rules, lines and fired
+  thresholds the detector actually emits, measured rather than asserted.
+- **A case names its fixture through `files[]` and in prose, the way every sibling suite does**:
+  `mcp-tools:audit` and `docs-hygiene:compress` both read "`evals/fixtures/<name>.md` relative to the
+  skill directory", and none of the eighteen fixture-backed suites here builds a repository to audit
+  in. These prompts are a *specification* of expected skill behavior, not a script: this repo has 200
+  `evals.json` files and zero of the `case.yaml` / `prompt.md` + `graders/` layout `claude plugin
+  eval` consumes, no manifest declares `experimental.evals`, and the only things that read
+  `evals.json` are lint scripts. Nothing executes a prompt, so a prompt must be readable by a human
+  or an agent working by hand, and environment control belongs nowhere in it. If this repo ever
+  adopts the CLI's format, per-case setup has a first-class home there: a `scaffold_script` run
+  under `--scaffold`.
+- **Cases 2, 6 and 7 tell the reader to work on a copy.** They invoke `fix`, and the fix flow
+  rewrites each flagged line in place, so running one by hand against the committed fixture
+  remediates it and dirties the repo, and a later run then grades already-fixed input, where the
+  declared findings no longer fire. One sentence in the prompt and one expectation per case, both
+  about the outcome rather than the mechanism: the committed fixture is byte-identical after the run,
+  and how the copy gets made is the reader's business. An instruction a case states but never checks
+  is the same defect in miniature as the one this release removes.
+- **Cases 4 and 5 state their premise instead of constructing it.** Both grade the persistence step,
+  which `SKILL.md` gates on the audit having "examined tracked files", so each prompt says the
+  audited file is tracked in the repo under audit and the expectations grade the skill's *decision*:
+  that it treats persistence as applicable, fetches the producer contract first, and, in case 4,
+  refuses to write when that fetch fails, rather than refusing because the target was out of tracked
+  space. A case cannot verify real repository state, and pretending otherwise is what made case 4
+  pass for the wrong reason. Case 5 also asserts the positive half, that the findings file is
+  actually written, because `context/persist-findings.md` permits reporting without writing when the
+  destination cannot be proven outside tracked space, so a negative-only case would be satisfied by a
+  run that persists nothing at all.
+- **This reverses 0.1.0's no-fixtures decision, which was recorded in `detect.test.sh`'s header.**
+  That decision holds for the *unit* suite, whose fixtures are still built inline in a tmpdir. It
+  does not survive contact with the eval suite: an eval case is graded against a deterministic
+  detector run, so its scenario has to satisfy an ERE the eval author does not have in front of
+  them. A committed fixture cannot disagree with the detector; prose describing one can, and did.
+- Cases 3 and 9 keep `narration: true`. They grade repo-wide flow and consuming-repo config, not
+  file content, so there is nothing for a fixture to pin.
+- The fixtures carry real tells, so a repo auditing its own tree has to decline them. Prefer an
+  `excluded_paths` glob over an in-file `ai-slop-ignore-file` marker: a file marker declines
+  unconditionally, including under the empty `HOME` + `CLAUDE_PROJECT_DIR` isolation, so
+  `detect.sh <fixture>` would print nothing and the eval author would be back to trusting prose.
+  An `excluded_paths` entry is a config layer, and that isolation lifts it. This repo's own
+  `.claude/ai-slop.json` carries the glob as the worked example.
+- Consuming repos need no exclusion of their own: the audit scans `git ls-files '*.md'`, and an
+  installed plugin's files are not tracked in the repo that installs it.
+
+## [0.2.2]
+
+The in-file suppression the fix flow and the catalog both tell operators to reach for now works in
+the two forms they reach for first. Only `ai-slop-ignore-file` parsed the documented `: reason`;
+the line and block forms did not, and each failed differently and without saying so.
+
+- **Every marker form takes the optional `: reason`**: `<!-- ai-slop-ignore -->`,
+  `-start`, `-end`, and `-file`. Previously a line marker carrying a reason did not match, so the
+  finding was still reported and the operator's own reason text was quoted back inside its excerpt;
+  an `ai-slop-ignore-start` carrying one never opened the block, so every line meant to be exempt
+  was scanned instead. `-end` takes one for the failure in the dangerous direction: an unmatched
+  `-end` left the block open and silently swallowed the rest of the file.
+- The audit skill's fix flow closes a file with findings "explicitly suppressed (in-file marker
+  with a reason)", and the catalog names the marker as the remedy for the recorded
+  `rule-knowledge-cutoff-disclaimer` false-positive class. Both instructions were unfollowable for
+  a single line or a block; they are now true of the code.
+- The backtick guard that stops a document *describing* the markers from exempting itself
+  generalized alongside them, so a backticked mention carrying a reason is still a mention. The
+  guard **mirrors the line-marker pattern exactly** rather than matching any string starting with
+  the marker prefix. Matching the prefix would let a backticked mention of `-start`, `-end`, or
+  `-file` veto a genuine line marker sharing that line. That would reintroduce, in a new shape, the
+  same failure this release removes: the suppression is rejected and the operator's own marker text is
+  quoted back inside the excerpt.
+- **Six new detector cases** (86 → 92) covering a reasoned line marker, a reasoned block, the
+  `-end` close, the declined counts, and a line that mentions one marker form while using another,
+  plus the marker-documentation fixture extended with a reasoned mention.
+- Calibration record: the knowledge-cutoff false-positive class measured on the 1214-file dogfood
+  corpus. All 8 findings fall in the recorded class, none was genuine assistant-frame residue.
+
+## [0.2.1]
+
+Eval coverage for the layer a shell test cannot reach. The deterministic side already had 86 cases
+over all 15 script rules; the judgment side had none, which is the half that only a model performs.
+
+- **Five new `audit` evals** (4 → 9, in line with sibling audit skills): the rubric layer reports
+  but never enters the findings file; a `fix` never swaps an em dash for a parenthesis or en dash
+  (the rewrite guide's substitution guardrail, and the tell most likely to be violated silently
+  because the swap looks like a fix); triads collapse toward the strongest item rather than being
+  repunctuated; the recorded knowledge-cutoff false-positive class routes to a marker or config
+  rather than a rewrite, and never to weakening the rule; exemptions are named with their cause.
+- **Two new `setup` evals** (3 → 5) covering the `_comment` rationale key added in 0.2.0: it is a
+  documented annotation rather than unknown-key drift, and disabling a rule records why alongside
+  the trade-off against `em_dash_allowed_paths`.
+- Every eval case carries `narration: true`. The four original cases named a prose path that
+  resolves nowhere, which the skill-quality Q4 check warns on unless the case declares itself
+  narrative.
+- Two eval scenarios corrected in review, both cases of a golden answer the scenario could not
+  produce: the rubric-boundary case used promotional words that are themselves in the mechanical
+  vocabulary list, so a second script finding fired and contradicted its own "one script finding"
+  answer (measured: 3 hits, density 142.9/1000); and the triad case demanded that a triad with
+  three needed items be kept while supplying only rhetorical ones.
+- The triad case needed a second correction, caught in review after the first: its example of a
+  triad whose three members were each needed used multi-word items ("project settings"), which
+  `rule-rule-of-three`'s ERE
+  (`[A-Za-z]+, [A-Za-z]+, and [A-Za-z]+`) requires to be single tokens, so the detector never
+  surfaced it and the fix flow had nothing to judge. Each scenario is now verified by running the
+  detector over it: the triad case measures 3 hits at 60.0/1000 words, with all three triads
+  reaching the finding.
+
+## [0.2.0]
+
+- Added a set of catalog entries inspired by
+  [Cursor's `unslop` skill](https://github.com/cursor/plugins/blob/main/pstack/skills/unslop/SKILL.md),
+  deduplicated against the Wikipedia inventory in an overlap map.
+- Three new detector rules, calibrated against this marketplace's corpus: `rule-chatbot-artifacts`
+  (chat-turn residue and sycophancy phrases; IMPORTANT in the severity crosswalk),
+  `rule-filler-phrases` (`in order to`, `due to the fact that`, deletable note-phrases), and
+  `rule-stacked-hedging` (`could potentially` and kin), both SUGGESTION.
+- Four new rubric tells: false ranges, colon crutches, abstract metaphor jargon (kept out of the
+  script layer by calibration: "substrate" alone had 114 legitimate uses on the calibration
+  corpus), and mechanism-free claims.
+- New `reference/rewrite-guide.md` owns fix-time guidance: plain-speech rewrites, substitution
+  guardrails (an em dash never becomes a parenthesis or en dash), voice guidance bounded by
+  meaning preservation, and a closing self-audit pass. The `fix` flow reads it first.
+- AI-vocabulary default list gains the plain-word trio `utilize`, `leverage`, `facilitate`
+  (density-gated; measured quiet on the calibration corpus).
+- `rule-inline-header-lists` records a boundary refinement as **calibration pre-work** for a
+  post-V1 script rule: a bold lead-in that ends in a period and is followed by new detail is
+  reference-doc style, not a tell. The entry stays `recorded-only`, so nothing runs it yet.
+- Overlap map says "catalogued by" rather than "covered by", and names the rows whose entries are
+  dormant; Name-dropping is recorded as deliberately out of scope for general prose, and generic
+  conclusions as detected only in their formulaic half.
+- `rule-chatbot-artifacts` gains "Found the smoking gun"; `rule-abstract-metaphor-jargon` and the
+  rewrite guide gain `evacuate` -> "move out". Two narrowings that were silent are now recorded:
+  the promotional word core deliberately omits travel-copy words with no technical base rate, and
+  the shipped AI-vocabulary list is a deliberate narrowing of the era-union rather than the union
+  itself (`vocab_add` restores the rest).
+- **Findings file no longer emits a `tier:` frontmatter field**, and `--tier` is retired from
+  `emit-findings.sh`. Both owner docs already said this producer omits it, and the flag defaulted
+  to a hardcoded value describing no property of the run.
+- `rule-filler-phrases` and `rule-stacked-hedging` carry their own Action strings instead of the
+  generic judgment fallback.
+- **Roster-agreement guard**: the suite now asserts all 15 rules' emitted tiers (was 2) and fails
+  when `detect.sh`'s registry no longer matches the tabled set, so a rule added without a
+  crosswalk row can no longer emit SUGGESTION by silent fall-through.
+- **Test config isolation**: the suite pins `HOME` and `CLAUDE_PROJECT_DIR` to empty directories
+  so fixtures grade against shipped defaults. Found by dogfooding, when a consuming repo disabling
+  a rule for its own house style turned nine unrelated cases red.
+- Relay expectations narrowed to what is true: `rule-utm-params` is the one relay-applicable rule;
+  every other rule is `/ai-slop:audit fix` work.
+- **Phrase rules match on whole words.** Without it, "These are great questions for the reviewer"
+  fired `rule-chatbot-artifacts` at IMPORTANT tier on prose containing no chat residue, because
+  the phrase merely prefixed a longer word. The registry carries a per-rule whole-word flag (POSIX
+  `-w`, not GNU `\b`, so the cross-grep parity claim holds); it is off for the byte-class rules,
+  the wildcard-bearing EREs, and the two whose match legitimately abuts a word character.
+
+## [0.1.0]
+
+- Initial release: `audit` skill (read-only default, explicit `fix` action), `setup` skill,
+  deterministic detector with the mechanical rule roster, judgment rubric, and the
+  Signs-of-AI-writing catalog (revision-pinned, CC BY-SA 4.0).
+- Hardened by the first dogfood run (pre-release, folded in): ignore markers must be
+  well-formed comment markers, not prose mentions, so a document that documents the markers no
+  longer exempts itself, and a mid-file `ai-slop-ignore-file` declines the whole file instead
+  of silently truncating the scan; declined files are named in output (`Declined:` rows with
+  cause), not just counted; `emit-findings.sh` composes the findings file deterministically
+  from detector output (the model resolves the destination and the contract gate; the script
+  owns row assembly at repo scale), writing coverage-only files on zero findings and refusing
+  non-detector input.
+- Fix guidance: `rule-of-three` rewrites collapse toward the single strongest item unless
+  every element is needed.

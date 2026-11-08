@@ -1,0 +1,10 @@
+{
+  "name": "check-wip-cap",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "resolve-config": "file:../resolve-config"
+  }
+}

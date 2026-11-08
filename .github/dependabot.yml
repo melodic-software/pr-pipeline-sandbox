@@ -1,0 +1,50 @@
+# Dependabot keeps this sandbox's SHA-pinned GitHub Actions and its one lockfile-backed npm root
+# (the resolve-config composite action's ajv and yaml) current with pull requests: GitHub-native,
+# no third-party app and no PAT. The other package.json files declare no dependencies, and the
+# composite actions under .github/actions use no other action, so "/" covers every `uses:` line.
+# Every entry is weekly with the org's 3-day cooldown (standards dependabot-policy) so new
+# releases settle; security-advisory updates bypass cooldown. A dependency joins the first group
+# that matches it, so majors fall through to the `github-actions` group.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    labels: ["dependencies"]
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: build
+    cooldown:
+      default-days: 3
+    groups:
+      vendor-actions:
+        patterns:
+          - actions/*
+          - github/*
+          - anthropics/*
+        update-types: [minor, patch]
+      github-actions:
+        patterns:
+          - "*"
+    # Every melodic-software/ci-workflows ref (reusable workflows and composite actions) moves
+    # only through deliberate reviewed PRs per the standards runner-policy selector-revision
+    # lockstep, so all of them are ignored here.
+    ignore:
+      - dependency-name: "melodic-software/ci-workflows/*"
+
+  - package-ecosystem: npm
+    directory: /.github/actions/resolve-config
+    labels: ["dependencies"]
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: build
+    cooldown:
+      default-days: 3
+    groups:
+      npm-minor-patch:
+        patterns:
+          - "*"
+        update-types: [minor, patch]

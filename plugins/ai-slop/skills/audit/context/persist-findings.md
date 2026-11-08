@@ -1,0 +1,111 @@
+# Persisting findings: this skill's read of the detector-findings contract
+
+**Read the producer contract before the first write**:
+<https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/conventions/detector-findings/README.md>.
+It owns the shape's authority, where the file goes, the producer-computed fields, the coexistence
+obligations, the self-ignore guard, and what a minimal producer may omit. This file adds only what
+an `ai-slop` run decides for itself and cites the contract for the rest. Where the two
+disagree, the contract wins and this file is the defect.
+
+**If the contract cannot be fetched, do not write.** Report that the destination and the guard
+could not be resolved from their owner, and stop. Inventing a destination reports success while
+the consumer never scans that path.
+
+## Where the file goes
+
+Resolve per the contract "Where the file goes": the current branch's findings directory in the
+memory slice (`<memory_dir>/reviews/<branch-slug>/`, `.work/` unless the project's instructions
+declare another root), honor the self-ignore guard, and prove the destination is outside tracked
+space before writing (a destination that cannot be proven is reported and not written to).
+
+Common case, a summary that yields to the contract on any disagreement: with no location declared
+in `CLAUDE.md` or `.claude/rules`, the file goes to `<repo>/.work/reviews/<branch-slug>/` once
+`git check-ignore` confirms that path is ignored. The slug rule is in `/review:fanout` "Shared inputs"
+(`plugins/review/skills/fanout/SKILL.md`). A destination that cannot be resolved follows the
+contract, and the run reports report-only.
+
+File name: `${TS}-ai-slop.md`, `TS="$(date -u +%Y%m%dT%H%M%SZ)"` (colon-free, Windows-safe).
+Never overwrite: when the path exists, take `-2`, `-3`, the smallest free integer.
+
+## Compose by script, not by hand
+
+Once the destination is resolved and the contract fetch succeeded, run
+`${CLAUDE_SKILL_DIR}/scripts/emit-findings.sh --from <detect output file> --out <resolved path>`.
+A chunked run passes `--from` once per chunk output, in chunk order; the script sums the per-rule
+counts across chunks and reports a rule as returning no result only when every chunk agreed.
+A repo-scale run produces thousands of rows; composing them in prose is exactly the hand-transform
+the fleet's scripting discipline forbids, and the script owns the mechanical half: cell assembly,
+escaping, tier lookup (a mirror of the crosswalk, whose row is authoritative), rank ordering, the
+non-overwrite suffix, and the `## Surfaces` counts.
+
+The self-ignore guard file is the one write the script does not own. Create it with the Write
+tool, never with a shell redirect: a repository running the guardrails plugin blocks
+`printf '*' > <memory root>/.gitignore` as a hook bypass, and the same block applies to any
+other shell write into the checkout. What stays with the model is
+everything before the script (destination resolution, the fetch-and-refuse gate, the self-ignore
+guard) and everything after it (reading the written file's head to confirm shape, and
+severity-vocabulary mapping when the consuming project defines its own, done by editing the
+written file's `Tier` cells per the contract's consumer-precedence rule). Hand-compose only when
+the script cannot run (no bash), on a small run, following "What each cell says" below.
+
+## What each cell says
+
+- **`branch:`** is `git branch --show-current` verbatim.
+- **`Location`** is `<repo-relative path>:<line>` from the detector's `file=` and `line=` fields;
+  never the file alone.
+- **`Surface(s)`** is `ai-slop:audit`.
+- **`Finding`** leads with the qualified rule id and the detector's `fired=` condition in the
+  run's own values (the zero-tolerance marker, or the density/threshold/hits/words tuple), then
+  the excerpt. No rubric reasoning in the cell.
+- **`Action`** states the remediation shape the crosswalk row implies: the reworded sentence for
+  style rules (judgment; the fix action owns it), the parameter strip for
+  `rule-utm-params`, the delete-or-source decision for the two IMPORTANT residue rules.
+- **Cell-escape** `Finding` and `Action` per the shape's rule (`\|`, newlines to spaces). The
+  detector's excerpts already replace `|` with `/`, but the composed cells must be re-checked.
+- **`Tier`** is LOOKED UP from the rule's crosswalk row, then mapped to the consuming project's
+  severity vocabulary when it defines one (the contract's consumer-precedence rule).
+  **`Confidence`** is `high` on every emitted row: a deterministic detector fired.
+
+**Only script-rule findings enter the file.** Judgment-rubric findings go to the human report
+only (the V1 relay boundary; a rubric verdict has no crosswalk row to look a tier up from).
+Every cell describes a finding the detector actually emitted this run; never compose an
+illustrative row or carry one forward.
+
+## Surfaces, and when the file is written at all
+
+`## Surfaces` names `ai-slop:audit` once, states what was scanned (files scanned, chunk count,
+whole files declined), names every rule the config disabled, and carries the declined counts per
+rule id straight from the detector's `Summary` rows (`declined=` with its `declined_marker=`,
+`declined_quote=`, and `declined_config=` split, and `disabled=` for the disabled-rule list), in
+the section's line form. The script writes all of it. Omit `tier:`,
+`## By dimension`, and `## Unparsed` (one dimension; nothing unparsed).
+
+- Findings to emit → write.
+- Files scanned, zero findings → write anyway with the empty `## Findings` header: coverage is
+  the payload.
+- Nothing scanned (empty target set, everything excluded) → write nothing; say so in the report.
+- Any target outside a repository (SKILL.md "Non-repository targets") → write nothing, on the
+  audit and on a re-run after `fix`.
+
+## Re-running
+
+A re-run writes what it currently finds and never replays: never re-emit a previous file, never
+copy rows forward. Writing a fresh file does not retire the old one: `review:fanout fix` skips a
+findings file only when a `type: fix-pass-record` for the same branch names it by file name and
+content digest (`plugins/review/skills/fanout/context/fix-pass-mode.md` Step 1). After this
+skill's own `fix` action completes, in this order:
+
+1. **Retire the consumed file.** Run
+   `${CLAUDE_SKILL_DIR}/scripts/emit-fix-record.sh --out-dir <findings home> --consumed <file>`
+   once per findings file of this branch the fix consumed (`--consumed` repeats): the file(s)
+   this audit run emitted, in the directory the emit wrote to. The script stages the record,
+   names it `<TS>-fix-pass-applied-<sha256-12 of the staged bytes>.md`, and prints the path.
+   Pass `--rows` and `--outcome` for the fixed count and the fixed/suppressed/reverted totals, and
+   `--not-applied-rows` with one table row (`Location | Finding | Why not applied | Source file`)
+   per reverted or suppressed finding. A fix with no prior findings file has nothing to retire and
+   writes no record. A pass that stops partway writes none either; the next run then re-admits the
+   file.
+2. **Re-run the detector and emit a fresh file** for what remains, per "Compose by script".
+
+The fresh file is then the only candidate left, and states only what remains. A non-repository
+target wrote no file, so it writes neither.

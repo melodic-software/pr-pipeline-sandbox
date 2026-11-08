@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { createGitHub } from "../check-trusted-trigger/check-trusted-trigger.mjs";
 import { decide } from "./decide.mjs";
+import { laneRecordOutput } from "./lane-record.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA = "docs/conventions/pr-pipeline/pr-pipeline.schema.json";
@@ -44,11 +45,15 @@ function readSkipReasons(basePath) {
 }
 
 // The signed-commit step runs unless can-commit is exactly 'false'; when it
-// should have run, anything but 'true' counts as unverified.
+// should have run, anything but 'true' counts as unverified. An empty
+// unverified list means the check could not verify, not that a commit failed.
 const signedCommitsFrom = (env) =>
   env.CAN_COMMIT === "false"
     ? null
-    : { all_verified: env.ALL_VERIFIED === "true" };
+    : {
+        all_verified: env.ALL_VERIFIED === "true",
+        unverified: (env.UNVERIFIED ?? "").split(" ").filter(Boolean),
+      };
 
 export async function main({
   env = process.env,
@@ -74,6 +79,9 @@ export async function main({
       runResult: env.RUN_RESULT,
       actOutcome: env.ACT_OUTCOME,
       gateReason: env.GATE_REASON ?? "",
+      runFailure: env.RUN_FAILURE ?? "",
+      notRunReason: env.NOT_RUN_REASON ?? "",
+      notRunDetail: env.NOT_RUN_DETAIL ?? "",
       headSha: env.HEAD_SHA ?? "",
       signedCommits: signedCommitsFrom(env),
       headShaFallback: env.HEAD_SHA_FALLBACK,
@@ -89,6 +97,28 @@ export async function main({
     return 1;
   }
   const body = { ...decision.report };
+  const record = laneRecordOutput({
+    lane: env.LANE,
+    failureClass: env.LANE_CLASS ?? "",
+    resets: env.LANE_RESETS ?? "",
+    turns: env.LANE_TURNS ?? "",
+    maxTurns: env.LANE_MAX_TURNS ?? "",
+    models: env.LANE_MODELS ?? "",
+    profile: env.LANE_PROFILE ?? "",
+    activity: env.ACTIVITY,
+    runId: env.GITHUB_RUN_ID ?? "",
+    runAttempt: env.GITHUB_RUN_ATTEMPT ?? "",
+  });
+  if (record) {
+    body.output = {
+      ...body.output,
+      summary: `${record.line}\n\n${body.output.summary}`,
+      text: record.text,
+    };
+    if (record.externalId) {
+      body.external_id = record.externalId;
+    }
+  }
   if (RUN_ID.test(env.GITHUB_RUN_ID ?? "")) {
     body.details_url = `${env.GITHUB_SERVER_URL ?? "https://github.com"}/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`;
   }

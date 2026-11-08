@@ -1,0 +1,36 @@
+---
+status: in-progress
+created: YYYY-MM-DDTHH:MM:SSZ
+updated: YYYY-MM-DDTHH:MM:SSZ
+---
+
+# {Video Title}
+
+**Target:** {resolved synthesis target, portable name only, never a local checkout path; context/watch-pipeline.md "Synthesis target resolution"}
+
+## TLDR
+
+{2–3 sentences: what the video argues and whether it matters for the resolved synthesis target.}
+
+## Journey
+
+### Capture
+
+{yt-dlp acquire, caption rung, transcript cleaning, link harvest, in 2–4 sentences.}
+
+### Vision
+
+{frame count, coverage plan summary, key-frame promotions, visual gaps if any.}
+
+### Research
+
+{claim clusters researched, consensus vs author, staleness notes, citing `RESEARCH.md`.}
+
+### Synthesis
+
+{top applicability items by category; link `recommendations/README.md`.}
+
+## Status
+
+**Next action:** {one concrete step, often `/planning:interview` from `recommendations/interview.md`}  
+**Blockers:** none

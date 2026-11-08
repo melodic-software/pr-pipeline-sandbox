@@ -1,0 +1,233 @@
+# Dispatch contract: the parent's side
+
+`SKILL.md` carries the routing mandate and the acceptance gate's steps. This file carries why each
+step is shaped the way it is **for exploration**, and what the parent does when one fails. The
+agent's own side is
+[`../../../agents/explorer.md`](../../../agents/explorer.md).
+
+Everything the parent owes that is **identical for exploration and research** is stated once in the
+shared contract. That covers the envelope's six fields as a literal template, the pre-dispatch
+baseline in both shell forms, what is and is not documented about argument substitution on the
+preload path, why the gate ships no permission grant and what to do when it cannot run, and the
+resume-before-discard ordering. The file is
+[`../../../reference/parent-contract.md`](../../../reference/parent-contract.md).
+This file does not restate it.
+
+## Discipline liveness: why a token at all
+
+A `skills:` entry that is missing or disabled is **skipped silently**: the harness logs a warning to
+the debug log and starts the agent regardless. The dated record for that harness behavior is
+[`../../../reference/parent-contract.md`](../../../reference/parent-contract.md),
+"Harness facts the dispatch design rests on". The resulting run has no exploration dimensions, no
+output format, and no outcome gate, and it still reads the tree, still writes an artifact, and
+still returns a payload with `status: complete`. At every seam this design builds, that failure is
+indistinguishable from success, and the artifact it produces is shaped by the dispatch prompt's
+description of the deliverable rather than by the contract.
+
+So the skill file carries a token, the agent echoes it verbatim, and **the parent discards any run
+whose `preload_token` is missing or mismatched**. Not downgrade, not warn, not accept-with-a-note:
+the artifact of an undisciplined run is worse than no artifact, because it will be read as though
+the workflow ran.
+
+The token lives in `SKILL.md` and nowhere in the agent definition. An agent that never received the
+skill has no way to produce it. That is **file-identity** evidence: the skill body reached the agent
+by some route.
+
+It is **not** preload evidence. The agent's disk fallback Reads this same file before any exploration
+work, so a recovered agent echoes the same token a preloaded agent would. Provenance is the
+structured `preload: fired | fallback` field. The parent grades that field and MUST NOT infer `fired`
+from a matching token. `fallback` is the accepted recovery, not a discard. A missing or unrecognized
+`preload:` field is an out-of-date agent definition, the same class as a missing `scope_as_received`.
+
+## Why the gate reads the slice path, not the payload
+
+A dispatched `explorer` can return `status: complete` with a mid-stream narration line as its whole
+payload: no `preload_token`, no summary, no artifact path. A parent that believes the status field
+proceeds as though exploration had finished.
+
+A check that resolves its input from `artifact:` cannot see that failure, because the payload it
+would read the path from is the thing that is broken. The parent already holds the answer: it
+resolved the memory-slice path itself, before dispatch, and put it in the dispatch prompt. Grading
+against **its own** path is what makes the check independent of every return-path defect, present or
+future.
+
+This is only true if the parent still **has** that path when the gate runs. It resolved one before
+dispatch, wrote a prompt, waited, and now has a payload sitting in front of it with an `artifact:`
+field right there. The wrong input is the convenient one at exactly the moment the gate fires. So
+the slice path is carried across the dispatch deliberately, as the gate's input, rather than
+recovered from whatever is nearest.
+
+The same reasoning demotes `--expect-sidecars` to a secondary cross-check. It compares the payload's
+self-reported count against what the index names, which is worth having, because an index and a
+payload that disagree mean one of them is wrong. But it is a claim grading a claim. The exit status
+without that flag is the verdict that counts, which is why the bare invocation is the gate and the
+flag is an addition to it. Drop the flag outright on a payload that reported no `sidecars:` count: passing
+`0` for a field the run never wrote asks the gate a false question, and it will answer it
+truthfully.
+
+## Why existence is not the same as freshness
+
+An artifact being *there* does not mean this dispatch put it there. A slice that already holds a
+complete set from an earlier exploration satisfies every on-disk check even when the run just
+failed without writing a byte, and the sidecar count agrees too, because both runs write the same
+sections. The gate would report success and planning would proceed against a stale snapshot of the
+codebase, which is the original failure wearing a different hat.
+
+So the parent creates the slice if it is not there and touches `<slice>/.explore-dispatch`
+immediately before dispatching, then passes that file as `--newer-than` (both shell forms of that
+one command are in the parent contract). Creating the directory is required on a first-time
+scope: a bare touch into a directory that does not exist yet fails, and the dispatch either never
+starts or reaches the gate with no baseline. The index has to be
+strictly newer than that baseline. A baseline the parent named but that is not on disk exits 2
+rather than quietly reporting `freshness=unchecked`: a check the caller asked for and only appeared
+to get is worse than one it knowingly skipped, which is why every opt-in check reports `unchecked`
+in the verdict line instead of being absent from it.
+
+## Why the payload's pointer is checked against the graded index
+
+The gate finds the index from the parent's own slice path, so the payload's `artifact:` value plays
+no part in selecting what gets graded. That leaves them free to disagree, and a payload naming some
+other file is not corroborating the artifact that passed. Worse, its `verification_request.target`
+carries the same wrong path, so the sibling verifier would grade a file the gate never looked at,
+and the handoff would point a fresh session at it too.
+
+`--expect-index` therefore compares the two, resolving both to a canonical directory plus basename
+so that two spellings of one file are one file. On `pointer=mismatch` the **gate's** `index=` path is
+authoritative for the verifier and the handoff, and the disagreement itself is treated as a payload
+defect, not reconciled silently.
+
+## Why "non-empty" was not enough on its own
+
+The obvious version of this check is `test -s EXPLORE.md`. A mid-stream stub passes it. So does an
+index whose sidecars the run died before writing, the truncation shape, where the index names files
+that are not there.
+
+The gate therefore requires substance a stub cannot fake: the index names at least one
+`EXPLORE-<section>.md` sidecar, and every sidecar it names exists beside it and is non-empty. It
+keys on the sidecar **filename** contract rather than parsing the index's section → file table, so a
+formatting edit to that table does not break the gate.
+
+It grades exactly the slice path it is given, the one the parent assigned pre-dispatch with any
+collision sub-slice included, and never scans the slice for candidates: reaching for an index the
+parent did not assign is how a prior run's artifact gets accepted as evidence that *this* run succeeded, the
+same class of silent success the gate exists to refuse.
+
+## Recovery ladder
+
+Take these in order. A non-zero exit is never a reason to proceed and note it later.
+
+**Exit 2 is ungradeable.** This is a parent-envelope problem, not a worker problem: the slice path
+was wrong or never created, or the baseline it named is missing. Fix the envelope and re-run the
+gate. Re-dispatching first pays for a whole exploration again to answer a question the parent could
+have answered itself.
+
+**Exit 1 with `persistence: by-value` means the parent writes the slice. Take this rung before the
+resume rung, because the payload has already told you why the disk is empty.** The agent finished
+and its environment refused every write, or the slice it was assigned turned out to be occupied,
+which it reports the same way rather than picking a sub-slice itself. Neither of the rungs below
+helps: a resume asks a worker
+to redo the one thing it just proved it cannot do, and a re-dispatch pays for the whole exploration
+again to reproduce the same refusal at full cost.
+
+So the parent does the writing, which it can: this is the checkout-not-process boundary
+`reference/parent-contract.md` draws ("Persistence by value"):
+
+1. **Check every filename before writing anything.** The payload carries the index and every sidecar
+   as verbatim bodies, each introduced by a filename, and this is the only place in the contract
+   where a name the *worker* produced becomes a write the *parent* performs, at the parent's wider
+   permission. Accept exactly `EXPLORE.md` and `EXPLORE-<section>.md` (`^EXPLORE-[A-Za-z0-9_-]+\.md$`),
+   each a bare filename. Reject anything carrying a directory separator, a `..` segment, a leading
+   `/`, or any other shape, and reject it as a **failed dispatch**, the same as a payload returning
+   findings instead of bodies. Confirm the resolved path of every write still sits directly inside
+   the destination directory. An explorer reads a repository and a researcher fetches the open web;
+   neither payload is a trusted source of paths.
+2. **Pick the destination the way a written run would have.** Anchor on the memory-slice path **the
+   parent resolved before dispatch**, the same path it fed the gate. If that slice root already
+   holds an unrelated `EXPLORE.md` from an earlier exploration (the case a worker reports as
+   occupancy rather than resolving itself), the collision rule is the parent's to apply: assign a
+   sub-slice under the root and write the whole set there, rather than overwriting the index the
+   collision rule exists to protect. The parent chooses that sub-slice, as it chooses every other
+   one; the payload's `artifact:` value is the destination the agent *names*, never the anchor.
+3. **Re-run the identical gate command**, against whichever of the two the parent wrote to. Do not
+   hand-inspect the directory instead; the whole reason this rung is safe is that the artifact ends
+   up graded by the same check as every other run. Freshness needs no special handling: the parent
+   writes after its own `touch`, so the index is strictly newer than the baseline. When the parent
+   wrote into a collision sub-slice, **drop `--expect-index`** for this re-run: the payload's
+   `artifact:` names the root the worker was blocked from, not the file the parent wrote, and on
+   this rung the parent is itself the writer, so there is no payload pointer left to corroborate.
+4. Proceed only on exit 0. A non-zero second run drops through to the rungs below. The exception
+   is to the halt, never to the gate, and `persistence: by-value` grades nothing on its own.
+
+**A by-value payload that returns findings instead of artifact bodies is a failed dispatch, not a
+fallback.** The value of the third outcome is *routing*: it tells the parent which recovery to
+take. It is not an acceptance value, and treating it as one would let a run be believed on the
+agent's own word, the exact thing the gate exists to refuse. An index body written back must carry
+`Run status: complete` or no marker; one still marked `Run status: in progress` fails the gate and
+is a failed dispatch. Why the mode exists and where its boundary sits:
+[`../../../reference/parent-contract.md`](../../../reference/parent-contract.md) ("Persistence by value").
+
+**Exit 1 with the agent still live: resume it, do not re-dispatch it.** A resume costs one message;
+a re-dispatch pays the full six dimensions over again. Address the agent by the **agent ID**, not by
+name, and ask for the return payload block alone rather than restating the task. If the artifact set
+is on disk and only the payload was malformed, the artifact is the source of truth. Read the index
+for the pointer, and still dispatch the sibling verifier. If the payload comes back naming a refused
+write, you are on the by-value rung above, not this one.
+
+**A refused resume, or exit 1 again after one.** *Now* discard the slice and re-dispatch with the
+same envelope. An index still marked `Run status: in progress` is refused by the gate, so that
+partial slice is visible to the gate; one with no status line cannot be told apart from a complete
+one by reading it. Either way, once the resume has failed there is nothing left that could tell you
+whether the slice is worth keeping. **The discard follows the resume; it does not replace it**,
+including for a `status: truncated` return and for a dispatch that returned no payload at all,
+which are the two cases that most often leave a live agent holding a complete artifact set. The
+ordering is stated once in
+[`../../../reference/parent-contract.md`](../../../reference/parent-contract.md)
+("Resume first, then decide about the slice").
+
+**Bound the wait either way.** `status: truncated` is not a special case: it takes the same ladder.
+
+**Why exit 1 alone is not enough to pick a rung.** The script emits the same exit 1 and the same
+message whether the agent never launched or finished perfectly and could not write. That is correct,
+because it grades disk state and nothing else, and reading the payload is not its job. The branch lives
+here instead, one level up, where gate step 1 has already put the payload in the parent's hands.
+
+### What the harness actually guarantees about a resume
+
+Verified 2026-09-25 against <https://code.claude.com/docs/en/sub-agents> (raw markdown; the page
+`docs/official-docs.md` indexes for subagents), quoting it:
+
+- The parent has the identifier it needs: "When a subagent completes, Claude receives its agent ID."
+- The mechanism: "Claude uses the `SendMessage` tool with the agent's ID or name as the `to` field
+  to resume it", and it "doesn't require agent teams to be enabled".
+- Why resuming is cheaper than re-dispatching: "Resumed subagents retain their full conversation
+  history, including all previous tool calls, results, and reasoning." and "The subagent picks up
+  exactly where it stopped rather than starting fresh." A finished agent needs no new spawn: "When
+  Claude sends a completed subagent a message with the `SendMessage` tool, the subagent resumes in
+  the background without a new `Agent` invocation."
+- Why the ID and not the name: "As of v2.1.199, `SendMessage` checks that a name still refers to the
+  same agent it reached earlier in the conversation" and refuses the send when a newer agent has
+  taken the name. The ID is unambiguous.
+- The one case the parent cannot retry: "A subagent you stopped yourself, with `x` in `/tasks` or an
+  SDK `stop_task` request, doesn't auto-resume. If Claude sends it a message, the message is refused
+  and Claude is told the agent was cancelled." Re-dispatch instead. A subagent Claude stopped with
+  the `TaskStop` tool is not this case: the page says the same background resume "applies to a
+  subagent that Claude stopped with the `TaskStop` tool, once its stopped run has exited".
+- **Recheck trigger.** The page's "Resume subagents" section changes, or a release note names
+  `SendMessage` resume, stopped-subagent handling, or agent-ID addressing.
+- This ladder covers `discovery:explorer` because it is a **custom** subagent. It does not extend to
+  the built-in Explore agent `SKILL.md` names as the fan-out scout, which is one-shot and returns no
+  agent ID. Dated record, with the quoted basis:
+  [`../../../reference/parent-contract.md`](../../../reference/parent-contract.md),
+  "The built-in Explore agent cannot hold this plugin's contract".
+
+At the turn limit, a subagent that reaches `maxTurns` returns its output marked as partial, and
+the parent can resume it. Dated record:
+[`../../../reference/parent-contract.md`](../../../reference/parent-contract.md),
+"A turn-limit stop returns partial output, and the parent can resume the agent".
+
+A partial marking says the run stopped; it does not put an artifact on disk. That is why the agent
+writes its index skeleton early, with `Run status: in progress` as the
+first non-blank line after the level-1 title heading (the first line starting with a single `#`
+and a space, outside a code fence), and its sidecars as they settle; the
+gate reads only that slot, so a quoted marker elsewhere in the index never counts. The agent
+still emits `status: truncated` with a partial payload before its budget runs out.
