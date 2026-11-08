@@ -1,9 +1,9 @@
 name: pr-review-hosted
 
-# Sandbox caller of the org pr-review-cli reusable, lane `code`, at the pin
-# claude-code-plugins#9910 uses and its hold inputs. A push by the lanes App
+# Sandbox caller of the org pr-review-cli reusable, lane `code`, at @main as
+# claude-code-plugins calls it, with its hold inputs. A push by the lanes App
 # bot is reviewed, any other bot's push is skipped. The job id `pr-review`
-# keeps the check `pr-review / claude-review-status`, which ci-status's
+# gives the check `pr-review / review-status`, which ci-status's
 # `Require both review lanes on this head` step reads. No resolve-model job:
 # the review runs on the reusable's default model.
 
@@ -73,7 +73,7 @@ jobs:
       checks: read # the reusable's status job reads its earlier runs' cost notices
       contents: read
       pull-requests: write # the review, its comments, the marker and the hold label
-    uses: melodic-software/ci-workflows/.github/workflows/pr-review-cli.yml@4fbceb4b75ffd568dfa5db31de0d0e753c0c64e6 # v0.65.9
+    uses: melodic-software/ci-workflows/.github/workflows/pr-review-cli.yml@main
     with:
       lane: code
       publish: comments
