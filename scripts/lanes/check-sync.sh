@@ -18,48 +18,67 @@ SYNCED=(
   .github/actions/check-trusted-base
   .github/actions/check-trusted-trigger
   .github/actions/check-wip-cap
+  .github/actions/check-upstream-status
   .github/actions/collect-base-activity
   .github/actions/log-api-budget
   .github/actions/open-lane-output
   .github/actions/report-check-run
   .github/actions/request-lane-token
   .github/actions/resolve-config
+  .github/actions/scan-upload
   .github/actions/seal-lane-output
   .github/actions/select-trusted-text
+  .github/actions/setup-pinned-node
   .github/actions/setup-runner-isolation
+  .github/actions/upload-fail-index
+  .github/actions/upload-lane-transcript
+  .github/artifact-retention.json
   .github/lane-keys
   .github/scripts/apply-patch
-  # The handoff jobs' evidence reader, checked out from the default branch tip.
-  .github/scripts/lib/handoff-evidence.sh
+  .github/scripts/lib
   .github/scripts/merge-base
+  .github/scripts/pr-merge
   .github/scripts/pr-unblock
+  .github/scripts/pr-verify
   .github/scripts/read-patch
   .github/scripts/work-resolve-issue
   # Modules the synced scripts and tests import from outside those folders.
+  .github/recurring-schedule.json
   .github/scripts/intake-triage/admit.mjs
+  .github/scripts/lane-run-report/post.mjs
+  .github/scripts/maintenance-reconcile-lost-runs/component-status.mjs
   .github/scripts/maintenance-reconcile-lost-runs/infra-failure.mjs
-  .github/scripts/pr-merge/merge-holds.mjs
-  .github/scripts/pr-verify/write-verdict.mjs
+  .github/scripts/pr-review-main/split-diff.py
+  .github/scripts/pr-review-main/write-verdict.mjs
+  .github/scripts/recurring-schedule/file-due.mjs
   .github/standards/dependabot-policy
   .github/standards/github-actions-conventions
   .github/standards/runner-policy
   .github/standards/trusted-actors
   .github/workflows/pr-feedback-dispatch.yml
+  .github/workflows/pr-merge.yml
   .github/workflows/pr-run-activity-read.yml
   .github/workflows/pr-run-activity-write.yml
   .github/workflows/pr-unblock-dispatch.yml
   .github/workflows/pr-unblock.yml
+  .github/workflows/pr-verify.yml
   .github/workflows/work-resolve-issue.yml
   docs/conventions/pr-pipeline/examples
   docs/conventions/pr-pipeline/pr-pipeline.schema.json
   # What the read runner's skill setup, leak scan and role routes read from
   # the base.
   .github/requirements-ci.txt
+  .github/npm-fetch.npmrc
   .python-version
   lib/publish-gate.mjs
+  lib/test-tmp.mjs
   package-lock.json
   package.json
   plugins/multi-agent/reference/defaults.yaml
+  plugins/source-control/skills/babysit-prs/scripts
+  plugins/source-control/scripts/resolve-version-bump-conflict.sh
+  plugins/source-control/skills/pull-request/scripts/feedback-thread.sh
+  plugins/work-items/scripts/charge-words.json
   scripts/setup-env.sh
   # The read runner's caller-secret gate, and the shadow check the owner runs
   # after the scan-carrier keygen.
@@ -71,6 +90,12 @@ SYNCED=(
   scripts/check-affected.sh
   scripts/git-mv-rm.sh
   scripts/lib/checkout-path.sh
+)
+
+# Upstream paths under a SYNCED path this sandbox leaves out. pr-verify's probe
+# fixtures hold a fake AWS key the secret scan refuses; no workflow reads them.
+LEFT_OUT=(
+  .github/scripts/pr-verify/probe
 )
 
 # The sandbox's own versions of files claude-code-plugins also has.
@@ -85,9 +110,6 @@ ADAPTED=(
   # Its run-name, dispatcher-run-id input and fix-docs jobs are main's on the
   # automations role: sync them with the dispatcher, which sends that input.
   .github/workflows/pr-refine.yml
-  # The synced dispatch job plus claude-code-plugins#9361's rerun-ci-status
-  # job, ahead of the next full resync.
-  .github/workflows/pr-feedback-dispatch.yml
   # The sandbox's own scan-carrier key pair: one per repository, never shared.
   # Until the owner runs keygen here it is the placeholder line, so seal fails
   # closed.
@@ -146,6 +168,14 @@ git -C "$repo" rev-parse -q --verify "$ref^{commit}" >/dev/null || {
   exit 2
 }
 
+left_out() {
+  local prefix
+  for prefix in "${LEFT_OUT[@]}"; do
+    case $1 in "$prefix" | "$prefix"/*) return 0 ;; esac
+  done
+  return 1
+}
+
 declare -A adapted pinned
 for path in "${ADAPTED[@]}"; do adapted[$path]=1; done
 for entry in "${PINNED[@]}"; do pinned[${entry%% *}]=${entry#* }; done
@@ -195,6 +225,7 @@ for synced in "${SYNCED[@]}"; do
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     [ -z "${adapted[$path]:-}" ] || continue
+    left_out "$path" && continue
     compare "$path" "${pinned[$path]:-$ref}"
   done <<<"$files"
 done

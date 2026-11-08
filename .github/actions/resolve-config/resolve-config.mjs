@@ -12,8 +12,10 @@ import {
   createGitHub,
   paginate,
 } from "../check-trusted-trigger/check-trusted-trigger.mjs";
+import { issueStatus } from "./issue-status.mjs";
 import { checkPatchRules } from "./patch-rules.mjs";
 import { pipelineEvent } from "./predicate.mjs";
+import { statusLabels } from "./read-status.mjs";
 import {
   checkAppliedBySupported,
   checkConfigPath,
@@ -76,44 +78,197 @@ function readJsonUnderBase(basePath, relative) {
 
 // The REST version that documents issue-field-values.
 const FIELD_API_VERSION = "2026-03-10";
-// The newest field events; the REST timeline names the actor but not the field.
+// The field event selection; the REST timeline names the actor but not the field.
+const FIELD_EVENT_TYPES = "[ISSUE_FIELD_ADDED_EVENT, ISSUE_FIELD_CHANGED_EVENT, ISSUE_FIELD_REMOVED_EVENT]";
+const FIELD_EVENT_NODES = `nodes {
+        __typename
+        ... on IssueFieldAddedEvent { createdAt value actor { ...who } issueField { ...field } }
+        ... on IssueFieldChangedEvent { createdAt previousValue newValue actor { ...who } issueField { ...field } }
+        ... on IssueFieldRemovedEvent { createdAt actor { ...who } issueField { ...field } }
+      }`;
+const FIELD_FRAGMENTS = `fragment who on Actor { __typename login ... on User { databaseId } ... on Bot { databaseId } }
+fragment field on IssueFields { ... on IssueFieldSingleSelect { fullDatabaseId } }`;
+// The newest field events one issue read takes.
+const FIELD_EVENT_LIMIT = 100;
 const FIELD_EVENTS = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { issue(number: $number) {
-    timelineItems(last: 100, itemTypes: [ISSUE_FIELD_ADDED_EVENT, ISSUE_FIELD_CHANGED_EVENT, ISSUE_FIELD_REMOVED_EVENT]) {
-      nodes {
-        __typename
-        ... on IssueFieldAddedEvent { actor { ...who } issueField { ...field } }
-        ... on IssueFieldChangedEvent { actor { ...who } issueField { ...field } }
-        ... on IssueFieldRemovedEvent { actor { ...who } issueField { ...field } }
-      }
+    timelineItems(last: ${FIELD_EVENT_LIMIT}, itemTypes: ${FIELD_EVENT_TYPES}) {
+      ${FIELD_EVENT_NODES}
     }
   } }
 }
-fragment who on Actor { ... on User { databaseId } ... on Bot { databaseId } }
-fragment field on IssueFields { ... on IssueFieldSingleSelect { fullDatabaseId } }`;
+${FIELD_FRAGMENTS}`;
 
-// Field id -> the account id that last set it (null after a removal or for an
-// actor with no id), from the issue's newest 100 field events, oldest first.
-export async function fieldSetters(github, repository, number) {
+const graphqlFailure = (answer, what) =>
+  Array.isArray(answer?.errors) && answer.errors.length > 0
+    ? new Error(`${what} could not be read: ${answer.errors.map((e) => e?.message).join("; ")}`)
+    : null;
+
+// The issue's newest 100 single-select field events, oldest first, each
+// {field, removed, actorId, actorLogin, actorType, at, from, to}: `field` the
+// field id as a string, `actorId` null for an actor with no id, `actorLogin`
+// as GraphQL names it (a bot's without `[bot]`), `actorType` `User` or `Bot`,
+// `at` the event time, and `from` and `to` the option names before and after
+// (null for none). An add or a removal names no earlier value, so its `from`
+// is what the earlier events left.
+export async function fieldEvents(github, repository, number) {
   const [owner, name] = repository.split("/");
   const answer = await github("POST", "/graphql", { query: FIELD_EVENTS, variables: { owner, name, number } });
-  if (Array.isArray(answer?.errors) && answer.errors.length > 0) {
-    throw new Error(`the issue's field events could not be read: ${answer.errors.map((e) => e?.message).join("; ")}`);
+  const failure = graphqlFailure(answer, "the issue's field events");
+  if (failure) {
+    throw failure;
   }
-  const setters = Object.create(null);
-  for (const node of answer?.data?.repository?.issue?.timelineItems?.nodes ?? []) {
+  const issue = answer?.data?.repository?.issue;
+  if (issue === null || typeof issue !== "object") {
+    throw new Error("the issue's field events answer named no issue");
+  }
+  const nodes = issue.timelineItems?.nodes;
+  if (!Array.isArray(nodes)) {
+    throw new Error("the issue's field events answer holds no event list");
+  }
+  // `full`: the window held its limit, so older events went unread.
+  return Object.defineProperty(eventsFrom(nodes), "full", { value: nodes.length >= FIELD_EVENT_LIMIT });
+}
+
+function eventsFrom(nodes) {
+  const text = (value) => (typeof value === "string" ? value : null);
+  const held = Object.create(null);
+  const events = [];
+  for (const node of nodes) {
     const field = node?.issueField?.fullDatabaseId;
-    if (typeof field === "string" && /^[1-9][0-9]*$/.test(field)) {
-      const id = node.actor?.databaseId;
-      setters[field] = node.__typename === "IssueFieldRemovedEvent" || !Number.isInteger(id) ? null : id;
+    if (typeof field !== "string" || !/^[1-9][0-9]*$/.test(field)) {
+      continue;
     }
+    const id = node.actor?.databaseId;
+    const removed = node.__typename === "IssueFieldRemovedEvent";
+    const changed = node.__typename === "IssueFieldChangedEvent";
+    const to = removed ? null : text(changed ? node.newValue : node.value);
+    events.push({
+      field,
+      removed,
+      actorId: Number.isInteger(id) ? id : null,
+      actorLogin: text(node.actor?.login),
+      actorType: text(node.actor?.__typename),
+      at: text(node.createdAt),
+      from: changed ? text(node.previousValue) : (held[field] ?? null),
+      to,
+    });
+    held[field] = to;
+  }
+  return events;
+}
+
+// Field id -> the account id that last set it (null after a removal or for an
+// actor with no id), from fieldEvents.
+export async function fieldSetters(github, repository, number) {
+  return settersOf(await fieldEvents(github, repository, number));
+}
+
+function settersOf(events) {
+  const setters = Object.create(null);
+  for (const event of events) {
+    setters[event.field] = event.removed ? null : event.actorId;
   }
   return setters;
 }
 
+// Pages of 100 open issues issuesByStatus reads before it throws.
+export const MAX_ISSUE_PAGES = 20;
+// Field events per issue in the listing, as many as fieldEvents reads: the
+// Work status setter is the newest Work status event among them, and a field
+// value with none among a full window throws rather than read as unset.
+const LISTED_FIELD_EVENTS = 100;
+const OPEN_ISSUES = `query($owner: String!, $name: String!, $cursor: String, $since: DateTime) {
+  repository(owner: $owner, name: $name) {
+    issues(states: OPEN, first: 100, after: $cursor, filterBy: { since: $since }) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        createdAt
+        labels(first: 30) { nodes { name } }
+        issueFieldValues(first: 10) { nodes { ... on IssueFieldSingleSelectValue { name field { ...field } } } }
+        timelineItems(last: ${LISTED_FIELD_EVENTS}, itemTypes: ${FIELD_EVENT_TYPES}) {
+          ${FIELD_EVENT_NODES}
+        }
+      }
+    }
+  }
+}
+${FIELD_FRAGMENTS}`;
+
+// The open issues whose Work status is one of `states`, oldest page first,
+// each {number, created_at, labels, state}: `labels` the label names, `state`
+// the trusted field state (issue-status.mjs issueStatus with `config` and
+// `trustedActors`), or null for an issue whose field no counted account set
+// and that carries one of those states' labels, which decide until the field
+// is set. `since` (ISO time, optional) keeps only issues updated at or after
+// it. A field value is read by its option name, a state name; a counted name
+// `config` does not map throws `unmapped-status`. More than MAX_ISSUE_PAGES
+// pages, a GraphQL error, a malformed answer or a Work status value whose
+// setter falls outside LISTED_FIELD_EVENTS throws.
+export async function issuesByStatus(github, repository, states, { since, config, trustedActors } = {}) {
+  const [owner, name] = repository.split("/");
+  const option = Object.fromEntries(Object.entries(config.options).map(([id, state]) => [state, Number(id)]));
+  const wanted = new Set(states.flatMap((state) => config.labels[state] ?? []).map((label) => label.toLowerCase()));
+  const found = [];
+  let cursor = null;
+  for (let page = 1; page <= MAX_ISSUE_PAGES; page += 1) {
+    const answer = await github("POST", "/graphql", { query: OPEN_ISSUES, variables: { owner, name, cursor, since: since ?? null } });
+    const failure = graphqlFailure(answer, "the open issues");
+    if (failure) {
+      throw failure;
+    }
+    const issues = answer?.data?.repository?.issues;
+    if (!Array.isArray(issues?.nodes) || typeof issues.pageInfo?.hasNextPage !== "boolean") {
+      throw new Error("the open issues answer holds no issue list");
+    }
+    for (const node of issues.nodes) {
+      const labels = (node?.labels?.nodes ?? []).map((label) => label?.name).filter((label) => typeof label === "string");
+      const fieldValues = (node?.issueFieldValues?.nodes ?? [])
+        .filter((value) => typeof value?.name === "string" && typeof value.field?.fullDatabaseId === "string")
+        .map((value) => ({ field: Number(value.field.fullDatabaseId), option: option[value.name] ?? value.name }));
+      const nodes = node?.timelineItems?.nodes;
+      if (!Number.isInteger(node?.number) || !Array.isArray(nodes)) {
+        throw new Error("the open issues answer holds an issue with no number or event list");
+      }
+      // The value and its events come from one read, so no fieldNames check.
+      const events = eventsFrom(nodes);
+      const statusField = String(config["field-id"]);
+      // An issue whose status cannot be read fails the listing only when it
+      // could be one of `states`: a wanted label, or a Work status value or
+      // event naming one of them. Any other is skipped, so one issue's
+      // unreadable field cannot stop a listing it has no part in.
+      const couldMatch = () =>
+        labels.some((label) => wanted.has(label.toLowerCase())) ||
+        (node?.issueFieldValues?.nodes ?? []).some((value) => value?.field?.fullDatabaseId === statusField && states.includes(value?.name)) ||
+        events.some((event) => event.field === statusField && states.includes(event.to));
+      let state;
+      try {
+        if (nodes.length >= LISTED_FIELD_EVENTS && fieldValues.some((value) => String(value.field) === statusField) && !events.some((event) => event.field === statusField)) {
+          throw new Error(`#${node.number}'s Work status setter is older than its newest ${LISTED_FIELD_EVENTS} field events`);
+        }
+        state = issueStatus({ fieldValues, fieldEvents: events, fieldEventsFull: nodes.length >= LISTED_FIELD_EVENTS }, config, trustedActors);
+      } catch (error) {
+        if (couldMatch()) {
+          throw error;
+        }
+        continue;
+      }
+      if (state === null ? labels.some((label) => wanted.has(label.toLowerCase())) : states.includes(state)) {
+        found.push({ number: node.number, created_at: node.createdAt, labels, state });
+      }
+    }
+    if (!issues.pageInfo.hasNextPage) {
+      return found;
+    }
+    cursor = issues.pageInfo.endCursor;
+  }
+  throw new Error(`the open issues run past ${MAX_ISSUE_PAGES} pages`);
+}
+
 async function gatherFacts(
   needed,
-  { eventName, event, prNumber, headSha, repository, github, sleep },
+  { eventName, event, prNumber, headSha, repository, github, sleep, splitChild, status },
 ) {
   const facts = { event: pipelineEvent(eventName, event) };
   let pull;
@@ -155,25 +310,61 @@ async function gatherFacts(
   // read now for labels-absent).
   const issue = eventName === "issues" ? event.issue : undefined;
   if (issue !== undefined) {
+    // The issue's org field values: REST answers the integer field and
+    // option ids the config maps (GraphQL answers only node ids). Each read
+    // once, shared by the dimensions and the Work status.
+    let values;
+    let events;
+    const readValues = async () => {
+      if (values === undefined) {
+        const rows = await github("GET", `/repos/${repository}/issues/${Number(issue.number)}/issue-field-values`, undefined, {
+          "X-GitHub-Api-Version": FIELD_API_VERSION,
+        });
+        if (!Array.isArray(rows)) {
+          throw new Error("the issue's field values answer is not a list");
+        }
+        values = rows.map((row) => ({
+          field: row?.issue_field_id,
+          option: row?.single_select_option?.id ?? null,
+        }));
+      }
+      return values;
+    };
+    const readEvents = async () => (events ??= await fieldEvents(github, repository, Number(issue.number)));
     if (needed.includes("fieldValues")) {
-      // The issue's org field values: REST answers the integer field and
-      // option ids the config maps (GraphQL answers only node ids).
-      const rows = await github("GET", `/repos/${repository}/issues/${Number(issue.number)}/issue-field-values`, undefined, {
-        "X-GitHub-Api-Version": FIELD_API_VERSION,
-      });
-      facts.fieldValues = (Array.isArray(rows) ? rows : []).map((row) => ({
-        field: row?.issue_field_id,
-        option: row?.single_select_option?.id ?? null,
-      }));
+      facts.fieldValues = await readValues();
     }
     if (needed.includes("fieldSetters")) {
-      facts.fieldSetters = await fieldSetters(github, repository, Number(issue.number));
+      facts.fieldSetters = settersOf(await readEvents());
+    }
+    if (needed.includes("splitChild")) {
+      // Whether the issue is a trusted size-split sub-issue, which takes
+      // split-child-size: the caller reads it (admit.mjs trustedSplitChild,
+      // in work-resolve-issue's check-blockers.mjs) and passes it as
+      // SPLIT_CHILD, so this floored module never loads intake's.
+      if (splitChild !== "true" && splitChild !== "false") {
+        throw new Error("split-child must be `true` or `false` when the issue's dimensions are read");
+      }
+      facts.splitChild = splitChild === "true";
     }
     if (needed.includes("labels")) {
       const labels = needed.includes("freshLabels")
         ? (await github("GET", `/repos/${repository}/issues/${Number(issue.number)}`)).labels
         : issue.labels;
       facts.labels = labels.map((label) => label.name);
+      // The trusted Work status decides the queue state, agent-ready included,
+      // as read-status.mjs statusLabels folds it in: a field-only admission
+      // matches `labels`, and a field hold matches `labels-absent`. A failed
+      // read throws rather than fall back to the labels, which could miss a hold.
+      if (status?.config) {
+        const fieldEventsRead = await readEvents();
+        const state = issueStatus(
+          { fieldValues: await readValues(), fieldEvents: fieldEventsRead, fieldEventsFull: fieldEventsRead.full === true },
+          status.config,
+          status.trustedActors,
+        );
+        facts.labels = statusLabels(state, facts.labels, status.config);
+      }
     }
   } else if (needed.includes("labels")) {
     const labels = needed.includes("freshLabels")
@@ -209,7 +400,7 @@ async function gatherFacts(
 
 // A model run's step outputs, or empty ones for a script. The args are
 // checked against their only shape, so no output can carry a second line.
-const MODEL_ARGS = /^(?:--model [a-z]+ )?--max-turns [1-9][0-9]*(?: --effort [a-z]+)?$/;
+const MODEL_ARGS = /^--model [a-z]+ --max-turns [1-9][0-9]*(?: --effort [a-z]+)?$/;
 function modelOutputs(models) {
   if (models === null) {
     return { profile: "", "claude-args": "", "settings-json": "", "max-turns": "", model: "", effort: "" };
@@ -223,9 +414,8 @@ function modelOutputs(models) {
     "claude-args": args,
     "settings-json": modelSettings(models),
     "max-turns": String(models["max-turns"]),
-    // run-claude-cli inputs: `default` has no --model to pass, so it is empty
-    // and the caller fails on it. A role profile always resolves an alias.
-    model: models.model === "default" ? "" : models.model,
+    // run-claude-cli inputs. Every profile resolves a routed alias.
+    model: models.model,
     effort: models.effort ?? "",
   };
 }
@@ -258,6 +448,7 @@ function outputsFor({ lane, selected }) {
     ...(selected["applied-by"]?.patch === undefined ? {} : { "applied-by-patch": selected["applied-by"].patch }),
     ...(selected.prepare === undefined ? {} : { prepare: selected.prepare }),
     ...(selected.kind === "skill" ? { "permission-mode": selected["permission-mode"] ?? "dontAsk" } : {}),
+    ...(selected.kind === "script" ? { checkout: selected.checkout ?? "head" } : {}),
     ...(selected["issue-dimensions"] === undefined
       ? {}
       : { "issue-dimensions": selected["issue-dimensions"], "timeout-minutes": String(selected["timeout-minutes"]) }),
@@ -322,6 +513,8 @@ export async function resolveFromBase({ env, github, sleep = wait, event, absent
     return null;
   }
   const facts = await gatherFacts(neededFacts(files, request), {
+    status: { config: loadConfig(files, { configPath }).models?.["issue-status"] ?? null, trustedActors: files.trustedActors },
+    splitChild: env.SPLIT_CHILD,
     eventName: env.EVENT_NAME,
     event: event ?? JSON.parse(readFileSync(env.EVENT_PATH, "utf8")),
     prNumber: env.PR_NUMBER,
@@ -377,12 +570,43 @@ export function adoptionFromBase(env) {
   return loadConfig(filesUnderBase(basePath, configPath), { configPath }).adoption ?? {};
 }
 
+// The base config's `merge.refire-skip-branches`, the head branches a workflow
+// owns and rebuilds, after the same file checks as resolve(), for the fix-ci
+// dispatcher and context job, which never run fix-ci on one.
+export function ownedBranchesFromBase(env) {
+  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
+  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  return loadConfig(filesUnderBase(basePath, configPath), { configPath }).merge?.["refire-skip-branches"] ?? [];
+}
+
+// The base config as resolve() loads it, after the same file checks, for
+// pr-refine's plan job.
+export function configFromBase(env) {
+  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
+  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  return loadConfig(filesUnderBase(basePath, configPath), { configPath });
+}
+
+// resolve-issue's `tidy.cutoffs` as set, or null when it does not tidy, for the
+// fix-docs dispatcher, which skips a lane PR tidied in its own run.
+export function tidyCutoffsFromBase(env) {
+  return configFromBase(env).activities["resolve-issue"]?.tidy?.cutoffs ?? null;
+}
+
 // The base config's `models.issue-dimensions` leaf as set, or null, after the
 // same file checks as resolve(), for intake triage's verdict writer.
 export function issueDimensionsFromBase(env) {
   const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
   const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
   return loadConfig(filesUnderBase(basePath, configPath), { configPath }).models?.["issue-dimensions"] ?? null;
+}
+
+// The base config's `models.issue-status` leaf as set, or null, after the
+// same file checks as resolve(), for the label writers' Work status mirror.
+export function issueStatusFromBase(env) {
+  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
+  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  return loadConfig(filesUnderBase(basePath, configPath), { configPath }).models?.["issue-status"] ?? null;
 }
 
 // The base config's `red-main` leaf as set and `merge.agent-identity`, after
@@ -396,6 +620,16 @@ export function redMainFromBase(env) {
   return { redMain: doc["red-main"] ?? {}, agentIdentity: doc.merge?.["agent-identity"] ?? "" };
 }
 
+// The base config's `post-merge.paths` as set and `merge.agent-identity`,
+// likewise, for .github/scripts/post-merge-demotion-alert/merge-path.mjs,
+// which applies them.
+export function postMergeFromBase(env) {
+  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
+  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  const doc = loadConfig(filesUnderBase(basePath, configPath), { configPath });
+  return { paths: doc["post-merge"]?.paths ?? {}, agentIdentity: doc.merge?.["agent-identity"] ?? "" };
+}
+
 // The hosts the issue lane (resolve-issue) may read, for intake admission:
 // its web-access domains, "any", or [] when web access is off.
 export function issueLaneWebHostsFromBase(env) {
@@ -403,6 +637,13 @@ export function issueLaneWebHostsFromBase(env) {
   const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
   const web = loadConfig(filesUnderBase(basePath, configPath), { configPath }).activities?.["resolve-issue"]?.["web-access"];
   return web?.enabled ? web.domains : [];
+}
+
+// The base config's attended classes, {name: meaning}, or {} when unset.
+export function attendedClassesFromBase(env) {
+  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
+  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  return loadConfig(filesUnderBase(basePath, configPath), { configPath }).attended?.classes ?? {};
 }
 
 // The base config's `branch-cleanup` leaf as set, likewise; its defaults have

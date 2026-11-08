@@ -1,0 +1,290 @@
+// stop-routes.json, the issue lane's one routing table: each stop reason's
+// route and why, as report-outcome.mjs reads it. It mirrors pr-unblock's
+// escalation-routes.json shape rather than sharing its loader, because
+// report-outcome runs from a copy of this directory alone.
+//   hold      hands the issue to a person: the human-gated label and the
+//             escalation marker. Only an intent, design, security or cost
+//             reason routes here: each hold row's `class` (HOLD_CLASSES)
+//             says which.
+//   host-run  adds the host-run label, the host queue's one signal, and
+//             removes agent-ready, so an unattended agent run on a host builds it.
+//   attended  adds the attended label and removes agent-ready: the work needs
+//             a manual external step only the owner, present, can take; only
+//             a listed human removes the label. It asks the owner for no
+//             decision, which stays needs-human's.
+//   retry     keeps agent-ready, so work-unblock starts it again, up to
+//             limits.stop-retries, or the row's `retries` when fewer; past
+//             that it takes retry-spent's route. The cap counts every retry
+//             since a listed human last added agent-ready, whatever stop
+//             wrote it, so a row's `retries` is a ceiling on that shared count.
+//             A row with `fault: true` is the lane's machinery failing, no
+//             evidence about the issue: when it and every retry counted were
+//             such stops, report-outcome holds at the cap instead of taking
+//             retry-spent's route (spentOnFaults).
+//   wait      keeps agent-ready with the open pull request the run names in
+//             its marker, so work-unblock starts it again once that pull
+//             request merges or closes, up to limits.stop-retries waits;
+//             past that it takes retry-spent's route.
+//   intake    removes agent-ready, status: ready and admission-deferred, so
+//             the triage sweep sends the issue back through intake, whose
+//             admission and refinement decide it as the owner settled, up
+//             to limits.stop-retries, or the row's `retries` when fewer;
+//             past that it takes retry-spent's route.
+//   park      removes agent-ready, status: ready and admission-deferred and
+//             adds status: confirmed beside the lanes App's admission comment
+//             naming the reason, as admission parks a refusal no person
+//             answers; intake takes it again once the reason is met.
+//   close     closes the issue as completed with the run's words.
+//   fail      removes agent-ready and adds no label: the comment's outcome
+//             marker is the visible stop the maintenance monitor reports.
+import { readFileSync } from "node:fs";
+
+const ROUTE_NAMES = new Set(["hold", "host-run", "attended", "retry", "wait", "intake", "park", "close", "fail"]);
+// The routes a row's `retries` may cap.
+const COUNTED_ROUTES = new Set(["retry", "wait", "intake"]);
+// The owner's reasons for a person (owner direction 2026-10-27).
+export const HOLD_CLASSES = new Set(["intent-change", "design-change", "security-risk", "cost-risk"]);
+
+export const STOP_ROUTES = Object.freeze(JSON.parse(readFileSync(new URL("./stop-routes.json", import.meta.url), "utf8")));
+for (const [reason, row] of Object.entries(STOP_ROUTES)) {
+  if (!ROUTE_NAMES.has(row?.route) || typeof row.why !== "string" || row.why === "") {
+    throw new Error(`stop-routes.json: ${reason} needs a route (${[...ROUTE_NAMES].join(", ")}) and a why`);
+  }
+  if (row.retries !== undefined && !(COUNTED_ROUTES.has(row.route) && Number.isSafeInteger(row.retries) && row.retries >= 0)) {
+    throw new Error(`stop-routes.json: ${reason}'s retries needs a ${[...COUNTED_ROUTES].join(", ")} route and a whole number`);
+  }
+  if (row.fault !== undefined && !(row.route === "retry" && row.fault === true)) {
+    throw new Error(`stop-routes.json: ${reason}'s fault needs a retry route and the value true`);
+  }
+  if (row.route === "hold" && !HOLD_CLASSES.has(row.class)) {
+    throw new Error(`stop-routes.json: ${reason} holds, so its class needs to be one of ${[...HOLD_CLASSES].join(", ")}`);
+  }
+  if (row.route !== "hold" && row.class !== undefined) {
+    throw new Error(`stop-routes.json: ${reason} does not hold, so it takes no class`);
+  }
+}
+// runCode's security backstop routes to this row.
+if (STOP_ROUTES["security-risk"]?.route !== "hold" || STOP_ROUTES["security-risk"].class !== "security-risk") {
+  throw new Error("stop-routes.json: security-risk needs a hold route and class security-risk");
+}
+// A spent cap that routed to retry would retry without end.
+for (const spent of ["retry-spent", "turn-cap-spent"]) {
+  if (STOP_ROUTES[spent]?.route === "retry" || !Object.hasOwn(STOP_ROUTES, spent)) {
+    throw new Error(`stop-routes.json: ${spent} needs a route other than retry`);
+  }
+}
+
+// The label host-run routes add: github-iac GovernedRepositories.cs defines it.
+export const HOST_RUN_LABEL = "host-run";
+// The label attended routes add, likewise declared in github-iac.
+export const ATTENDED_LABEL = "attended";
+
+// A reason's route; a reason the table does not list names no owner reason,
+// so it fails rather than reaching a person.
+export const stopRoute = (reason) => (Object.hasOwn(STOP_ROUTES, reason) ? STOP_ROUTES[reason].route : "fail");
+// The stop-reason code (../lib/stop-reason.mjs) a reason's comment carries:
+// its hold row's class as intent, design, security or cost, else none.
+const CLASS_CODES = { "intent-change": "intent", "design-change": "design", "security-risk": "security", "cost-risk": "cost" };
+export const stopReasonCode = (reason) => (Object.hasOwn(STOP_ROUTES, reason) && CLASS_CODES[STOP_ROUTES[reason].class]) || "none";
+// The most retries a reason's row allows, within limits.stop-retries.
+export const stopRetries = (reason, cap) => Math.min(cap, (Object.hasOwn(STOP_ROUTES, reason) ? STOP_ROUTES[reason].retries : undefined) ?? cap);
+export const stopFault = (reason) => Object.hasOwn(STOP_ROUTES, reason) && STOP_ROUTES[reason].fault === true;
+export const stopWhy = (reason) => (Object.hasOwn(STOP_ROUTES, reason) ? STOP_ROUTES[reason].why : "the stop reason is not in the lane's route table");
+
+// The codes a run may open its `stopped` reason with, longest first, each in
+// any case: security-risk with a hyphen, underscore, space or nothing between
+// its words, every other code only hyphenated and followed by no word
+// character or hyphen, so "Design change in X" names no code.
+const CODES = Object.keys(STOP_ROUTES)
+  .filter((reason) => STOP_ROUTES[reason].code === true)
+  .sort((a, b) => b.length - a.length)
+  .map((code) => [code, code === "security-risk" ? /^security[-_\s]*risk/i : new RegExp(`^${code}(?![\\w-])`, "i")]);
+// A reason that names a security concern, even inside a word (but not wholly
+// inside a listed name, KNOWN_NAMES below); the short acronyms (XSS, RCE, CVE)
+// only as whole words, so "source" names none.
+const SECURITY_CONCERN =
+  /security|vuln|inject|exfiltrat|malicious|backdoor|exploit|branch[\s_-]?protection|attack|unauthori[sz]|hijack|\btake[\s-]?over\b|took\s+over|\bstol(?:e|en)\b|\bstranger|\boutsider|\b(?:xss|rce|cve)\b|ignore\b.{0,40}\binstructions?\b/i;
+// The secret nouns: a security word everywhere, released only after an
+// ending code and only in a capability phrasing (CAPABILITY below).
+const SECRET_NOUN = String.raw`credential|secret|token|passw(?:or)?d|api[\s_-]?key|private[\s_-]?key|deploy[\s_-]?key|ssh[\s_-]?key|access[\s_-]?key|\bpat\b(?!-)`;
+const SECURITY_WORD = new RegExp(`${SECURITY_CONCERN.source}|${SECRET_NOUN}`, "i");
+// known-names.json: identifiers (a skill id, a principle name) that hold a
+// security word but name no risk, each with a why. A security word that lies
+// wholly inside one, written exactly as listed as a whole identifier (not next
+// to a letter, digit, `-`, `_` or `:`), names none; one that runs past its edge
+// ("github-deploy key") still does. Fail closed: a listed name joins at least
+// two parts with `-`, `_` or `:`, so a bare word such as "attack" cannot be
+// listed, and holds no secret noun, so it never releases a credential mention.
+// A checkout without the file (a sparse one that lists only this module and
+// its table) reads no names, which only holds more.
+const readKnownNames = () => {
+  try {
+    return JSON.parse(readFileSync(new URL("./known-names.json", import.meta.url), "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return {};
+    throw error;
+  }
+};
+const KNOWN_NAMES = readKnownNames();
+if (KNOWN_NAMES === null || typeof KNOWN_NAMES !== "object" || Array.isArray(KNOWN_NAMES)) {
+  throw new Error("known-names.json: needs an object of name to why");
+}
+for (const [name, why] of Object.entries(KNOWN_NAMES)) {
+  if (!/^[a-z0-9]+(?:[-_:][a-z0-9]+)+$/.test(name) || new RegExp(SECRET_NOUN, "i").test(name) || typeof why !== "string" || why === "") {
+    throw new Error(`known-names.json: ${name} needs to join lowercase parts with -, _ or :, hold no secret noun, and have a why`);
+  }
+}
+const NAME_EDGE = String.raw`[\p{L}\p{N}_:-]`;
+const LISTED_NAME = Object.keys(KNOWN_NAMES).length
+  ? new RegExp(
+      `(?<!${NAME_EDGE})(?:${Object.keys(KNOWN_NAMES)
+        .sort((a, b) => b.length - a.length)
+        .join("|")})(?!${NAME_EDGE})`,
+      "gu",
+    )
+  : null;
+// The first match of `pattern` in `text` that does not lie wholly inside a
+// listed name. Each match start is tried, so a match that starts inside a name
+// and runs past it is still found.
+const outsideNames = (pattern) => {
+  const global = new RegExp(pattern.source, `${pattern.flags}g`);
+  return (text) => {
+    const spans = LISTED_NAME ? [...text.matchAll(LISTED_NAME)].map((name) => [name.index, name.index + name[0].length]) : [];
+    global.lastIndex = 0;
+    for (let found = global.exec(text); found; found = global.exec(text)) {
+      if (!spans.some(([start, end]) => found.index >= start && found.index + found[0].length <= end)) return found[0];
+      global.lastIndex = found.index + 1;
+    }
+    return undefined;
+  };
+};
+const concernOutsideNames = outsideNames(SECURITY_CONCERN);
+const wordOutsideNames = outsideNames(SECURITY_WORD);
+// The phrasings that name a secret only as something a run needs ("a host
+// with model credentials", "needs an API key the lane does not hold", "tokens
+// per task"). Fail closed: the phrasing counts only when the secret noun,
+// after at most a model or deploy qualifier, ends the clause or is followed by
+// a lane capability ("the lane", "to run"), so "needs the token to be
+// rotated", "needs the API key, which ..." and "needs the reused token" hold.
+const N = "(?:credentials?|api[\\s_-]?keys?|tokens?|secrets?|passwords?)";
+const END = "(?=\\s*(?:$|[.;)]|\\s(?:to\\s+(?:run|invoke|call|use|reach|spend)|the\\s+lane|this\\s+lane|it\\s+does|which\\s+only|only)\\b))";
+const CAPABILITY = new RegExp(
+  `\\b(?:(?:a|the)\\s+)?host\\s+with\\s+(?:(?:model|an?|the)\\s+)*${N}${END}|\\b(?:needs?|requires?|lacks?)\\s+(?:(?:an?|the|model|deploy)\\s+)*${N}${END}|\\btokens?\\s+(?:per|spent|count|usage|budget)\\b|,\\s*tokens\\s*,`,
+  "gi",
+);
+// A token count of a thousand or more ("76,888 tokens", "1500000 tokens",
+// "120k tokens") is a measure, not a credential, so after an ending code its
+// "tokens" names no secret. Fail closed: the count is a measure only when
+// "tokens" ends the reason (a final full stop included) or a parenthesis, or
+// a measurement word follows it ("76,888 tokens headless"), so "1,500 tokens
+// were sent to ...", "1,500 tokens. They ..." and "2,048 tokens, now in the
+// public log" hold. A small count ("3 tokens leaked") still holds, and a
+// count releases nothing in a reason that also says what was done with
+// tokens (TOKEN_HANDLING): "rotate the 1,200 tokens" holds.
+const TOKEN_COUNT =
+  /(?<![\w.,])(?:\d{1,3}(?:,\d{3})+|\d{4,}|\d+(?:\.\d+)?[kKM])\s?tokens?\b(?=\s*(?:\.?\s*$|\))|\s+(?:headless|interactive|vs|versus|per|spent|used|total|budget|startup|payload|context|prompt|cached|saved|more|fewer|less)\b)/g;
+const TOKEN_HANDLING = /\b(?:rotat|revok|leak|expos|upload|paste|print|commit|push|dump|reveal|email|cop(?:y|ie[ds])|gist|screenshot)|\b(?:post(?:ed|s)?|shar(?:e|ed|es|ing)|logged|visible|shown|reus\w*|stol\w*)\b/i;
+// The technical senses of a secret noun, which name no secret. A hyphenated
+// measure (a per-token rate, token spending) can never name a credential, so
+// it releases wherever it stands (TOKEN_MEASURE). A phrase that can name a
+// real credential by its kind or scope (a subscription, model, read or write
+// token; an input, output or cache token, which in Actions wording is an
+// action's `token` input or a step's token output; "whose token has no
+// `statuses: read`"; "the token's permissions"; "has no credentials") is read
+// like a capability phrasing (CRED_SENSE): it releases only when every other
+// word of the reason is a capability word, so any word before or after it
+// that could state an exposure ("the public run log now holds the write
+// token", "the output token is in ...") holds. Like a count, each releases
+// nothing in a reason that also says what was done with a secret
+// (TOKEN_HANDLING).
+const TOKEN_MEASURE = /\b[\w-]+-per-tokens?\b|\bper-tokens?\b|\btokens?-(?:spending|budget|count|counting|usage)\b/gi;
+const SCOPE = String.raw`(?:\x60[^\x60\n]{1,40}\x60|[\w-]+:\s*(?:read|write)|(?:[\w-]+\s+)?(?:permissions?|scopes?))`;
+const CRED_SENSE = new RegExp(
+  String.raw`\b(?:subscription|model|input|output|cache)\s+tokens?\b|\b(?:[\w-]+:\s*(?:read|write)|read-only|read|write)\s+tokens?\b|\btokens?\s+(?:has|have|had)\s+no\s+${SCOPE}|\btoken['’]s\s+(?:permissions?|scopes?)\b|\b(?:has|have|had)\s+no\s+(?:[\w-]+\s+)?credentials?\b`,
+  "gi",
+);
+const withoutCounts = (text) => (TOKEN_HANDLING.test(text) ? text : text.replace(TOKEN_COUNT, " ").replace(TOKEN_MEASURE, " "));
+// The only words a reason that names a secret noun may hold beside its
+// capability phrasings. Fail closed: any other word, so any exposure however
+// worded ("uploaded", "posted", "holds", "contains", "the key was ..."), a
+// pronoun that could point at the secret but "it", or a word in another
+// script, holds. "this" and "that" count only before "lane", "needs" or "ci".
+const CAPABILITY_WORDS = new Set(
+  "a an the and or to on of for with not no cannot can does do only lane host desktop machine gpu run runs need needs requires lacks hold invoke call calls spend paid credit prepaid eval evals suite suites claude model live task tasks completed work against records pass rate advisor wall time printer driver it has role s ci azure dequeue step merge job whose read write cover workflow".split(" "),
+);
+const capabilityOnly = (text) => {
+  const words = text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  return words.every((word, i) => CAPABILITY_WORDS.has(word) || (/^th(?:is|at)$/.test(word) && /^(?:lane|needs|ci)$/.test(words[i + 1] ?? "")));
+};
+// The routes that end the lane's work on the issue rather than bring it back:
+// a security mention after one of their codes still reaches a person (owner
+// decision 2026-10-29), unless the secret is only named in a capability
+// phrasing: a person is only for a real security risk such as a leaked token
+// (owner direction, docs/contracts/loop-lane/README.md "When work stops for
+// the owner"), and a capability limit is none. This holds for a pushback that
+// opens with a host-run or attended code too. An intake code removes
+// agent-ready, so it ends the lane's work as well. A wait or retry code comes
+// back to the lane anyway, except after a pushback (runCode's anyCodeEnds).
+const ENDING_ROUTES = new Set(["close", "host-run", "attended", "intake"]);
+const endingRiskWord = (text) => {
+  const counted = withoutCounts(text);
+  const capabilities = counted.replace(CAPABILITY, " ");
+  const rest = TOKEN_HANDLING.test(text) ? capabilities : capabilities.replace(CRED_SENSE, " ");
+  // A listed name counts only for the word match: CAPABILITY and
+  // capabilityOnly still read it, so a name beside a secret noun holds.
+  return concernOutsideNames(text) ?? wordOutsideNames(rest) ?? (capabilityOnly(rest) ? "" : (wordOutsideNames(counted) ?? ""));
+};
+const namesEndingRisk = (text) => endingRiskWord(text) !== "";
+
+// The code a run's stop reason opens with, read NFKC-normalized (so a
+// full-width letter reads as its ASCII one) past any emphasis, backticks and a
+// `Reason:` label. A code whose route ends the lane's work, followed by text
+// that names security, is security-risk instead. With no code, security-risk
+// when it names security, so a misformatted security code still reaches a
+// person; else "stopped". Intent, design and cost words are common in plain
+// reasons, so only their code holds for them.
+const plainText = (text) =>
+  String(text ?? "")
+    .normalize("NFKC")
+    .replace(/[\p{Cf}\p{Mn}]/gu, "");
+const reasonText = (reason) => plainText(reason).replace(/^[\s*_`]*(?:reason\s*:)?[\s*_`]*/i, "");
+// A pushback's `cause` as a row name: read as a reason is, lowercased, with
+// trailing `.`, `:`, `;` and spaces dropped and each run of spaces,
+// underscores and hyphens one hyphen, so "Security Risk", "intent - change"
+// and "intent:" name their rows.
+export const causeName = (cause) =>
+  plainText(cause)
+    .trim()
+    .toLowerCase()
+    .replace(/[.:;\s]+$/, "")
+    .replace(/[\s_-]+/g, "-")
+    .replace(/^-+|[-.:;]+$/g, "");
+// The code a reason explicitly opens with, read as runCode reads it, with no
+// security-word reading: "" when it opens with none.
+export const leadingCode = (reason) => {
+  const text = reasonText(reason);
+  return CODES.find(([, code]) => code.test(text))?.[0] ?? "";
+};
+// With `anyCodeEnds`, every code reads as ending the lane's work: a pushback
+// never waits or retries, so a security mention after a wait code such as
+// blocked-by-pr counts as well.
+export const runCode = (reason, { anyCodeEnds = false } = {}) => {
+  const text = reasonText(reason);
+  for (const [name, code] of CODES) {
+    const match = code.exec(text);
+    if (match) {
+      return (anyCodeEnds || ENDING_ROUTES.has(STOP_ROUTES[name].route)) && namesEndingRisk(text.slice(match[0].length)) ? "security-risk" : name;
+    }
+  }
+  return wordOutsideNames(text) !== undefined ? "security-risk" : "stopped";
+};
+// The security word runCode, with `anyCodeEnds`, reads in `reason`, as text
+// safe to show in a code span of a public comment: a match can hold free text
+// ("ignore ... instructions"), so it keeps only ASCII letters, digits, hyphens,
+// underscores and single spaces. "" when it names none.
+export const securityWord = (reason) => {
+  const text = reasonText(reason);
+  const found = CODES.find(([, code]) => code.test(text));
+  const word = found ? endingRiskWord(text.slice(found[1].exec(text)[0].length)) : (wordOutsideNames(text) ?? "");
+  return word.replaceAll(/[^A-Za-z0-9_-]+/g, " ").trim();
+};

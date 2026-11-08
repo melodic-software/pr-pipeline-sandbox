@@ -78,6 +78,31 @@ test("dispatches review-dependency for a review-tier Dependabot PR", async () =>
   });
 });
 
+test("a check-run read that fails, on a 5xx after its retries, a rate limit or any other answer, skips that PR with a warning and fails nothing", async () => {
+  const api = fakeApi({ nodes: [pr(4), pr(5)] });
+  const listCheckRuns = api.listCheckRuns;
+  let error = Object.assign(new Error("GET check-runs returned 502"), { status: 502 });
+  api.listCheckRuns = async (query) => {
+    if (query.sha === pr(4).headRefOid) {
+      throw error;
+    }
+    return listCheckRuns(query);
+  };
+  const lines = [];
+  const skipped = await run(api, { log: (line) => lines.push(line) });
+  assert.deepEqual(skipped, { dispatched: [{ number: 5, workflowRunId: "7005" }], failed: 0 });
+  assert.ok(lines.some((line) => line.startsWith("::warning::#4:") && line.includes("502")));
+  for (const other of [
+    Object.assign(new Error("GET check-runs returned 403"), { status: 403, rateLimited: true }),
+    Object.assign(new Error("GET check-runs returned 404"), { status: 404 }),
+  ]) {
+    error = other;
+    lines.length = 0;
+    assert.equal((await run(api, { log: (line) => lines.push(line) })).failed, 0, other.message);
+    assert.ok(lines.some((line) => line.startsWith("::warning::#4:") && line.includes(other.message)), other.message);
+  }
+});
+
 test("leaves auto-tier bumps, other authors, drafts and forks alone", async () => {
   const api = fakeApi({
     nodes: [
@@ -217,6 +242,47 @@ test("a head whose last round had no model turn dispatches again, and is not rec
   }
 });
 
+// A kill switch turned on after the model call ran stops the verdict job at
+// the broker (request-lane-token kill-switch-ok): its check skips
+// kill-switch and acts on nothing, so the head is released like a
+// no-model-turn round, and so is a kill-switch stop of the review itself.
+test("a head the kill switch stopped dispatches again, and is not recorded as handled", async () => {
+  for (const [label, checks] of [
+    ["the verdict job's mint was refused", [roundRun("review-dependency", "success", "Passed", "2026-10-17T10:00:00Z"), roundRun("apply-dependency-verdict", "neutral", "Skipped: kill-switch", "2026-10-17T10:05:00Z")]],
+    ["the review run's own kill step stopped it", [roundRun("review-dependency", "neutral", "Skipped: kill-switch", "2026-10-17T10:00:00Z")]],
+  ]) {
+    const node = pr(60);
+    const record = emptyRecord();
+    const { dispatched } = await run(fakeApi({ nodes: [node], checks: headOf(node, checks) }), { record });
+    assert.deepEqual(dispatched, [{ number: 60, workflowRunId: "7060" }], label);
+    assert.equal(record.handled.get(CHECK), undefined, label);
+  }
+});
+
+// The gate stopped the review head-lag: report-check-run posts a superseded-sha
+// skip on the head the run read. On the head the dispatcher reads, the PR's
+// current one, it did no work, so it is sent again once and not recorded,
+// unlike the select job's superseded-sha, which lands on a head the PR left.
+const lagged = (started) => roundRun("review-dependency", "neutral", "Skipped: superseded-sha", started);
+
+test("a review the gate stopped head-lag on the current head is sent again once, under the cap, and not recorded", async () => {
+  const node = pr(62);
+  const record = emptyRecord();
+  const lines = [];
+  const once = await run(fakeApi({ nodes: [node], checks: headOf(node, [lagged("2026-10-17T10:00:00Z")]) }), { record, log: (line) => lines.push(line) });
+  assert.deepEqual(once.dispatched, [{ number: 62, workflowRunId: "7062" }]);
+  assert.equal(record.handled.get(CHECK), undefined);
+  assert.ok(lines.includes(`refire: #62: head ${node.headRefOid}'s ${CHECK} was stopped head-lag; sending it again`), lines.join("\n"));
+  for (const [label, checks] of [
+    ["a newer review passed", [lagged("2026-10-17T10:00:00Z"), roundRun("review-dependency", "success", "Passed", "2026-10-17T10:30:00Z")]],
+    ["a newer review is still going", [lagged("2026-10-17T10:00:00Z"), { ...roundRun("review-dependency", null, "", "2026-10-17T10:30:00Z"), status: "in_progress" }]],
+    ["the head is at the cap", [lagged("2026-10-17T10:00:00Z"), lagged("2026-10-17T10:30:00Z"), lagged("2026-10-17T11:00:00Z")]],
+  ]) {
+    const { dispatched } = await run(fakeApi({ nodes: [node], checks: headOf(node, checks) }));
+    assert.deepEqual(dispatched, [], label);
+  }
+});
+
 // A review-dependency run the usage limit stopped at `started`, its lane record
 // naming a reset an hour later.
 const limitStop = (started) => {
@@ -300,6 +366,29 @@ test("a round that answered, or a newer review-dependency check, still holds the
   }
 });
 
+// A verdict job that stopped on a reason routed to a failing status
+// (dependency-invalid) posts lane-stopped: the next run retries the same head,
+// a fresh model session, until limit-stops-per-head such stops stand on it.
+const laneStopped = (started) => roundRun("apply-dependency-verdict", "neutral", "Skipped: lane-stopped", started);
+test("a head whose last verdict was a lane stop dispatches again under the per-head cap, and not at it", async () => {
+  const limits = { ...LIMIT_DEFAULTS, "limit-stops-per-head": 2 };
+  const node = pr(64);
+  const first = [roundRun("review-dependency", "success", "Passed", "2026-10-17T10:00:00Z"), laneStopped("2026-10-17T10:05:00Z")];
+  const record = emptyRecord();
+  const under = await run(fakeApi({ nodes: [node], checks: headOf(node, first) }), { record, limits });
+  assert.deepEqual(under.dispatched, [{ number: 64, workflowRunId: "7064" }], "1 stop of a cap of 2");
+  assert.equal(record.handled.get(CHECK), undefined, "a released head is not recorded");
+
+  const atCap = [...first, roundRun("review-dependency", "success", "Passed", "2026-10-17T11:00:00Z"), laneStopped("2026-10-17T11:05:00Z")];
+  const lines = [];
+  const capRecord = emptyRecord();
+  const api = fakeApi({ nodes: [node], checks: headOf(node, atCap) });
+  assert.deepEqual((await run(api, { record: capRecord, limits, log: (line) => lines.push(line) })).dispatched, [], "2 stops of a cap of 2");
+  assert.deepEqual(api.calls.dispatch, []);
+  assert.ok(lines.some((line) => line.startsWith("::warning::#64:") && line.includes("stopped 2 time(s)")), "the cap is named");
+  assert.ok(capRecord.handled.get(CHECK)?.has(node.headRefOid), "a capped head is recorded");
+});
+
 // Between the round's review-dependency check and its verdict job's check, a
 // dispatcher run must not record the head, or the verdict's no-model-turn skip
 // could never release it.
@@ -354,6 +443,16 @@ test("a version 2 record that holds a limit-stopped head is ignored, and the hea
   const checks = headOf(node, [limitStop("2026-10-17T10:00:00Z"), noModelTurn()]);
   const { dispatched } = await run(fakeApi({ nodes: [node], checks }), { record, now: Date.parse("2026-10-17T12:00:00Z") });
   assert.deepEqual(dispatched, [{ number: 67, workflowRunId: "7067" }]);
+});
+
+// A version 5 record held a head-lag-stopped head as reviewed (its
+// superseded-sha skip was terminal); that record's version is read as empty.
+test("a version 5 record that holds a head-lag-stopped head is ignored, and the head dispatches again", async () => {
+  const node = pr(68);
+  const record = parseRecord(JSON.stringify({ version: 5, handled: { [CHECK]: [node.headRefOid] }, dispatched: {} }));
+  assert.equal(record.handled.get(CHECK), undefined, "read as empty");
+  const checks = headOf(node, [roundRun("review-dependency", "neutral", "Skipped: superseded-sha", "2026-10-17T10:00:00Z")]);
+  assert.deepEqual((await run(fakeApi({ nodes: [node], checks }), { record })).dispatched, [{ number: 68, workflowRunId: "7068" }]);
 });
 
 // Reads spent only where they change the decision. Each count beside the

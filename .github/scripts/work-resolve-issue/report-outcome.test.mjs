@@ -3,37 +3,90 @@
 // with a Conventional Commits title (the run's, else one from the issue title), no
 // label (the class lives on the issue only), and the hold line for
 // untrusted-provenance work or a trust or lane-power diff; `pushback` and
-// `stopped` comment, add needs-human and remove agent-ready.
+// `stopped` comment and take the route stop-routes.json gives their stop:
+// needs-human only for an intent, design, security or cost reason.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  capRetries,
   closingPulls,
+  countRestarts,
   countTurnCapRestarts,
   decide,
+  DECISION_LINE,
+  REFINE_MARKER,
+  doneEvidence,
+  ESCALATION_MARKER,
   findPrior,
+  redispatchComment,
+  limitedMarker,
+  readLaneCredential,
+  withCredential,
   findPriorMain,
   main,
+  mustHold,
   parseOutcomeMarker,
+  pruneBranches,
+  heldPaths,
   readHoldPaths,
   readFunding,
   readChecks,
+  readIssueStop,
   readOutcome,
+  readOverCap,
+  readScanRefusal,
+  SCAN_REFUSALS,
   readTurnCap,
   RESUMABLE,
+  LANE_HOLDS,
+  refireStale,
+  REFIRED,
   reusePlan,
+  HOLD_LINE,
+  HOLD_LABEL,
+  linkageLines,
   trustedLabeler,
+  unmarkedAnswer,
+  waitedPull,
+  humanSince,
+  workStatusField,
 } from "./report-outcome.mjs";
+import { closeStop, parentDone } from "../lib/done-evidence.mjs";
+import { finishedParent, patchCapStopped } from "../intake-triage/admit.mjs";
+import { LIMIT_DEFAULTS } from "./limits.mjs";
+import { STOP_ROUTES } from "./stop-routes.mjs";
+import { STATUS_CONFIG, TRUSTED_ACTORS, withFields } from "../../actions/resolve-config/read-status.fixtures.mjs";
+import { statusReader } from "../../actions/resolve-config/read-status.mjs";
+import { statusWriter } from "../../actions/resolve-config/write-status.mjs";
+
+// The real Work status reader (read-status.mjs statusReader) over field reads
+// that `fields` answers (read-status.fixtures.mjs withFields); it makes no
+// other call.
+const fieldReaderOver = (github) => statusReader({ github, repository: "o/r", config: STATUS_CONFIG, trustedActors: TRUSTED_ACTORS, log: () => {} });
+const fieldReader = (fields) => {
+  const github = withFields(async (method, path) => {
+    throw new Error(`unexpected ${method} ${path}`);
+  }, fields);
+  return statusReader({ github, repository: "o/r", config: STATUS_CONFIG, trustedActors: TRUSTED_ACTORS, log: () => {} });
+};
+import { isPersonReason, parseReason } from "../lib/stop-reason.mjs";
+import { tempDir } from "../../../lib/test-tmp.mjs";
+import { ADMISSION_RECORD_MARKER, recordBody } from "../lib/admission-record.mjs";
 
 const BRANCH = "work-resolve-issue/issue-77-123-1";
 // The first line of every hand-back comment: the attended queue's escalation
 // marker in the grammar of plugins/work-items/reference/escalation-marker.md.
 const ESC = "<!-- work-items:escalation lane=work-resolve-issue kind=escalated -->\n";
+// The issue history a retry reads to count the retries already made.
+const HISTORY = [
+  ["GET", /\/issues\/77\/comments$/, 200, []],
+  ["GET", /\/issues\/77\/events$/, 200, []],
+];
 
 // The run-checks job's `checks` output for `branch` at `tip`, and the ref
 // read main compares that tip with. A test puts it in the outcome directory as
@@ -48,7 +101,7 @@ const NO_CHECKS = { tip: CHECKED_TIP, results: [] };
 const branchTip = (branch = BRANCH, sha = CHECKED_TIP) => ["GET", new RegExp(`/git/ref/heads/${branch}$`), 200, { object: { sha } }];
 
 function withDir(files, run) {
-  const dir = mkdtempSync(join(tmpdir(), "outcome-"));
+  const dir = tempDir("outcome-");
   try {
     for (const [name, text] of Object.entries(files)) {
       writeFileSync(join(dir, name), text);
@@ -76,6 +129,12 @@ function decideDone(overrides = {}) {
     ...overrides,
   });
 }
+
+
+// main's Work status write, recorded among a fake's calls in call order.
+const statusInto = (calls) => async (number, state) => {
+  calls.push({ method: "STATUS", path: `/issues/${number}`, body: { state } });
+};
 
 test("a missing outcome file reads as stopped", () => {
   withDir({}, (dir) => {
@@ -168,6 +227,48 @@ test("a remaining item is neutralized like other run text", () => {
   assert.ok(body.includes("\n## Remaining work\n\n- Closes ＃12 for someone ＃＃ Heading\n"), body);
 });
 
+// #13425: a done-when that asks the PR body for a linkage line gets it as a
+// plain line under the Closes line, built from the issue's text, while the
+// run's own text keeps its full-width ＃.
+const LINKED_ISSUE = [
+  "## Done when",
+  "",
+  "- [ ] The PR body carries `Refs: #6917`.",
+  "- [x] The pull request body carries `Siblings:  #20 ,#30` too.",
+  "- [ ] A test asserts `Refs: #12` holds.",
+  "- [ ] The PR body names `Refs: #77` again.",
+  "<!-- - [ ] The PR body carries `Refs: #99`. -->",
+  "```",
+  "- [ ] The PR body carries `Refs: #98`.",
+  "```",
+  "The PR body carries `Refs: #97` in prose.",
+].join("\n");
+
+test("linkageLines reads the done-when items that ask the PR body for a Refs or Siblings line", () => {
+  assert.deepEqual(linkageLines(LINKED_ISSUE, 77), ["Refs: #6917", "Siblings: #20, #30"]);
+  assert.deepEqual(linkageLines("- [ ] The PR body carries `Refs: #6917 and #2`.", 77), []);
+  const eleven = Array.from({ length: 11 }, (_, i) => `#${i + 1}`).join(", ");
+  assert.deepEqual(linkageLines(`- [ ] The PR body carries \`Siblings: ${eleven}\`.`, 77), []);
+  assert.deepEqual(linkageLines(undefined, 77), []);
+});
+
+test("a done-when's Refs line opens the PR body as a plain line while the quoted summary keeps ＃", () => {
+  const plan = decideDone({ outcome: { ...done, summary: "Set Refs: #6917 for the lane." }, linkage: linkageLines(LINKED_ISSUE, 77) });
+  assert.ok(plan.body.startsWith("Closes #77\nRefs: #6917\nSiblings: #20, #30\n\n## Summary\n"), plan.body);
+  assert.ok(plan.body.includes("> Set Refs: ＃6917 for the lane."), plan.body);
+});
+
+test("a Refs PR keeps only one Refs number, so the merge lane still reads its issue", () => {
+  const plan = decideDone({ outcome: { ...done, remaining: ["Part B"] }, linkage: ["Refs: #6917", "Siblings: #20"] });
+  assert.ok(plan.body.startsWith("Refs: #77\nSiblings: #20\n\n## Summary"), plan.body);
+  assert.ok(!plan.body.includes("#6917"), plan.body);
+});
+
+test("a reused branch's PR carries the done-when's linkage lines under Closes", () => {
+  const plan = reusePlan({ issueNumber: 77, branch: BRANCH, changedFiles: ["README.md"], holdPaths: HOLD_GLOBS, checks: NO_CHECKS, linkage: ["Refs: #6917"] });
+  assert.ok(plan.body.startsWith("Closes #77\nRefs: #6917\n\n"), plan.body);
+});
+
 test("a Refs PR with a trusted merge: human label still carries the hold line", () => {
   const plan = decideDone({ outcome: { ...done, remaining: ["Part B"] }, humanMerge: true });
   assert.ok(plan.body.startsWith("Refs: #77\n\nHold: a human merges this\n"), plan.body);
@@ -229,10 +330,12 @@ test("read-only work on ordinary files carries no hold line", () => {
   assert.ok(!decideDone().body.includes("Hold: a human merges this"));
 });
 
-test("untrusted-provenance work carries the hold line", () => {
-  const plan = decideDone({ issueLabels: ["work-class: untrusted-provenance"] });
-  assert.ok(plan.body.split("\n").includes("Hold: a human merges this"), plan.body);
-});
+for (const label of ["work-class: untrusted-provenance", "provenance: untrusted"]) {
+  test(`untrusted-provenance work labeled only ${label} carries the hold line`, () => {
+    const plan = decideDone({ issueLabels: [label] });
+    assert.ok(plan.body.split("\n").includes("Hold: a human merges this"), plan.body);
+  });
+}
 
 // Structural risk shows in the diff, which the review lanes read.
 test("structural work on ordinary files carries no hold line", () => {
@@ -293,6 +396,25 @@ for (const [name, text] of [
     });
   });
 }
+
+// merge.diff-check.path-holds (owner decisions Q15 and Q16): off, a denied
+// path holds nothing; on, it holds as before; an unreadable list still holds.
+test("with path holds off a denied path holds nothing, and on it holds the PR", () => {
+  const config = (pathHolds) => JSON.stringify({ merge: { "diff-check": { "denied-paths": ["a/**"], ...(pathHolds === undefined ? {} : { "path-holds": pathHolds }) } } });
+  for (const off of [undefined, false]) {
+    withDir({ "resolved-config.json": config(off) }, (dir) => {
+      const holdPaths = heldPaths(join(dir, "resolved-config.json"));
+      assert.deepEqual(holdPaths, []);
+      assert.ok(!decideDone({ holdPaths, changedFiles: ["a/x.md"] }).body.includes("Hold: a human merges this"));
+    });
+  }
+  withDir({ "resolved-config.json": config(true) }, (dir) => {
+    const holdPaths = heldPaths(join(dir, "resolved-config.json"));
+    assert.deepEqual(holdPaths, ["a/**"]);
+    assert.ok(decideDone({ holdPaths, changedFiles: ["a/x.md"] }).body.split("\n").includes("Hold: a human merges this"));
+  });
+  withDir({ "resolved-config.json": "{" }, (dir) => assert.equal(heldPaths(join(dir, "resolved-config.json")), null));
+});
 
 test("an unreadable resolved config reads as no denied-path list and holds the PR", () => {
   withDir({}, (dir) => {
@@ -361,7 +483,56 @@ test("the model's text is cut to the length caps after escaping", () => {
   });
   // 3000 for the summary, 20 items of 300 for the list, plus the fixed text.
   assert.ok(plan.body.length < 3000 + 20 * 305 + 1000, String(plan.body.length));
-  assert.ok(!/&l?t?$|&lt$/m.test(plan.body.split("## Fix")[0].trim()), "no half-cut entity");
+  assert.ok(!/&[a-z]*…$/m.test(plan.body), "no half-cut entity before the cut marker");
+  assert.ok(/&lt;…$/m.test(plan.body), plan.body);
+});
+
+const LONG_ITEM = `${"word ".repeat(70)}tail`;
+const itemLines = (body, heading) => section(body, heading).split("\n").filter((line) => line.startsWith("- "));
+
+test("a long item is cut at its last word inside the cap and marked", () => {
+  const body = bodyOf({ ...done, changes: [LONG_ITEM], verification: [LONG_ITEM], not_done: [LONG_ITEM] });
+  for (const heading of ["Fix", "Verification", "Not verified"]) {
+    const [line] = itemLines(body, heading);
+    assert.ok(/^- (word )+word…$/.test(line), `${heading}: ${line}`);
+    assert.ok(line.length - 2 <= 300, `${heading}: ${line.length}`);
+  }
+});
+
+test("a long summary is cut at a word and marked", () => {
+  const quote = section(bodyOf({ ...done, summary: `${"word ".repeat(700)}tail` }), "Summary");
+  assert.ok(/word…$/.test(quote.trim()), quote.slice(-40));
+  assert.ok(!quote.includes("tail"), quote.slice(-40));
+});
+
+test("an item that is one token past the cap is cut hard and marked", () => {
+  assert.deepEqual(itemLines(bodyOf({ ...done, changes: ["x".repeat(400)] }), "Fix"), [`- ${"x".repeat(299)}…`]);
+});
+
+test("a cut never splits a surrogate pair", () => {
+  for (const pad of [298, 299]) {
+    const [line] = itemLines(bodyOf({ ...done, changes: [`${"x".repeat(pad)}${"😀".repeat(20)}`] }), "Fix");
+    assert.equal(Buffer.from(line, "utf8").toString("utf8"), line, `pad ${pad}`);
+    assert.ok(line.endsWith("…"), line);
+  }
+});
+
+test("a cut that keeps only whitespace is empty, and leading whitespace does not drop the token after it", () => {
+  const quote = section(bodyOf({ ...done, summary: " ".repeat(3500) }), "Summary");
+  assert.ok(quote.endsWith("\n> (none)"), quote);
+  assert.deepEqual(itemLines(bodyOf({ ...done, changes: [`  ${"x".repeat(400)}`] }), "Fix"), [`- ${"x".repeat(297)}…`]);
+});
+
+test("a runner check name past the cap is cut at a word", () => {
+  const check = `${"step ".repeat(70)}tail`;
+  const [result] = readChecks(checksFile({ results: [{ check, exit: 0 }] }), { branch: BRANCH }).results;
+  assert.match(result.check, /^(step )+step…$/);
+  assert.ok(result.check.length <= 300, String(result.check.length));
+});
+
+test("an item within the cap is unchanged", () => {
+  const item = `${"a".repeat(296)} end`;
+  assert.deepEqual(itemLines(bodyOf({ ...done, changes: [item, "short ünïcode 😀 item"] }), "Fix"), [`- ${item}`, "- short ünïcode 😀 item"]);
 });
 
 // CommonMark decodes `&commat;` to `@` and `&num;` to `#`, and GitHub links a
@@ -385,7 +556,9 @@ test("a bare URL in model text does not autolink", () => {
 test("a not_done item marked required counts even when it names nothing", () => {
   withDir({ "work-outcome.json": JSON.stringify({ ...done, not_done: [{ what: 5, required: true }] }) }, (dir) => {
     const outcome = readOutcome(join(dir, "work-outcome.json"));
-    assert.equal(decideDone({ outcome }).exit, "stopped");
+    const plan = decideDone({ outcome });
+    assert.equal(plan.action, "retry");
+    assert.equal(plan.stop, "required-undone");
   });
 });
 
@@ -437,16 +610,18 @@ test("a done outcome with an empty not_done and a failing runner check is stoppe
     outcome: { ...done, notDone: [], verification: ["every check passed"] },
     checks: { tip: CHECKED_TIP, results: [{ check: FRAGMENTS, exit: 1 }] },
   });
-  assert.equal(plan.action, "hand-back");
-  assert.equal(plan.exit, "stopped");
-  assert.deepEqual(plan.addLabels, ["needs-human"]);
-  assert.deepEqual(plan.removeLabels, ["agent-ready"]);
+  // An unfinished check goes back to agent-ready with the branch named.
+  assert.equal(plan.action, "retry");
+  assert.equal(plan.stop, "check-failed");
+  assert.deepEqual(plan.addLabels, []);
   assert.ok(plan.comment.includes("- scripts/check-changelog-fragments.sh --check failed (exit 1)"), plan.comment);
+  assert.ok(plan.comment.includes(`Partial work is on the branch \`${BRANCH}\``), plan.comment);
+  assert.ok(!plan.comment.startsWith(ESC), plan.comment);
 });
 
 test("a done outcome whose runner check results are missing is stopped", () => {
   const plan = decideDone({ checks: null });
-  assert.equal(plan.exit, "stopped");
+  assert.equal(plan.action, "retry");
   assert.ok(plan.comment.includes("check results are missing"), plan.comment);
 });
 
@@ -537,8 +712,8 @@ test("a done outcome whose not_done holds a skipped required check is stopped", 
       ],
     },
   });
-  assert.equal(plan.action, "hand-back");
-  assert.equal(plan.exit, "stopped");
+  assert.equal(plan.action, "retry");
+  assert.equal(plan.stop, "required-undone");
   assert.match(plan.comment, /check-changelog-fragments/);
 });
 
@@ -603,23 +778,47 @@ test("with no denied path a diff at the compare cap carries no hold line, since 
   assert.ok(!decideDone({ changedFiles: files, holdPaths: [] }).body.includes("Hold: a human merges this"));
 });
 
-test("done with no branch is stopped, since nothing was committed", () => {
+test("done with no branch is retried, since nothing was committed", () => {
   const plan = decideDone({ branch: "" });
-  assert.equal(plan.action, "hand-back");
-  assert.equal(plan.exit, "stopped");
+  assert.equal(plan.action, "retry");
+  assert.equal(plan.stop, "done-no-commit");
+});
+
+// collect-patch.sh exits 3, and writes no patch, when a run leaves content at
+// a stub name such as .npmrc or .env: possibly a planted credential or config
+// file. The run's outcome file and records are its own to forge, so the
+// refusal holds whatever they say.
+test("a run whose patch collector refused goes to a person, whatever its outcome or records say", () => {
+  const base = { issueNumber: 77, issueLabels: ["agent-ready"], branch: "", changedFiles: [], collectRefused: true };
+  for (const [name, args] of [
+    ["done", { outcome: { exit: "done", reason: "", title: "", summary: "" } }],
+    ["unread", { outcome: readOutcome("/nonexistent/work-outcome.json") }],
+    ["turn cap", { outcome: readOutcome("/nonexistent/work-outcome.json"), turnCap: { cap: 50 }, turnCapRestarts: 0, limits: { ...LIMIT_DEFAULTS, "turn-cap-restarts": 1 } }],
+    ["resumed", { outcome: { exit: "done", reason: "", title: "", summary: "" }, resumed: "work-resolve-issue/issue-77-1-1" }],
+  ]) {
+    const plan = decide({ ...base, ...args });
+    assert.equal(plan.stop, "collect-refused", name);
+    assert.equal(plan.status, "needs-human", name);
+    assert.match(plan.comment, /\.npmrc/, name);
+  }
 });
 
 // apply-issue-patch's escalation reason: a done run whose patch was refused
 // committed something that never landed, and the person sees why.
-for (const [reason, why] of [
-  ["patch-protected-path", /a path the issue lane may not push/],
-  ["patch-invalid", /not a valid patch/],
-  ["patch-not-applied", /did not apply/],
+// A protected path goes to the host queue, a credential shape to a person (a
+// token-leak path, owner decision on #11021), and any other invalid patch or
+// an apply fault back to the lane.
+for (const [reason, why, action, labels] of [
+  ["patch-protected-path", /a path the issue lane may not push/, "host-run", ["host-run", "status: confirmed"]],
+  ["patch-credential", /credential shape/, "hand-back", ["needs-human"]],
+  ["patch-invalid", /not a valid patch/, "retry", []],
+  ["patch-not-applied", /did not apply/, "retry", []],
+  ["patch-apply-failed", /failed before it committed or refused the patch/, "retry", []],
 ]) {
-  test(`done whose patch apply-issue-patch refused (${reason}) hands back naming the reason, not an empty run`, () => {
-    const plan = decideDone({ branch: "", escalation: reason, runUrl: "https://example/o/r/actions/runs/123" });
-    assert.equal(plan.action, "hand-back");
-    assert.equal(plan.exit, "stopped");
+  test(`done whose patch apply-issue-patch refused (${reason}) routes to ${action} naming the reason, not an empty run`, () => {
+    const plan = decideDone({ branch: "", escalation: reason, humanLabel: "needs-human", runUrl: "https://example/o/r/actions/runs/123" });
+    assert.equal(plan.action, action);
+    assert.deepEqual([...plan.addLabels, ...(plan.status ? [plan.status] : [])], labels);
     assert.ok(plan.comment.includes(`\`${reason}\``), plan.comment);
     assert.match(plan.comment, why);
     assert.doesNotMatch(plan.comment, /committed nothing/);
@@ -627,11 +826,18 @@ for (const [reason, why] of [
   });
 }
 
-test("a refused patch on a resumed run hands back instead of opening the PR from the resumed branch", () => {
+test("a refused patch on a resumed run goes to the host queue instead of opening the PR from the resumed branch", () => {
   const plan = decideDone({ branch: "", resumed: "work-resolve-issue/issue-77-100-1", checks: { tip: CHECKED_TIP, results: [{ check: FRAGMENTS, exit: 0 }] }, escalation: "patch-protected-path" });
-  assert.equal(plan.action, "hand-back");
+  assert.equal(plan.action, "host-run");
   assert.ok(plan.comment.includes("`patch-protected-path`"), plan.comment);
   assert.ok(plan.comment.includes("Partial work is on the branch `work-resolve-issue/issue-77-100-1`"), plan.comment);
+});
+
+// A failure after apply-issue-patch made its branch (a later step) leaves the
+// branch's plan as it was.
+test("patch-apply-failed changes no plan for a run whose branch apply-issue-patch made", () => {
+  const branch = "work-resolve-issue/issue-77-100-1";
+  assert.deepEqual(decideDone({ branch, escalation: "patch-apply-failed" }), decideDone({ branch }));
 });
 
 test("patch-empty changes no plan: a done run with no commit, a resumed run, or a pushback", () => {
@@ -639,7 +845,7 @@ test("patch-empty changes no plan: a done run with no commit, a resumed run, or 
   assert.deepEqual(decideDone({ ...resumed, escalation: "patch-empty" }), decideDone(resumed));
   assert.deepEqual(decideDone({ branch: "", escalation: "patch-empty" }), decideDone({ branch: "" }));
   assert.match(decideDone({ branch: "", escalation: "patch-empty" }).comment, /committed nothing/);
-  const pushback = { exit: "pushback", reason: "Which file?", title: "", summary: "" };
+  const pushback = { exit: "pushback", reason: "Which file?", cause: "intent", title: "", summary: "" };
   for (const escalation of ["patch-empty", "patch-protected-path"]) {
     assert.deepEqual(decideDone({ outcome: pushback, branch: "", escalation }), decideDone({ outcome: pushback, branch: "" }), escalation);
   }
@@ -647,7 +853,7 @@ test("patch-empty changes no plan: a done run with no commit, a resumed run, or 
 
 test("pushback comments, adds needs-human and removes agent-ready", () => {
   const plan = decide({
-    outcome: { exit: "pushback", reason: "Which file?", title: "", summary: "" },
+    outcome: { exit: "pushback", reason: "Which file?", cause: "intent", title: "", summary: "" },
     issueNumber: 77,
     issueLabels: ["agent-ready"],
     branch: "",
@@ -655,27 +861,255 @@ test("pushback comments, adds needs-human and removes agent-ready", () => {
     humanLabel: "needs-human",
   });
   assert.equal(plan.action, "hand-back");
-  assert.deepEqual(plan.addLabels, ["needs-human"]);
-  assert.deepEqual(plan.removeLabels, ["agent-ready"]);
+  assert.equal(plan.status, "needs-human");
   assert.match(plan.comment, /Which file\?/);
 });
 
-// A stopped issue goes to a person, so it carries the hold alone: agent-ready
-// beside needs-human leaves it in both queues.
-test("stopped removes agent-ready and names the branch that holds partial work", () => {
+// The owner's rule for when work stops for the owner: a pre-edit question reaches a person only as an intent
+// question, which the run names with `cause: "intent"`; a choice of means or a
+// design detail, or a pushback naming no cause, is the lane's to decide.
+test("a pushback whose cause opens with a hold code holds on that code, whatever its reason", () => {
+  const plain = { issueNumber: 77, issueLabels: ["agent-ready"], branch: "", changedFiles: [], humanLabel: "needs-human" };
+  for (const [cause, stop] of [
+    ["cost-risk: provisions a paid Azure plan", "cost-risk"],
+    ["security-risk: the deploy token is in the log", "security-risk"],
+    ["design-change: a new store", "design-change"],
+  ]) {
+    const plan = decide({ ...plain, outcome: { exit: "pushback", reason: "Which plan?", cause, title: "", summary: "" } });
+    assert.equal(plan.action, "hand-back", cause);
+    assert.equal(plan.stop, stop, cause);
+    assert.ok((plan.status === "needs-human"), cause);
+  }
+});
+
+test("a pushback-means intake comment shows the cause the run named", () => {
+  const plain = { issueNumber: 77, issueLabels: ["agent-ready"], branch: "", changedFiles: [], humanLabel: "needs-human" };
+  const plan = decide({ ...plain, outcome: { exit: "pushback", reason: "Which helper?", cause: "means: two helpers fit", title: "", summary: "" } });
+  assert.equal(plan.stop, "pushback-means");
+  assert.match(plan.comment, /The cause the run named:\n\n> means: two helpers fit/, plan.comment);
+});
+
+test("a pushback without cause intent goes back through intake instead of reaching a person", () => {
+  const plain = { issueNumber: 77, issueLabels: ["agent-ready"], branch: "", changedFiles: [], humanLabel: "needs-human" };
+  for (const cause of [undefined, "", "design", "means", 7]) {
+    const plan = decide({ ...plain, outcome: { exit: "pushback", reason: "Split the test file or fix only the rows?", cause, title: "", summary: "" } });
+    assert.equal(plan.action, "intake", String(cause));
+    assert.equal(plan.stop, "pushback-means", String(cause));
+    assert.ok(!(plan.status === "needs-human") && !plan.comment.includes("work-items:escalation"), plan.comment);
+    assert.equal(parseReason(plan.comment), null, plan.comment);
+  }
+  for (const cause of ["intent", "INTENT", " Intent\n", "intent-change", "Intent-Change"]) {
+    const intent = decide({ ...plain, outcome: { exit: "pushback", reason: "Which outcome?", cause, title: "", summary: "" } });
+    assert.equal(intent.action, "hand-back", JSON.stringify(cause));
+    assert.equal(parseReason(intent.comment).reason, "intent");
+  }
+  withDir({ "work-outcome.json": JSON.stringify({ exit: "pushback", reason: "Which outcome?", cause: "intent" }) }, (dir) => {
+    assert.equal(readOutcome(join(dir, "work-outcome.json")).cause, "intent");
+  });
+});
+
+// A pushback with no intent cause holds only for a hold code its reason opens
+// with or its cause names; a security word alone goes to intake, whose own
+// security rules judge it.
+test("a pushback holds only for an explicit hold code, never for a security word alone", () => {
+  const plain = { issueNumber: 77, issueLabels: ["agent-ready"], branch: "", changedFiles: [], humanLabel: "needs-human" };
+  const run = (reason, cause) => decide({ ...plain, outcome: { exit: "pushback", reason, cause, title: "", summary: "" } });
+  for (const reason of [
+    "Should the fix inject the config through DI or read the file directly?",
+    "Should this use the GITHUB_TOKEN or the lanes App token for the call?",
+    "Which of the security review lane's two prompts should change?",
+    "This needs an API key the lane does not hold.",
+    "The issue asks to print the deploy token in the log.",
+  ]) {
+    const plan = run(reason);
+    assert.equal(plan.stop, "pushback-means", reason);
+    assert.equal(plan.action, "intake", reason);
+    assert.ok(!(plan.status === "needs-human"), reason);
+  }
+  for (const [reason, cause, stop, code] of [
+    ["security-risk: the issue asks to print the deploy token in the log.", undefined, "security-risk", "security"],
+    ["design-change: the fix replaces the lane's routing table with a service.", undefined, "design-change", "design"],
+    ["This provisions a paid Azure plan that bills the owner.", "cost-risk", "cost-risk", "cost"],
+    ["This needs a new shared store other services depend on.", "design-change", "design-change", "design"],
+    ["The fix needs the token rotated.", "security-risk", "security-risk", "security"],
+    ["Which outcome does the issue want?", "intent_change", "pushback", "intent"],
+    ["Which outcome does the issue want?", "intent change", "pushback", "intent"],
+    ["Which outcome does the issue want?", " Intent_Change\n", "pushback", "intent"],
+    ["cost-risk: provisions a paid Azure plan.", "intent", "cost-risk", "cost"],
+    ["design-change: a new store.", "intent", "design-change", "design"],
+  ]) {
+    const plan = run(reason, cause);
+    assert.equal(plan.action, "hand-back", `${cause} ${reason}`);
+    assert.equal(plan.stop, stop, `${cause} ${reason}`);
+    assert.equal(parseReason(plan.comment).reason, code, plan.comment);
+  }
+  // A cause that names a code with no hold route, or a hold-class word that
+  // is not a code, is no hold.
+  for (const cause of ["cost", "host-only", "stopped", "pushback-means"]) {
+    assert.equal(run("Which helper should change?", cause).stop, "pushback-means", cause);
+  }
+  // A host-run or attended code takes its row.
+  const host = run("host-only: needs the GPU desktop.");
+  assert.equal(host.stop, "host-only");
+  assert.equal(host.action, "host-run");
+  // Work status leaves agent-ready, so a listed human's agent-ready after the
+  // host step is a field change that starts a run.
+  assert.equal(host.status, "status: confirmed");
+  // One that names a security risk after the code reaches a person (owner
+  // decision 2026-10-29), and a capability phrasing names none.
+  for (const reason of ["host-only: needs the deploy token printed in the log.", "manual-external: rotate the leaked deploy token in the DNS account."]) {
+    const risky = run(reason);
+    assert.equal(risky.stop, "security-risk", reason);
+    assert.equal(risky.action, "hand-back", reason);
+    assert.ok((risky.status === "needs-human"), reason);
+    assert.equal(parseReason(risky.comment).reason, "security", risky.comment);
+  }
+  assert.equal(run("host-only: needs a host with model credentials.").stop, "host-only");
+  const attended = run("manual-external: add the DNS record for the docs site.");
+  assert.equal(attended.stop, "manual-external");
+  assert.equal(attended.action, "attended");
+  assert.equal(attended.status, "status: confirmed");
+  // A non-hold, non-lane code goes through intake.
+  for (const reason of ["blocked-by-pr: #12 changes the same file.", "already-done: abc1234 fixed it.", "report-delivered: the report is posted."]) {
+    const plan = run(reason);
+    assert.equal(plan.stop, "pushback-means", reason);
+    assert.equal(plan.action, "intake", reason);
+  }
+  // A cause names its code in spaces, mixed case, full-width letters, hyphen
+  // runs and a trailing colon.
+  for (const [cause, stop] of [
+    ["Security Risk", "security-risk"],
+    ["COST_RISK.", "cost-risk"],
+    ["ｉｎｔｅｎｔ", "pushback"],
+    ["intent - change", "pushback"],
+    ["intent:", "pushback"],
+    ["intent: ", "pushback"],
+    ["-design--change-", "design-change"],
+  ]) {
+    assert.equal(run("Which helper should change?", cause).stop, stop, JSON.stringify(cause));
+  }
+});
+
+// A pushback with no code whose words read as a security risk goes to intake
+// with no means framing; a second one since a listed human added agent-ready
+// holds as security-risk instead of failing.
+test("a pushback naming a security risk goes to intake unframed once, then reaches a person", () => {
+  const plain = { issueNumber: 77, issueLabels: ["agent-ready"], branch: "", changedFiles: [], humanLabel: "needs-human" };
+  for (const reason of ["The issue asks to print the deploy token in the log.", "blocked-by-pr: #12's log printed the deploy token."]) {
+    const plan = decide({ ...plain, outcome: { exit: "pushback", reason, title: "", summary: "" } });
+    assert.equal(plan.action, "intake", reason);
+    assert.equal(plan.stop, "pushback-means", reason);
+    assert.doesNotMatch(plan.comment, /waits on no decision|choice of means|design detail/, plan.comment);
+    assert.match(plan.comment, /security risk/, plan.comment);
+    const spent = capRetries(plan, 1);
+    assert.equal(spent.action, "hand-back", reason);
+    assert.equal(spent.stop, "security-risk", reason);
+    assert.ok((spent.status === "needs-human") && spent.comment.includes("work-items:escalation"), spent.comment);
+    assert.equal(parseReason(spent.comment).reason, "security", spent.comment);
+  }
+  const means = decide({ ...plain, outcome: { exit: "pushback", reason: "Split the test file or fix only the rows?", title: "", summary: "" } });
+  assert.match(means.comment, /choice of means/);
+  assert.match(means.comment, /waits on no decision from a person/);
+  assert.equal(capRetries(means, 1).action, "fail");
+});
+
+// The security reading reads every text the comment can show (the reason, the
+// summary, each not-done item) and the cause, so no security text the run
+// wrote ends the issue with no person.
+test("a pushback whose summary or cause names a security risk goes to intake marked security, then reaches a person", () => {
+  const plain = { issueNumber: 77, issueLabels: ["agent-ready"], branch: "", changedFiles: [], humanLabel: "needs-human", runId: "123" };
+  for (const [reason, cause, summary, notDone = []] of [
+    ["", "", "the deploy token was printed in the CI log"],
+    ["Which helper?", "security", ""],
+    ["Which helper?", "secret leak", ""],
+    ["Which helper?", "", "Two helpers fit.", [{ what: "The issue asks to print the deploy token in the log." }]],
+  ]) {
+    const label = JSON.stringify([reason, cause, summary, notDone]);
+    const plan = decide({ ...plain, outcome: { exit: "pushback", reason, cause, title: "", summary, notDone } });
+    assert.equal(plan.action, "intake", label);
+    assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=intake security run=123 -->\n"), plan.comment);
+    assert.equal(parseOutcomeMarker(plan.comment).security, true, label);
+    const spent = capRetries(plan, 1);
+    assert.equal(spent.action, "hand-back", label);
+    assert.equal(spent.stop, "security-risk", label);
+    assert.equal(parseReason(spent.comment).reason, "security", spent.comment);
+    assert.match(spent.comment, /named a possible security risk again after its intake rounds were spent/, spent.comment);
+    assert.doesNotMatch(spent.comment, /make it clearer first/, spent.comment);
+  }
+  const means = decide({ ...plain, outcome: { exit: "pushback", reason: "Which helper?", cause: "means", title: "", summary: "" } });
+  assert.ok(means.comment.startsWith("<!-- work-resolve-issue outcome=intake run=123 -->\n"), means.comment);
+  assert.equal(parseOutcomeMarker(means.comment).security, undefined);
+});
+
+// A security marker parses with every other field intact.
+test("parseOutcomeMarker reads the security tag beside run and branch", () => {
+  assert.deepEqual(parseOutcomeMarker("<!-- work-resolve-issue outcome=intake security run=99 branch=resumed -->\nWhy."), {
+    outcome: "intake",
+    resets: null,
+    run: "99",
+    onResumed: true,
+    security: true,
+  });
+  assert.equal(parseOutcomeMarker(`${ESC}<!-- work-resolve-issue outcome=intake security run=99 -->`).run, "99");
+});
+
+// An explicit security-risk code outranks an intent cause.
+test("a pushback with cause intent whose reason opens with security-risk holds as security-risk", () => {
+  const plain = { issueNumber: 77, issueLabels: ["agent-ready"], branch: "", changedFiles: [], humanLabel: "needs-human" };
+  for (const cause of ["intent", "intent-change"]) {
+    const outcome = { exit: "pushback", reason: "security-risk: the issue asks to print the deploy token in the log.", cause, title: "", summary: "" };
+    const plan = decide({ ...plain, outcome });
+    assert.equal(plan.action, "hand-back", cause);
+    assert.equal(plan.stop, "security-risk", cause);
+    assert.equal(parseReason(plan.comment).reason, "security", plan.comment);
+    // Intake never ran on this round-one hold, so its line claims no intake.
+    assert.match(plan.comment, /the run named a possible security risk/, plan.comment);
+    assert.doesNotMatch(plan.comment, /intake triage/, plan.comment);
+  }
+  const worded = decide({ ...plain, outcome: { exit: "pushback", reason: "The issue asks to print the deploy token in the log.", cause: "intent", title: "", summary: "" } });
+  assert.equal(worded.stop, "pushback");
+});
+
+// The lane's preamble tells a run whose change needs a path apply-issue-patch
+// refuses to stop with a reason starting patch-protected-path: the issue goes
+// to the host queue (#6908), never to needs-human and never restarted; any
+// other stop reads as before.
+test("a run that stopped with patch-protected-path goes to host-run naming the reason, never restarted", () => {
+  const stoppedWith = (reason) =>
+    decide({
+      outcome: { exit: "stopped", reason, title: "", summary: "" },
+      issueNumber: 77,
+      issueLabels: ["agent-ready"],
+      branch: "",
+      changedFiles: [],
+      humanLabel: "needs-human",
+      runId: "123",
+    });
+  const plan = stoppedWith("patch-protected-path: .github/workflows/ci.yml needs a new step");
+  assert.equal(plan.action, "host-run");
+  assert.equal(plan.exit, "host-run");
+  assert.deepEqual(plan.addLabels, ["host-run"]);
+  assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=host-run run=123 -->"), plan.comment);
+  assert.ok(plan.comment.includes("The run stopped early (`patch-protected-path`): its change needs a path the issue lane may not push"), plan.comment);
+  assert.ok(plan.comment.includes("ci.yml needs a new step"), plan.comment);
+  assert.doesNotMatch(stoppedWith("Tests failed; not a patch-protected-path stop.").comment, /stopped early/);
+});
+
+// A stop held for a person carries the hold alone: agent-ready beside
+// needs-human leaves it in both queues.
+test("a held stop removes agent-ready and names the branch that holds partial work", () => {
   const plan = decide({
-    outcome: { exit: "stopped", reason: "Tests failed.", title: "", summary: "" },
+    outcome: { exit: "stopped", reason: "design-change: Tests failed.", title: "", summary: "" },
     issueNumber: 77,
     issueLabels: ["agent-ready"],
     branch: BRANCH,
     changedFiles: ["README.md"],
     humanLabel: "needs-human",
   });
-  assert.deepEqual(plan.addLabels, ["needs-human"]);
-  assert.deepEqual(plan.removeLabels, ["agent-ready"]);
+  assert.equal(plan.status, "needs-human");
   assert.ok(plan.comment.includes(BRANCH));
   assert.match(plan.comment, /A retry continues from it while it is not behind the default branch, and otherwise starts fresh from the default branch; delete the branch first to always start fresh\./);
-  assert.ok(plan.comment.includes("remove `needs-human` and add `agent-ready` again"), plan.comment);
+  assert.ok(plan.comment.includes("set Work status to agent-ready again (clearing the `needs-human` hold)"), plan.comment);
 });
 
 // main against a fake GitHub API: the calls it makes are the lane's effect on
@@ -686,7 +1120,15 @@ function fakeFetch(routes) {
     const method = init.method ?? "GET";
     const path = new URL(url).pathname;
     calls.push({ method, path, body: init.body ? JSON.parse(init.body) : undefined });
-    const route = routes.find(([m, p]) => m === method && p.test(path));
+    // An issue no open PR closes, unless a route says otherwise.
+    // A held PR's do-not-merge label write succeeds, unless a route says otherwise.
+    const none =
+      path === "/graphql"
+        ? [method, /./, 200, { data: { repository: { issue: { closedByPullRequestsReferences: { nodes: [], pageInfo: { hasNextPage: false } } } } } }]
+        : method === "POST" && /\/issues\/90\/labels$/.test(path)
+          ? [method, /./, 200, []]
+          : null;
+    const route = routes.find(([m, p]) => m === method && p.test(path)) ?? none;
     const [, , status, body] = route ?? [method, /./, 404, { message: "Not Found" }];
     return { ok: status < 300, status, json: async () => body, text: async () => JSON.stringify(body) };
   };
@@ -702,31 +1144,54 @@ function env(dir) {
     GITHUB_API_URL: "https://api.example",
     GITHUB_SERVER_URL: "https://example",
     GITHUB_RUN_ID: "123",
+    GITHUB_RUN_ATTEMPT: "1",
     TRACKER_CONFIG: join(dir, "absent.json"),
+    BASE_PATH: fileURLToPath(new URL("../../..", import.meta.url)),
     RUNNER_CHECKS: existsSync(join(dir, "runner-checks")) ? readFileSync(join(dir, "runner-checks"), "utf8") : "",
   };
 }
 
-const ISSUE = [/./, 200, { number: 77, labels: [{ name: "agent-ready" }, { name: "work-class: read-only" }] }];
+const ISSUE = [/./, 200, { number: 77, created_at: "2026-10-01T00:00:00Z", labels: [{ name: "agent-ready" }, { name: "work-class: read-only" }] }];
 
-test("main with no outcome files comments stopped and adds needs-human", async () => {
-  await withDir({}, async (dir) => {
+// #7291 (run 40284651739): a run that wrote no readable outcome file crashed,
+// which needs no person. It keeps agent-ready, adds no label and posts a retry
+// marker with no escalation marker, so work-unblock restarts it.
+test("main with no outcome files keeps agent-ready and posts a retry, never needs-human", async () => {
+  await withAsyncDir({}, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ...HISTORY,
+      ["POST", /\/issues\/77\/labels$/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: env(dir), fetch }), 0);
+    assert.ok(!calls.some((c) => c.path.endsWith("/labels")), JSON.stringify(calls));
+    const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+    assert.ok(comment.startsWith("<!-- work-resolve-issue outcome=retry run=123 -->"), comment);
+    assert.match(comment, /`outcome-unread`/);
+    assert.match(comment, /retry 1 of 2/);
+    assert.ok(!calls.some((c) => c.path.endsWith("/pulls")));
+  });
+});
+
+test("main on a run whose issue changed after agent-ready comments that reason, not a missing outcome file", async () => {
+  await withDir({ "lane.json": JSON.stringify({ branch: "", class: "issue-edited" }) }, async (dir) => {
     const { fetch, calls } = fakeFetch([
       ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
       ["POST", /\/issues\/77\/labels$/, 200, []],
       ["POST", /\/issues\/77\/comments$/, 201, {}],
     ]);
     assert.equal(await main({ env: env(dir), fetch }), 0);
-    assert.deepEqual(calls.find((c) => c.path.endsWith("/labels")).body, { labels: ["needs-human"] });
-    assert.ok(calls.some((c) => c.method === "POST" && c.path.endsWith("/comments")));
-    assert.ok(!calls.some((c) => c.path.endsWith("/pulls")));
+    const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+    assert.match(comment, /the issue's title or body changed after `agent-ready` was added/);
+    assert.doesNotMatch(comment, /no readable outcome file/);
   });
 });
 
 // agent-ready starts this lane, so a run that added it would start the next.
 test("main refuses a human-gated label that is agent-ready and writes no label", async () => {
   // Not withDir: main reads the tracker config after its first await.
-  const dir = mkdtempSync(join(tmpdir(), "outcome-"));
+  const dir = tempDir("outcome-");
   try {
     writeFileSync(join(dir, "tracker.json"), JSON.stringify({ config: { role_labels: { "human-gated": " Agent-Ready" } } }));
     const { fetch, calls } = fakeFetch([
@@ -742,32 +1207,441 @@ test("main refuses a human-gated label that is agent-ready and writes no label",
 });
 
 // A run its issue dimensions skipped took no model turn, so it left no
-// outcome: report-outcome hands the issue to a person with the next step.
+// outcome. Owner decision on #11021: an Uncertainty skip reaches no person; the
+// issue drops agent-ready and status: ready and parks at status: confirmed
+// with the reason, as admission parks the same refusal: the lanes App's
+// admission comment first (intake-reenter lifts status: confirmed only beside
+// it), then Work status confirmed, then the label removals and the lane's
+// outcome comment.
 for (const [reason, step] of [
-  ["split-required", "/work-items:decompose"],
-  ["research-first", "research"],
-  ["probe-first", "probe"],
+  ["research-first", "plan or research the approach"],
+  ["probe-first", "run a probe or spike first"],
 ]) {
-  test(`main on a ${reason} dimension skip hands the issue back naming the next step`, async () => {
+  test(`main on a ${reason} dimension skip parks the issue at status: confirmed with the reason, to no person`, async () => {
     await withDir({}, async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        ["GET", /\/issues\/77\/comments/, 200, []],
+        ["GET", /\/issues\/77\/events/, 200, []],
+        ["POST", /\/issues\/77\/labels$/, 200, []],
+        ["DELETE", /\/issues\/77\/labels\//, 200, []],
+        ["POST", /\/issues\/77\/comments$/, 201, {}],
+      ]);
+      assert.equal(await main({ env: { ...env(dir), DIMENSION_SKIP: reason }, fetch, setStatus: statusInto(calls), leaveAgentReady: async () => assert.fail("a park writes its own state") }), 0);
+      const writes = calls.filter((c) => c.method !== "GET");
+      const [admission, status, ...rest] = writes;
+      assert.equal(admission.method, "POST");
+      assert.ok(admission.body.body.startsWith("<!-- intake-triage admission -->\nNot admitted to the issue lane: "), admission.body.body);
+      assert.ok(admission.body.body.includes(`\`${reason}\``) && admission.body.body.includes(step), admission.body.body);
+      assert.deepEqual(status, { method: "STATUS", path: "/issues/77", body: { state: "confirmed" } });
+      assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")), "no status label is added");
+      const removed = rest.filter((c) => c.method === "DELETE").map((c) => decodeURIComponent(c.path.split("/labels/")[1]));
+      assert.deepEqual(removed, []);
+      const comment = rest.at(-1).body.body;
+      assert.ok(comment.startsWith("<!-- work-resolve-issue outcome=parked run=123 -->\n"), comment);
+      assert.ok(comment.includes(`\`${reason}\``) && comment.includes(step), comment);
+      assert.ok(comment.includes("set Work status to confirmed"), comment);
+      assert.ok(!comment.includes("work-items:escalation") && !comment.includes("needs-human"), comment);
+      assert.equal(parseReason(comment), null);
+      assert.ok(!calls.some((c) => c.path.endsWith("/pulls") || c.path.includes("/compare/")));
+    });
+  });
+}
+
+test("main leaves a park alone when a person set needs-human after the run read the issue: no field write, every label on", async () => {
+  await withDir({}, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["GET", /\/issues\/77\/comments/, 200, []],
+      ["GET", /\/issues\/77\/events/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\//, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    const fields = { 77: { state: "agent-ready", setter: 337595936 } };
+    const fieldPosts = [];
+    const github = withFields(async (method, path, body) => {
+      fieldPosts.push(`${method} ${path} ${body.issue_field_values[0].value}`);
+      return [];
+    }, fields);
+    const { set } = await statusWriter({ env: { BASE_PATH: fileURLToPath(new URL("../../..", import.meta.url)) }, github, repository: "o/r" });
+    const setStatus = (...args) => {
+      fields[77] = { state: "needs-human", setter: 153232337 };
+      return set(...args);
+    };
+    assert.equal(await main({ env: { ...env(dir), DIMENSION_SKIP: "probe-first" }, fetch, setStatus }), 0);
+    assert.deepEqual(fieldPosts, [], "the person's needs-human stands");
+    assert.ok(!calls.some((c) => c.method === "DELETE"), "agent-ready and the queue labels stay on");
+    assert.ok(!calls.some((c) => c.method === "POST" && c.body.body.startsWith("<!-- work-resolve-issue outcome=")), "no outcome comment");
+  });
+});
+
+// The field is the state: a write that fails stops the stop before any label
+// comes off, as a failed label add did, so a re-run finds agent-ready still on.
+test("main fails a park whose Work status write fails, leaving every label on", async () => {
+  await withDir({}, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["GET", /\/issues\/77\/comments/, 200, []],
+      ["GET", /\/issues\/77\/events/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\//, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    const setStatus = async () => {
+      throw new Error("#77's Work status field was not set to `confirmed`: HTTP 502");
+    };
+    assert.equal(await main({ env: { ...env(dir), DIMENSION_SKIP: "probe-first" }, fetch, setStatus }), 1);
+    assert.ok(!calls.some((c) => c.method === "DELETE"), JSON.stringify(calls));
+    assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/comments") && c.body.body.startsWith("<!-- work-resolve-issue outcome=")));
+  });
+});
+
+// Only a hold and a park have a Work status state of their own; an
+// outside-author stop moves a field still at agent-ready to needs-triage
+// after its comment, before agent-ready comes off.
+test("main's outside-author stop leaves agent-ready for needs-triage", async () => {
+  await withDir({}, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77\/comments$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: { ...env(dir), DIMENSION_SKIP: "outside-author" }, fetch, setStatus: async () => assert.fail("no state of its own"), leaveAgentReady: statusInto(calls) }), 0);
+    assert.deepEqual(calls.filter((c) => c.method !== "GET").map((c) => c.method), ["POST", "STATUS"], "the field moves; no label comes off");
+    assert.deepEqual(calls.find((c) => c.method === "STATUS").body, { state: "needs-triage" });
+  });
+});
+
+test("main's close removes only host-run of its labels and writes no Work status", async () => {
+  const report = JSON.stringify({ exit: "stopped", reason: "report-delivered: the report is below", summary: "Rows 4 and 9 are stale." });
+  const labels = [{ name: "agent-ready" }, { name: "status: confirmed" }, { name: "host-run" }, { name: "work-class: read-only" }];
+  await withAsyncDir({ "work-outcome.json": report }, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, 200, { ...ISSUE[2], labels }],
+      ["GET", /\/issues\/77\/comments$/, 200, []],
+      ["GET", /\/issues\/77\/events$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\//, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+      ["PATCH", /\/issues\/77$/, 200, {}],
+    ]);
+    assert.equal(await main({ env: env(dir), fetch, setStatus: statusInto(calls) }), 0);
+    assert.ok(calls.some((c) => c.method === "PATCH" && c.body?.state === "closed"));
+    assert.ok(!calls.some((c) => c.method === "STATUS"));
+    const removed = calls.filter((c) => c.method === "DELETE").map((c) => decodeURIComponent(c.path.split("/labels/")[1]));
+    assert.deepEqual(removed, ["host-run"]);
+  });
+});
+
+// The lanes App keeps one admission comment per issue, so a park edits the one
+// admission already wrote.
+test("main on a dimension skip edits the lanes App's earlier admission comment in place", async () => {
+  await withDir({}, async (dir) => {
+    const own = { id: 501, user: { login: "melodic-automation-lanes[bot]" }, body: "<!-- intake-triage admission -->\nNot admitted to the issue lane yet: an older reason.", created_at: "2026-10-20T00:00:00Z" };
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["GET", /\/issues\/77\/comments/, 200, [own]],
+      ["GET", /\/issues\/77\/events/, 200, []],
+      ["PATCH", /\/issues\/comments\/501$/, 200, {}],
+      ["POST", /\/issues\/77\/labels$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\//, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: { ...env(dir), DIMENSION_SKIP: "probe-first" }, fetch }), 0);
+    const patched = calls.filter((c) => c.method === "PATCH");
+    assert.equal(patched.length, 1);
+    assert.match(patched[0].body.body, /^<!-- intake-triage admission -->\nNot admitted to the issue lane: .*`probe-first`/);
+    const posted = calls.filter((c) => c.method === "POST" && c.path.endsWith("/comments"));
+    assert.deepEqual(posted.map((c) => c.body.body.split("\n")[0]), ["<!-- work-resolve-issue outcome=parked run=123 -->"]);
+  });
+});
+
+// Owner Q93: intake splits a Size Large issue, so a split-required skip goes
+// back through intake with no person: agent-ready and the status labels
+// admission reads come off, and nothing adds needs-human.
+test("main on a split-required dimension skip sends the issue back through intake, to no person", async () => {
+  await withDir({}, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["GET", /\/issues\/77\/comments/, 200, []],
+      ["GET", /\/issues\/77\/events/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\//, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: { ...env(dir), DIMENSION_SKIP: "split-required" }, fetch, leaveAgentReady: statusInto(calls) }), 0);
+    assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")));
+    const removed = calls.filter((c) => c.method === "DELETE").map((c) => decodeURIComponent(c.path.split("/labels/")[1]));
+    assert.deepEqual(removed, [], "no status label is written");
+    const writes = calls.filter((c) => c.method !== "GET");
+    assert.deepEqual(writes.map((c) => c.method), ["POST", "STATUS"], "the field leaves agent-ready after the comment");
+    assert.deepEqual(writes[1].body, { state: "needs-triage" });
+    const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+    assert.ok(comment.startsWith("<!-- work-resolve-issue outcome=intake run=123 -->\n"), comment);
+    assert.ok(!comment.includes("work-items:escalation") && !comment.includes("needs-human"), comment);
+    assert.match(comment, /triage sweep sends it back through intake/);
+    assert.match(comment, /owner Q93/);
+  });
+});
+
+// A trusted split child keeps Size Large past admission (owner Q93), so the
+// lane may skip it again: a second intake since a listed human added
+// agent-ready fails, so intake and the lane never loop.
+test("main fails a split-required skip that intake already sent back once, to no person", async () => {
+  await withDir({}, async (dir) => {
+    const earlier = { user: { login: "melodic-automation-lanes[bot]" }, body: "<!-- work-resolve-issue outcome=intake run=99 -->\nWhy.", created_at: "2026-10-29T10:00:00Z" };
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["GET", /\/issues\/77\/comments/, 200, [earlier]],
+      ["GET", /\/issues\/77\/events/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\//, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: { ...env(dir), DIMENSION_SKIP: "split-required" }, fetch, leaveAgentReady: statusInto(calls) }), 0);
+    const removed = calls.filter((c) => c.method === "DELETE").map((c) => decodeURIComponent(c.path.split("/labels/")[1]));
+    assert.deepEqual(removed, []);
+    assert.deepEqual(calls.filter((c) => c.method !== "GET").map((c) => c.method), ["POST", "STATUS"]);
+    assert.deepEqual(calls.find((c) => c.method === "STATUS").body, { state: "needs-triage" });
+    assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")));
+    const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+    assert.ok(comment.startsWith("<!-- work-resolve-issue outcome=failed run=123 -->\n"), comment);
+  });
+});
+
+// A pushback naming no cause goes back through intake with no person, and a
+// second intake since a listed human added agent-ready fails, so intake and
+// the lane never loop.
+test("main on a pushback with no cause sends the issue back through intake once, then fails", async () => {
+  const pushback = JSON.stringify({ exit: "pushback", reason: "Split the test file or fix only the rows?", title: "", summary: "" });
+  const earlier = { user: { login: "melodic-automation-lanes[bot]" }, body: "<!-- work-resolve-issue outcome=intake run=99 -->\nWhy.", created_at: "2026-10-29T10:00:00Z" };
+  for (const [prior, outcome] of [[[], "intake"], [[earlier], "failed"]]) {
+    await withAsyncDir({ "work-outcome.json": pushback, "lane.json": JSON.stringify({ branch: "" }), "trusted.json": TRUSTED_LIST }, async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        ["GET", /\/issues\/77\/comments/, 200, prior],
+        ["GET", /\/issues\/77\/events/, 200, []],
+        ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        ["DELETE", /\/issues\/77\/labels\//, 200, []],
+        ["POST", /\/issues\/77\/comments$/, 201, {}],
+      ]);
+      assert.equal(await main({ env: { ...env(dir), TRUSTED_ACTORS: join(dir, "trusted.json") }, fetch }), 0);
+      assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")), outcome);
+      const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+      assert.ok(comment.startsWith(`<!-- work-resolve-issue outcome=${outcome} run=123 -->\n`), comment);
+      assert.ok(!comment.includes("work-items:escalation"), comment);
+    });
+  }
+});
+
+// The tracker's human-gated label decides the hand-back's Work status through
+// models.issue-status labels; one no state lists fails the run unwritten.
+test("main's hand-back writes the Work status the configured human label maps to, and fails on a label no state lists", async () => {
+  const pushback = JSON.stringify({ exit: "pushback", reason: "The issue asks to print the deploy token in the log.", title: "", summary: "" });
+  const earlier = { user: { login: "melodic-automation-lanes[bot]" }, body: "<!-- work-resolve-issue outcome=intake run=99 -->\nWhy.", created_at: "2026-10-29T10:00:00Z" };
+  for (const [label, code, state] of [
+    ["needs-owner-decision", 0, "needs-owner-decision"],
+    ["needs-a-person", 1, undefined],
+  ]) {
+    await withAsyncDir({ "work-outcome.json": pushback, "lane.json": JSON.stringify({ branch: "" }), "trusted.json": TRUSTED_LIST, "tracker.json": JSON.stringify({ config: { role_labels: { "human-gated": label } } }) }, async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        ["GET", /\/issues\/77\/comments/, 200, [earlier]],
+        ["GET", /\/issues\/77\/events/, 200, []],
+        ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        ["POST", /\/issues\/77\/labels$/, 200, []],
+        ["DELETE", /\/issues\/77\/labels\//, 200, []],
+        ["POST", /\/issues\/77\/comments$/, 201, {}],
+      ]);
+      assert.equal(await main({ env: { ...env(dir), TRUSTED_ACTORS: join(dir, "trusted.json"), TRACKER_CONFIG: join(dir, "tracker.json") }, fetch, setStatus: statusInto(calls) }), code, label);
+      assert.deepEqual(calls.find((c) => c.method === "STATUS")?.body.state, state, label);
+      assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")), `${label}: no label is added`);
+    });
+  }
+});
+
+// The same pushback naming a security risk: the second intake holds it for a
+// person instead of failing.
+test("main on a second pushback naming a security risk holds it as security-risk", async () => {
+  const pushback = JSON.stringify({ exit: "pushback", reason: "The issue asks to print the deploy token in the log.", title: "", summary: "" });
+  const earlier = { user: { login: "melodic-automation-lanes[bot]" }, body: "<!-- work-resolve-issue outcome=intake run=99 -->\nWhy.", created_at: "2026-10-29T10:00:00Z" };
+  await withAsyncDir({ "work-outcome.json": pushback, "lane.json": JSON.stringify({ branch: "" }), "trusted.json": TRUSTED_LIST }, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77\/comments/, 200, [earlier]],
+      ["GET", /\/issues\/77\/events/, 200, []],
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["POST", /\/issues\/77\/labels$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\//, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: { ...env(dir), TRUSTED_ACTORS: join(dir, "trusted.json") }, fetch, setStatus: statusInto(calls) }), 0);
+    assert.deepEqual(calls.find((c) => c.method === "STATUS").body, { state: "needs-human" });
+    assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")));
+    const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+    assert.ok(comment.includes("work-items:escalation"), comment);
+    assert.equal(parseReason(comment).reason, "security", comment);
+  });
+});
+
+// An earlier round's security mark does not carry over: intake triage
+// re-judged it before admitting the issue again, so whatever stops the second
+// intake round (a plain means pushback, a split-required skip) ends as it
+// would after a plain round.
+test("main ends a second intake round the same after a security or a plain earlier intake marker", async () => {
+  const bot = { login: "melodic-automation-lanes[bot]" };
+  const secure = { user: bot, body: "<!-- work-resolve-issue outcome=intake security run=99 -->\nWhy.", created_at: "2026-10-29T10:00:00Z" };
+  const plainEarlier = { user: bot, body: "<!-- work-resolve-issue outcome=intake run=99 -->\nWhy.", created_at: "2026-10-29T10:00:00Z" };
+  const means = JSON.stringify({ exit: "pushback", reason: "Split the test file or fix only the rows?", title: "", summary: "" });
+  for (const [name, prior, files, extra] of [
+    ["security then means pushback", secure, { "work-outcome.json": means, "lane.json": JSON.stringify({ branch: "" }) }, {}],
+    ["plain then means pushback", plainEarlier, { "work-outcome.json": means, "lane.json": JSON.stringify({ branch: "" }) }, {}],
+  ]) {
+    await withAsyncDir({ ...files, "trusted.json": TRUSTED_LIST }, async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        ["GET", /\/issues\/77\/comments/, 200, [prior]],
+        ["GET", /\/issues\/77\/events/, 200, []],
+        ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        ["POST", /\/issues\/77\/labels$/, 200, []],
+        ["DELETE", /\/issues\/77\/labels\//, 200, []],
+        ["POST", /\/issues\/77\/comments$/, 201, {}],
+      ]);
+      assert.equal(await main({ env: { ...env(dir), TRUSTED_ACTORS: join(dir, "trusted.json"), ...extra }, fetch }), 0, name);
+      const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+      assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")), name);
+      assert.ok(comment.startsWith("<!-- work-resolve-issue outcome=failed run=123 -->\n"), comment);
+    });
+  }
+});
+
+// A spent retry fails the same after a security or a plain intake round.
+test("main fails a spent retry the same after a security or a plain earlier intake marker", async () => {
+  const bot = { login: "melodic-automation-lanes[bot]" };
+  const marker = (outcome, run, at) => ({ user: bot, body: `<!-- work-resolve-issue outcome=${outcome} run=${run} -->\nWhy.`, created_at: at });
+  for (const first of ["intake security", "intake"]) {
+    const prior = [marker(first, "97", "2026-10-29T10:00:00Z"), marker("retry", "98", "2026-10-29T11:00:00Z"), marker("retry", "99", "2026-10-29T12:00:00Z")];
+    await withAsyncDir({}, async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        ["GET", /\/issues\/77\/comments$/, 200, prior],
+        ["GET", /\/issues\/77\/events$/, 200, []],
+        ["POST", /\/issues\/77\/labels$/, 200, []],
+        ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+        ["POST", /\/issues\/77\/comments$/, 201, {}],
+      ]);
+      assert.equal(await main({ env: env(dir), fetch }), 0, first);
+      const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+      assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")), first);
+      assert.equal(parseOutcomeMarker(comment).outcome, "failed");
+    });
+  }
+});
+
+// A report-delivered close closes the same after a security or a plain intake round.
+test("main closes a report-delivered stop the same after a security or a plain earlier intake marker", async () => {
+  const bot = { login: "melodic-automation-lanes[bot]" };
+  const report = JSON.stringify({ exit: "stopped", reason: "report-delivered: the report is below", summary: "Rows 4 and 9 are stale." });
+  for (const first of ["intake security", "intake"]) {
+    const prior = [{ user: bot, body: `<!-- work-resolve-issue outcome=${first} run=97 -->\nWhy.`, created_at: "2026-10-29T10:00:00Z" }];
+    await withAsyncDir({ "work-outcome.json": report }, async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        ["GET", /\/issues\/77\/comments$/, 200, prior],
+        ["GET", /\/issues\/77\/events$/, 200, []],
+        ["POST", /\/issues\/77\/labels$/, 200, []],
+        ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+        ["POST", /\/issues\/77\/comments$/, 201, {}],
+        ["PATCH", /\/issues\/77$/, 200, {}],
+      ]);
+      assert.equal(await main({ env: env(dir), fetch }), 0, first);
+      const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+      assert.ok(calls.some((c) => c.method === "PATCH" && c.body?.state === "closed"), first);
+      assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")), first);
+      assert.ok(comment.length > 0, first);
+    });
+  }
+});
+
+// An issue whose author is outside the trusted list stops at the admit job;
+// report-skip says so on the issue and takes agent-ready off, with no
+// needs-human: a listed human re-files the work, and a retry stops again.
+test("main on an outside-author stop moves agent-ready to needs-triage and posts one comment telling a listed human to re-file", async () => {
+  await withDir({}, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77\/comments$/, 200, []],
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["POST", /\/issues\/77\/labels$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: { ...env(dir), DIMENSION_SKIP: "outside-author" }, fetch, leaveAgentReady: statusInto(calls) }), 0);
+    assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")));
+    assert.ok(!calls.some((c) => c.method === "DELETE"), "no label comes off");
+    assert.deepEqual(calls.find((c) => c.method === "STATUS").body, { state: "needs-triage" });
+    const comments = calls.filter((c) => c.method === "POST" && c.path.endsWith("/comments"));
+    assert.equal(comments.length, 1);
+    const comment = comments[0].body.body;
+    assert.equal(parseOutcomeMarker(comment).outcome, "outside-author");
+    assert.match(comment, /trusted/);
+    assert.match(comment, /re-file/);
+    assert.ok(!comment.includes("agent-ready again"), comment);
+  });
+});
+
+// lane.json's `stale`: the stale lane branch the run started fresh past,
+// which issue-prior found no comment naming. report-outcome names it once on
+// the issue, beside its usual report, and never deletes it.
+test("main names lane.json's stale branch on the issue once, and deletes no branch", async () => {
+  const stale = "work-resolve-issue/issue-77-400-1";
+  await withAsyncDir({ "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: "", stale }) }, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["POST", /\/issues\/77\/labels$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: { ...env(dir), ESCALATION_REASON: "patch-protected-path" }, fetch }), 0);
+    const named = calls.filter((c) => c.method === "POST" && c.path.endsWith("/comments") && c.body.body.startsWith("<!-- work-resolve-issue stale-branch="));
+    assert.equal(named.length, 1);
+    assert.equal(named[0].body.body.split("\n")[0], `<!-- work-resolve-issue stale-branch=${stale} -->`);
+    assert.ok(named[0].body.body.includes(`\`${stale}\``), named[0].body.body);
+    assert.doesNotMatch(named[0].body.body, /no lane deletes it/, "the next run on the issue deletes it");
+    assert.match(named[0].body.body, /next run on this issue deletes it/);
+    assert.equal(parseOutcomeMarker(named[0].body.body), null, "the stale comment is no outcome marker");
+    assert.ok(!calls.some((c) => c.path.includes("/git/refs")), "no branch is deleted");
+  });
+});
+
+test("main names no stale branch when lane.json has none, or one of another shape", async () => {
+  for (const stale of ["", "main", "work-resolve-issue/issue-7-400-1"]) {
+    await withAsyncDir({ "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: "", stale }) }, async (dir) => {
       const { fetch, calls } = fakeFetch([
         ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
         ["POST", /\/issues\/77\/labels$/, 200, []],
         ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
         ["POST", /\/issues\/77\/comments$/, 201, {}],
       ]);
-      assert.equal(await main({ env: { ...env(dir), DIMENSION_SKIP: reason }, fetch }), 0);
-      assert.deepEqual(calls.find((c) => c.method === "POST" && c.path.endsWith("/labels")).body, { labels: ["needs-human"] });
-      assert.ok(calls.some((c) => c.method === "DELETE" && c.path.endsWith("/labels/agent-ready")));
-      const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
-      assert.match(comment, new RegExp(`^${ESC}<!-- work-resolve-issue outcome=${reason} run=123 -->`));
-      assert.equal(parseOutcomeMarker(comment).outcome, reason);
-      assert.ok(comment.includes(step), comment);
-      assert.ok(comment.includes("https://example/o/r/actions/runs/123"), comment);
-      assert.ok(!calls.some((c) => c.path.endsWith("/pulls") || c.path.includes("/compare/")));
+      assert.equal(await main({ env: { ...env(dir), ESCALATION_REASON: "patch-protected-path" }, fetch }), 0);
+      assert.ok(!calls.some((c) => c.method === "POST" && c.body?.body?.includes("stale-branch=")), JSON.stringify(stale));
     });
-  });
-}
+  }
+});
+
+// A re-run of report-skip finds the lanes App's own outside-author comment and
+// posts no second one; the same marker from anyone else (the outside author
+// can write it) does not count.
+test("main on an outside-author stop posts no second comment when the lanes App already posted one", async () => {
+  const marker = "<!-- work-resolve-issue outcome=outside-author run=99 -->\nThe lane did not start this issue.";
+  for (const [login, posts] of [
+    ["melodic-automation-lanes[bot]", 0],
+    ["stranger", 1],
+  ]) {
+    await withDir({}, async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        ["GET", /\/issues\/77\/comments$/, 200, [{ id: 5, user: { login }, body: marker }]],
+        ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+        ["POST", /\/issues\/77\/comments$/, 201, {}],
+      ]);
+      assert.equal(await main({ env: { ...env(dir), DIMENSION_SKIP: "outside-author" }, fetch, leaveAgentReady: statusInto(calls) }), 0);
+      assert.equal(calls.filter((c) => c.method === "POST" && c.path.endsWith("/comments")).length, posts, login);
+      assert.ok(calls.some((c) => c.method === "STATUS" && c.body.state === "needs-triage"), login);
+    });
+  }
+});
 
 test("main refuses a dimension skip it does not know and writes nothing", async () => {
   await withDir({}, async (dir) => {
@@ -797,6 +1671,102 @@ test("main on done with apply-issue-patch's escalation reason hands the issue ba
   });
 });
 
+// The read runner's scan job refused the run's output (say a patch over its
+// 262144-byte cap), so it uploaded no outcome and its scan-refusal job a
+// scan-refused-<attempt>.txt marker instead. The
+// hand-back names the refusal, not a missing outcome file; the marker's text
+// picks one fixed sentence and never reaches the comment.
+// `states` is the Work status the route writes: none for a retry, needs-human for a hold.
+async function scanRefusedComment({ outcome = null, marker = null, name = "scan-refused-1.txt", read = "success", attempt = "1", lane = null, states = [] } = {}) {
+  const dir = tempDir("outcome-");
+  try {
+    if (lane) {
+      writeFileSync(join(dir, "lane.json"), JSON.stringify(lane));
+    }
+    if (outcome) {
+      writeFileSync(join(dir, "work-outcome.json"), JSON.stringify(outcome));
+      writeFileSync(join(dir, "lane.json"), JSON.stringify({ branch: "" }));
+    }
+    const refusedDir = join(dir, "scan-refused");
+    mkdirSync(refusedDir);
+    if (marker !== null) {
+      writeFileSync(join(refusedDir, name), marker);
+    }
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ...HISTORY,
+      ["POST", /\/issues\/77\/labels$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: { ...env(dir), GITHUB_RUN_ATTEMPT: attempt, SCAN_REFUSED_DIR: refusedDir, SCAN_REFUSED_READ: read }, fetch, setStatus: statusInto(calls) }), 0);
+    assert.deepEqual(calls.filter((c) => c.method === "STATUS").map((c) => c.body.state), states);
+    assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")));
+    assert.ok(!calls.some((c) => c.path.endsWith("/pulls")));
+    return calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("main sends a run whose scan refused an oversize patch to intake for a split, naming the patch cap", async () => {
+  const comment = await scanRefusedComment({ marker: "patch\n" });
+  assert.ok(comment.includes("too-large: the patch was over its 262144-byte cap"), comment);
+  assert.doesNotMatch(comment, /no readable outcome file/);
+  assert.equal(parseOutcomeMarker(comment).outcome, "intake");
+  // Admission reads this comment as the patch-cap stop that splits the issue.
+  assert.equal(patchCapStopped([{ user: { id: 9 }, created_at: "2026-10-21T10:00:00Z", body: comment }], [], new Set(), 9), true);
+});
+
+// A refusal means a model ran, so a lane.json that says it never started loses.
+test("a scan refusal outranks a lane.json issue-file class in the hand-back", async () => {
+  const comment = await scanRefusedComment({ marker: "patch\n", lane: { branch: "", class: "issue-edited" } });
+  assert.ok(comment.includes("too-large: the patch was over its 262144-byte cap"), comment);
+  assert.doesNotMatch(comment, /did not start/);
+});
+
+// Any other refusal may be a credential shape, so a person decides it.
+test("main hands back a run whose scan refused any other output naming the scan refusal", async () => {
+  const comment = await scanRefusedComment({ marker: "output", name: "scan-refused-2-rung-up.txt", attempt: "2", states: ["needs-human"] });
+  assert.ok(comment.includes("The scan job refused the run's output, so nothing was published. The run's log names why."), comment);
+  assert.doesNotMatch(comment, /no readable outcome file|262144|too-large/);
+});
+
+test("a forged scan refusal marker's text never reaches the hand-back", async () => {
+  const comment = await scanRefusedComment({ marker: "patch @someone #1 https://evil.example", states: ["needs-human"] });
+  assert.ok(comment.includes("The scan job refused the run's output, so nothing was published. The run's log names why."), comment);
+  assert.doesNotMatch(comment, /someone|evil|262144|too-large/);
+});
+
+test("a file that is not a scan refusal marker is no refusal", async () => {
+  const comment = await scanRefusedComment({ marker: "patch", name: "scan-refused-0.txt" });
+  assert.ok(comment.includes("no readable outcome file"), comment);
+});
+
+test("an earlier attempt's refusal marker is no refusal of the current attempt", async () => {
+  const comment = await scanRefusedComment({ marker: "patch", name: "scan-refused-1.txt", attempt: "2" });
+  assert.ok(comment.includes("no readable outcome file"), comment);
+  assert.doesNotMatch(comment, /scan job refused|262144/i);
+});
+
+test("with no readable run attempt no refusal marker is read", async () => {
+  const comment = await scanRefusedComment({ marker: "patch", attempt: "" });
+  assert.ok(comment.includes("no readable outcome file"), comment);
+  assert.doesNotMatch(comment, /scan job refused|262144/i);
+});
+
+test("a readable outcome wins over a scan refusal marker", async () => {
+  const comment = await scanRefusedComment({ outcome: { exit: "stopped", reason: "design-change: The issue names no file." }, marker: "patch", states: ["needs-human"] });
+  assert.ok(comment.includes("The issue names no file."), comment);
+  assert.doesNotMatch(comment, /262144|scan job refused/i);
+});
+
+test("a failed marker download claims no refusal: the hand-back keeps the missing-outcome text", async () => {
+  const comment = await scanRefusedComment({ read: "failure" });
+  assert.ok(comment.includes("no readable outcome file"), comment);
+  assert.doesNotMatch(comment, /scan job refused/i);
+});
+
 test("main refuses an escalation reason it does not know and writes nothing", async () => {
   await withDir({ "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: "" }) }, async (dir) => {
     const { fetch, calls } = fakeFetch([
@@ -808,7 +1778,7 @@ test("main refuses an escalation reason it does not know and writes nothing", as
   });
 });
 
-test("main on done opens a ready PR from the branch and adds no label to it", async () => {
+test("main on done opens a ready PR from the branch, labels it do-not-merge when it holds, and writes nothing to the issue", async () => {
   await withDir(
     { "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: BRANCH }), "runner-checks": checksFile() },
     async (dir) => {
@@ -827,7 +1797,8 @@ test("main on done opens a ready PR from the branch and adds no label to it", as
       assert.equal(pull.head, BRANCH);
       assert.equal(pull.base, "main");
       assert.ok(pull.body.startsWith("Closes #77\n"));
-      assert.ok(!calls.some((c) => c.path.endsWith("/issues/90/labels")));
+      assert.ok(pull.body.split("\n").includes(HOLD_LINE), pull.body);
+      assert.deepEqual(calls.filter((c) => c.path.endsWith("/issues/90/labels")).map((c) => c.body), [{ labels: ["do-not-merge"] }]);
       assert.ok(!calls.some((c) => c.method === "POST" && c.path.startsWith("/repos/o/r/issues/77/")));
     },
   );
@@ -835,7 +1806,7 @@ test("main on done opens a ready PR from the branch and adds no label to it", as
 
 // #7497: an outcome file that says done with nothing left undone opens no PR
 // when the runner's checks failed, are missing, or ran on another tip.
-test("main on done opens no PR and hands the issue back when the runner's checks do not pass", async () => {
+test("main on done opens no PR and retries the issue when the runner's checks do not pass", async () => {
   for (const [label, files, tip] of [
     ["a failing check", { "runner-checks": checksFile({ results: [{ check: FRAGMENTS, exit: 1 }] }) }, CHECKED_TIP],
     ["no check results", {}, CHECKED_TIP],
@@ -852,14 +1823,16 @@ test("main on done opens no PR and hands the issue back when the runner's checks
           branchTip(BRANCH, tip),
           ["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }],
           ["GET", /\/compare\//, 200, { files: [{ filename: "README.md" }] }],
+          ...HISTORY,
           ["POST", /\/issues\/77\/labels$/, 200, []],
           ["POST", /\/issues\/77\/comments$/, 201, {}],
         ]);
         assert.equal(await main({ env: env(dir), fetch }), 0, label);
         assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/pulls")), label);
-        assert.deepEqual(calls.find((c) => c.path.endsWith("/issues/77/labels")).body, { labels: ["needs-human"] }, label);
-        const comment = calls.find((c) => c.path.endsWith("/issues/77/comments")).body.body;
-        assert.ok(comment.startsWith(ESC + "<!-- work-resolve-issue outcome=stopped run=123 -->"), comment);
+        assert.ok(!calls.some((c) => c.path.endsWith("/issues/77/labels")), label);
+        const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/issues/77/comments")).body.body;
+        assert.ok(comment.startsWith("<!-- work-resolve-issue outcome=retry run=123 -->"), comment);
+        assert.ok(comment.includes(BRANCH), comment);
       },
     );
   }
@@ -877,12 +1850,13 @@ test("main on done ignores check results for another run's lane branch", async (
         branchTip(other),
         ["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }],
         ["GET", /\/compare\//, 200, { files: [{ filename: "README.md" }] }],
+        ...HISTORY,
         ["POST", /\/issues\/77\/labels$/, 200, []],
         ["POST", /\/issues\/77\/comments$/, 201, {}],
       ]);
       assert.equal(await main({ env: env(dir), fetch }), 0);
       assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/pulls")));
-      assert.ok(calls.find((c) => c.path.endsWith("/issues/77/comments")).body.body.includes("check results are missing"));
+      assert.ok(calls.find((c) => c.method === "POST" && c.path.endsWith("/issues/77/comments")).body.body.includes("check results are missing"));
     },
   );
 });
@@ -921,11 +1895,60 @@ test("main on done with Refs opens the PR and writes nothing to the issue", asyn
         ["POST", /\/pulls$/, 201, { number: 90 }],
       ]);
       assert.equal(await main({ env: env(dir), fetch }), 0);
-      const writes = calls.filter((c) => c.method !== "GET").map((c) => `${c.method} ${c.path}`);
-      assert.deepEqual(writes, ["POST /repos/o/r/pulls"]);
+      const writes = calls.filter((c) => c.method !== "GET" && c.path !== "/graphql").map((c) => `${c.method} ${c.path}`);
+      // No denied-path list reads here, so the PR holds and carries the hold label.
+      assert.deepEqual(writes, ["POST /repos/o/r/pulls", "POST /repos/o/r/issues/90/labels"]);
       assert.ok(calls.find((c) => c.path.endsWith("/pulls") && c.method === "POST").body.body.startsWith("Refs: #77\n"));
     },
   );
+});
+
+// A create that fails on the network may still have opened the PR: it is read
+// back, and never sent again, since a create is a non-idempotent write
+// (element 1 of docs/outage-posture-audit.md). When the read finds none, the
+// run fails for a rerun to settle. A read that lost its socket is sent again.
+test("main after a dropped PR create reads the PR back, and never creates it again", async () => {
+  const dropped = () => Object.assign(new TypeError("fetch failed"), { cause: { code: "UND_ERR_SOCKET" } });
+  for (const landed of [true, false]) {
+    await withDir(
+      { "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: BRANCH }), "runner-checks": checksFile() },
+      async (dir) => {
+        const { fetch: inner, calls } = fakeFetch([
+          ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+          branchTip(),
+          ["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }],
+          ["GET", /\/compare\//, 200, { files: [{ filename: "README.md" }] }],
+          ["POST", /\/pulls$/, 201, { number: 90 }],
+          ["POST", /\/issues\/90\/labels$/, 200, []],
+        ]);
+        let createSent = false;
+        let compareDropped = false;
+        const fetch = async (url, init = {}) => {
+          const path = new URL(url).pathname;
+          if (path.includes("/compare/") && !compareDropped) {
+            compareDropped = true;
+            throw dropped();
+          }
+          if (path.endsWith("/pulls") && init.method === "POST" && !createSent) {
+            createSent = true;
+            await inner(url, init);
+            throw dropped();
+          }
+          if (path.endsWith("/pulls") && (init.method ?? "GET") === "GET") {
+            await inner(url, init);
+            const open = createSent && landed ? [{ number: 90, user: { login: "melodic-automation-lanes[bot]" } }] : [];
+            return { ok: true, status: 200, json: async () => open, text: async () => JSON.stringify(open) };
+          }
+          return inner(url, init);
+        };
+        assert.equal(await main({ env: env(dir), fetch, sleep: async () => {} }), landed ? 0 : 1, `landed=${landed}`);
+        const sends = (method, suffix) => calls.filter((c) => c.method === method && c.path.endsWith(suffix)).length;
+        assert.equal(sends("POST", "/pulls"), 1, `landed=${landed}`);
+        assert.equal(sends("GET", "/pulls"), 2, `landed=${landed}`);
+        assert.equal(calls.filter((c) => c.path.includes("/compare/")).length, 1, "the dropped compare read was sent again");
+      },
+    );
+  }
 });
 
 test("main on a rerun reuses the open PR from the branch", async () => {
@@ -942,7 +1965,7 @@ test("main on a rerun reuses the open PR from the branch", async () => {
       ]);
       assert.equal(await main({ env: env(dir), fetch }), 0);
       assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/pulls")));
-      assert.ok(!calls.some((c) => c.path.endsWith("/issues/90/labels")));
+      assert.deepEqual(calls.filter((c) => c.path.endsWith("/issues/90/labels")).map((c) => c.body), [{ labels: ["do-not-merge"] }]);
     },
   );
 });
@@ -985,23 +2008,24 @@ const resumedCompare = (commits = [APP_COMMIT, APP_COMMIT]) => [
   { files: [{ filename: "README.md" }], commits, total_commits: commits.length },
 ];
 
-test("main on a resumed done with no commit of its own and no check results hands back, naming the resumed branch", async () => {
-  await withDir(
+test("main on a resumed done with no commit of its own and no check results retries, naming the resumed branch", async () => {
+  await withAsyncDir(
     { "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: "", resume: RESUMED }) },
     async (dir) => {
       const { fetch, calls } = fakeFetch([
         ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        ...HISTORY,
         ["POST", /\/issues\/77\/labels$/, 200, []],
         ["DELETE", /\/labels\//, 200, []],
         ["POST", /\/issues\/77\/comments$/, 201, {}],
       ]);
       assert.equal(await main({ env: env(dir), fetch }), 0);
       assert.ok(!calls.some((c) => c.path.endsWith("/pulls")));
-      const comment = calls.find((c) => c.path.endsWith("/issues/77/comments")).body.body;
-      assert.ok(comment.startsWith(ESC + "<!-- work-resolve-issue outcome=stopped"), comment);
+      const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/issues/77/comments")).body.body;
+      assert.ok(comment.startsWith("<!-- work-resolve-issue outcome=retry"), comment);
       assert.match(comment, /resumed .* no new commit/);
       assert.ok(comment.includes(RESUMED), comment);
-      assert.deepEqual(calls.find((c) => c.method === "POST" && c.path.endsWith("/labels")).body, { labels: ["needs-human"] });
+      assert.ok(!calls.some((c) => c.path.endsWith("/labels") || c.path.includes("/labels/")));
     },
   );
 });
@@ -1042,7 +2066,7 @@ test("main on a resumed done with no commit of its own opens the PR from the res
 // rewrite, so the runner opens it only when its checks name it, the branch is
 // still at the tip they checked, they passed, and every commit ahead of the
 // default branch is the lanes App's.
-test("main on a resumed done hands back when its branch's checks fail, moved, or carry a commit not the App's", async () => {
+test("main on a resumed done retries when its branch's checks fail, moved, or carry a commit not the App's", async () => {
   for (const [label, checks, tip, compare] of [
     ["a failing check", checksFile({ branch: RESUMED, results: [{ check: FRAGMENTS, exit: 1 }] }), CHECKED_TIP, resumedCompare()],
     ["no checks ran", checksFile({ branch: RESUMED, results: [] }), CHECKED_TIP, resumedCompare()],
@@ -1059,14 +2083,15 @@ test("main on a resumed done hands back when its branch's checks fail, moved, or
           branchTip(RESUMED, tip),
           ["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }],
           compare,
+          ...HISTORY,
           ["POST", /\/issues\/77\/labels$/, 200, []],
           ["DELETE", /\/labels\//, 200, []],
           ["POST", /\/issues\/77\/comments$/, 201, {}],
         ]);
         assert.equal(await main({ env: env(dir), fetch }), 0, label);
         assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/pulls")), label);
-        const comment = calls.find((c) => c.path.endsWith("/issues/77/comments")).body.body;
-        assert.ok(comment.startsWith(ESC + "<!-- work-resolve-issue outcome=stopped"), `${label}: ${comment}`);
+        const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/issues/77/comments")).body.body;
+        assert.ok(comment.startsWith("<!-- work-resolve-issue outcome=retry"), `${label}: ${comment}`);
         assert.ok(comment.includes(RESUMED), `${label}: ${comment}`);
       },
     );
@@ -1075,7 +2100,7 @@ test("main on a resumed done hands back when its branch's checks fail, moved, or
 
 // The branch name can move between the tip check and the PR open, so a PR
 // whose head is not the checked tip is closed and the issue handed back.
-test("main closes a resumed branch's new PR whose head is not the tip the runner checked, and hands back", async () => {
+test("main closes a resumed branch's new PR whose head is not the tip the runner checked, and retries", async () => {
   await withAsyncDir(
     {
       "work-outcome.json": JSON.stringify(done),
@@ -1091,24 +2116,27 @@ test("main closes a resumed branch's new PR whose head is not the tip the runner
         ["GET", /\/pulls$/, 200, []],
         ["POST", /\/pulls$/, 201, { number: 90, head: { sha: "d".repeat(40) } }],
         ["PATCH", /\/pulls\/90$/, 200, {}],
+        ...HISTORY,
         ["POST", /\/issues\/77\/labels$/, 200, []],
         ["DELETE", /\/labels\//, 200, []],
         ["POST", /\/issues\/77\/comments$/, 201, {}],
       ]);
       assert.equal(await main({ env: env(dir), fetch }), 0);
       assert.deepEqual(calls.find((c) => c.method === "PATCH" && c.path.endsWith("/pulls/90"))?.body, { state: "closed" });
-      assert.deepEqual(calls.find((c) => c.path.endsWith("/issues/77/labels")).body, { labels: ["needs-human"] });
-      const comment = calls.find((c) => c.path.endsWith("/issues/77/comments")).body.body;
-      assert.ok(comment.startsWith(ESC + "<!-- work-resolve-issue outcome=stopped"), comment);
+      assert.ok(!calls.some((c) => c.path.endsWith("/issues/77/labels")));
+      const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/issues/77/comments")).body.body;
+      assert.ok(comment.startsWith("<!-- work-resolve-issue outcome=retry"), comment);
+      assert.match(comment, /`pr-head-moved`/);
       assert.ok(comment.includes(CHECKED_TIP), comment);
     },
   );
 });
 
-test("a resumed done with no new commit is stopped unless the runner's checks passed on the resumed branch", () => {
+test("a resumed done with no new commit is retried unless the runner's checks passed on the resumed branch", () => {
   for (const checks of [null, NO_CHECKS, { tip: CHECKED_TIP, results: [{ check: FRAGMENTS, exit: 1 }] }]) {
     const plan = decideDone({ branch: "", resumed: RESUMED, checks });
-    assert.equal(plan.action, "hand-back");
+    assert.equal(plan.action, "retry");
+    assert.equal(plan.stop, "resumed-unchecked");
     assert.match(plan.comment, /resumed `work-resolve-issue\/issue-77-100-1` and reported done with no new commit/);
   }
   const plan = decideDone({ branch: "", resumed: RESUMED, checks: { tip: CHECKED_TIP, results: [{ check: FRAGMENTS, exit: 0 }] } });
@@ -1119,7 +2147,7 @@ test("a resumed done with no new commit is stopped unless the runner's checks pa
 test("main on a resumed stop with no commit of its own names no branch", async () => {
   await withDir(
     {
-      "work-outcome.json": JSON.stringify({ exit: "stopped", reason: "Blocked." }),
+      "work-outcome.json": JSON.stringify({ exit: "stopped", reason: "design-change: Blocked." }),
       "lane.json": JSON.stringify({ branch: "", resume: RESUMED }),
     },
     async (dir) => {
@@ -1131,7 +2159,7 @@ test("main on a resumed stop with no commit of its own names no branch", async (
       ]);
       assert.equal(await main({ env: env(dir), fetch }), 0);
       assert.ok(!calls.some((c) => c.path.endsWith("/pulls")));
-      const comment = calls.find((c) => c.path.endsWith("/issues/77/comments")).body.body;
+      const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/issues/77/comments")).body.body;
       assert.ok(!comment.includes(RESUMED), comment);
       assert.equal(parseOutcomeMarker(comment).onResumed, true, comment);
     },
@@ -1144,6 +2172,7 @@ test("main refuses a lane.json branch that is not this issue's lane branch", asy
     async (dir) => {
       const { fetch, calls } = fakeFetch([
         ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        ...HISTORY,
         ["POST", /\/issues\/77\/labels$/, 200, []],
         ["POST", /\/issues\/77\/comments$/, 201, {}],
       ]);
@@ -1170,7 +2199,6 @@ test("a limit-stopped run is limited: one marker comment, agent-ready kept, no l
   });
   assert.equal(plan.action, "limited");
   assert.deepEqual(plan.addLabels, []);
-  assert.deepEqual(plan.removeLabels, []);
   assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=limited resets=2026-10-17T18:00:00Z run=555 -->\n"));
 });
 
@@ -1213,7 +2241,7 @@ test("a limit stop's stated reset is held between one hour and seven days out", 
 // overrides an outcome the skill wrote.
 test("a stop the skill reported goes to a person even with a limit record", () => {
   const plan = decide({
-    outcome: { exit: "stopped", reason: "The tests cannot run here.", title: "", summary: "" },
+    outcome: { exit: "stopped", reason: "design-change: The tests cannot run here.", title: "", summary: "" },
     issueNumber: 77,
     issueLabels: ["agent-ready"],
     branch: "",
@@ -1221,11 +2249,11 @@ test("a stop the skill reported goes to a person even with a limit record", () =
     limit: { resets: null },
   });
   assert.notEqual(plan.action, "limited");
-  assert.deepEqual(plan.addLabels, ["needs-human"]);
+  assert.equal(plan.status, "needs-human");
   assert.match(plan.comment, /The tests cannot run here\./);
 });
 
-test("done with no branch still hands back even with a limit record", () => {
+test("done with no branch is still retried, not limited, even with a limit record", () => {
   const plan = decide({
     outcome: { exit: "done", reason: "", title: "", summary: "" },
     issueNumber: 77,
@@ -1234,8 +2262,8 @@ test("done with no branch still hands back even with a limit record", () => {
     changedFiles: [],
     limit: { resets: null },
   });
-  assert.notEqual(plan.action, "limited");
-  assert.deepEqual(plan.addLabels, ["needs-human"]);
+  assert.equal(plan.action, "retry");
+  assert.equal(plan.stop, "done-no-commit");
 });
 
 test("an unreadable outcome file with a limit record reads as limited", () => {
@@ -1253,15 +2281,14 @@ test("an unreadable outcome file with a limit record reads as limited", () => {
 
 test("a pushback stays a pushback even on a limit-stopped run", () => {
   const plan = decide({
-    outcome: { exit: "pushback", reason: "Unclear.", title: "", summary: "" },
+    outcome: { exit: "pushback", reason: "Unclear.", cause: "intent", title: "", summary: "" },
     issueNumber: 77,
     issueLabels: ["agent-ready"],
     branch: "",
     changedFiles: [],
     limit: { resets: null },
   });
-  assert.deepEqual(plan.addLabels, ["needs-human"]);
-  assert.deepEqual(plan.removeLabels, ["agent-ready"]);
+  assert.equal(plan.status, "needs-human");
 });
 
 test("the limited marker reads back with its reset and run", () => {
@@ -1274,6 +2301,70 @@ test("the limited marker reads back with its reset and run", () => {
   assert.equal(parseOutcomeMarker("<!-- work-resolve-issue outcome=stopped -->").outcome, "stopped");
   assert.equal(parseOutcomeMarker("hello"), null);
   assert.equal(parseOutcomeMarker("<!-- work-resolve-issue outcome=turn-cap cap=75 run=555 branch=resumed -->").onResumed, true);
+});
+
+// ADR 0087: the marker names the secret the run used and why it fell back,
+// from lane.json, which the run could rewrite, so only closed values pass.
+// A fake value in a key's shape, built at run time so no scanner reads a key here.
+const TOKEN_SHAPED = ["sk", "ant", "api03", "x".repeat(24)].join("-");
+const credentialOf = (lane) => withDir({ "lane.json": JSON.stringify(lane) }, (dir) => readLaneCredential(dir));
+
+test("the outcome marker names a valid credential and fallback reason from lane.json", () => {
+  const read = credentialOf({ branch: "", class: "rate-limit", credential: "ISSUE_LANE_CLAUDE_API_KEY", fallback: "credit-stop" });
+  assert.deepEqual(read, { credential: "ISSUE_LANE_CLAUDE_API_KEY", fallback: "credit-stop" });
+  const plan = withCredential({ action: "limited", comment: `${limitedMarker({ resets: "2026-10-17T18:00:00Z", runId: "555", onResumed: true })}\nStopped.` }, read);
+  assert.equal(
+    plan.comment,
+    "<!-- work-resolve-issue outcome=limited resets=2026-10-17T18:00:00Z run=555 branch=resumed credential=ISSUE_LANE_CLAUDE_API_KEY fallback=credit-stop -->\nStopped.",
+  );
+  assert.deepEqual(parseOutcomeMarker(plan.comment), {
+    outcome: "limited",
+    resets: Date.parse("2026-10-17T18:00:00Z"),
+    run: "555",
+    onResumed: true,
+    credential: "ISSUE_LANE_CLAUDE_API_KEY",
+    fallback: "credit-stop",
+  });
+  // A hand-back decide builds opens with the escalation line; its outcome line takes the tags.
+  const handBack = decide({
+    outcome: { exit: "stopped", reason: "design-change: The tests cannot run here.", title: "", summary: "", changes: [], verification: [], notDone: [], steps: [] },
+    issueNumber: 77,
+    issueLabels: ["agent-ready"],
+    branch: BRANCH,
+    changedFiles: [],
+    runId: "555",
+  });
+  assert.ok(handBack.comment.startsWith(`${ESCALATION_MARKER}\n<!-- work-resolve-issue outcome=stopped run=555 -->`), handBack.comment);
+  const tagged = withCredential(handBack, { credential: "FALLBACK_CLAUDE_CODE_OAUTH_TOKEN", fallback: "no-key" });
+  assert.ok(tagged.comment.startsWith(`${ESCALATION_MARKER}\n<!-- work-resolve-issue outcome=stopped run=555 credential=FALLBACK_CLAUDE_CODE_OAUTH_TOKEN fallback=no-key -->\n`), tagged.comment);
+  assert.equal(tagged.comment.split("\n").slice(2).join("\n"), handBack.comment.split("\n").slice(2).join("\n"), "only the outcome line changes");
+  assert.deepEqual(parseOutcomeMarker(tagged.comment), { outcome: "stopped", resets: null, run: "555", onResumed: false, credential: "FALLBACK_CLAUDE_CODE_OAUTH_TOKEN", fallback: "no-key" });
+  assert.equal(withCredential(tagged, { credential: "ISSUE_LANE_CLAUDE_API_KEY" }).comment, tagged.comment, "a tagged line is tagged once");
+});
+
+test("the outcome marker drops a credential that is not a secret name and a fallback reason outside the closed set", () => {
+  // An upper-snake value outside the three names run-claude-cli records for
+  // issue-lane is dropped too: a rewritten lane.json could hold an encoded token.
+  for (const credential of ["issue_lane_claude_api_key", TOKEN_SHAPED, "ISSUE-LANE KEY", "Q".repeat(42), "AUTOMATIONS_CLAUDE_API_KEY", "", 7]) {
+    assert.deepEqual(credentialOf({ credential }), {}, String(credential));
+  }
+  for (const fallback of ["handoff", "fallback", "rate-limit", "auth", "limit-stop", "CREDIT-STOP", ""]) {
+    assert.deepEqual(credentialOf({ credential: "ISSUE_LANE_CLAUDE_API_KEY", fallback }), { credential: "ISSUE_LANE_CLAUDE_API_KEY" }, fallback);
+  }
+  assert.deepEqual(credentialOf({ branch: "" }), {}, "a lane.json without the fields");
+  assert.deepEqual(withDir({ "lane.json": "{not json" }, (dir) => readLaneCredential(dir)), {}, "an unreadable lane.json");
+  const plan = { action: "limited", comment: "<!-- work-resolve-issue outcome=failed run=9 -->" };
+  assert.equal(withCredential(plan, { credential: TOKEN_SHAPED, fallback: "handoff" }), plan, "nothing valid leaves the plan as it was");
+  // A marker whose tokens fall outside the closed values does not parse as the lane's.
+  assert.equal(parseOutcomeMarker("<!-- work-resolve-issue outcome=failed run=9 credential=lower_case -->"), null);
+  assert.equal(parseOutcomeMarker("<!-- work-resolve-issue outcome=failed run=9 fallback=handoff -->"), null);
+  assert.equal(parseOutcomeMarker("<!-- work-resolve-issue outcome=failed run=9 credential=AUTOMATIONS_CLAUDE_API_KEY -->"), null);
+});
+
+test("an outcome marker without a credential or fallback still parses without them", () => {
+  const read = parseOutcomeMarker("<!-- work-resolve-issue outcome=failed run=9 branch=resumed -->");
+  assert.deepEqual(read, { outcome: "failed", resets: null, run: "9", onResumed: true });
+  assert.equal(parseOutcomeMarker("<!-- work-resolve-issue outcome=failed run=9 fallback=no-key -->").fallback, "no-key");
 });
 
 const LIMIT_NOW = Date.parse("2026-10-17T12:00:00Z");
@@ -1291,6 +2382,37 @@ test("main on a limit stop comments the marker and touches no label", async () =
     assert.equal(posted.length, 1);
     assert.ok(posted[0].body.body.startsWith("<!-- work-resolve-issue outcome=limited resets=2026-10-17T18:00:00Z run=123 -->"));
     assert.ok(!calls.some((c) => c.path.endsWith("/labels") || c.method === "DELETE"));
+  });
+});
+
+// The tags reach the posted comment on the limited path and on a stop that
+// finishStop finalizes.
+test("main posts the credential and fallback tags on a limited stop and a routed stop", async () => {
+  const tags = { credential: "ISSUE_LANE_CLAUDE_CODE_OAUTH_TOKEN", fallback: "credit-stop" };
+  await withAsyncDir({ "lane.json": JSON.stringify({ ...JSON.parse(LIMITED_LANE), ...tags }) }, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["GET", /\/issues\/77\/comments$/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: env(dir), fetch, now: LIMIT_NOW }), 0);
+    const posted = calls.filter((c) => c.method === "POST");
+    assert.equal(posted.length, 1);
+    assert.ok(
+      posted[0].body.body.startsWith("<!-- work-resolve-issue outcome=limited resets=2026-10-17T18:00:00Z run=123 credential=ISSUE_LANE_CLAUDE_CODE_OAUTH_TOKEN fallback=credit-stop -->\n"),
+      posted[0].body.body,
+    );
+  });
+  await withAsyncDir({ "lane.json": JSON.stringify({ branch: "", class: "issue-edited", ...tags }) }, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["POST", /\/issues\/77\/labels$/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: env(dir), fetch }), 0);
+    const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+    assert.match(comment, /^(?:<!-- work-items:escalation [^\n]* -->\n)?<!-- work-resolve-issue outcome=[a-z-]+[^\n]* credential=ISSUE_LANE_CLAUDE_CODE_OAUTH_TOKEN fallback=credit-stop -->\n/, comment);
+    assert.equal(parseOutcomeMarker(comment).credential, "ISSUE_LANE_CLAUDE_CODE_OAUTH_TOKEN");
   });
 });
 
@@ -1386,20 +2508,21 @@ test("a run at its turn cap with a restart left keeps agent-ready and names the 
   const plan = capped();
   assert.equal(plan.action, "turn-cap");
   assert.deepEqual(plan.addLabels, []);
-  assert.deepEqual(plan.removeLabels, []);
   assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=turn-cap cap=75 run=555 -->\n"), plan.comment);
   assert.match(plan.comment, /turn cap 75 reached/);
   assert.ok(plan.comment.includes(BRANCH));
 });
 
-test("a run at its turn cap with no restart left hands back, naming the cap", () => {
+// A spent cap is a visible stop, not a person: agent-ready comes off, no label.
+test("a run at its turn cap with no restart left fails, naming the cap, never needs-human", () => {
   for (const overrides of [{ turnCapRestarts: 1 }, { limits: { "turn-cap-restarts": 0 } }]) {
     const plan = capped(overrides);
-    assert.equal(plan.action, "hand-back");
-    assert.deepEqual(plan.addLabels, ["needs-human"]);
-    assert.deepEqual(plan.removeLabels, ["agent-ready"]);
-    assert.ok(plan.comment.startsWith(ESC + "<!-- work-resolve-issue outcome=turn-cap cap=75 run=555 -->\n"), plan.comment);
+    assert.equal(plan.action, "fail");
+    assert.deepEqual(plan.addLabels, []);
+    assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=failed run=555 -->\n"), plan.comment);
+    assert.match(plan.comment, /`turn-cap-spent`/);
     assert.match(plan.comment, /turn cap 75 reached/);
+    assert.ok(plan.comment.includes(BRANCH), plan.comment);
   }
 });
 
@@ -1413,7 +2536,7 @@ test("a run at its turn cap that committed nothing names no branch", () => {
 // skill wrote never overrides it.
 test("a forged turn-cap class beside a readable outcome keeps that outcome", () => {
   assert.equal(capped({ outcome: done }).action, "open-pr");
-  const stoppedPlan = capped({ outcome: { exit: "stopped", reason: "The tests cannot run here.", title: "", summary: "" } });
+  const stoppedPlan = capped({ outcome: { exit: "stopped", reason: "design-change: The tests cannot run here.", title: "", summary: "" } });
   assert.ok(stoppedPlan.comment.startsWith(ESC + "<!-- work-resolve-issue outcome=stopped run=555 -->"), stoppedPlan.comment);
 });
 
@@ -1424,6 +2547,77 @@ test("the turn-cap marker reads back with its run", () => {
     run: "555",
     onResumed: false,
   });
+});
+
+// Run 40208736808 (#6377): write-issue refused with "the issue title or body
+// changed after agent-ready was added; no issue file written", so no model
+// ran, and the hand-back said only that no outcome file was read.
+test("lane.json's issue-file classes name why the run never started; any other class is none", () => {
+  for (const [lane, expected] of [
+    [{ branch: "", class: "issue-edited" }, /the issue's title or body changed after `agent-ready` was added, so/],
+    [{ branch: "", class: "issue-edited-trusted" }, /changed after `agent-ready` was added, each change by a listed account/],
+    [{ branch: "", class: "issue-file" }, /could not write the issue file/],
+    [{ branch: "", class: "max-turns" }, null],
+    [{ branch: "", class: "" }, null],
+  ]) {
+    const reason = withDir({ "lane.json": JSON.stringify(lane) }, (dir) => readIssueStop(dir));
+    if (expected === null) {
+      assert.equal(reason, null, JSON.stringify(lane));
+    } else {
+      assert.match(reason, expected, JSON.stringify(lane));
+    }
+  }
+  assert.equal(withDir({}, (dir) => readIssueStop(dir)), null, "no lane.json");
+});
+
+test("a run whose issue changed after agent-ready hands back naming that, not a missing outcome file", () => {
+  const issueStop = withDir({ "lane.json": JSON.stringify({ branch: "", class: "issue-edited" }) }, (dir) => readIssueStop(dir));
+  const plan = decide({
+    outcome: readOutcome("/nonexistent/work-outcome.json"),
+    issueNumber: 77,
+    issueLabels: ["agent-ready"],
+    branch: "",
+    changedFiles: [],
+    issueStop,
+  });
+  assert.equal(plan.action, "hand-back");
+  assert.equal(plan.status, "needs-human");
+  assert.match(plan.comment, /the issue's title or body changed after `agent-ready` was added/);
+  assert.doesNotMatch(plan.comment, /no readable outcome file/);
+  assert.match(plan.comment, /<!-- stop-reason lane=work-resolve-issue reason=security -->/);
+});
+
+// The brief for this route: an edit by a listed human or one of our Apps goes
+// back through intake triage, with no needs-human and no person reason.
+test("a run whose issue only listed accounts changed after agent-ready goes back through intake, not to a person", () => {
+  const issueStop = withDir({ "lane.json": JSON.stringify({ branch: "", class: "issue-edited-trusted" }) }, (dir) => readIssueStop(dir));
+  const plan = decide({
+    outcome: readOutcome("/nonexistent/work-outcome.json"),
+    issueNumber: 77,
+    issueLabels: ["agent-ready", "status: ready"],
+    branch: "",
+    changedFiles: [],
+    issueStop,
+  });
+  assert.equal(plan.action, "intake");
+  assert.deepEqual(plan.addLabels, []);
+  assert.match(plan.comment, /^<!-- work-resolve-issue outcome=intake -->/);
+  assert.match(plan.comment, /each change by a listed account/);
+  assert.match(plan.comment, /sends it back through intake triage, and it waits on no decision from a person/);
+  assert.doesNotMatch(plan.comment, /stop-reason|needs-human|Reason:/);
+});
+
+test("an issue-file record never replaces an outcome the run reported", () => {
+  const plan = decide({
+    outcome: { exit: "stopped", reason: "The tests cannot run here.", title: "", summary: "" },
+    issueNumber: 77,
+    issueLabels: ["agent-ready"],
+    branch: "",
+    changedFiles: [],
+    issueStop: "The run did not start.",
+  });
+  assert.match(plan.comment, /The tests cannot run here\./);
+  assert.doesNotMatch(plan.comment, /The run did not start\./);
 });
 
 test("lane.json's max-turns class is the turn-cap record; any other class is none", () => {
@@ -1438,6 +2632,37 @@ test("lane.json's max-turns class is the turn-cap record; any other class is non
   }
 });
 
+// run-claude-cli counts a run that finished past its cap a success (empty
+// class), so lane.json's turns over its max-turns is the only sign of it.
+test("lane.json's turns over its max-turns is the over-cap record; anything else is none", () => {
+  for (const [lane, expected] of [
+    [{ branch: "", class: "", "max-turns": "75", turns: "140" }, { turns: 140, cap: 75 }],
+    [{ branch: "", class: "", "max-turns": "75", turns: "75" }, null],
+    [{ branch: "", class: "", "max-turns": "75", turns: "" }, null],
+    [{ branch: "", class: "", "max-turns": "", turns: "140" }, null],
+    [{ branch: "", class: "", "max-turns": "75", turns: "140; rm" }, null],
+    [{ branch: "", class: "", "max-turns": "75" }, null],
+  ]) {
+    withDir({ "lane.json": JSON.stringify(lane) }, (dir) => assert.deepEqual(readOverCap(dir), expected, JSON.stringify(lane)));
+  }
+  withDir({ "lane.json": "{" }, (dir) => assert.equal(readOverCap(dir), null));
+});
+
+test("a done run past its turn cap still opens its PR, and the Summary says so", () => {
+  const plan = decideDone({ overCap: { turns: 140, cap: 75 } });
+  assert.equal(plan.action, "open-pr");
+  assert.ok(plan.body.startsWith("Closes #77\n"), plan.body);
+  const line = "The run went past its turn budget (turns=140 max-turns=75): the work may be too big for one run.";
+  assert.ok(plan.body.split("\n").includes(line), plan.body);
+  assert.ok(plan.body.indexOf(line) > plan.body.indexOf("## Summary") && plan.body.indexOf(line) < plan.body.indexOf("## Fix"), "the line sits in the Summary");
+});
+
+test("a done run within its turn cap opens its PR with no turn-budget line", () => {
+  const plan = decideDone();
+  assert.equal(plan.action, "open-pr");
+  assert.doesNotMatch(plan.body, /turn budget|max-turns=/);
+});
+
 // A leg run-claude-cli stopped at its timeout (class timeout) ran out of time
 // like a turn cap: with a restart left it keeps agent-ready, so work-unblock
 // restarts it and the next run resumes its branch (turn-cap is RESUMABLE);
@@ -1447,17 +2672,19 @@ test("a leg timeout with no outcome of its own restarts from its branch like a t
   const plan = capped({ turnCap: timedOut });
   assert.equal(plan.action, "turn-cap");
   assert.deepEqual(plan.addLabels, []);
-  assert.deepEqual(plan.removeLabels, []);
   assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=turn-cap run=555 -->\n"), plan.comment);
   assert.match(plan.comment, /its time ran out \(the launcher's leg timeout\)/);
   assert.ok(plan.comment.includes(BRANCH));
   assert.equal(parseOutcomeMarker(plan.comment).outcome, "turn-cap");
   assert.ok(RESUMABLE.has(parseOutcomeMarker(plan.comment).outcome), "the next run resumes the branch");
   const spent = capped({ turnCap: timedOut, turnCapRestarts: 1 });
-  assert.equal(spent.action, "hand-back", "with its restarts used it goes to a person");
+  assert.equal(spent.action, "fail", "with its restarts used it stops, visibly, with no label");
 });
 
-test("restarts count the App's turn-cap markers since a person last added agent-ready, not this run's", () => {
+// A Work status field event as resolve-config.mjs fieldEvents shapes it.
+const fieldSet = (actorId, at, { to = "agent-ready", actorType = actorId === 337595936 ? "Bot" : "User", removed = false, field = "48484079" } = {}) => ({ field, removed, actorId, actorLogin: "x", actorType, at, from: null, to: removed ? null : to });
+
+test("restarts count the App's turn-cap markers since a listed human last set Work status agent-ready, not this run's", async () => {
   const marker = (run, at, login = "melodic-automation-lanes[bot]") => ({
     user: { login },
     body: `<!-- work-resolve-issue outcome=turn-cap cap=75 run=${run} -->`,
@@ -1470,13 +2697,19 @@ test("restarts count the App's turn-cap markers since a person last added agent-
     marker("555", "2026-10-17T05:00:00Z"),
   ];
   const events = [
-    { event: "labeled", label: { name: "agent-ready" }, actor: { login: "kyle-sexton", id: 153232337 }, created_at: "2026-10-17T02:00:00Z" },
-    { event: "labeled", label: { name: "agent-ready" }, actor: { login: "melodic-automation-lanes[bot]", id: 1 }, created_at: "2026-10-17T03:30:00Z" },
-    // An unlisted triager's re-add resets nothing.
-    { event: "labeled", label: { name: "agent-ready" }, actor: { login: "triager", id: 42 }, created_at: "2026-10-17T03:45:00Z" },
+    fieldSet(153232337, "2026-10-17T02:00:00Z"),
+    // The App's restart and an unlisted triager's set reset nothing, nor does
+    // a listed human's set of another state or field.
+    fieldSet(337595936, "2026-10-17T03:30:00Z"),
+    fieldSet(42, "2026-10-17T03:45:00Z"),
+    fieldSet(153232337, "2026-10-17T03:50:00Z", { to: "needs-human" }),
+    fieldSet(153232337, "2026-10-17T03:55:00Z", { field: "1" }),
   ];
   const humans = new Set([153232337]);
-  assert.equal(countTurnCapRestarts({ comments, events, bot: "melodic-automation-lanes[bot]", humans, runId: "555" }), 1);
+  const since = await humanSince(events, "48484079", humans);
+  assert.equal(since, Date.parse("2026-10-17T02:00:00Z"));
+  assert.equal(countTurnCapRestarts({ comments, since, bot: "melodic-automation-lanes[bot]", runId: "555" }), 1);
+  assert.equal(await humanSince(events, null, humans), Number.NEGATIVE_INFINITY, "an unset field counts every marker");
 });
 
 const CAPPED_LANE = JSON.stringify({ branch: BRANCH, class: "max-turns", resets: "", "max-turns": "75" });
@@ -1511,7 +2744,26 @@ test("main on a rerun after its turn-cap marker posts nothing again", async () =
   });
 });
 
-test("main at the turn cap with no restarts configured hands the issue to a person", async () => {
+// A turn cap with no restart left fails, an earlier security intake marker included.
+test("main fails a spent turn cap after an earlier security intake marker", async () => {
+  const secure = { user: { login: "melodic-automation-lanes[bot]" }, body: "<!-- work-resolve-issue outcome=intake security run=99 -->\nWhy.", created_at: "2026-10-29T10:00:00Z" };
+  await withAsyncDir({ "lane.json": CAPPED_LANE }, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["GET", /\/issues\/77\/comments$/, 200, [secure]],
+      ["GET", /\/issues\/77\/events$/, 200, []],
+      ["POST", /\/issues\/77\/labels$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: env(dir), fetch }), 0);
+    assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")));
+    const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+    assert.equal(parseOutcomeMarker(comment).outcome, "failed");
+  });
+});
+
+test("main at the turn cap with no restarts configured fails to needs-triage and writes no label", async () => {
   await withAsyncDir({ "lane.json": CAPPED_LANE }, async (dir) => {
     const { fetch, calls } = fakeFetch([
       ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
@@ -1521,10 +2773,12 @@ test("main at the turn cap with no restarts configured hands the issue to a pers
       ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
       ["POST", /\/issues\/77\/comments$/, 201, {}],
     ]);
-    assert.equal(await main({ env: env(dir), fetch }), 0);
-    assert.deepEqual(calls.find((c) => c.path.endsWith("/labels")).body, { labels: ["needs-human"] });
-    assert.ok(calls.some((c) => c.method === "DELETE" && c.path.endsWith("/labels/agent-ready")));
+    assert.equal(await main({ env: env(dir), fetch, leaveAgentReady: statusInto(calls) }), 0);
+    assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")));
+    assert.ok(!calls.some((c) => c.method === "DELETE"));
+    assert.ok(calls.some((c) => c.method === "STATUS" && c.body.state === "needs-triage"));
     const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+    assert.equal(parseOutcomeMarker(comment).outcome, "failed");
     assert.match(comment, /turn cap 75 reached/);
     assert.ok(comment.includes(BRANCH));
   });
@@ -1636,7 +2890,7 @@ test("a verified tip is the lane's work only with the bot as author and web-flow
 // The sha goes into a request path, so anything but a full commit id fails
 // the step rather than being passed over: matching-refs only ever answers
 // full ids, so another shape means the answer itself is wrong.
-test("--find-prior fails on a lane ref whose sha is not a full commit id", async () => {
+test("--find-prior holds on a lane ref whose sha is not a full commit id", async () => {
   for (const sha of ["abc", "../../x", "A".repeat(40), undefined]) {
     await failsClosed(String(sha), { refs: [{ ref: `refs/heads/${lane(400)}`, object: { sha } }] });
   }
@@ -1701,7 +2955,7 @@ test("a pushback marker, or a newer pushback for another run, resumes nothing", 
 // earlier run's resume as it was.
 test("a newer dimension-skip marker keeps an earlier run's resume", () => {
   const branches = [branchFact(lane(400), { sha: SHA_400 })];
-  for (const reason of ["split-required", "research-first", "probe-first"]) {
+  for (const reason of ["split-required", "research-first", "probe-first", "parked"]) {
     const markers = [marked("turn-cap", "400"), marked(reason, "401", "2026-10-16T12:00:00Z")];
     assert.deepEqual(prior({ branches, markers }), { action: "resume", branch: lane(400), tip: SHA_400, cause: "turn-cap" }, reason);
   }
@@ -1772,7 +3026,7 @@ test("a marked run's branch behind main starts fresh instead of resuming", () =>
     const branches = [branchFact(lane(400), { sha: SHA_400, behindBy })];
     assert.deepEqual(
       prior({ branches, markers: [marked("stopped", "400")] }),
-      { action: "run", stale: { branch: lane(400), behindBy } },
+      { action: "run", stale: { branch: lane(400), tip: SHA_400, behindBy } },
       String(behindBy),
     );
   }
@@ -1831,9 +3085,33 @@ test("--find-prior names the resumed branch, its tip and the cause, and still ru
   assert.equal(output, `proceed=true\nskip-reason=\nreuse-branch=\nresume-branch=${lane(400)}\nresume-tip=${"a".repeat(40)}\nresume-cause=turn-cap\n`);
 });
 
-test("--find-prior runs the model fresh, with no resume outputs, when the marked run's branch is behind main", async () => {
+test("--find-prior runs the model fresh, with no resume outputs, when the marked run's branch is behind main, naming that branch and its tip", async () => {
   const comments = [{ user: { login: BOT }, body: "<!-- work-resolve-issue outcome=stopped run=400 -->", created_at: "2026-10-16T11:00:00Z" }];
   const comparison = { ahead_by: 1, behind_by: 865, total_commits: 1, commits: [LANE_TIP] };
+  const { code, calls, output } = await runPrior({ comments, refs: [refOf(lane(400))], comparison });
+  assert.equal(code, 0);
+  assert.equal(output, `proceed=true\nskip-reason=\nreuse-branch=\nstale-branch=${lane(400)}\nstale-tip=${"a".repeat(40)}\nstale-noted=false\n`);
+  // Only the reads the resume decision already made: one compare per lane branch.
+  assert.equal(calls.filter((c) => c.path.includes("/compare/")).length, 1);
+  assert.deepEqual(writesToGitHub(calls), []);
+});
+
+// report-outcome names a stale branch once: a lanes App comment opening with
+// its marker, from any earlier run, makes stale-noted true.
+test("--find-prior marks a stale branch noted only when a lanes App comment opens with that branch's marker", async () => {
+  const stopped = { user: { login: BOT }, body: "<!-- work-resolve-issue outcome=stopped run=400 -->", created_at: "2026-10-16T11:00:00Z" };
+  const comparison = { ahead_by: 1, behind_by: 865, total_commits: 1, commits: [LANE_TIP] };
+  const noted = async (comment) =>
+    (await runPrior({ comments: [stopped, comment], refs: [refOf(lane(400))], comparison })).output.match(/^stale-noted=(.*)$/m)?.[1];
+  assert.equal(await noted({ user: { login: BOT }, body: `<!-- work-resolve-issue stale-branch=${lane(400)} -->\nNamed.`, created_at: "2026-10-16T12:00:00Z" }), "true");
+  assert.equal(await noted({ user: { login: BOT }, body: `<!-- work-resolve-issue stale-branch=${lane(401)} -->\nAnother branch.`, created_at: "2026-10-16T12:00:00Z" }), "false");
+  assert.equal(await noted({ user: { login: "stranger" }, body: `<!-- work-resolve-issue stale-branch=${lane(400)} -->`, created_at: "2026-10-16T12:00:00Z" }), "false");
+  assert.equal(await noted({ user: { login: BOT }, body: `Quoted: <!-- work-resolve-issue stale-branch=${lane(400)} -->`, created_at: "2026-10-16T12:00:00Z" }), "false");
+});
+
+test("--find-prior names no stale branch when a commit on the behind branch is not the lanes App's", async () => {
+  const comments = [{ user: { login: BOT }, body: "<!-- work-resolve-issue outcome=stopped run=400 -->", created_at: "2026-10-16T11:00:00Z" }];
+  const comparison = { ahead_by: 2, behind_by: 865, total_commits: 2, commits: [LANE_TIP, { ...LANE_TIP, author: { login: "stranger" } }] };
   const { code, output } = await runPrior({ comments, refs: [refOf(lane(400))], comparison });
   assert.equal(code, 0);
   assert.equal(output, "proceed=true\nskip-reason=\nreuse-branch=\n");
@@ -1856,10 +3134,71 @@ test("with no lane branch and no closing PR the run goes ahead as before", () =>
   assert.deepEqual(prior({}), { action: "run" });
 });
 
+// The issue's lane branches a run deletes (#7948): a stopped run's branch,
+// one whose run posted an outcome marker and whose tip is the lanes App's,
+// with no pull request in any state. The branch the run reuses, resumes or
+// starts fresh past, an unreported branch and this run's own are spared.
+const prune = (facts) => {
+  const all = { issueNumber: 77, repo: "o/r", bot: BOT, humans: HUMANS, branches: [], closing: [], markers: [], ...facts };
+  return pruneBranches({ ...all, prior: findPrior(all) });
+};
+
+test("a stopped run's lane branch with no pull request is pruned", () => {
+  const markers = [marked("pushback", "400")];
+  assert.deepEqual(prune({ branches: [branchFact(lane(400))], markers }), [lane(400)]);
+  // Every attempt of a stopped run that is not resumed goes.
+  assert.deepEqual(prune({ branches: [branchFact(lane(400, 1)), branchFact(lane(400, 2))], markers }), [lane(400, 2), lane(400, 1)]);
+});
+
+test("a lane branch that backs a pull request in any state, by anyone, is kept", () => {
+  for (const pull of [pullBy(BOT, "closed"), pullBy("stranger", "open"), pullBy("kyle-sexton", "closed")]) {
+    assert.deepEqual(prune({ branches: [branchFact(lane(400), { pulls: [pull] })], markers: [marked("pushback", "400")] }), [], JSON.stringify(pull));
+  }
+});
+
+test("an unreported lane branch, or one whose tip is not the lanes App's, is kept", () => {
+  assert.deepEqual(prune({ branches: [branchFact(lane(400))] }), [], "unreported: the reuse branch");
+  assert.deepEqual(prune({ branches: [branchFact(lane(401)), branchFact(lane(400))] }), [], "an older unreported branch");
+  const tip = { ...LANE_TIP, author: { login: "stranger", type: "User" } };
+  assert.deepEqual(prune({ branches: [branchFact(lane(400), { tip })], markers: [marked("pushback", "400")] }), [], "another author's tip");
+  const commits = [LANE_TIP, tip];
+  assert.deepEqual(prune({ branches: [branchFact(lane(400), { commits })], markers: [marked("pushback", "400")] }), [], "another author's commit");
+  assert.deepEqual(prune({ branches: [branchFact(lane(400), { commits: null })], markers: [marked("pushback", "400")] }), [], "a listing cut short");
+});
+
+test("the branch the run resumes or starts fresh past is kept, and an older stopped run's goes", () => {
+  const branches = [branchFact(lane(401), { sha: SHA_400 }), branchFact(lane(400))];
+  const markers = [marked("stopped", "400", "2026-10-16T10:30:00Z"), marked("turn-cap", "401")];
+  assert.equal(findPrior({ issueNumber: 77, repo: "o/r", bot: BOT, humans: HUMANS, branches, closing: [], markers }).branch, lane(401));
+  assert.deepEqual(prune({ branches, markers }), [lane(400)]);
+  const behind = [branchFact(lane(401), { sha: SHA_400, behindBy: 3 }), branchFact(lane(400))];
+  assert.deepEqual(prune({ branches: behind, markers }), [lane(400)], "the stale branch is this run's data");
+});
+
+test("no branch of the run itself is pruned, whatever its attempt", () => {
+  const branches = [branchFact(lane(400, 1)), branchFact(lane(400, 2)), branchFact(lane(399))];
+  const markers = [marked("pushback", "399"), marked("pushback", "400")];
+  const all = { issueNumber: 77, repo: "o/r", bot: BOT, humans: HUMANS, branches, closing: [], markers };
+  assert.deepEqual(pruneBranches({ ...all, prior: findPrior(all), runId: "400" }), [lane(399)]);
+});
+
+test("--find-prior names a stopped run's branch with no pull request to prune, and none of this run's", async () => {
+  const comments = [{ user: { login: BOT }, body: "<!-- work-resolve-issue outcome=pushback run=400 -->", created_at: "2026-10-16T11:00:00Z" }];
+  const comparison = { ahead_by: 1, behind_by: 0, total_commits: 1, commits: [LANE_TIP] };
+  const { code, calls, output } = await runPrior({ comments, refs: [refOf(lane(400))], comparison });
+  assert.equal(code, 0);
+  assert.equal(output, `proceed=true\nskip-reason=\nreuse-branch=\nprune-branches=${lane(400)}\n`);
+  assert.deepEqual(writesToGitHub(calls), [], "the read job deletes nothing");
+  const own = await runPrior({ comments, refs: [refOf(lane(400))], comparison, env: { GITHUB_RUN_ID: "400" } });
+  assert.equal(own.output, "proceed=true\nskip-reason=\nreuse-branch=\n");
+  const kept = await runPrior({ comments, refs: [refOf(lane(400))], comparison, pulls: [pullBy(BOT, "closed")] });
+  assert.equal(kept.output, "proceed=true\nskip-reason=\nreuse-branch=\n");
+});
+
 // findPriorMain against a fake GitHub API: its only effect is the step
 // outputs, and it writes nothing to GitHub.
 async function withAsyncDir(files, run) {
-  const dir = mkdtempSync(join(tmpdir(), "prior-"));
+  const dir = tempDir("prior-");
   try {
     for (const [name, text] of Object.entries(files)) {
       writeFileSync(join(dir, name), text);
@@ -1877,7 +3216,35 @@ const TRUSTED_LIST = JSON.stringify({
     { id: 337595936, login: BOT, kind: "bot" },
   ],
 });
-const graphql = (nodes, pageInfo = { hasNextPage: false, endCursor: null }) => ({
+
+// #13425: main takes the linkage lines from the issue body only when a listed
+// human wrote the issue.
+test("main opens the PR with the done-when's Refs line only for a listed human's issue", async () => {
+  for (const [user, expected] of [
+    [{ login: "kyle-sexton", id: OWNER_ID, type: "User" }, "Closes #77\nRefs: #6917\n"],
+    [{ login: "someone", id: 5, type: "User" }, "Closes #77\n\n"],
+  ]) {
+    await withAsyncDir(
+      { "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: BRANCH }), "runner-checks": checksFile(), "trusted.json": TRUSTED_LIST },
+      async (dir) => {
+        const { fetch, calls } = fakeFetch([
+          ["GET", /\/issues\/77$/, 200, { ...ISSUE[2], user, body: "## Done when\n\n- [ ] The PR body carries `Refs: #6917`." }],
+          branchTip(),
+          ["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }],
+          ["GET", /\/compare\//, 200, { files: [{ filename: "README.md" }] }],
+          ["GET", /\/pulls$/, 200, []],
+          ["POST", /\/pulls$/, 201, { number: 90, html_url: "https://example/o/r/pull/90" }],
+          ["POST", /\/issues\/90\/labels$/, 200, []],
+        ]);
+        assert.equal(await main({ env: { ...env(dir), TRUSTED_ACTORS: join(dir, "trusted.json") }, fetch }), 0);
+        const pull = calls.find((c) => c.method === "POST" && c.path.endsWith("/pulls")).body;
+        assert.ok(pull.body.startsWith(expected), pull.body);
+      },
+    );
+  }
+});
+
+const graphql = (nodes,pageInfo = { hasNextPage: false, endCursor: null }) => ({
   data: { repository: { issue: { closedByPullRequestsReferences: { nodes, pageInfo } } } },
 });
 const refOf = (name) => ({ ref: `refs/heads/${name}`, object: { sha: "a".repeat(40) } });
@@ -1992,22 +3359,52 @@ test("--find-prior does not take another account's copy of a marker as a report"
   assert.equal(output, `proceed=false\nskip-reason=not-applicable\nreuse-branch=${lane(400)}\n`);
 });
 
-test("--find-prior fails and writes no output when a read fails, so the mint never follows", async () => {
-  await withAsyncDir({ "trusted.json": TRUSTED_LIST, output: "" }, async (dir) => {
-    const { fetch } = fakeFetch([["GET", /\/issues\/77\/comments$/, 200, []]]);
-    const code = await findPriorMain({
-      env: {
-        ISSUE_NUMBER: "77",
-        GITHUB_REPOSITORY: "o/r",
-        GITHUB_API_URL: "https://api.example",
-        TRUSTED_ACTORS_PATH: join(dir, "trusted.json"),
-        GITHUB_OUTPUT: join(dir, "output"),
-      },
-      fetch,
+// The read runner's `go` step stops the activity only on proceed=false, so the
+// hold writes exactly that: no reuse branch to report and no branch to prune.
+const HELD = "proceed=false\n";
+
+test("--find-prior holds when a read fails: green with a notice and proceed=false, and it writes nothing to GitHub", async (t) => {
+  const log = t.mock.method(console, "log", () => {});
+  for (const status of [404, 502]) {
+    await withAsyncDir({ "trusted.json": TRUSTED_LIST, output: "" }, async (dir) => {
+      const { fetch, calls } = fakeFetch([["GET", /\/issues\/77\/comments$/, status, { message: "boom" }]]);
+      const code = await findPriorMain({
+        env: {
+          ISSUE_NUMBER: "77",
+          GITHUB_REPOSITORY: "o/r",
+          GITHUB_API_URL: "https://api.example",
+          TRUSTED_ACTORS_PATH: join(dir, "trusted.json"),
+          GITHUB_OUTPUT: join(dir, "output"),
+        },
+        fetch,
+        sleep: async () => {},
+      });
+      assert.equal(code, 0, status);
+      assert.equal(readFileSync(join(dir, "output"), "utf8"), HELD, status);
+      assert.deepEqual(writesToGitHub(calls), [], status);
     });
-    assert.equal(code, 1);
-    assert.equal(readFileSync(join(dir, "output"), "utf8"), "");
-  });
+  }
+  const logged = log.mock.calls.map((call) => String(call.arguments[0]));
+  assert.ok(logged.some((line) => line.startsWith("::notice")), logged.join("\n"));
+  assert.ok(!logged.some((line) => line.startsWith("::error")), logged.join("\n"));
+});
+
+// The issue-fields job's re-derive publishes a branch claim only on this
+// step's success (pr-run-activity-read.yml), so a read it could not make still
+// fails, and its job continues on the error.
+test("--find-prior re-deriving a claim (FIND_PRIOR_KEEP_BEHIND) still fails on a failed read, with no output", async () => {
+  const { code, output } = await runPrior({ refs: { message: "odd" }, env: { FIND_PRIOR_KEEP_BEHIND: "true" } });
+  assert.equal(code, 1);
+  assert.equal(output, "");
+});
+
+// What no read can fix is a fault in the step, not an outage.
+test("--find-prior still fails on a bad issue number, a bad repository or an unreadable trust list", async () => {
+  for (const env of [{ ISSUE_NUMBER: "x" }, { GITHUB_REPOSITORY: "nope" }, { TRUSTED_ACTORS_PATH: "/nonexistent/trusted.json" }]) {
+    const { code, output } = await runPrior({ env });
+    assert.equal(code, 1, JSON.stringify(env));
+    assert.equal(output, "", JSON.stringify(env));
+  }
 });
 
 test("--find-prior reads every page of closing PRs, so outsiders' PRs cannot hide a trusted one", async () => {
@@ -2018,83 +3415,83 @@ test("--find-prior reads every page of closing PRs, so outsiders' PRs cannot hid
   assert.equal(output, "proceed=false\nskip-reason=not-applicable\nreuse-branch=\n");
 });
 
-test("--find-prior fails on a pull request listing that is not a list", async () => {
+test("--find-prior holds on a pull request listing that is not a list", async () => {
   for (const pulls of [{ message: "odd" }, "x"]) {
     const { code, output } = await runPrior({ refs: [refOf(lane(400))], pulls });
-    assert.equal(code, 1, JSON.stringify(pulls));
-    assert.equal(output, "");
+    assert.equal(code, 0, JSON.stringify(pulls));
+    assert.equal(output, HELD);
   }
 });
 
-// Each answer of the wrong shape fails the step with no outputs written.
+// Each answer of the wrong shape is an incomplete read: the step holds.
 const failsClosed = async (label, facts) => {
   const { code, output } = await runPrior(facts);
-  assert.equal(code, 1, label);
-  assert.equal(output, "", label);
+  assert.equal(code, 0, label);
+  assert.equal(output, HELD, label);
 };
 
-test("--find-prior fails past the 50-page cap of closing PRs", async () => {
+test("--find-prior holds past the 50-page cap of closing PRs", async () => {
   const pages = Array.from({ length: 51 }, (_, i) => [{ ...closer("User", `stranger${i}`, 1000 + i), number: 600 + i }]);
   await failsClosed("51 pages", { graphqlPages: pages });
 });
 
-test("--find-prior fails on a closing PR with no state", async () => {
+test("--find-prior holds on a closing PR with no state", async () => {
   for (const state of [undefined, null, 1]) {
     await failsClosed(String(state), { nodes: [{ ...closer("User", "stranger", 42), state }] });
   }
 });
 
-test("--find-prior fails on a closing-PR page with no page information", async () => {
+test("--find-prior holds on a closing-PR page with no page information", async () => {
   const page = (pageInfo) => ({ data: { repository: { issue: { closedByPullRequestsReferences: { nodes: [], pageInfo } } } } });
   for (const pageInfo of [undefined, {}, { hasNextPage: "false" }]) {
     await failsClosed(JSON.stringify(pageInfo) ?? "no pageInfo", { closingAnswer: page(pageInfo) });
   }
 });
 
-test("--find-prior fails at once on a next page with no cursor, after one closing-PR read", async () => {
+test("--find-prior holds at once on a next page with no cursor, after one closing-PR read", async () => {
   for (const endCursor of [null, ""]) {
     const { code, calls, output } = await runPrior({ closingAnswer: graphql([], { hasNextPage: true, endCursor }) });
-    assert.equal(code, 1, String(endCursor));
-    assert.equal(output, "", String(endCursor));
+    assert.equal(code, 0, String(endCursor));
+    assert.equal(output, HELD, String(endCursor));
     assert.equal(calls.filter((c) => c.path === "/graphql").length, 1, String(endCursor));
   }
 });
 
-test("--find-prior fails on a lanes-App marker naming no run whose time cannot be read", async () => {
+test("--find-prior holds on a lanes-App marker naming no run whose time cannot be read", async () => {
   for (const created_at of [undefined, "not a date"]) {
     const comments = [{ user: { login: BOT }, body: "<!-- work-resolve-issue outcome=stopped -->", created_at }];
     await failsClosed(String(created_at), { comments });
   }
 });
 
-test("--find-prior fails on a lane-branch listing that is not a list", async () => {
+test("--find-prior holds on a lane-branch listing that is not a list", async () => {
   await failsClosed("matching-refs object", { refs: { message: "odd" } });
 });
 
-test("--find-prior fails on a repository answer with no default branch", async () => {
+test("--find-prior holds on a repository answer with no default branch", async () => {
   for (const repoAnswer of [{}, { default_branch: "" }, { default_branch: 5 }]) {
     await failsClosed(JSON.stringify(repoAnswer), { refs: [refOf(lane(400))], repoAnswer });
   }
 });
 
-test("--find-prior fails on a tip commit with no readable time when a marker names no run", async () => {
+test("--find-prior holds on a tip commit with no readable time when a marker names no run", async () => {
   const comments = [{ user: { login: BOT }, body: "<!-- work-resolve-issue outcome=stopped -->", created_at: "2026-10-16T11:00:00Z" }];
   for (const commitAnswer of [{}, { ...LANE_TIP, commit: { ...LANE_TIP.commit, committer: { date: "not a date" } } }]) {
     await failsClosed(JSON.stringify(commitAnswer), { comments, refs: [refOf(lane(400))], commitAnswer });
   }
 });
 
-test("--find-prior fails on a comparison with no whole-number behind_by", async () => {
+test("--find-prior holds on a comparison with no whole-number behind_by", async () => {
   for (const behind of [undefined, "3", null, 1.5, -1]) {
     await failsClosed(String(behind), { refs: [refOf(lane(400))], comparison: { ahead_by: 1, behind_by: behind } });
   }
 });
 
-test("--find-prior fails on a comparison with no whole-number ahead_by", async () => {
+test("--find-prior holds on a comparison with no whole-number ahead_by", async () => {
   for (const comparison of [{}, { ahead_by: "3" }, { ahead_by: null }, { ahead_by: 1.5 }, { ahead_by: -1 }]) {
     const { code, output } = await runPrior({ refs: [refOf(lane(400))], comparison });
-    assert.equal(code, 1, JSON.stringify(comparison));
-    assert.equal(output, "");
+    assert.equal(code, 0, JSON.stringify(comparison));
+    assert.equal(output, HELD);
   }
 });
 
@@ -2102,8 +3499,8 @@ test("--find-prior fails on a comparison with no whole-number ahead_by", async (
 // issue-<N>-<run>-* to its report.
 test("hand-back markers carry run= and read back with it", () => {
   for (const outcome of [
-    { exit: "stopped", reason: "Tests failed.", title: "", summary: "" },
-    { exit: "pushback", reason: "Which file?", title: "", summary: "" },
+    { exit: "stopped", reason: "design-change: Tests failed.", title: "", summary: "" },
+    { exit: "pushback", reason: "Which file?", cause: "intent", title: "", summary: "" },
   ]) {
     const plan = decide({ outcome, issueNumber: 77, issueLabels: [], branch: BRANCH, changedFiles: [], runId: "555" });
     assert.ok(plan.comment.startsWith(`${ESC}<!-- work-resolve-issue outcome=${outcome.exit} run=555 -->\n`), plan.comment);
@@ -2111,7 +3508,7 @@ test("hand-back markers carry run= and read back with it", () => {
   }
 });
 
-test("the reuse PR body is fixed text, held, and follows the PR body contract's order", () => {
+test("a reuse PR body with no runner checks is fixed text, held, and follows the PR body contract's order", () => {
   const plan = reusePlan({
     issueNumber: 77,
     issueTitle: "Lane PR titles fall back",
@@ -2161,7 +3558,8 @@ test("a reused branch with another run's or no outcome opens a held PR with none
       assert.ok(pull.body.split("\n").includes("Hold: a human merges this"), pull.body);
       assert.ok(!pull.body.includes("MODEL-SUMMARY-TEXT") && !pull.body.includes("model title"), pull.body);
       assert.ok(pull.body.includes("https://example/o/r/actions/runs/400"), pull.body);
-      assert.ok(!calls.some((c) => c.path.endsWith("/comments") || c.path.endsWith("/labels")), Object.keys(files).join());
+      assert.ok(!calls.some((c) => c.path.endsWith("/comments") || c.path.endsWith("/issues/77/labels")), Object.keys(files).join());
+      assert.deepEqual(calls.filter((c) => c.path.endsWith("/issues/90/labels")).map((c) => c.body), [{ labels: ["do-not-merge"] }]);
     });
   }
 });
@@ -2187,8 +3585,8 @@ test("a reuse branch that is not this issue's lane branch is refused", async () 
 
 // The summary pass: on a reuse, a read-only model pass over the branch diff
 // and the issue writes reuse-summary.json beside runner facts (issue, branch,
-// the tip it read). Owner decision: a reuse PR keeps the hold line whether or
-// not it carries a usable summary; with none, it keeps today's fixed text.
+// the tip it read). A reuse PR holds on mustHold's conditions whether or not
+// it carries a usable summary; with none, it keeps the fixed text.
 const TIP = "a".repeat(40);
 const summaryFile = (overrides = {}, output = {}) =>
   JSON.stringify({
@@ -2199,10 +3597,9 @@ const summaryFile = (overrides = {}, output = {}) =>
     output: { title: "docs(work-items): summary title", summary: "SUMMARY-PASS-TEXT", changes: ["CHANGE-ONE"], ...output },
     ...overrides,
   });
-// Readable denied paths, so a hold decided from runner facts (decide()'s
-// predicate) would not hold the README-only, read-only-class reuse PRs below:
-// only the rule that every reuse PR is held puts the hold line on them.
-const RESOLVED = JSON.stringify({ merge: { "diff-check": { "denied-paths": HOLD_GLOBS } } });
+// Readable denied paths, so the README-only, read-only-class reuse PRs below
+// hold only because no runner checks or leak scan reached them.
+const RESOLVED = JSON.stringify({ merge: { "diff-check": { "denied-paths": HOLD_GLOBS, "path-holds": true } } });
 const summaryEnv = (dir) => ({ ...reuseEnv(dir), REUSE_SUMMARY_DIR: dir, RESOLVED_CONFIG: join(dir, "resolved.json") });
 const tipRoute = (sha = TIP) => ["GET", /\/git\/ref\/heads\/work-resolve-issue\/issue-77-400-1$/, 200, { object: { sha } }];
 const usable = { title: "docs(work-items): summary title", summary: "SUMMARY-PASS-TEXT", changes: ["CHANGE-ONE"] };
@@ -2326,7 +3723,7 @@ test("a branch's own outcome wins over a summary, so the summary never stands in
 
 // main on a done run of an issue with these labels and `labeled` events, under
 // a resolved config that denies no path, so only the label can hold the PR.
-async function runHumanMerge({ labels, events = [], eventsStatus = 200, trusted = TRUSTED_LIST }) {
+async function runHumanMerge({ labels, events = [], eventsStatus = 200, trusted = TRUSTED_LIST, open = [], labelStatus = 200 }) {
   return withAsyncDir(
     {
       "work-outcome.json": JSON.stringify(done),
@@ -2342,14 +3739,21 @@ async function runHumanMerge({ labels, events = [], eventsStatus = 200, trusted 
         branchTip(),
         ["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }],
         ["GET", /\/compare\//, 200, { files: [{ filename: "README.md" }] }],
-        ["GET", /\/pulls$/, 200, []],
+        ["GET", /\/pulls$/, 200, open],
         ["POST", /\/pulls$/, 201, { number: 90 }],
+        ["POST", /\/issues\/90\/labels$/, labelStatus, []],
+        ["PATCH", /\/pulls\/90$/, 200, {}],
+        ...HISTORY,
+        ["POST", /\/issues\/77\/labels$/, 200, []],
+        ["DELETE", /\/issues\/77\/labels\//, 200, []],
+        ["POST", /\/issues\/77\/comments$/, 201, {}],
       ]);
       const code = await main({
         env: { ...env(dir), RESOLVED_CONFIG: join(dir, "resolved.json"), TRUSTED_ACTORS: join(dir, "trusted.json") },
         fetch,
+        sleep: async () => {},
       });
-      return { code, calls, body: calls.find((c) => c.method === "POST" && c.path.endsWith("/pulls")).body.body };
+      return { code, calls, body: calls.find((c) => c.method === "POST" && c.path.endsWith("/pulls"))?.body.body };
     },
   );
 }
@@ -2374,14 +3778,87 @@ test("main without merge: human holds no PR and reads no label events", async ()
   assert.ok(!calls.some((c) => c.path.endsWith("/events")));
 });
 
+// The hold line is body text the lanes App can edit, so a held PR also
+// carries a label only a listed person's removal lifts (ci-status's
+// human-merge hold step).
+const holdLabelPosts = (calls) => calls.filter((c) => c.method === "POST" && c.path.endsWith("/issues/90/labels"));
+
+test("main labels a held PR do-not-merge right after it opens", async () => {
+  assert.equal(HOLD_LABEL, "do-not-merge");
+  const { code, calls } = await runHumanMerge({ labels: MERGE_HUMAN, events: [labeled("merge: human", "kyle-sexton", OWNER_ID)] });
+  assert.equal(code, 0);
+  assert.deepEqual(holdLabelPosts(calls).map((c) => c.body), [{ labels: ["do-not-merge"] }]);
+  assert.ok(!calls.some((c) => c.method === "PATCH"));
+});
+
+test("main puts no do-not-merge label on a PR that does not hold", async () => {
+  const { code, calls } = await runHumanMerge({ labels: ["agent-ready", "work-class: scoped"] });
+  assert.equal(code, 0);
+  assert.deepEqual(holdLabelPosts(calls), []);
+});
+
+test("main labels a held PR it reuses from an earlier attempt", async () => {
+  const { code, calls } = await runHumanMerge({
+    labels: MERGE_HUMAN,
+    events: [labeled("merge: human", "kyle-sexton", OWNER_ID)],
+    open: [{ number: 90, user: { login: BOT } }],
+  });
+  assert.equal(code, 0);
+  assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/pulls")));
+  assert.deepEqual(holdLabelPosts(calls).map((c) => c.body), [{ labels: ["do-not-merge"] }]);
+});
+
+test("main closes a held PR it cannot label and retries the issue", async () => {
+  const { code, calls } = await runHumanMerge({
+    labels: MERGE_HUMAN,
+    events: [labeled("merge: human", "kyle-sexton", OWNER_ID)],
+    labelStatus: 500,
+  });
+  assert.equal(code, 0);
+  assert.ok(holdLabelPosts(calls).length >= 2, "the label write is resent");
+  assert.deepEqual(calls.find((c) => c.method === "PATCH" && c.path.endsWith("/pulls/90"))?.body, { state: "closed" });
+  const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/issues/77/comments")).body.body;
+  assert.ok(comment.startsWith("<!-- work-resolve-issue outcome=retry"), comment);
+  assert.match(comment, /`hold-label-failed`/);
+});
+
 test("main ignores merge: human from a labeler who is not a listed human or the lanes App", async () => {
   const { body } = await runHumanMerge({ labels: MERGE_HUMAN, events: [labeled("merge: human", "stranger", 42)] });
   assert.ok(!holds(body), body);
 });
 
-test("main holds the PR when merge: human's labeler cannot be read", async () => {
-  assert.ok(holds((await runHumanMerge({ labels: MERGE_HUMAN, eventsStatus: 500, events: { message: "boom" } })).body));
+test("main holds the PR when the trusted list that judges merge: human's labeler cannot be read", async () => {
   assert.ok(holds((await runHumanMerge({ labels: MERGE_HUMAN, events: [labeled("merge: human", "kyle-sexton", OWNER_ID)], trusted: null })).body));
+});
+
+// A label whose adder is unknown is neither ignored, which would drop a listed
+// human's hold, nor taken as one, which would hold the PR for a person on no
+// evidence. No marker goes up, so the branch stays unreported and the next run
+// reuses it.
+test("main opens no PR and writes nothing when merge: human's labeler cannot be read, and ends green", async (t) => {
+  const log = t.mock.method(console, "log", () => {});
+  const { code, calls } = await runHumanMerge({ labels: MERGE_HUMAN, eventsStatus: 500, events: { message: "boom" } });
+  assert.equal(code, 0);
+  assert.deepEqual(calls.filter((c) => c.method !== "GET"), []);
+  assert.ok(log.mock.calls.some((call) => String(call.arguments[0]).startsWith("::notice")));
+});
+
+test("main still reports a stop that opens no PR when merge: human's labeler cannot be read", async () => {
+  await withAsyncDir({ "work-outcome.json": JSON.stringify({ exit: "stopped", reason: "host-only: this needs a desktop", title: "", summary: "" }) }, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, 200, { number: 77, labels: MERGE_HUMAN.map((name) => ({ name })) }],
+      ["GET", /\/issues\/77\/events$/, 500, { message: "boom" }],
+      ["POST", /\/issues\/77\/labels$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\//, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: env(dir), fetch, sleep: async () => {} }), 0);
+    const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+    assert.equal(parseOutcomeMarker(comment).outcome, "host-run");
+    // The stop sets Work status to confirmed and still adds its host-run label.
+    assert.ok(calls.some((c) => c.method === "POST" && c.path.endsWith("/issues/77/labels") && c.body?.labels?.includes("host-run")), JSON.stringify(calls.map((c) => `${c.method} ${c.path}`)));
+    assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/pulls")));
+  });
 });
 
 // The funding stop (ci-workflows#781): a run that exits 1 with
@@ -2429,16 +3906,24 @@ test("a funding stop keeps agent-ready, adds no label and leaves a funding marke
   const plan = decideFunding({ funding: { regain: Date.parse("2026-11-01T00:00:00Z") } });
   assert.equal(plan.action, "funding");
   assert.deepEqual(plan.addLabels, []);
-  assert.deepEqual(plan.removeLabels, []);
   assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=funding resets=2026-11-01T00:00:00Z run=555 -->\n"), plan.comment);
   assert.match(plan.comment, /funding/);
   assert.deepEqual(parseOutcomeMarker(plan.comment), { outcome: "funding", resets: Date.parse("2026-11-01T00:00:00Z"), run: "555", onResumed: false });
 });
 
-test("a funding stop with no date leaves a marker with no reset", () => {
+test("a funding stop with no date leaves a marker with no reset, and work-unblock, not a person, restarts it", () => {
   const plan = decideFunding({ funding: { regain: null } });
   assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=funding run=555 -->\n"), plan.comment);
   assert.equal(parseOutcomeMarker(plan.comment).resets, null);
+  assert.match(plan.comment, /work-unblock starts it again after limits\.fallback-reset hours/);
+  assert.doesNotMatch(plan.comment, /a person/);
+});
+
+// work-unblock's fail route after limits.limit-stops-per-issue leaves an
+// outcome=failed marker naming the stopped run; a person's new agent-ready
+// then resumes that run's branch like the limit or funding marker it follows.
+test("a failed marker is resumable", () => {
+  assert.ok(RESUMABLE.has("failed"));
 });
 
 test("a funding stop wins over a turn-cap or limit record, so it counts as neither", () => {
@@ -2447,17 +3932,23 @@ test("a funding stop wins over a turn-cap or limit record, so it counts as neith
 });
 
 test("a stop the skill reported goes to a person even with a funding record", () => {
-  const plan = decideFunding({ outcome: { exit: "stopped", reason: "Blocked.", title: "", summary: "" }, funding: { regain: null } });
+  const plan = decideFunding({ outcome: { exit: "stopped", reason: "design-change: Blocked.", title: "", summary: "" }, funding: { regain: null } });
   assert.equal(plan.action, "hand-back");
 });
 
 // collect-base-activity runs a script activity from a copy of its own
 // directory under $RUNNER_TEMP, so every import must resolve inside it.
-test("the script loads from a copy of its own directory alone", async () => {
-  const copy = mkdtempSync(join(tmpdir(), "base-script-"));
+// collect-base-activity puts the base .github/scripts/lib/ beside that copy.
+test("the script loads from a copy of its own directory alone, beside the shared lib", async () => {
+  const copy = tempDir("base-script-");
   try {
-    cpSync(dirname(fileURLToPath(import.meta.url)), copy, { recursive: true });
-    const module = await import(pathToFileURL(join(copy, "report-outcome.mjs")).href);
+    const here = dirname(fileURLToPath(import.meta.url));
+    cpSync(here, join(copy, "base-script"), { recursive: true });
+    cpSync(join(here, "..", "lib"), join(copy, "lib"), { recursive: true });
+    // collect-base-activity also stages the base merge-holds.mjs as ../pr-merge/.
+    mkdirSync(join(copy, "pr-merge"));
+    cpSync(join(here, "..", "pr-merge", "merge-holds.mjs"), join(copy, "pr-merge", "merge-holds.mjs"));
+    const module = await import(pathToFileURL(join(copy, "base-script", "report-outcome.mjs")).href);
     assert.equal(typeof module.main, "function");
   } finally {
     rmSync(copy, { recursive: true, force: true });
@@ -2470,10 +3961,10 @@ test("the script loads from a copy of its own directory alone", async () => {
 // (.txt, .json, .jsonl) the merged ref would hold: the base's, with the
 // branch's own changes since the merge base; a committed symlink there fails
 // the step.
-function runChecksScript() {
+function runChecksScript(step = "run-checks") {
   const lines = readFileSync(new URL("../../workflows/work-resolve-issue.yml", import.meta.url), "utf8").split("\n");
-  const id = lines.findIndex((line) => /^\s+id: run-checks$/.test(line));
-  assert.notEqual(id, -1, "work-resolve-issue.yml has the run-checks step");
+  const id = lines.findIndex((line) => line.trim() === `id: ${step}`);
+  assert.notEqual(id, -1, `work-resolve-issue.yml has the ${step} step`);
   const start = lines.findIndex((line, i) => i > id && /^\s+run: \|$/.test(line));
   const keyIndent = lines[start].search(/\S/);
   const body = [];
@@ -2502,8 +3993,9 @@ function runChecks({
   baseFiles = {},
   extraCheck = "true",
   unrelatedBase = false,
+  env = () => ({}),
 }) {
-  const root = mkdtempSync(join(tmpdir(), "run-checks-"));
+  const root = tempDir("run-checks-");
   try {
     const base = join(root, "base");
     const laneDir = join(root, "lane");
@@ -2551,7 +4043,7 @@ function runChecks({
     write(join(root, "resolved.json"), JSON.stringify({ lane: { slots: [{ name: "resolve-issue", checks }] } }));
     const run = spawnSync("bash", ["-e", "-o", "pipefail", "-c", runChecksScript()], {
       encoding: "utf8",
-      env: { ...process.env, BASE: base, LANE: laneDir, BRANCH, RESOLVED: join(root, "resolved.json"), GITHUB_OUTPUT: out, LOG: log },
+      env: { ...process.env, BASE: base, LANE: laneDir, BRANCH, RESOLVED: join(root, "resolved.json"), GITHUB_OUTPUT: out, LOG: log, ...env(tip) },
     });
     const output = existsSync(out) ? readFileSync(out, "utf8").split("\n").find((line) => line.startsWith("checks=")) : undefined;
     return {
@@ -2660,27 +4152,129 @@ test("the runner records an empty result list when the activity lists no checks"
 // whose first line is exactly the escalation marker (work-items reference
 // escalation-marker.md), so every plan that adds the human-gated label opens
 // with it, and a plan that keeps agent-ready for a restart carries none.
-test("every hand-back opens with the attended queue's escalation marker, and a restart carries none", () => {
+test("every hand-back opens with the attended queue's escalation marker, and no other route carries one", () => {
   const plain = { issueNumber: 77, issueLabels: [], branch: BRANCH, changedFiles: [], runId: "555" };
   const handBacks = [
-    decide({ ...plain, outcome: { exit: "pushback", reason: "Which file?", title: "", summary: "" } }),
-    decide({ ...plain, outcome: { exit: "stopped", reason: "Tests failed.", title: "", summary: "" } }),
-    decide({ ...plain, outcome: { exit: "done", reason: "", title: "", summary: "" }, escalation: "patch-protected-path" }),
-    capped({ limits: { "turn-cap-restarts": 0 } }),
+    decide({ ...plain, outcome: { exit: "pushback", reason: "Which file?", cause: "intent", title: "", summary: "" } }),
+    decide({ ...plain, outcome: { exit: "stopped", reason: "design-change: Tests failed.", title: "", summary: "" } }),
+    decide({ ...plain, outcome: { exit: "done", reason: "", title: "", summary: "" }, escalation: "patch-credential" }),
   ];
   for (const plan of handBacks) {
-    assert.deepEqual(plan.addLabels, ["needs-human"], plan.comment);
+    assert.equal(plan.status, "needs-human", plan.comment);
     assert.equal(plan.comment.split("\n")[0], "<!-- work-items:escalation lane=work-resolve-issue kind=escalated -->", plan.comment);
   }
   const restarts = [
     capped(),
+    capped({ limits: { "turn-cap-restarts": 0 } }),
+    decide({ ...plain, outcome: { exit: "done", reason: "", title: "", summary: "" }, escalation: "patch-protected-path" }),
+    decide({ ...plain, outcome: readOutcome("/nonexistent/work-outcome.json") }),
+    decide({ ...plain, outcome: { exit: "stopped", reason: "Tests failed.", title: "", summary: "" } }),
+    decide({ ...plain, outcome: { exit: "stopped", reason: "blocked-by-pr: #5 adds the helper", title: "", summary: "" } }),
+    decide({ ...plain, outcome: { exit: "stopped", reason: "already-done: on main at abc1234", title: "", summary: "" } }),
     decideFunding({ funding: { regain: null } }),
     decideFunding({ limit: { resets: Date.parse("2026-10-17T18:00:00Z") }, now: Date.parse("2026-10-17T12:00:00Z") }),
   ];
   for (const plan of restarts) {
-    assert.deepEqual(plan.addLabels, [], plan.comment);
+    assert.ok(!(plan.status === "needs-human"), plan.comment);
     assert.ok(!plan.comment.includes("work-items:escalation"), plan.comment);
   }
+});
+
+// Every comment that reaches a person says which of the owner's reasons
+// applies, as a marker and a visible line (../lib/stop-reason.mjs); `none`
+// never reaches one.
+test("every person-routed comment carries the stop-reason marker and the Reason line", async () => {
+  const holds = Object.keys(STOP_ROUTES).filter((reason) => STOP_ROUTES[reason].route === "hold");
+  assert.ok(holds.length > 0);
+  const plain = { issueNumber: 77, issueLabels: [], branch: BRANCH, changedFiles: [], runId: "555", humanLabel: "needs-human" };
+  for (const reason of holds) {
+    const outcome = { exit: "stopped", reason: "Why.", title: "", summary: "", changes: [], verification: [], notDone: [], steps: [], unread: true, stop: reason };
+    const plan = decide({ ...plain, outcome });
+    assert.equal(plan.action, "hand-back", reason);
+    const code = parseReason(plan.comment)?.reason;
+    assert.ok(isPersonReason(code), `${reason}: ${code}`);
+    assert.ok(plan.comment.split("\n").includes(`Reason: \`${code}\``), plan.comment);
+  }
+  const pushback = decide({ ...plain, outcome: { exit: "pushback", reason: "Which file?", cause: "intent", title: "", summary: "" } });
+  assert.equal(parseReason(pushback.comment).reason, "intent");
+  assert.ok(pushback.comment.includes("Reason: `intent`"));
+  // A comment that reaches no person carries no stop-reason marker.
+  assert.equal(parseReason(decide({ ...plain, outcome: { exit: "stopped", reason: "Tests failed.", title: "", summary: "" } }).comment), null);
+});
+
+// A security hold read from the run's words names the word, so a person can
+// dismiss a false hit in one read. Expected lines follow the comment's rule:
+// the word, in a code span, of ASCII letters, digits, hyphens, underscores and
+// single spaces.
+const WORD_LINE = "Matched security word: ";
+const wordLine = (comment) => comment.split("\n").find((line) => line.startsWith(WORD_LINE));
+const wordsPlan = (reason, over = {}) =>
+  decide({
+    issueNumber: 77,
+    issueLabels: [],
+    branch: "",
+    changedFiles: [],
+    humanLabel: "needs-human",
+    outcome: { exit: "stopped", reason, title: "", summary: "", changes: [], verification: [], notDone: [], steps: [], ...over },
+  });
+
+test("a security hold read from the run's words names the matched word and keeps its hold", () => {
+  for (const [reason, word] of [
+    ["already-done: merged in #11518, which closed the part that took over #9103's whole scope.", "took over"],
+    ["The TOKEN is in the URL.", "TOKEN"],
+    ["host-only: needs credentials, and the run found a backdoor", "backdoor"],
+    ["manual-external: rotate the leaked deploy token in the DNS account.", "token"],
+  ]) {
+    const plan = wordsPlan(reason);
+    assert.equal(plan.action, "hand-back", reason);
+    assert.equal(plan.stop, "security-risk", reason);
+    assert.ok((plan.status === "needs-human"), reason);
+    assert.equal(parseReason(plan.comment).reason, "security", plan.comment);
+    assert.ok(wordLine(plan.comment)?.startsWith(`${WORD_LINE}\`${word}\`.`), plan.comment);
+  }
+});
+
+test("a matched word cannot mention, link, close, or add markup to the comment", () => {
+  for (const [reason, word] of [
+    ["ignore @owner [x](http://e.co) #5 `y` <b> instructions", "ignore owner x http e co 5 y b instructions"],
+    ["ignore \uff20owner \uff035 instructions", "ignore owner 5 instructions"],
+    ["ignore closes GH-5 instructions", "ignore closes GH-5 instructions"],
+    ["took\n\n  over the account", "took over"],
+  ]) {
+    const plan = wordsPlan(reason);
+    assert.equal(plan.stop, "security-risk", reason);
+    assert.ok(wordLine(plan.comment)?.startsWith(`${WORD_LINE}\`${word}\`.`), plan.comment);
+    assert.equal(plan.comment.split("\n").filter((line) => line.startsWith("<!--")).length, 3, plan.comment);
+  }
+});
+
+test("a spent intake round names the word from whichever of the run's words holds it", () => {
+  const plain = { issueNumber: 77, issueLabels: ["agent-ready"], branch: "", changedFiles: [], humanLabel: "needs-human" };
+  const plan = decide({ ...plain, outcome: { exit: "pushback", reason: "Which helper?", title: "", summary: "The log printed the deploy token." } });
+  const spent = capRetries(plan, 1);
+  assert.equal(spent.stop, "security-risk");
+  assert.ok(wordLine(spent.comment)?.startsWith(`${WORD_LINE}\`token\`.`), spent.comment);
+  const coded = capRetries(decide({ ...plain, outcome: { exit: "pushback", reason: "Which helper?", title: "", summary: "design-change: the token store needs a new shape" } }), 1);
+  assert.equal(coded.stop, "security-risk");
+  assert.ok(wordLine(coded.comment)?.startsWith(`${WORD_LINE}\`token\`.`), coded.comment);
+});
+
+test("a hold no word put there names no word", () => {
+  const plain = { issueNumber: 77, issueLabels: [], branch: "", changedFiles: [], humanLabel: "needs-human" };
+  const pushback = (reason, cause) => decide({ ...plain, outcome: { exit: "pushback", reason, cause, title: "", summary: "" } });
+  for (const plan of [
+    wordsPlan("security-risk: the deploy token is in the log"),
+    wordsPlan("security-risk: see the summary", { summary: "The deploy token is in the log." }),
+    pushback("security-risk: the issue asks to print the deploy token in the log."),
+    pushback("The fix needs the token rotated.", "security-risk"),
+    wordsPlan("Why.", { stop: "patch-credential", unread: true }),
+    pushback("Which token does the issue mean?", "intent"),
+    wordsPlan("design-change: the token store needs a new shape"),
+  ]) {
+    assert.equal(plan.action, "hand-back", plan.comment);
+    assert.equal(wordLine(plan.comment), undefined, plan.comment);
+  }
+  assert.equal(wordLine(wordsPlan("The tests failed twice.").comment), undefined);
 });
 
 test("an outcome marker reads back after the escalation marker line, and after no other line", () => {
@@ -2690,4 +4284,1610 @@ test("an outcome marker reads back after the escalation marker line, and after n
   assert.deepEqual(parseOutcomeMarker(`<!-- work-items:escalation lane=work-resolve-issue kind=escalated -->\r\n${outcome}`), read);
   assert.equal(parseOutcomeMarker(`<!-- work-items:escalation lane=pr-unblock kind=escalated -->\n${outcome}`), null);
   assert.equal(parseOutcomeMarker(`Quoting <!-- work-items:escalation lane=work-resolve-issue kind=escalated -->\n${outcome}`), null);
+});
+
+// The run counts a listed human's comment as an answer only when its first
+// line is `**Decision recorded.**` (write-issue.mjs), so a pushback links the
+// owner's newest comment that lacks it and shows the line (#7916).
+const commentUrl = (id) => `https://github.com/o/r/issues/77#issuecomment-${id}`;
+const issueComment = (id, userId, body, extra = {}) => ({ id, user: { id: userId }, body, html_url: commentUrl(id), performed_via_github_app: null, ...extra });
+const STRANGER_ID = 999;
+
+test("unmarkedAnswer names the newest listed human's own comment only when it lacks the decision line", () => {
+  const unmarked = issueComment(2, OWNER_ID, "Use `claude auth status`.");
+  const pick = (comments) => unmarkedAnswer(comments, HUMANS, BOT);
+  assert.equal(pick([issueComment(1, OWNER_ID, "**Decision recorded.** Option 1."), unmarked]), commentUrl(2));
+  assert.equal(pick([unmarked, issueComment(3, STRANGER_ID, "Me too.")]), commentUrl(2), "a stranger's comment is not the owner's");
+  assert.equal(pick([unmarked, issueComment(3, OWNER_ID, "**Decision recorded.** Via an App.", { performed_via_github_app: { slug: "x" } })]), null, "an App-posted newest comment links no older one");
+  for (const body of ["> **Decision recorded.** Quoted.", "Context first.\n**Decision recorded.** Option 2.", "**Decision recorded.**Option 2."]) {
+    assert.equal(pick([issueComment(4, OWNER_ID, body)]), commentUrl(4), body);
+  }
+  for (const body of ["**Decision recorded.** Option 2.", "\n  **Decision recorded.**\nOption 2.", "**Decision recorded.**"]) {
+    assert.equal(pick([unmarked, issueComment(5, OWNER_ID, body)]), null, body);
+  }
+  assert.equal(pick([]), null);
+  assert.equal(pick([issueComment(6, STRANGER_ID, "Hi.")]), null);
+  for (const html_url of ["https://evil.example/o/r/issues/77#issuecomment-6 extra", "javascript:alert(1)", undefined]) {
+    assert.equal(pick([issueComment(6, OWNER_ID, "Hi.", { html_url })]), null, String(html_url));
+  }
+  // A comment the lane's last outcome comment already answered is not linked again.
+  const report = { id: 7, user: { login: BOT }, body: `${ESC}<!-- work-resolve-issue outcome=pushback run=5 -->\nWhy.`, html_url: commentUrl(7) };
+  assert.equal(pick([unmarked, report]), null);
+  assert.equal(pick([unmarked, report, issueComment(8, OWNER_ID, "Still option 1.")]), commentUrl(8));
+  assert.equal(pick([unmarked, { ...report, user: { login: "someone" } }]), commentUrl(2), "only the lanes App's marker counts");
+});
+
+test("a pushback links the unmarked comment, shows the decision line, and its retry text names the line", () => {
+  const plain = { issueNumber: 77, issueLabels: [], branch: "", changedFiles: [], humanLabel: "needs-human" };
+  const pushback = { exit: "pushback", reason: "Which file?", cause: "intent", title: "", summary: "" };
+  const linked = decide({ ...plain, outcome: pushback, unmarked: commentUrl(2) }).comment;
+  assert.ok(linked.includes(`The newest comment from a listed maintainer, ${commentUrl(2)}, does not start with \`**Decision recorded.**\``), linked);
+  assert.ok(linked.includes("\n```\n**Decision recorded.** <answer>\n```\n"), linked);
+  const retry = "To retry, answer the question in a comment whose first line is `**Decision recorded.**`, then set Work status to agent-ready again (clearing the `needs-human` hold).";
+  assert.ok(linked.endsWith(retry), linked);
+  const unlinked = decide({ ...plain, outcome: pushback }).comment;
+  assert.ok(!unlinked.includes("newest comment") && unlinked.endsWith(retry), unlinked);
+  const stopped = decide({ ...plain, outcome: { exit: "stopped", reason: "Tests failed.", title: "", summary: "" }, unmarked: commentUrl(2) }).comment;
+  assert.ok(!stopped.includes(commentUrl(2)) && !stopped.includes("**Decision recorded.**"), stopped);
+});
+
+test("main on a pushback reads the issue's comments and links the owner's unmarked one; a failed read leaves it out", async () => {
+  const pushback = JSON.stringify({ exit: "pushback", reason: "Which file?", cause: "intent", title: "", summary: "" });
+  for (const [route, linked] of [
+    [["GET", /\/issues\/77\/comments$/, 200, [issueComment(2, OWNER_ID, "Use `claude auth status`.")]], true],
+    [["GET", /\/issues\/77\/comments$/, 500, { message: "boom" }], false],
+  ]) {
+    await withAsyncDir({ "work-outcome.json": pushback, "lane.json": JSON.stringify({ branch: "" }), "trusted.json": TRUSTED_LIST }, async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        route,
+        ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        ["POST", /\/issues\/77\/labels$/, 200, []],
+        ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+        ["POST", /\/issues\/77\/comments$/, 201, {}],
+      ]);
+      assert.equal(await main({ env: { ...env(dir), TRUSTED_ACTORS: join(dir, "trusted.json") }, fetch }), 0);
+      const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+      assert.equal(comment.includes(commentUrl(2)), linked, comment);
+      assert.match(comment, /first line is `\*\*Decision recorded\.\*\*`, then set Work status to agent-ready again \(clearing the `needs-human` hold\)/);
+    });
+  }
+});
+
+// main reads a pushback's cause from work-outcome.json: a hold-class cause
+// reaches a person as that code with no code in the reason.
+test("main on a pushback whose work-outcome.json names cause cost-risk holds it as cost-risk", async () => {
+  const pushback = JSON.stringify({ exit: "pushback", reason: "This provisions a paid Azure plan.", cause: "cost-risk", title: "", summary: "" });
+  await withAsyncDir({ "work-outcome.json": pushback, "lane.json": JSON.stringify({ branch: "" }), "trusted.json": TRUSTED_LIST }, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77\/comments$/, 200, []],
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["POST", /\/issues\/77\/labels$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: { ...env(dir), TRUSTED_ACTORS: join(dir, "trusted.json") }, fetch, setStatus: statusInto(calls) }), 0);
+    const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+    assert.equal(parseReason(comment).reason, "cost", comment);
+    assert.ok(calls.some((c) => c.method === "STATUS" && c.body.state === "needs-human"), "sets Work status needs-human");
+  });
+});
+
+// Ledger L7: write-issue.mjs leaves out a record posted after the run's
+// admission, so a pushback hold would wait on an answer the issue already
+// has. The answer re-dispatches the lane once, with a fresh admission record
+// and the App's restart of the Work status field; any other late comment
+// takes the hold as before.
+const ADDED = "2026-10-02T00:00:00Z";
+const LATE = "2026-10-02T01:00:00Z";
+const APP_ID = 337595936;
+const late = (id, userId, body, { at = LATE, type = "User", login = "someone", app = null } = {}) =>
+  issueComment(id, userId, body, { user: { id: userId, type, login }, created_at: at, updated_at: at, performed_via_github_app: app });
+const DECISION_BODY = "**Decision recorded.** Change only the README.";
+const OWNER_SET = fieldSet(OWNER_ID, ADDED);
+const redispatchRecord = (id, names, at = LATE, run = "99") =>
+  late(id, APP_ID, `<!-- work-resolve-issue outcome=redispatch run=${run} -->\n<!-- work-resolve-issue redispatch comment=${names} -->\nre-dispatched`, { at, type: "Bot", login: BOT });
+const ISSUE_TEXT = { title: "Fix the README", body: "Done when: the README says so." };
+// A Work status field (report-outcome.mjs workStatusField's shape) whose
+// trusted state and events are given; each restart goes into `calls`.
+const fakeField = ({ state = "agent-ready", events = [], calls = [], restarted = true } = {}) => ({
+  id: "48484079",
+  state: async () => {
+    if (state instanceof Error) throw state;
+    return state;
+  },
+  events: async () => events,
+  restart: async (number, from) => {
+    calls.push({ method: "RESTART", path: `/issues/${number}`, body: { from } });
+    return restarted;
+  },
+});
+// `states` lists the Work status writes, `restarts` the field restarts'
+// expected states, `records` the admission records posted; `statusOf` is
+// main's field reader.
+async function runLateRecord(comments, { fieldEvents = [OWNER_SET], reason = "Which file?", state = "agent-ready", statusOf, recordStatus = 201 } = {}) {
+  const pushback = JSON.stringify({ exit: "pushback", reason, cause: "intent", title: "", summary: "" });
+  let result;
+  await withAsyncDir({ "work-outcome.json": pushback, "lane.json": JSON.stringify({ branch: "" }), "trusted.json": TRUSTED_LIST }, async (dir) => {
+    const routes = [
+      ["GET", /\/issues\/77\/comments$/, 200, comments],
+      ["GET", /\/issues\/77$/, 200, { number: 77, state: "open", ...ISSUE_TEXT, labels: [{ name: "agent-ready" }] }],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ];
+    const { fetch: inner, calls } = fakeFetch(routes);
+    // The admission record's post answers `recordStatus`.
+    const fetch = async (url, init = {}) =>
+      String(init.body ?? "").includes(ADMISSION_RECORD_MARKER) && recordStatus !== 201
+        ? (calls.push({ method: "POST", path: new URL(url).pathname, body: JSON.parse(init.body) }), { ok: false, status: recordStatus, json: async () => ({}), text: async () => "" })
+        : inner(url, init);
+    const field = fakeField({ state, events: fieldEvents, calls });
+    const code = await main({ env: { ...env(dir), TRUSTED_ACTORS: join(dir, "trusted.json") }, fetch, setStatus: statusInto(calls), statusOf, field });
+    const posted = calls.filter((c) => c.method === "POST" && c.path.endsWith("/comments")).map((c) => c.body.body);
+    result = {
+      code,
+      posted,
+      labeled: calls.filter((c) => c.path.includes("/labels")).map((c) => `${c.method} ${c.path}`),
+      states: calls.filter((c) => c.method === "STATUS").map((c) => c.body.state),
+      restarts: calls.filter((c) => c.method === "RESTART").map((c) => c.body.from),
+      records: posted.filter((body) => body.startsWith(ADMISSION_RECORD_MARKER)),
+      redispatches: posted.filter((body) => body.includes("<!-- work-resolve-issue redispatch comment=")),
+    };
+  });
+  return result;
+}
+
+test("a listed human's decision posted after admission re-dispatches a pushback hold exactly once, with a fresh admission record", async () => {
+  const { posted, labeled, states, redispatches, records, restarts } = await runLateRecord([late(5, OWNER_ID, DECISION_BODY, { login: "kyle-sexton" })]);
+  assert.deepEqual(states, []);
+  assert.deepEqual(redispatches, [`<!-- work-resolve-issue outcome=redispatch run=123 -->\n<!-- work-resolve-issue redispatch comment=5 -->\nA record this run did not read was posted after its admission: ${commentUrl(5)}. The run's report-outcome posted a fresh admission record and set the Work status field to agent-ready again, so a fresh run admits the issue as it stands now and reads it.`]);
+  // The record carries the sha256 of the title and body this run read.
+  assert.deepEqual(records, [recordBody({ actorId: APP_ID, ...ISSUE_TEXT })]);
+  assert.equal(posted.length, 2, "the redispatch record, then the admission record, and no hand-back comment");
+  assert.ok(posted[0].includes("redispatch comment=5") && posted[1] === records[0], "the redispatch record goes first");
+  assert.deepEqual(restarts, ["agent-ready"], "the App restarts the field from agent-ready");
+  assert.deepEqual(labeled, [], "no label is written");
+});
+
+test("a redispatch whose admission record fails to post restarts nothing", async () => {
+  const run = await runLateRecord([late(5, OWNER_ID, DECISION_BODY, { login: "kyle-sexton" })], { recordStatus: 502 });
+  assert.equal(run.code, 1, "the failed post fails the job");
+  assert.deepEqual(run.restarts, []);
+});
+
+// A hold that exists only on the Work status field holds, and so does a
+// field read that fails, or a field no longer at agent-ready.
+test("a hold on the Work status field alone, an unread field, or a field off agent-ready takes the hold over a late decision", async () => {
+  const decision = [late(5, OWNER_ID, DECISION_BODY, { login: "kyle-sexton" })];
+  for (const [name, options] of [
+    ["needs-human on the field", { statusOf: async (number, names) => [...names, "needs-human"] }],
+    ["needs-reporter-info on the field", { statusOf: async (number, names) => [...names, "status: needs-info"] }],
+    ["an unread field", { statusOf: async () => { throw new Error("#77's Work status could not be read: HTTP 502"); } }],
+    ["an unread state", { state: new Error("HTTP 502") }],
+    ["the field at ready", { state: "ready" }],
+  ]) {
+    const { redispatches, restarts, states } = await runLateRecord(decision, options);
+    assert.deepEqual(redispatches, [], name);
+    assert.deepEqual([restarts, states], [[], ["needs-human"]], name);
+  }
+});
+
+test("the real Work status reader holds a late decision on a field-only hold or an unread field, and re-dispatches on a field with none", async () => {
+  const decision = [late(5, OWNER_ID, DECISION_BODY, { login: "kyle-sexton" })];
+  for (const [name, fields] of [
+    ["needs-human on the field", { 77: { state: "needs-human" } }],
+    ["needs-reporter-info on the field", { 77: { state: "needs-reporter-info" } }],
+    ["an unread field", { 77: new Error("HTTP 502") }],
+  ]) {
+    const { redispatches, restarts, states } = await runLateRecord(decision, { statusOf: fieldReader(fields) });
+    assert.deepEqual(redispatches, [], name);
+    assert.deepEqual([restarts, states], [[], ["needs-human"]], name);
+  }
+  const ready = await runLateRecord(decision, { statusOf: fieldReader({ 77: { state: "agent-ready" } }) });
+  assert.equal(ready.redispatches.length, 1, "a field with no hold re-dispatches");
+});
+
+test("intake's refinement posted after admission re-dispatches a pushback hold once", async () => {
+  const refinement = late(6, APP_ID, "<!-- intake-triage refinement -->\nDone when: the README says so.", { type: "Bot", login: BOT });
+  const { redispatches, restarts } = await runLateRecord([refinement]);
+  assert.equal(redispatches.length, 1);
+  assert.deepEqual(restarts, ["agent-ready"]);
+});
+
+test("a late comment that is no decision, or is not a listed human's own, or predates admission, takes the hold", async () => {
+  const cases = {
+    "a listed human's comment without the decision line": [late(5, OWNER_ID, "Change only the README.")],
+    "an unlisted account's decision line": [late(5, 999, DECISION_BODY)],
+    "a listed human's decision posted through an App": [late(5, OWNER_ID, DECISION_BODY, { app: { id: 1 } })],
+    "a decision posted before the person's agent-ready set": [late(5, OWNER_ID, DECISION_BODY, { at: "2026-10-01T23:59:59Z" })],
+  };
+  for (const [name, comments] of Object.entries(cases)) {
+    const { redispatches, restarts, states } = await runLateRecord(comments);
+    assert.deepEqual(redispatches, [], name);
+    assert.deepEqual([restarts, states], [[], ["needs-human"]], name);
+  }
+});
+
+// The admission is the newest App record or listed human's agent-ready set:
+// an App restart's set and a stranger's set never move it past the answer.
+test("the admission a late decision is read against is the newest App record or listed human's set, never an App restart", async () => {
+  const decision = late(5, OWNER_ID, DECISION_BODY, { login: "kyle-sexton" });
+  const restart = await runLateRecord([decision], { fieldEvents: [OWNER_SET, fieldSet(APP_ID, "2026-10-02T02:00:00Z"), fieldSet(42, "2026-10-02T02:00:00Z")] });
+  assert.equal(restart.redispatches.length, 1, "an App restart after the answer is no admission");
+  const record = late(7, APP_ID, recordBody({ actorId: APP_ID, ...ISSUE_TEXT }), { at: "2026-10-02T02:00:00Z", type: "Bot", login: BOT });
+  const recorded = await runLateRecord([decision, record]);
+  assert.deepEqual([recorded.redispatches, recorded.states], [[], ["needs-human"]], "a record after the answer admitted it");
+  const none = await runLateRecord([decision], { fieldEvents: [] });
+  assert.deepEqual([none.redispatches, none.states], [[], ["needs-human"]], "no admission found takes the hold");
+});
+
+// A security stop reaches a person first, whatever was posted since.
+test("a security-risk hold takes the hold even with a listed human's late decision", async () => {
+  const { redispatches, restarts, states } = await runLateRecord([late(5, OWNER_ID, DECISION_BODY)], { reason: "security-risk: the change prints a token." });
+  assert.deepEqual(redispatches, []);
+  assert.deepEqual([restarts, states], [[], ["needs-human"]]);
+});
+
+// A re-run of this run's report finds its own redispatch record (run=123)
+// and finishes what is missing, never posting it again or taking the hold;
+// another run's record is read like any App comment.
+test("a re-run finishes this run's redispatch: the record once, then the restart; a landed restart is done", async () => {
+  const decision = late(5, OWNER_ID, DECISION_BODY);
+  const own = redispatchRecord(6, 5, LATE, "123");
+  const unrecorded = await runLateRecord([decision, own]);
+  assert.deepEqual(unrecorded.redispatches, [], "no second redispatch record");
+  assert.equal(unrecorded.records.length, 1, "the admission record the first attempt did not post");
+  assert.deepEqual([unrecorded.restarts, unrecorded.states], [["agent-ready"], []]);
+  const record = late(7, APP_ID, recordBody({ actorId: APP_ID, ...ISSUE_TEXT }), { at: "2026-10-02T01:00:01Z", type: "Bot", login: BOT });
+  const recorded = await runLateRecord([decision, own, record]);
+  assert.deepEqual([recorded.posted, recorded.restarts, recorded.states], [[], ["agent-ready"], []], "the field write the first attempt lost");
+  const landed = await runLateRecord([decision, own, record], { fieldEvents: [OWNER_SET, fieldSet(APP_ID, "2026-10-02T01:00:02Z")] });
+  assert.deepEqual([landed.posted, landed.restarts, landed.states], [[], [], []], "its restart landed: nothing left to do, and no hold");
+});
+
+// The App's removal landed and its set did not: the re-run sets agent-ready
+// on the unset field, while a person's removal takes the hold.
+test("a redispatch stopped after the App removed the field value is finished on a re-run; a person's removal takes the hold", async () => {
+  const comments = [late(5, OWNER_ID, DECISION_BODY), redispatchRecord(6, 5, LATE, "123"), late(7, APP_ID, recordBody({ actorId: APP_ID, ...ISSUE_TEXT }), { at: LATE, type: "Bot", login: BOT })];
+  const removal = (actorId) => fieldSet(actorId, "2026-10-02T01:00:02Z", { removed: true });
+  const resumed = await runLateRecord(comments, { state: null, fieldEvents: [OWNER_SET, removal(APP_ID)] });
+  assert.deepEqual([resumed.posted, resumed.restarts, resumed.states], [[], [null], []]);
+  const person = await runLateRecord(comments, { state: null, fieldEvents: [OWNER_SET, removal(OWNER_ID)] });
+  assert.deepEqual([person.restarts, person.states], [[], ["needs-human"]]);
+});
+
+// The stopped run may have committed to its lane branch; the record's outcome
+// marker reports that run, so the fresh admission runs the model instead of
+// reusing the branch unread.
+test("a redispatch record reports its run's lane branch, so findPrior runs fresh instead of reusing it", () => {
+  const body = redispatchComment({ id: 5, html_url: commentUrl(5) }, "400");
+  assert.deepEqual(parseOutcomeMarker(body), { outcome: "redispatch", resets: null, run: "400", onResumed: false });
+  const branches = [branchFact(lane(400))];
+  assert.equal(prior({ branches }).action, "reuse", "unreported without the record");
+  assert.deepEqual(prior({ branches, markers: [{ ...parseOutcomeMarker(body), at: Date.parse(LATE) }] }), { action: "run" });
+});
+
+// report-outcome restates these because a script activity runs from a copy
+// of its own directory; the sources they restate must not drift from them.
+test("report-outcome's restated decision line and refinement marker match their sources", async () => {
+  const admit = await import("../intake-triage/admit.mjs");
+  assert.equal(REFINE_MARKER, admit.REFINE_MARKER);
+  const { isDecisionComment } = await import("../../actions/select-trusted-text/select-trusted-text.mjs");
+  const decision = (body) => ({ comment: { user: { id: OWNER_ID }, performed_via_github_app: null, body }, lastEditedAt: null, lastEditorId: null });
+  assert.equal(isDecisionComment(decision(`${DECISION_LINE} yes`), HUMANS), true);
+});
+
+// stop-routes.json routes every stop. Expected values are the owner's
+// direction of 2026-10-27: a person only for an intent, design, security or
+// cost reason; a host-only or protected-path stop to the host queue's one
+// signal, host-run; a crash or unfinished check back to agent-ready under a
+// hard retry cap, and past it a visible stop with no label.
+const stoppedPlan = (reason, overrides = {}) =>
+  decide({
+    outcome: { exit: "stopped", reason, title: "", summary: "" },
+    issueNumber: 77,
+    issueLabels: ["agent-ready"],
+    branch: BRANCH,
+    changedFiles: [],
+    humanLabel: "needs-human",
+    runId: "555",
+    ...overrides,
+  });
+
+test("route hold: a run's intent, design, security or cost code goes to a person", () => {
+  for (const code of ["intent-change", "design-change", "security-risk", "cost-risk"]) {
+    const plan = stoppedPlan(`${code}: the issue asks for X but the code needs Y`);
+    assert.equal(plan.action, "hand-back", code);
+    assert.equal(plan.stop, code);
+    assert.equal(plan.status, "needs-human", code);
+    assert.ok(plan.comment.startsWith(ESC), code);
+  }
+});
+
+// #6930 and #6887: the work needs a host the lane cannot reach.
+test("route host-run: a run's host-only code adds host-run, removes agent-ready and escalates to no person", () => {
+  const plan = stoppedPlan("host-only: the work needs the Claude Code 2.1.296 native bundle on a host");
+  assert.equal(plan.action, "host-run");
+  assert.deepEqual(plan.addLabels, ["host-run"]);
+  assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=host-run run=555 -->\n"), plan.comment);
+  assert.ok(!plan.comment.includes("needs-human"), plan.comment);
+  assert.match(plan.comment, /2\.1\.296 native bundle/);
+  assert.match(plan.comment, /remove `host-run` and set Work status to agent-ready again/);
+  assert.ok(RESUMABLE.has(parseOutcomeMarker(plan.comment).outcome));
+});
+
+// Owner decision 2026-10-28: a manual external step goes to attended, never
+// to needs-human, which keeps meaning an owner decision.
+test("route attended: a run's manual-external code adds attended, removes agent-ready and escalates to no person", () => {
+  const plan = stoppedPlan("manual-external: the record needs a DNS change at the registrar");
+  assert.equal(plan.action, "attended");
+  assert.equal(plan.stop, "manual-external");
+  assert.deepEqual(plan.addLabels, ["attended"]);
+  assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=attended run=555 -->\n"), plan.comment);
+  assert.ok(!plan.comment.includes("needs-human"), plan.comment);
+  assert.match(plan.comment, /a DNS change at the registrar/);
+  assert.match(plan.comment, /removes `attended` and sets Work status to agent-ready again/);
+  assert.ok(RESUMABLE.has(parseOutcomeMarker(plan.comment).outcome));
+});
+
+test("route retry: a crash keeps agent-ready, names the branch and counts toward the cap", () => {
+  const plan = decide({ outcome: readOutcome("/nonexistent/work-outcome.json"), issueNumber: 77, issueLabels: [], branch: BRANCH, changedFiles: [], runId: "555" });
+  assert.equal(plan.action, "retry");
+  assert.deepEqual(plan.addLabels, []);
+  assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=retry run=555 -->\n"), plan.comment);
+  assert.ok(plan.comment.includes(BRANCH), plan.comment);
+  assert.ok(RESUMABLE.has("retry"), "the next run continues the branch");
+});
+
+test("route fail: a retry past limits.stop-retries removes agent-ready and adds no label", () => {
+  const plan = decide({ outcome: readOutcome("/nonexistent/work-outcome.json"), issueNumber: 77, issueLabels: [], branch: BRANCH, changedFiles: [], runId: "555" });
+  assert.equal(capRetries(plan, 1, { "stop-retries": 2 }).action, "retry");
+  assert.match(capRetries(plan, 1, { "stop-retries": 2 }).comment, /retry 2 of 2/);
+  for (const [retries, cap] of [[2, 2], [0, 0]]) {
+    const spent = capRetries(plan, retries, { "stop-retries": cap });
+    assert.equal(spent.action, "fail", `${retries} of ${cap}`);
+    assert.deepEqual(spent.addLabels, []);
+    assert.ok(spent.comment.startsWith("<!-- work-resolve-issue outcome=failed run=555 -->\n"), spent.comment);
+    assert.match(spent.comment, /`outcome-unread`/);
+    assert.match(spent.comment, /limits\.stop-retries/);
+    assert.ok(!spent.comment.includes("work-items:escalation"), spent.comment);
+  }
+  const hold = stoppedPlan("design-change: Unclear.");
+  assert.equal(capRetries(hold, 9, { "stop-retries": 0 }), hold, "a plan that is not a retry is left as it is");
+});
+
+// Owner direction 2026-10-29: a stop with no code names no intent, design,
+// security or cost finding, so it retries once and then fails, never a person.
+test("a stop with no code retries once, then fails, and never goes to a person", () => {
+  const plan = stoppedPlan("I could not finish this.");
+  assert.equal(plan.stop, "stopped");
+  assert.equal(plan.action, "retry");
+  assert.deepEqual(plan.addLabels, []);
+  assert.match(plan.comment, /retry 1 of 1/);
+  const spent = capRetries(plan, 1, { "stop-retries": 2 });
+  assert.equal(spent.action, "fail");
+  assert.deepEqual(spent.addLabels, []);
+  assert.ok(!spent.comment.includes("work-items:escalation"), spent.comment);
+  assert.equal(capRetries(plan, 0, { "stop-retries": 0 }).action, "fail", "the lane-wide cap still bounds it");
+});
+
+// A run that waits on an unmerged pull request names no owner reason, so it
+// keeps agent-ready instead of going to a person.
+test("route wait: a blocked-by-pr code keeps agent-ready and names the pull request in its marker", () => {
+  const plan = stoppedPlan("blocked-by-pr: #10743 adds the binding this needs; see also #77");
+  assert.equal(plan.action, "wait");
+  assert.equal(plan.pr, "10743");
+  assert.deepEqual(plan.addLabels, []);
+  assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=wait pr=10743 run=555 -->\n"), plan.comment);
+  assert.match(plan.comment, /once #10743 merges or closes/);
+  assert.deepEqual(parseOutcomeMarker(plan.comment), { outcome: "wait", resets: null, run: "555", onResumed: false, pr: "10743" });
+  assert.ok(RESUMABLE.has("wait"), "the next run continues the branch");
+  assert.equal(capRetries(plan, 2, { "stop-retries": 2 }).action, "fail", "waits are bounded too");
+  assert.equal(waitedPull("blocked-by-pr: waits on ＃12", 77), "12");
+  assert.equal(waitedPull("blocked-by-pr: nothing named", 77), "");
+});
+
+// Work that must land after another issue names no owner reason: intake
+// triage writes the blocked-by edge the run names, so admission waits for it.
+test("route intake: a blocked-by-issue code sends the issue back through intake, naming the issue it waits on", () => {
+  const plan = stoppedPlan("blocked-by-issue #13187 must land first; see also #77");
+  assert.equal(plan.stop, "blocked-by-issue");
+  assert.equal(plan.action, "intake");
+  assert.equal(plan.after, "13187");
+  assert.equal(plan.pr, undefined, "the marker names no pull request");
+  assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=intake run=555 -->\n"), plan.comment);
+  assert.match(plan.comment, /^It must land after #13187: intake triage records #13187 on its `Blocked by:` line/m);
+  assert.ok(!plan.comment.includes("work-items:escalation"), plan.comment);
+  assert.equal(stoppedPlan("blocked-by-issue: nothing named").after, undefined);
+  assert.equal(capRetries(plan, 1, { "stop-retries": 2 }).action, "fail", "one intake round, then retry-spent");
+});
+
+test("route close: already-done and report-delivered close the issue as completed, to no person", () => {
+  for (const reason of ["already-done: both items are on main at abb359be", "report-delivered: the report is below"]) {
+    const plan = stoppedPlan(reason, { issueLabels: ["agent-ready", "work-class: read-only"], branch: "" });
+    assert.equal(plan.action, "close", reason);
+    assert.deepEqual(plan.addLabels, []);
+    assert.ok(plan.comment.startsWith("<!-- work-resolve-issue outcome=closed run=555 -->\n"), plan.comment);
+    assert.match(plan.comment, /closes the issue as completed/);
+    assert.ok(plan.comment.includes(reason), plan.comment);
+  }
+  // The close comment reads back as its stop and the run's own reason, which
+  // isTrustedClose re-checks (owner Q9, 2026-10-29).
+  const done = stoppedPlan("already-done: #5 shipped it\nand abb359be too", { issueLabels: ["agent-ready", "work-class: read-only"], branch: "" });
+  assert.deepEqual(closeStop(done.comment), { stop: "already-done", reason: "already-done: ＃5 shipped it\nand abb359be too" });
+  const report = stoppedPlan("report-delivered: the report is below", { issueLabels: ["agent-ready", "work-class: read-only"], branch: "" });
+  assert.equal(closeStop(report.comment).stop, "report-delivered");
+  assert.equal(closeStop(stoppedPlan("the tests failed").comment), null, "a retry comment is no close");
+  // A report closes only an issue the run committed nothing for.
+  assert.equal(stoppedPlan("report-delivered: the report is below").action, "retry");
+  for (const opts of [{}, { issueLabels: ["agent-ready", "work-class: read-only"], branch: "work/7" }]) {
+    const retry = stoppedPlan("report-delivered: the report is below", opts);
+    assert.equal(retry.action, "retry");
+    assert.match(retry.comment, /so it retries instead of closing\./, retry.comment);
+  }
+});
+
+// Owner Q85: a stop routes by no work class, or by a missing one.
+test("route close: report-delivered closes a class-less or structural issue with no branch, and retries with one", () => {
+  for (const issueLabels of [["agent-ready"], ["agent-ready", "work-class: structural"]]) {
+    const closed = stoppedPlan("report-delivered: the report is below", { issueLabels, branch: "" });
+    assert.equal(closed.action, "close", issueLabels.join());
+    assert.equal(closeStop(closed.comment).stop, "report-delivered");
+    const retry = stoppedPlan("report-delivered: the report is below", { issueLabels, branch: "work/7" });
+    assert.equal(retry.action, "retry", issueLabels.join());
+    assert.match(retry.comment, /so it retries instead of closing\./, retry.comment);
+  }
+});
+
+// The earlier run's commits are unmerged on the branch this run resumed, so a
+// report that committed nothing of its own closes nothing.
+test("route close: report-delivered retries on a resumed branch when the run committed nothing, keeping that branch for the next run", () => {
+  for (const issueLabels of [["agent-ready"], ["agent-ready", "work-class: structural"]]) {
+    const plan = stoppedPlan("report-delivered: the report is below", { issueLabels, branch: "", resumed: "work/7-earlier" });
+    assert.equal(plan.action, "retry", issueLabels.join());
+    assert.match(plan.comment, /The run committed to a branch, or resumed one, so it retries instead of closing\./, plan.comment);
+    assert.equal(parseOutcomeMarker(plan.comment).onResumed, true, plan.comment);
+  }
+});
+
+// main against a fake API for the routes whose effect needs a read first.
+// `trusted` adds the trusted-actor list, whose humans' pull requests a wait accepts.
+const stopRun = async ({ reason, summary = "", routes, trusted = false, issue = ISSUE[2], extraEnv = {}, extraFiles = {} }) => {
+  let result;
+  const files = { "work-outcome.json": JSON.stringify({ exit: "stopped", reason, summary }), ...(trusted && { "trusted.json": TRUSTED_LIST }), ...extraFiles };
+  await withAsyncDir(files, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, 200, issue],
+      ...routes,
+      ["GET", /\/issues\/77\/comments/, 200, []],
+      ["GET", /\/issues\/77\/events/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+      ["DELETE", /\/issues\/77\/labels\//, 200, []],
+      ["PATCH", /\/issues\/77$/, 200, {}],
+    ]);
+    result = { code: await main({ env: { ...env(dir), ...(trusted && { TRUSTED_ACTORS: join(dir, "trusted.json") }), ...extraEnv }, fetch }), calls };
+  });
+  return result;
+};
+
+const APP_USER = { login: BOT, type: "Bot", id: 337595936 };
+
+test("main waits on an open pull request, and retries when the named one is not open", async () => {
+  const open = await stopRun({ reason: "blocked-by-pr: #5 adds the helper", routes: [["GET", /\/pulls\/5$/, 200, { state: "open", merged_at: null, user: APP_USER }]] });
+  assert.equal(open.code, 0);
+  assert.ok(!open.calls.some((c) => c.method === "DELETE" || c.method === "PATCH"));
+  assert.match(open.calls.find((c) => c.method === "POST").body.body, /^<!-- work-resolve-issue outcome=wait pr=5 run=123 -->/);
+  const merged = await stopRun({ reason: "blocked-by-pr: #5 adds the helper", routes: [["GET", /\/pulls\/5$/, 200, { state: "closed", merged_at: "2026-10-29T14:07:27Z" }]] });
+  assert.equal(merged.code, 0);
+  assert.match(merged.calls.find((c) => c.method === "POST").body.body, /^<!-- work-resolve-issue outcome=retry run=123 -->/);
+  assert.ok(!merged.calls.some((c) => c.method === "DELETE"));
+  assert.match(merged.calls.find((c) => c.method === "POST").body.body, /#5 is not an open pull request here, so it retries instead\./);
+});
+
+// Security review on #10978: anyone can open a pull request, so a wait on one
+// only the lanes App or a listed human opened, as closed-by-open-pr reads it.
+test("main waits only on an open pull request the lanes App or a listed human opened, and retries on anyone else's", async () => {
+  const waitOn = (user, trusted = false) =>
+    stopRun({ reason: "blocked-by-pr: #5 adds the helper", trusted, routes: [["GET", /\/pulls\/5$/, 200, { state: "open", merged_at: null, user }]] });
+  const marker = async (run) => (await run).calls.find((c) => c.method === "POST").body.body;
+  assert.match(await marker(waitOn({ login: "kyle-sexton", type: "User", id: OWNER_ID }, true)), /^<!-- work-resolve-issue outcome=wait pr=5 run=123 -->/);
+  for (const [name, user, trusted] of [
+    ["an outsider", { login: "someone", type: "User", id: 555 }, true],
+    ["another App", { login: "other-app[bot]", type: "Bot", id: 556 }, true],
+    ["a Bot with a listed human's id", { login: "other-app[bot]", type: "Bot", id: OWNER_ID }, true],
+    ["a listed human with no readable list", { login: "kyle-sexton", type: "User", id: OWNER_ID }, false],
+  ]) {
+    const body = await marker(waitOn(user, trusted));
+    assert.match(body, /^<!-- work-resolve-issue outcome=retry run=123 -->/, name);
+    assert.match(body, /#5 was not opened by the lanes App or a listed human, so it retries instead\./, name);
+  }
+});
+
+test("main closes an already-done issue only when its cited commit is on the default branch and cites the issue", async () => {
+  const tiedCommit = ["GET", /\/commits\/abb359be$/, 200, { commit: { message: "fix(lane): resolve both items (#80)\n\nFixes #77", committer: { date: "2026-10-28T00:00:00Z" } }, files: [] }];
+  const done = await stopRun({
+    reason: "already-done: both items are on main at abb359be",
+    routes: [["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }], ["GET", /\/compare\/abb359be\.\.\.main$/, 200, { status: "ahead" }], tiedCommit],
+  });
+  assert.equal(done.code, 0);
+  assert.deepEqual(done.calls.find((c) => c.method === "PATCH").body, { state: "closed", state_reason: "completed" });
+  const unproven = await stopRun({
+    reason: "already-done: both items are on main at abb359be",
+    routes: [["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }], ["GET", /\/compare\/abb359be\.\.\.main$/, 200, { status: "diverged" }], tiedCommit],
+  });
+  assert.ok(!unproven.calls.some((c) => c.method === "PATCH"), "no proof, no close");
+  assert.match(unproven.calls.find((c) => c.method === "POST").body.body, /^<!-- work-resolve-issue outcome=retry run=123 -->/);
+  assert.match(unproven.calls.find((c) => c.method === "POST").body.body, /cites no pull request merged into the default branch, or commit on it, made after the issue opened whose commit message closes this issue,/);
+  // Run 40844966342: a release commit on main closed an issue it never touched.
+  const release = await stopRun({
+    reason: "already-done: both items are on main at abb359be",
+    routes: [
+      ["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }],
+      ["GET", /\/compare\/abb359be\.\.\.main$/, 200, { status: "ahead" }],
+      ["GET", /\/commits\/abb359be$/, 200, { commit: { message: "chore(release): cut 3.2.0 (#77)", committer: { date: "2026-10-28T00:00:00Z" } }, files: [{ filename: "CHANGELOG.md" }] }],
+    ],
+  });
+  assert.ok(!release.calls.some((c) => c.method === "PATCH"), "an unrelated commit on main is no proof");
+  assert.match(release.calls.find((c) => c.method === "POST").body.body, /^<!-- work-resolve-issue outcome=retry run=123 -->/);
+  const later = await stopRun({
+    reason: "already-done: effaced text, then the commit abb359be",
+    routes: [["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }], ["GET", /\/compare\/abb359be\.\.\.main$/, 200, { status: "identical" }], tiedCommit],
+  });
+  assert.ok(later.calls.some((c) => c.method === "PATCH"), "a hex-looking word before the SHA hides nothing");
+});
+
+// #12456 class A: a finished parent's run checks its own done-when and stops
+// verified-done, which closes it only when its sub-issues, read fresh, are each
+// closed as completed and among the admit job's trusted closes (VERIFY_CLOSE).
+const subs = (...children) => ["GET", /\/issues\/77\/sub_issues/, 200, children];
+const doneSub = (number, reason = "completed", repo = "o/r") => ({ number, state: "closed", state_reason: reason, repository_url: `https://api.github.com/repos/${repo}` });
+const VERIFIED = "verified-done: every done-when item checks out: the guide names each flag (#80), the tests cover each (#81)";
+
+test("main closes a verified-done parent only when every sub-issue is closed as completed among VERIFY_CLOSE", async () => {
+  const checks = "The guide names each flag: #80.\nThe tests cover each flag: #81.";
+  const done = await stopRun({ reason: VERIFIED, summary: checks, routes: [subs(doneSub(80), doneSub(81))], extraEnv: { VERIFY_CLOSE: "80,81" } });
+  assert.equal(done.code, 0);
+  assert.deepEqual(done.calls.find((c) => c.method === "PATCH").body, { state: "closed", state_reason: "completed" });
+  const comment = done.calls.find((c) => c.method === "POST").body.body;
+  assert.match(comment, /^<!-- work-resolve-issue outcome=closed run=123 -->/);
+  // The close posts each check the run cites (its summary).
+  assert.match(comment, /The run's report:\n\n> The guide names each flag: ＃80\.\n> The tests cover each flag: ＃81\./);
+  // The stop line carries the code, so a verify run's close is told apart from
+  // an already-done one when close lag is measured again.
+  assert.equal(closeStop(comment).stop, "verified-done");
+  for (const [name, routes, extraEnv] of [
+    ["no VERIFY_CLOSE", [subs(doneSub(80), doneSub(81))], {}],
+    ["a sub-issue closed not planned", [subs(doneSub(80), doneSub(81, "not_planned"))], { VERIFY_CLOSE: "80,81" }],
+    ["an open sub-issue", [subs(doneSub(80), { ...doneSub(81), state: "open", state_reason: null })], { VERIFY_CLOSE: "80,81" }],
+    ["a sub-issue the admit job did not trust", [subs(doneSub(80), doneSub(81))], { VERIFY_CLOSE: "80" }],
+    ["no sub-issue", [subs()], { VERIFY_CLOSE: "80" }],
+    // The listing can name an issue in another repository; VERIFY_CLOSE's
+    // numbers are this repository's, so #81 there is no trusted close.
+    ["a sub-issue in another repository", [subs(doneSub(80), doneSub(81, "completed", "o/other"))], { VERIFY_CLOSE: "80,81" }],
+    ["a sub-issue with no repository_url", [subs(doneSub(80), { number: 81, state: "closed", state_reason: "completed" })], { VERIFY_CLOSE: "80,81" }],
+  ]) {
+    const run = await stopRun({ reason: VERIFIED, routes, extraEnv });
+    assert.ok(!run.calls.some((c) => c.method === "PATCH"), name);
+    assert.match(run.calls.find((c) => c.method === "POST").body.body, /^<!-- work-resolve-issue outcome=retry run=123 -->/, name);
+  }
+});
+
+// A verify run that resumed an earlier unmerged branch and committed nothing
+// checked work that is still off the default branch, so it closes nothing.
+test("main retries a verified-done stop on a resumed branch with no commit of its own, keeping that branch", async () => {
+  const run = await stopRun({
+    reason: VERIFIED,
+    routes: [subs(doneSub(80), doneSub(81))],
+    extraEnv: { VERIFY_CLOSE: "80,81" },
+    extraFiles: { "lane.json": JSON.stringify({ branch: "", resume: RESUMED }) },
+  });
+  assert.equal(run.code, 0);
+  assert.ok(!run.calls.some((c) => c.method === "PATCH"), "no close");
+  const comment = run.calls.find((c) => c.method === "POST").body.body;
+  assert.match(comment, /^<!-- work-resolve-issue outcome=retry run=123 branch=resumed -->/);
+  assert.match(comment, /The run committed to a branch, or resumed one, so it retries instead of closing\./);
+  for (const opts of [{ branch: "", resumed: "work/7-earlier" }, { branch: "work/7" }]) {
+    assert.equal(stoppedPlan(VERIFIED, opts).action, "retry", JSON.stringify(opts));
+  }
+});
+
+test("a verify-unmet stop parks the parent naming the unmet item, with no retry and no person", () => {
+  const plan = stoppedPlan("verify-unmet: the guide does not name --dry-run");
+  assert.equal(plan.action, "park");
+  assert.equal(plan.status, "status: confirmed");
+  assert.match(plan.comment, /^<!-- work-resolve-issue outcome=parked run=555 -->/);
+  assert.match(plan.comment, /--dry-run/);
+  assert.ok(!plan.comment.includes(ESCALATION_MARKER));
+});
+
+// #12365's real shape: its one sub-issue (#12772) closed completed, but its own
+// UX-3 done-when line waits on a watcher capability that does not exist.
+const UX3 = "UX-3: when the watcher or the session can report a pending terminal permission prompt, the page shows that state and a test covers it. Until then, this item stays parked and the #7280 hint stays.";
+const UI14 = "UI-14: the 2026-10-12 \"keep it\" decision is recorded in `plugins/planning/surface/deferred.md`, citing the decision comment.";
+const PARENT_12365 = `## Done when\n\n- [ ] ${UX3}\n- [ ] ${UI14}\n`;
+
+test("#12365: all sub-issues done but its own UX-3 line unmet parks, never closes", async () => {
+  const sub = doneSub(12772);
+  const found = await finishedParent({
+    github: async (method, path) => (path.includes("/sub_issues") ? [sub] : null),
+    repository: "o/r",
+    issue: { number: 12365, body: PARENT_12365, sub_issues_summary: { total: 1, completed: 1 } },
+    trusted: async () => true,
+  });
+  assert.deepEqual(found, [12772], "every sub-issue closed completed, so the parent gets its one verify run");
+  const unmet = `verify-unmet: ${UX3}`;
+  const plan = stoppedPlan(unmet);
+  assert.equal(plan.action, "park");
+  assert.ok(!plan.comment.includes(ESCALATION_MARKER));
+  const run = await stopRun({ reason: unmet, summary: PARENT_12365, routes: [subs(sub), ["POST", /\/issues\/77\/labels$/, 200, []]], extraEnv: { VERIFY_CLOSE: found.join(",") } });
+  assert.equal(run.code, 0);
+  assert.ok(!run.calls.some((c) => c.method === "PATCH"), "no close call");
+  const comment = run.calls.filter((c) => c.method === "POST").map((c) => c.body.body).find((body) => body?.startsWith("<!-- work-resolve-issue outcome=parked"));
+  assert.ok(comment, "the park posts its outcome comment");
+  assert.match(comment, /^<!-- work-resolve-issue outcome=parked run=123 -->/);
+  assert.match(comment, /UX-3/);
+  assert.equal(closeStop(comment), null, "no close evidence");
+  assert.equal(await parentDone(evidenceClient([[/\/issues\/77\/sub_issues/, [sub]]]), "/repos/o/r", 77, async () => true), true, "sub-issues alone would pass, so the unmet own item is what keeps it open");
+});
+
+test("parentDone proves nothing for an issue with no sub-issue,so doneEvidence stays the only already-done proof", async () => {
+  assert.equal(await parentDone(evidenceClient([[/\/issues\/77\/sub_issues/, []]]), "/repos/o/r", 77, async () => true), false);
+  assert.equal(await parentDone(evidenceClient([]), "/repos/o/r", 77, async () => true), false, "an unread listing");
+  assert.equal(await parentDone(evidenceClient([[/\/issues\/77\/sub_issues/, [doneSub(80)]]]), "/repos/o/r", 77, async () => true), true);
+});
+
+// doneEvidence against a fake client: each route answers its path, and a path
+// no route names fails the read, as a GitHub error would. An issue never
+// reopened answers its event list empty unless a route says otherwise.
+const NO_EVENTS = [/\/issues\/77\/events\?per_page=100&page=1$/, []];
+const evidenceClient = (routes) => async (method, path) => {
+  const route = [...routes, NO_EVENTS].find(([pattern]) => pattern.test(path));
+  if (method !== "GET" || !route) {
+    throw new Error(`no route for ${method} ${path}`);
+  }
+  return route[1];
+};
+const ON_MAIN = [
+  [/\/repos\/o\/r$/, { default_branch: "main" }],
+  [/\/compare\/abb359be\.\.\.main$/, { status: "ahead" }],
+];
+
+// The issue, opened before every change below; its body names a path, which
+// proves nothing.
+const EVIDENCE_ISSUE = [/\/issues\/77$/, { created_at: "2026-10-01T00:00:00Z", body: "The table in `docs/lanes.md:12` is stale." }];
+const MERGE_SHA = "cafe".repeat(10);
+// A merged pull request #5 whose merge commit says `message`; its title and
+// body, which stay editable after the merge, say `body` (by default the same).
+// A null message leaves the merge commit unreadable.
+const evidencePull = (message, { body = message, base = "main", mergedAt = "2026-10-29T14:07:27Z", files = [{ filename: "docs/lanes.md" }] } = {}) =>
+  evidenceClient([
+    [/\/repos\/o\/r$/, { default_branch: "main" }],
+    [/\/pulls\/5$/, { merged_at: mergedAt, merge_commit_sha: MERGE_SHA, base: { ref: base }, title: "fix: tidy", body }],
+    [/\/pulls\/5\/files/, files],
+    ...(message === null ? [] : [[new RegExp(`/commits/${MERGE_SHA}$`), { commit: { message, committer: { date: mergedAt } } }]]),
+    EVIDENCE_ISSUE,
+  ]);
+
+test("doneEvidence takes a merged pull request only when its merge commit closes the issue", async () => {
+  const reason = "already-done: #5 shipped it";
+  assert.equal(await doneEvidence(evidencePull("Tidies an unrelated table."), "/repos/o/r", reason, 77), false, "an unrelated merged PR");
+  assert.equal(await doneEvidence(evidencePull("Closes #770"), "/repos/o/r", reason, 77), false, "#770 is not #77");
+  assert.equal(await doneEvidence(evidencePull("fix: tidy (#5)\n\nCloses #77"), "/repos/o/r", reason, 77), true);
+});
+
+// Re-review on #10978: a pull request's title and body stay editable after
+// it merges, so only its merge commit, which a squash fills from the body, counts.
+test("doneEvidence reads the closing keyword from the merge commit, not the pull request's current body", async () => {
+  const reason = "already-done: #5 shipped it";
+  assert.equal(await doneEvidence(evidencePull("fix: tidy (#5)", { body: "Closes #77" }), "/repos/o/r", reason, 77), false, "a body edited after the merge");
+  assert.equal(await doneEvidence(evidencePull("fix: tidy (#5)\n\nCloses #77", { body: "Tidies a table." }), "/repos/o/r", reason, 77), true);
+  assert.equal(await doneEvidence(evidencePull(null, { body: "Closes #77" }), "/repos/o/r", reason, 77), false, "an unreadable merge commit");
+});
+
+// Security review on #10978: only a GitHub closing keyword says a change
+// finishes the issue; a Refs line, a follow-up or a squash suffix does not.
+test("doneEvidence counts a citation only as a closing keyword before #<issue>", async () => {
+  const reason = "already-done: #5 shipped it";
+  for (const [message, closes] of [
+    ["Refs: #77", false],
+    ["Filed #77 for follow-up", false],
+    ["Tidy the table (#77)", false],
+    ["Closes #770", false],
+    ["fix #77a", false],
+    ["Fixes #77", true],
+    ["fixes: #77", true],
+    ["RESOLVED #77.", true],
+    ["Part of it.\n\nClosed #77", true],
+    ["This does not fix #77", false],
+    ['Revert "fix: tidy (#5)"\n\nThis reverts commit abc1234.\n\nCloses #77', false],
+  ]) {
+    assert.equal(await doneEvidence(evidencePull(message), "/repos/o/r", reason, 77), closes, message);
+  }
+});
+
+test("doneEvidence takes a merged pull request only into the default branch and after the issue opened", async () => {
+  const reason = "already-done: #5 shipped it";
+  assert.equal(await doneEvidence(evidencePull("Closes #77", { base: "release/3.x" }), "/repos/o/r", reason, 77), false, "merged into another branch");
+  assert.equal(await doneEvidence(evidencePull("Closes #77", { mergedAt: "2026-09-30T00:00:00Z" }), "/repos/o/r", reason, 77), false, "merged before the issue opened");
+  assert.equal(await doneEvidence(evidencePull("Closes #77", { mergedAt: "not a date" }), "/repos/o/r", reason, 77), false, "an unreadable merge time");
+});
+
+// Re-review on #10978: lane pull requests carry `Closes #N`, so a change to a
+// path the issue names is no evidence of its own.
+test("doneEvidence takes no change to a path the issue names as evidence", async () => {
+  assert.equal(await doneEvidence(evidencePull("Tidies a file."), "/repos/o/r", "already-done: #5 shipped it", 77), false, "a pull request");
+  const commit = evidenceClient([
+    ...ON_MAIN,
+    [/\/commits\/abb359be$/, { commit: { message: "fix: tidy", committer: { date: "2026-10-28T00:00:00Z" } }, files: [{ filename: "docs/lanes.md" }] }],
+    EVIDENCE_ISSUE,
+  ]);
+  assert.equal(await doneEvidence(commit, "/repos/o/r", "already-done: on main at abb359be", 77), false, "a commit");
+});
+
+test("doneEvidence takes a default-branch commit only when its message closes the issue", async () => {
+  const reason = "already-done: on main at abb359be";
+  const commit = (message, date = "2026-10-28T00:00:00Z") =>
+    evidenceClient([...ON_MAIN, [/\/commits\/abb359be$/, { commit: { message, committer: { date } }, files: [] }], EVIDENCE_ISSUE]);
+  assert.equal(await doneEvidence(commit("fix(lane): drop the stale row\n\nFixes #77"), "/repos/o/r", reason, 77), true);
+  assert.equal(await doneEvidence(commit("fix(lane): drop the stale row\n\nRefs #77"), "/repos/o/r", reason, 77), false, "a Refs line closes nothing");
+  assert.equal(await doneEvidence(commit("chore(release): cut 3.2.0"), "/repos/o/r", reason, 77), false, "an unrelated release commit");
+  assert.equal(await doneEvidence(commit("fix: tidy\n\nFixes #77", "2026-09-30T00:00:00Z"), "/repos/o/r", reason, 77), false, "committed before the issue opened");
+});
+
+// Review on #10978: a reason may cite an issue before the pull request that
+// closed it, so each cited number is tried, not only the first.
+test("doneEvidence tries each pull request the reason cites", async () => {
+  const github = evidenceClient([
+    [/\/repos\/o\/r$/, { default_branch: "main" }],
+    [/\/pulls\/60$/, { merged_at: "2026-10-29T14:07:27Z", merge_commit_sha: MERGE_SHA, base: { ref: "main" } }],
+    [new RegExp(`/commits/${MERGE_SHA}$`), { commit: { message: "fix: tidy (#60)\n\nCloses #77" } }],
+    EVIDENCE_ISSUE,
+  ]);
+  assert.equal(await doneEvidence(github, "/repos/o/r", "already-done: duplicate of #50, fixed by #60", 77), true);
+  assert.equal(await doneEvidence(github, "/repos/o/r", "already-done: duplicate of #50, #51 and #52, fixed by #60", 77), false, "past the first three numbers");
+});
+
+// Security review on #10978: a person who reopened the issue after the cited
+// merge said the work is not done, so that merge proves nothing; work merged
+// after the reopen does, and an event list that does not read proves nothing.
+test("doneEvidence takes only work merged after the issue was last reopened", async () => {
+  const reason = "already-done: #5 shipped it";
+  const pull = (events) =>
+    evidenceClient([
+      [/\/repos\/o\/r$/, { default_branch: "main" }],
+      [/\/pulls\/5$/, { merged_at: "2026-10-29T14:07:27Z", merge_commit_sha: MERGE_SHA, base: { ref: "main" } }],
+      [new RegExp(`/commits/${MERGE_SHA}$`), { commit: { message: "fix: tidy (#5)\n\nCloses #77" } }],
+      [/\/issues\/77\/events\?/, events],
+      EVIDENCE_ISSUE,
+    ]);
+  const reopen = (at) => ({ event: "reopened", created_at: at });
+  assert.equal(await doneEvidence(pull([reopen("2026-10-29T15:00:00Z")]), "/repos/o/r", reason, 77), false, "reopened after the merge");
+  assert.equal(await doneEvidence(pull([reopen("2026-10-20T00:00:00Z"), { event: "closed", created_at: "2026-10-21T00:00:00Z" }]), "/repos/o/r", reason, 77), true, "reopened before the merge");
+  assert.equal(await doneEvidence(pull(null), "/repos/o/r", reason, 77), false, "an unreadable event list");
+});
+
+test("doneEvidence proves nothing when a read fails", async () => {
+  const commit = [/\/commits\/abb359be$/, { commit: { message: "Fixes #77", committer: { date: "2026-10-28T00:00:00Z" } }, files: [] }];
+  // The issue read fails, so its time cannot be read.
+  assert.equal(await doneEvidence(evidenceClient([...ON_MAIN, commit]), "/repos/o/r", "already-done: abb359be", 77), false);
+  // The commit read fails, though the compare says it is on main.
+  assert.equal(await doneEvidence(evidenceClient([...ON_MAIN, EVIDENCE_ISSUE]), "/repos/o/r", "already-done: abb359be", 77), false);
+  // The default branch read fails.
+  assert.equal(await doneEvidence(evidenceClient([commit, EVIDENCE_ISSUE]), "/repos/o/r", "already-done: abb359be", 77), false);
+  // Each read answering, the same evidence holds.
+  assert.equal(await doneEvidence(evidenceClient([...ON_MAIN, commit, EVIDENCE_ISSUE]), "/repos/o/r", "already-done: abb359be", 77), true);
+});
+
+test("main posts a delivered report and closes the issue", async () => {
+  const run = await stopRun({ reason: "report-delivered: the audit found three stale rows", summary: "Rows 4, 9 and 12 name retired lanes.", routes: [] });
+  assert.equal(run.code, 0);
+  assert.match(run.calls.find((c) => c.method === "POST").body.body, /three stale rows/);
+  assert.match(run.calls.find((c) => c.method === "POST").body.body, /The run's report:\n\n> Rows 4, 9 and 12 name retired lanes\./);
+  assert.deepEqual(run.calls.find((c) => c.method === "PATCH").body, { state: "closed", state_reason: "completed" });
+});
+
+// A close writes no status label: the issue closes, then host-run comes off
+// (after the close, so a failed close never leaves an open issue without its
+// state); attended stays, and so does every status label.
+const withLabels = (...names) => ({ ...ISSUE[2], labels: names.map((name) => ({ name })) });
+const labelWrites = (calls) => calls.filter((c) => c.method === "DELETE" || c.method === "PATCH").map((c) => `${c.method} ${c.path.replace(/^.*\/issues\/77/, "")}`);
+test("main's close writes no status label and removes host-run after the close, keeping attended", async () => {
+  const reason = "report-delivered: the audit found three stale rows";
+  const run = await stopRun({ reason, routes: [], issue: withLabels("status: ready", "admission-deferred", "status: confirmed", "host-run", "attended", "agent-ready") });
+  assert.equal(run.code, 0);
+  assert.deepEqual(labelWrites(run.calls), ["PATCH ", "DELETE /labels/host-run"]);
+  const bare = await stopRun({ reason, routes: [], issue: withLabels("priority: low") });
+  assert.equal(bare.code, 0);
+  assert.deepEqual(labelWrites(bare.calls), ["PATCH "]);
+});
+
+// A verified-done parent closes through the same route.
+test("main's verified-done close writes no status label", async () => {
+  const run = await stopRun({ reason: VERIFIED, extraEnv: { VERIFY_CLOSE: "80,81" }, issue: withLabels("status: ready", "agent-ready"), routes: [subs(doneSub(80), doneSub(81))] });
+  assert.equal(run.code, 0);
+  assert.deepEqual(labelWrites(run.calls), ["PATCH "]);
+});
+
+test("retries count the App's retry markers since a listed human last set Work status agent-ready, not this run's", () => {
+  const marker = (outcome, run, at) => ({ user: { login: "melodic-automation-lanes[bot]" }, body: `<!-- work-resolve-issue outcome=${outcome} run=${run} -->`, created_at: at });
+  const comments = [marker("retry", "1", "2026-10-17T01:00:00Z"), marker("retry", "2", "2026-10-17T03:00:00Z"), marker("turn-cap", "3", "2026-10-17T04:00:00Z"), marker("retry", "555", "2026-10-17T05:00:00Z")];
+  const args = { comments, since: Date.parse("2026-10-17T02:00:00Z"), bot: "melodic-automation-lanes[bot]", runId: "555" };
+  assert.equal(countRestarts({ ...args, outcome: "retry" }), 1);
+  assert.equal(countRestarts({ ...args, outcome: "turn-cap" }), 1);
+});
+
+test("main fails a crashed run whose retries are spent: Work status to needs-triage, no label, no person", async () => {
+  const earlier = (run, at) => ({ user: { login: "melodic-automation-lanes[bot]" }, body: `<!-- work-resolve-issue outcome=retry run=${run} -->`, created_at: at });
+  await withAsyncDir({}, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["GET", /\/issues\/77\/comments$/, 200, [earlier("1", "2026-10-17T01:00:00Z"), earlier("2", "2026-10-17T02:00:00Z")]],
+      ["GET", /\/issues\/77\/events$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: env(dir), fetch, leaveAgentReady: statusInto(calls) }), 0);
+    assert.ok(!calls.some((c) => c.method === "POST" && c.path.endsWith("/labels")), JSON.stringify(calls));
+    assert.ok(!calls.some((c) => c.method === "DELETE"));
+    assert.ok(calls.some((c) => c.method === "STATUS" && c.body.state === "needs-triage"));
+    const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+    assert.equal(parseOutcomeMarker(comment).outcome, "failed");
+  });
+});
+
+// Element 4 of docs/outage-posture-audit.md: a fault is no evidence about the
+// issue, so retries that were all faults do not fail it. The earlier retries'
+// comments here are the ones main itself posts, for the crash below.
+const crashRetryComment = async () =>
+  withAsyncDir({}, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ...HISTORY,
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    assert.equal(await main({ env: env(dir), fetch }), 0);
+    return calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+  });
+const earlierRetry = (body, run) => ({ user: { login: "melodic-automation-lanes[bot]" }, body: body.replace("run=123", `run=${run}`), created_at: `2026-10-17T0${run}:00:00Z` });
+const spentStop = (comments, files = {}, runEnv = () => ({})) =>
+  withAsyncDir(files, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["GET", /\/issues\/77\/comments$/, 200, comments],
+      ["GET", /\/issues\/77\/events$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 201, {}],
+    ]);
+    const code = await main({ env: { ...env(dir), ...runEnv(dir) }, fetch });
+    return { code, writes: calls.filter((c) => c.method !== "GET"), comment: calls.find((c) => c.method === "POST" && c.path.endsWith("/comments"))?.body.body };
+  });
+
+test("main holds a crash past the cap when every retry was a fault: green with a notice, agent-ready kept, nothing posted", async (t) => {
+  const body = await crashRetryComment();
+  assert.equal(parseOutcomeMarker(body).outcome, "retry");
+  const log = t.mock.method(console, "log", () => {});
+  const { code, writes } = await spentStop([earlierRetry(body, 1), earlierRetry(body, 2)]);
+  assert.equal(code, 0);
+  assert.deepEqual(writes, []);
+  assert.ok(log.mock.calls.some((call) => String(call.arguments[0]).startsWith("::notice")));
+});
+
+test("main fails a crash past the cap when one retry was not a fault", async () => {
+  const body = await crashRetryComment();
+  const named = body.replace("`outcome-unread`", "`stopped`");
+  assert.notEqual(named, body);
+  const { comment } = await spentStop([earlierRetry(body, 1), earlierRetry(named, 2)]);
+  assert.equal(parseOutcomeMarker(comment).outcome, "failed");
+});
+
+test("main fails a stop past the cap that is itself no fault, even after retries that all were", async () => {
+  const body = await crashRetryComment();
+  const { comment } = await spentStop([earlierRetry(body, 1), earlierRetry(body, 2)], {
+    "work-outcome.json": JSON.stringify({ exit: "stopped", reason: "No code here", title: "", summary: "" }),
+  });
+  assert.equal(parseOutcomeMarker(comment).outcome, "failed");
+});
+
+// A hold posts no marker, so a branch this run made would read as unreported
+// work, and the next run would open a PR from it (findPrior's reuse).
+test("main fails a fault past the cap that left a branch of this run's own, and holds on one the run only resumed", async () => {
+  const body = await crashRetryComment();
+  const earlier = [earlierRetry(body, 1), earlierRetry(body, 2)];
+  const own = await spentStop(earlier, { "lane.json": JSON.stringify({ branch: "work-resolve-issue/issue-77-123-1" }) });
+  assert.equal(parseOutcomeMarker(own.comment).outcome, "failed");
+  // patch-apply-failed names the resumed branch on the stop, so this reaches the run-id check.
+  const resumed = await spentStop(
+    earlier,
+    {
+      "lane.json": JSON.stringify({ resume: "work-resolve-issue/issue-77-1-1" }),
+      "work-outcome.json": JSON.stringify({ exit: "done", title: "t", summary: "s" }),
+    },
+    () => ({ ESCALATION_REASON: "patch-apply-failed" }),
+  );
+  assert.deepEqual(resumed.writes, []);
+});
+
+// limits.stop-retries 0 means no retries: nothing has been tried, so no retry
+// was a fault.
+test("main fails a fault at once under a cap of 0", async () => {
+  const { comment } = await spentStop([], { "resolved.json": JSON.stringify({ limits: { "stop-retries": 0 } }) }, (dir) => ({ RESOLVED_CONFIG: join(dir, "resolved.json") }));
+  assert.equal(parseOutcomeMarker(comment).outcome, "failed");
+});
+
+test("main hands a run to a person when COLLECT_REFUSED is exactly true, and retries it otherwise", async () => {
+  for (const [value, held] of [["true", true], ["TRUE", false], ["", false]]) {
+    await withAsyncDir({}, async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        ...HISTORY,
+        ["POST", /\/issues\/77\/labels$/, 200, []],
+        ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+        ["POST", /\/issues\/77\/comments$/, 201, {}],
+      ]);
+      assert.equal(await main({ env: { ...env(dir), COLLECT_REFUSED: value }, fetch, setStatus: statusInto(calls) }), 0);
+      assert.equal(calls.some((c) => c.method === "STATUS" && c.body.state === "needs-human"), held, value);
+      assert.ok(!calls.some((c) => c.method === "DELETE"), value);
+    });
+  }
+});
+
+test("main keeps agent-ready on a spent retry whose failed marker could not be posted, so the stranded sweep still finds it", async () => {
+  const earlier = (run, at) => ({ user: { login: "melodic-automation-lanes[bot]" }, body: `<!-- work-resolve-issue outcome=retry run=${run} -->`, created_at: at });
+  await withAsyncDir({}, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["GET", /\/issues\/77\/comments$/, 200, [earlier("1", "2026-10-17T01:00:00Z"), earlier("2", "2026-10-17T02:00:00Z")]],
+      ["GET", /\/issues\/77\/events$/, 200, []],
+      ["DELETE", /\/issues\/77\/labels\/agent-ready$/, 200, []],
+      ["POST", /\/issues\/77\/comments$/, 500, { message: "boom" }],
+    ]);
+    assert.equal(await main({ env: env(dir), fetch }), 1);
+    assert.ok(!calls.some((c) => c.method === "DELETE"), JSON.stringify(calls));
+  });
+});
+
+test("main on a rerun after its own retry marker posts nothing again", async () => {
+  const own = { user: { login: "melodic-automation-lanes[bot]" }, body: "<!-- work-resolve-issue outcome=retry run=123 -->", created_at: "2026-10-17T05:00:00Z" };
+  await withAsyncDir({}, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+      ["GET", /\/issues\/77\/comments$/, 200, [own]],
+      ["GET", /\/issues\/77\/events$/, 200, []],
+    ]);
+    assert.equal(await main({ env: env(dir), fetch }), 0);
+    assert.deepEqual(calls.filter((c) => c.method !== "GET"), []);
+  });
+});
+
+// The owner's rule: a patch not proven clear of a credential holds, whatever
+// exit or forgeable record the run left beside it.
+test("a patch-credential escalation and a scan's output refusal hold past any exit or record", () => {
+  const unread = () => readOutcome("/nonexistent/work-outcome.json");
+  const refused = () => ({ ...unread(), stop: "scan-refused-output", reason: SCAN_REFUSALS.output });
+  const base = { issueNumber: 77, issueLabels: ["agent-ready"], branch: "", changedFiles: [], humanLabel: "needs-human", runId: "555" };
+  const records = { turnCap: { cap: 50 }, turnCapRestarts: 0, limits: { ...LIMIT_DEFAULTS, "turn-cap-restarts": 1 } };
+  for (const [name, args] of [
+    ["stopped", { outcome: { exit: "stopped", reason: "Tests failed.", title: "", summary: "" }, escalation: "patch-credential" }],
+    ["turn cap", { outcome: unread(), escalation: "patch-credential", ...records }],
+    ["limit", { outcome: unread(), escalation: "patch-credential", limit: { resets: null } }],
+    ["funding", { outcome: unread(), escalation: "patch-credential", funding: { regain: null } }],
+  ]) {
+    const plan = decide({ ...base, ...args });
+    assert.equal(plan.action, "hand-back", name);
+    assert.equal(plan.stop, "patch-credential", name);
+    assert.equal(plan.status, "needs-human", name);
+    assert.match(plan.comment, /credential shape/, name);
+    assert.doesNotMatch(plan.comment, /reported done/, name);
+  }
+  for (const [name, args] of [
+    ["turn cap", records],
+    ["limit", { limit: { resets: null } }],
+    ["funding", { funding: { regain: null } }],
+  ]) {
+    const plan = decide({ ...base, outcome: refused(), ...args });
+    assert.equal(plan.action, "hand-back", name);
+    assert.equal(plan.stop, "scan-refused-output", name);
+    assert.equal(plan.status, "needs-human", name);
+  }
+});
+
+test("an escalation that does not hold still yields to the turn-cap restart", () => {
+  const plan = decide({
+    issueNumber: 77,
+    issueLabels: ["agent-ready"],
+    branch: "",
+    changedFiles: [],
+    humanLabel: "needs-human",
+    runId: "555",
+    outcome: readOutcome("/nonexistent/work-outcome.json"),
+    escalation: "patch-invalid",
+    turnCap: { cap: 50 },
+    turnCapRestarts: 0,
+    limits: { ...LIMIT_DEFAULTS, "turn-cap-restarts": 1 },
+  });
+  assert.notEqual(plan.stop, "patch-invalid");
+  assert.deepEqual(plan.addLabels ?? [], []);
+});
+
+test("a scan fault retries with no person, up to limits.stop-retries, and every scan refusal has a route", () => {
+  for (const kind of Object.keys(SCAN_REFUSALS)) assert.ok(Object.hasOwn(STOP_ROUTES, `scan-refused-${kind}`), kind);
+  const outcome = { ...readOutcome("/nonexistent/work-outcome.json"), stop: "scan-refused-fault", reason: SCAN_REFUSALS.fault };
+  const plan = decide({ issueNumber: 77, issueLabels: ["agent-ready"], branch: "", changedFiles: [], humanLabel: "needs-human", runId: "555", outcome });
+  assert.equal(plan.action, "retry");
+  assert.equal(plan.stop, "scan-refused-fault");
+  assert.deepEqual(plan.addLabels ?? [], []);
+  assert.equal(capRetries(plan, 1, { "stop-retries": 2 }).action, "retry");
+  const spent = capRetries(plan, 2, { "stop-retries": 2 });
+  assert.equal(spent.action, "fail");
+  assert.deepEqual(spent.addLabels ?? [], []);
+});
+
+test("scan markers: only fault, or fault beside patch, reads as fault; anything else beside either reads as output", () => {
+  for (const [base, rungUp, want] of [
+    ["fault", "", "fault"],
+    ["fault", "patch", "fault"],
+    ["patch", "fault", "fault"],
+    ["fault", "output", "output"],
+    ["output", "fault", "output"],
+    ["fault", "forged", "output"],
+  ]) {
+    const dir = tempDir("scan-refused-");
+    try {
+      writeFileSync(join(dir, "scan-refused-1.txt"), `${base}\n`);
+      if (rungUp) writeFileSync(join(dir, "scan-refused-1-rung-up.txt"), `${rungUp}\n`);
+      assert.equal(readScanRefusal(dir, "1"), want, `${base} then ${rungUp}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a current attempt with a patch and an output scan marker reads as output, in either order", () => {
+  for (const [base, rungUp] of [["patch", "output"], ["output", "patch"]]) {
+    const dir = tempDir("scan-refused-");
+    try {
+      writeFileSync(join(dir, "scan-refused-1.txt"), `${base}\n`);
+      writeFileSync(join(dir, "scan-refused-1-rung-up.txt"), `${rungUp}\n`);
+      assert.equal(readScanRefusal(dir, "1"), "output", `${base} then ${rungUp}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+// A reuse PR holds on exactly decide()'s conditions plus its own leak scan
+// (mustHold), and a clean one opens with no hold line. Each case pairs a clean
+// reuse, which carries none, with the same reuse and one condition changed.
+const CLEAN_CHECKS = { tip: TIP, results: [{ check: FRAGMENTS, exit: 0 }], scan: "clean" };
+const CLEAN_REUSE = {
+  issueNumber: 77,
+  issueLabels: ["agent-ready", "work-class: scoped"],
+  branch: lane(400),
+  changedFiles: ["README.md"],
+  holdPaths: HOLD_GLOBS,
+  humanMerge: false,
+  checks: CLEAN_CHECKS,
+};
+const reuseHeld = (overrides = {}) => reusePlan({ ...CLEAN_REUSE, ...overrides }).body.split("\n").includes(HOLD_LINE);
+const CAPPED = Array.from({ length: 300 }, (_, i) => `docs/page-${i}.md`);
+const HOLD_CASES = {
+  "the denied paths cannot be read": { holdPaths: null },
+  "the compare request failed": { changedFiles: null },
+  "the listing is cut at the cap while a path is denied": { changedFiles: CAPPED },
+  "a changed path is denied": { changedFiles: ["README.md", ".github/workflows/x.yml"] },
+  "the issue is labeled untrusted-provenance": { issueLabels: ["agent-ready", "work-class: untrusted-provenance"] },
+  "the issue is labeled provenance: untrusted": { issueLabels: ["agent-ready", "provenance: untrusted"] },
+  "a trusted labeler set merge: human": { humanMerge: true },
+};
+// A reuse's scan word, when it is anything but clean: lint-repo's gitleaks
+// does not cover what scanLeak flags, so a missing scan holds like a finding.
+const SCAN_CASES = {
+  "the leak scan found something": { checks: { ...CLEAN_CHECKS, scan: "found" } },
+  "the leak scan failed": { checks: { ...CLEAN_CHECKS, scan: "failed" } },
+  "the leak scan never ran": { checks: { tip: TIP, results: CLEAN_CHECKS.results } },
+  "the runner checks and their scan are missing": { checks: null },
+};
+
+for (const [name, overrides] of Object.entries({ ...HOLD_CASES, ...SCAN_CASES })) {
+  test(`a reuse PR holds when ${name}, and the same clean reuse does not`, () => {
+    assert.equal(reuseHeld(), false, "the clean reuse");
+    assert.equal(reuseHeld(overrides), true, name);
+  });
+}
+
+test("a reuse PR with a clean scan does not hold only because no runner check reported, and says what checks its head", () => {
+  const { body } = reusePlan({ ...CLEAN_REUSE, checks: { ...CLEAN_CHECKS, results: [] } });
+  assert.ok(!body.split("\n").includes(HOLD_LINE), body);
+  assert.ok(body.includes("ci-status, pr-verify and the security review lane check the head before it merges."), body);
+  assert.ok(!body.includes("a person reviews the diff"), body);
+});
+
+test("a clean reuse PR names the clean leak scan and leaves the person's review out", () => {
+  const { body } = reusePlan(CLEAN_REUSE);
+  assert.ok(body.startsWith("Closes #77\n\n## Summary\n"), body);
+  assert.ok(body.includes("leak scan read everything the branch changes"), body);
+  assert.ok(!body.includes("a person reviews the diff"), body);
+  const found = reusePlan({ ...CLEAN_REUSE, ...SCAN_CASES["the leak scan found something"] }).body;
+  assert.ok(found.includes("leak scan found a credential shape") && found.includes("a person reviews the diff"), found);
+});
+
+test("a capped listing holds a reuse PR only while some path is denied", () => {
+  assert.equal(reuseHeld({ changedFiles: CAPPED, holdPaths: [] }), false);
+  assert.equal(reuseHeld({ changedFiles: CAPPED }), true);
+});
+
+// A failed runner check is not a reason for a person: the PR opens, its
+// Verification section names the failure, and its own CI stays red until fixed.
+test("a reuse PR whose runner check failed opens unheld and names the failure in Verification", () => {
+  const plan = reusePlan({ ...CLEAN_REUSE, checks: { ...CLEAN_CHECKS, results: [{ check: FRAGMENTS, exit: 1 }] } });
+  assert.equal(plan.hold, false);
+  assert.ok(!plan.body.split("\n").includes(HOLD_LINE), plan.body);
+  assert.ok(plan.body.includes(`${FRAGMENTS}: failed (exit 1)`), plan.body);
+  assert.ok(plan.body.includes("ci-status, pr-verify and the security review lane check the head before it merges."), plan.body);
+});
+
+test("a reuse PR whose runner check failed still holds on a leak scan that is not clean", () => {
+  const failed = [{ check: FRAGMENTS, exit: 1 }];
+  for (const checks of [{ ...CLEAN_CHECKS, results: failed, scan: "found" }, { ...CLEAN_CHECKS, results: failed, scan: "failed" }, { tip: TIP, results: failed }]) {
+    const plan = reusePlan({ ...CLEAN_REUSE, checks });
+    assert.equal(plan.hold, true, JSON.stringify(checks));
+    assert.ok(plan.body.split("\n").includes(HOLD_LINE), plan.body);
+  }
+});
+
+test("mustHold: a reuse holds on any scan word but clean; a failed runner check and runner checks that did not report hold nothing", () => {
+  const facts = { issueLabels: CLEAN_REUSE.issueLabels, humanMerge: false, holdPaths: HOLD_GLOBS, changedFiles: ["README.md"], reused: true };
+  assert.equal(mustHold({ ...facts, checks: CLEAN_CHECKS }), false, "clean reuse");
+  assert.equal(mustHold({ ...facts, checks: { tip: TIP, results: CLEAN_CHECKS.results } }), true, "scan missing");
+  assert.equal(mustHold({ ...facts, checks: null }), true, "checks and scan missing");
+  assert.equal(mustHold({ ...facts, checks: { ...CLEAN_CHECKS, scan: "failed" } }), true, "scan failed");
+  assert.equal(mustHold({ ...facts, checks: { ...CLEAN_CHECKS, scan: "found" } }), true, "scan found");
+  assert.equal(mustHold({ ...facts, checks: { ...CLEAN_CHECKS, results: [{ check: FRAGMENTS, exit: 1 }] } }), false, "a failed check");
+  assert.equal(mustHold({ ...facts, checks: { ...CLEAN_CHECKS, results: [] } }), false, "reuse, clean scan, no runner check reported");
+  assert.equal(mustHold({ ...facts, reused: false, checks: null }), false, "no reuse, runner checks missing");
+  assert.equal(mustHold({ ...facts, reused: false, checks: { tip: TIP, results: [{ check: FRAGMENTS, exit: 1 }] } }), false, "no reuse, a failed check");
+});
+
+test("decide() and reusePlan() hold on the same runner facts, through one mustHold", () => {
+  const held = (body) => body.split("\n").includes(HOLD_LINE);
+  for (const [name, overrides] of Object.entries({ "nothing": {}, ...HOLD_CASES })) {
+    // decide() stops a done run whose checks are missing or failed before it reaches the hold.
+    if (overrides.checks !== undefined) continue;
+    const facts = { ...CLEAN_REUSE, ...overrides };
+    const plan = decide({ outcome: done, branch: BRANCH, ...facts });
+    assert.equal(plan.action, "open-pr", name);
+    assert.equal(held(plan.body), mustHold(facts), `decide(): ${name}`);
+    assert.equal(held(reusePlan(facts).body), mustHold({ ...facts, reused: true }), `reusePlan(): ${name}`);
+    assert.equal(held(plan.body), held(reusePlan(facts).body), name);
+  }
+});
+
+test("readChecks carries a reused branch's scan word, reads an unknown one as failed, and adds none to a record without one", () => {
+  const record = (scan) => JSON.stringify({ version: 1, branch: BRANCH, tip: CHECKED_TIP, results: [], ...(scan === undefined ? {} : { scan }) });
+  for (const word of ["clean", "found", "failed"]) assert.equal(readChecks(record(word), { branch: BRANCH }).scan, word);
+  for (const word of ["CLEAN", "", null, 1, { clean: true }]) assert.equal(readChecks(record(word), { branch: BRANCH }).scan, "failed", JSON.stringify(word));
+  assert.deepEqual(readChecks(record(undefined), { branch: BRANCH }), { tip: CHECKED_TIP, results: [] });
+});
+
+// main on a reuse with no outcome of its own: the runner's checks for the
+// reused branch at TIP, with `scan` (null: none), and the issue's labels and events.
+async function runReuse({ scan = "clean", exit = 0, labels = ["agent-ready", "work-class: scoped"], events = [], eventsStatus = 200, files = [{ filename: "README.md" }], compareStatus = 200 } = {}) {
+  const checks = JSON.stringify({ version: 1, branch: lane(400), tip: TIP, results: [{ check: FRAGMENTS, exit }], ...(scan === null ? {} : { scan }) });
+  return withAsyncDir({ "runner-checks": checks, "resolved.json": RESOLVED, "trusted.json": TRUSTED_LIST }, async (dir) => {
+    const { fetch, calls } = fakeFetch([
+      ["GET", /\/issues\/77$/, 200, { number: 77, labels: labels.map((name) => ({ name })) }],
+      ["GET", /\/issues\/77\/events$/, eventsStatus, events],
+      tipRoute(),
+      ["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }],
+      ["GET", /\/compare\//, compareStatus, compareStatus === 200 ? { files } : { message: "boom" }],
+      ["GET", /\/pulls$/, 200, []],
+      ["POST", /\/pulls$/, 201, { number: 90 }],
+    ]);
+    const code = await main({ env: { ...reuseEnv(dir), RESOLVED_CONFIG: join(dir, "resolved.json"), TRUSTED_ACTORS: join(dir, "trusted.json") }, fetch });
+    assert.equal(code, 0);
+    return { calls, body: calls.find((c) => c.method === "POST" && c.path.endsWith("/pulls"))?.body.body };
+  });
+}
+
+test("main opens a clean reuse PR with no hold line, and holds it on a leak scan that is not clean", async () => {
+  assert.ok(!holds((await runReuse()).body));
+  for (const scan of ["found", "failed", null]) assert.ok(holds((await runReuse({ scan })).body), String(scan));
+});
+
+test("main opens a reuse PR whose runner check failed with no hold line or hold label, and still holds it on a leak scan that is not clean", async () => {
+  const holdLabeled = (calls) => calls.some((c) => c.method === "POST" && c.path.endsWith("/labels") && c.body?.labels?.includes(HOLD_LABEL));
+  const failing = await runReuse({ exit: 1 });
+  assert.ok(!holds(failing.body), failing.body);
+  assert.ok(failing.body.includes(`${FRAGMENTS}: failed (exit 1)`), failing.body);
+  assert.ok(!holdLabeled(failing.calls));
+  for (const scan of ["found", null]) assert.ok(holds((await runReuse({ exit: 1, scan })).body), String(scan));
+});
+
+test("main holds a reuse PR on a denied path or a failed compare, and opens a clean one unheld", async () => {
+  assert.ok(!holds((await runReuse()).body));
+  assert.ok(holds((await runReuse({ files: [{ filename: ".github/workflows/x.yml" }] })).body), "a denied path");
+  assert.ok(holds((await runReuse({ compareStatus: 500 })).body), "a failed compare");
+});
+
+test("main reads merge: human on a reuse too, and opens no PR when its labeler cannot be read", async () => {
+  const labels = ["agent-ready", "work-class: scoped", "merge: human"];
+  assert.ok(!holds((await runReuse({ labels, events: [labeled("merge: human", "stranger", 42)] })).body), "an untrusted labeler");
+  assert.ok(holds((await runReuse({ labels, events: [labeled("merge: human", "kyle-sexton", OWNER_ID)] })).body), "the owner");
+  const unread = await runReuse({ labels, eventsStatus: 404, events: { message: "boom" } });
+  assert.deepEqual(unread.calls.filter((c) => c.method !== "GET"), [], "unreadable events");
+});
+
+// The run-checks step puts the reuse scan's word in the record only on a
+// reused branch, and only for the tip it checked; anything else is failed.
+test("the checks record carries the reuse scan's word for the checked tip, failed for another tip or no word, and none off a reuse", () => {
+  const scanOf = (env) => runChecks({ goodFragment: true, env }).checks.scan;
+  assert.equal(scanOf((tip) => ({ REUSE: "true", SCAN: "clean", SCAN_TIP: tip })), "clean");
+  assert.equal(scanOf((tip) => ({ REUSE: "true", SCAN: "found", SCAN_TIP: tip })), "found");
+  assert.equal(scanOf(() => ({ REUSE: "true", SCAN: "clean", SCAN_TIP: "e".repeat(40) })), "failed", "another tip");
+  assert.equal(scanOf(() => ({ REUSE: "true", SCAN: "", SCAN_TIP: "" })), "failed", "the scan step set no word");
+  assert.equal(scanOf((tip) => ({ REUSE: "true", SCAN: "clean\nscan=clean", SCAN_TIP: tip })), "failed", "not one word");
+  assert.equal(scanOf((tip) => ({ REUSE: "", SCAN: "found", SCAN_TIP: tip })), undefined, "not a reuse");
+});
+
+// The reuse-scan step against a throwaway base holding the gate and the scan
+// script, and a lane branch cloned from it.
+function runReuseScan(laneFiles) {
+  const root = tempDir("reuse-scan-");
+  try {
+    const base = join(root, "base");
+    const laneDir = join(root, "lane");
+    const out = join(root, "out");
+    const gitIn = (dir, ...args) => {
+      const run = spawnSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { encoding: "utf8" });
+      assert.equal(run.status, 0, `git ${args.join(" ")}: ${run.stderr}`);
+      return run.stdout;
+    };
+    for (const file of ["lib/publish-gate.mjs", ".github/scripts/work-resolve-issue/scan-reuse.mjs"]) {
+      mkdirSync(dirname(join(base, file)), { recursive: true });
+      cpSync(fileURLToPath(new URL(`../../../${file}`, import.meta.url)), join(base, file));
+    }
+    gitIn(root, "init", "-q", "-b", "main", base);
+    gitIn(base, "add", "-A");
+    gitIn(base, "commit", "-qm", "base");
+    gitIn(root, "clone", "-q", base, laneDir);
+    gitIn(laneDir, "checkout", "-q", "-b", "lane");
+    for (const [file, bytes] of Object.entries(laneFiles)) writeFileSync(join(laneDir, file), bytes);
+    gitIn(laneDir, "add", "-A");
+    gitIn(laneDir, "commit", "-qm", "lane", "--allow-empty");
+    const tip = gitIn(laneDir, "rev-parse", "HEAD").trim();
+    const run = spawnSync("bash", ["-e", "-o", "pipefail", "-c", runChecksScript("reuse-scan")], {
+      encoding: "utf8",
+      env: { ...process.env, BASE: base, LANE: laneDir, GITHUB_OUTPUT: out },
+    });
+    assert.equal(run.status, 0, run.stderr);
+    const outputs = Object.fromEntries(readFileSync(out, "utf8").trim().split("\n").map((line) => line.split("=")));
+    return { ...outputs, tip, stdout: run.stdout, stderr: run.stderr };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// Samples built from parts, so no line of this file forms the shape it tests.
+const SAMPLE_KEY = ["sk", "ant", "api03", "x".repeat(40)].join("-");
+const SAMPLE_ASSIGNMENT = `${"pass"}word = "${"hunter"}2-zz9"`;
+
+test("the reuse-scan step scans what the branch changes and records its word and tip", () => {
+  const clean = runReuseScan({ "notes.md": "a plain change\n" });
+  assert.deepEqual({ scan: clean.scan, tip: clean.tip }, { scan: "clean", tip: clean.tip });
+  const keyed = runReuseScan({ "notes.md": `key ${SAMPLE_KEY}\n` });
+  assert.equal(keyed.scan, "found", "a credential format");
+  assert.match(keyed.stderr, /scan-reuse: Anthropic key; rotate this credential/);
+  assert.equal(runReuseScan({ "notes.md": `${SAMPLE_ASSIGNMENT}\n` }).scan, "found", "a plain assignment, which the read runner only warns on");
+  assert.equal(runReuseScan({ "blob.bin": Buffer.concat([Buffer.from([0, 1, 0]), Buffer.from(SAMPLE_KEY), Buffer.from([0])]) }).scan, "found", "a binary file");
+  assert.equal(runReuseScan({ [`${SAMPLE_KEY}.txt`]: "x\n" }).scan, "found", "a credential-format file name");
+  const quiet = runReuseScan({ "notes.md": `key ${SAMPLE_KEY}\n` });
+  assert.ok(!`${quiet.stdout}${quiet.stderr}`.includes(SAMPLE_KEY), "the step never prints the match");
+});
+
+test("scan-reuse.mjs prints failed when the scan cannot finish, and refuses arguments that are not a repository and two SHAs", () => {
+  const script = fileURLToPath(new URL("./scan-reuse.mjs", import.meta.url));
+  const root = tempDir("scan-reuse-");
+  try {
+    const run = spawnSync(process.execPath, [script, join(root, "absent"), "a".repeat(40), "b".repeat(40)], { encoding: "utf8" });
+    assert.deepEqual({ status: run.status, stdout: run.stdout }, { status: 0, stdout: "failed\n" });
+    for (const args of [[], [root, "main", "b".repeat(40)], [root, "a".repeat(40)]]) {
+      const bad = spawnSync(process.execPath, [script, ...args], { encoding: "utf8" });
+      assert.deepEqual({ status: bad.status, stdout: bad.stdout }, { status: 2, stdout: "" }, args.join(" "));
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// #10698 (run 40732936415): the earlier-work check read no closing PR at
+// 17:11, a listed human's open #10686 gained a closing keyword at 17:13, and the
+// lane still opened a second PR at 17:19. report-outcome reads the closers
+// again before the open.
+async function openWithClosers(nodes, { own = [] } = {}) {
+  return withAsyncDir(
+    {
+      "work-outcome.json": JSON.stringify(done),
+      "lane.json": JSON.stringify({ branch: BRANCH }),
+      "runner-checks": checksFile(),
+      "trusted.json": TRUSTED_LIST,
+    },
+    async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        branchTip(),
+        ["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }],
+        ["GET", /\/compare\//, 200, { files: [{ filename: "README.md" }] }],
+        ["GET", /\/pulls$/, 200, own],
+        ["POST", /^\/graphql$/, 200, graphql(nodes)],
+        ["POST", /\/pulls$/, 201, { number: 90 }],
+        ...HISTORY,
+        ["POST", /\/issues\/77\/labels$/, 200, []],
+        ["DELETE", /\/labels\//, 200, []],
+        ["POST", /\/issues\/77\/comments$/, 201, {}],
+      ]);
+      const lines = [];
+      const log = console.log;
+      console.log = (line) => lines.push(line);
+      try {
+        const code = await main({ env: { ...env(dir), TRUSTED_ACTORS: join(dir, "trusted.json") }, fetch });
+        return { code, calls, lines };
+      } finally {
+        console.log = log;
+      }
+    },
+  );
+}
+const opened = (calls) => calls.some((c) => c.method === "POST" && c.path === "/repos/o/r/pulls");
+
+test("main on done opens no PR when a listed human's open PR already closes the issue, and keeps agent-ready", async () => {
+  const { code, calls, lines } = await openWithClosers([{ ...closer("User", "kyle-sexton", OWNER_ID), number: 10686 }]);
+  assert.equal(code, 0);
+  assert.ok(!opened(calls), JSON.stringify(calls));
+  assert.ok(lines.some((line) => line.includes("#10686")), lines.join("\n"));
+  assert.ok(!calls.some((c) => c.path.endsWith("/issues/77/labels") || c.method === "DELETE"));
+  const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/issues/77/comments")).body.body;
+  assert.ok(comment.startsWith("<!-- work-resolve-issue outcome=retry run=123 -->"), comment);
+  assert.match(comment, /`closed-by-open-pr`/);
+  // Quoted as the stop's words, so its `#` is neutralized like any run text.
+  assert.match(comment, /PR .10686 already closes this issue/);
+  assert.ok(comment.includes(BRANCH), comment);
+});
+
+test("main on done still opens the PR when no open PR closes the issue, or only an outsider's does", async () => {
+  for (const nodes of [[], [closer("User", "stranger", 42)], [closer("User", "kyle-sexton", OWNER_ID, "fork/r")]]) {
+    const { code, calls } = await openWithClosers(nodes);
+    assert.equal(code, 0, JSON.stringify(nodes));
+    assert.ok(opened(calls), JSON.stringify(nodes));
+    assert.ok(!calls.some((c) => c.path.endsWith("/issues/77/comments")), JSON.stringify(nodes));
+  }
+});
+
+// A rerun of the report finds the lanes App's own PR from this branch, which
+// closes the issue itself, so it is never read as a second PR.
+test("main on done keeps the lanes App's own open PR from the branch without reading the closers", async () => {
+  const { code, calls } = await openWithClosers([closer("Bot", BOT)], { own: [{ number: 90, user: { login: BOT }, head: { sha: CHECKED_TIP } }] });
+  assert.equal(code, 0);
+  assert.ok(!calls.some((c) => c.path === "/graphql"));
+  assert.ok(!opened(calls));
+  assert.ok(!calls.some((c) => c.path.endsWith("/issues/77/comments")));
+});
+
+test("main opens no PR when the closing PRs cannot be read", async () => {
+  await withAsyncDir(
+    { "work-outcome.json": JSON.stringify(done), "lane.json": JSON.stringify({ branch: BRANCH }), "runner-checks": checksFile() },
+    async (dir) => {
+      const { fetch, calls } = fakeFetch([
+        ["GET", /\/issues\/77$/, ...ISSUE.slice(1)],
+        branchTip(),
+        ["GET", /\/repos\/o\/r$/, 200, { default_branch: "main" }],
+        ["GET", /\/compare\//, 200, { files: [{ filename: "README.md" }] }],
+        ["GET", /\/pulls$/, 200, []],
+        ["POST", /^\/graphql$/, 200, { errors: [{ message: "boom" }] }],
+        ["POST", /\/pulls$/, 201, { number: 90 }],
+      ]);
+      assert.equal(await main({ env: env(dir), fetch }), 1);
+      assert.ok(!opened(calls));
+    },
+  );
+});
+
+// A run that waited in its slot past a lane workflow change stopped before
+// any model turn (workflow-stale): report-outcome re-fires the issue at once
+// on main's files, with work-unblock's re-fire record, so the sweep's restart
+// accounting reads it as its own, and backs off to the sweep past
+// limits.limit-stops-per-issue re-fires since the issue's admission or a run
+// last reported.
+const STALE_BOT = "melodic-automation-lanes[bot]";
+const STALE_APP = 337595936;
+const MAIN_BLOBS = ["a".repeat(40), "b".repeat(40)];
+const RUN_SHA = "c".repeat(40);
+const staleFetch = ({ runBlobs = ["d".repeat(40), "b".repeat(40)], labels = [], state = "open", comments = [] } = {}) => {
+  const calls = [];
+  const fetch = async (url, init = {}) => {
+    const method = init.method ?? "GET";
+    const { pathname, searchParams } = new URL(url);
+    calls.push({ method, path: pathname, body: init.body ? JSON.parse(init.body) : undefined });
+    const ok = (body, status = 200) => ({ ok: true, status, json: async () => body, text: async () => JSON.stringify(body) });
+    const contents = /\/contents\/(.+)$/.exec(pathname);
+    if (method === "GET" && contents) {
+      const index = [".github/workflows/pr-run-activity-write.yml", ".github/workflows/work-resolve-issue.yml"].indexOf(contents[1]);
+      return ok({ sha: (searchParams.get("ref") === "main" ? MAIN_BLOBS : runBlobs)[index] });
+    }
+    if (method === "GET" && /\/issues\/77$/.test(pathname)) return ok({ number: 77, state, labels: labels.map((name) => ({ name })) });
+    if (method === "GET" && /\/issues\/77\/comments$/.test(pathname)) return ok(comments);
+    if (method === "POST") return ok({}, 201);
+    return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+  };
+  return { fetch, calls };
+};
+const staleGitHub = (fetch) => async (method, path, body) => {
+  const response = await fetch(`https://api.example${path}`, { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  if (!response.ok) throw new Error(`${method} ${path} answered ${response.status}`);
+  return response.json();
+};
+// A listed human (id 1) set agent-ready at 10:00, the admission.
+const HUMAN_SET = fieldSet(1, "2026-11-01T10:00:00Z");
+const staleField = (calls, { state = "agent-ready", events = [HUMAN_SET], restarted = true } = {}) => fakeField({ state, events, calls, restarted });
+const refire = ({ fetch, calls }, limits = LIMIT_DEFAULTS, field = staleField(calls), statusOf) =>
+  refireStale(staleGitHub(fetch), "/repos/o/r", 77, { workflowSha: RUN_SHA, bot: STALE_BOT, appId: STALE_APP, humans: new Set([1]), limits, field, ...(statusOf && { statusOf }) });
+const writes = (calls) => calls.filter((c) => c.method !== "GET").map((c) => `${c.method} ${c.path.replace("/repos/o/r/issues/77", "")}`);
+const record = (at, body = `<!-- work-unblock refired ${MAIN_BLOBS.join("-")} -->\nre-fired`) => ({ user: { login: STALE_BOT }, created_at: at, body });
+
+test("refireStale re-fires a stale run's issue at once with work-unblock's re-fire record, then the field restart", async () => {
+  const run = staleFetch();
+  assert.match(await refire(run), /^re-fired on workflow files a{40}-b{40}$/);
+  assert.deepEqual(writes(run.calls), ["POST /comments", "RESTART /issues/77"]);
+  const comment = run.calls.find((c) => c.method === "POST" && c.path.endsWith("/comments")).body.body;
+  assert.equal(REFIRED.exec(comment)?.[1], MAIN_BLOBS.join("-"), "the sweep parses it as its own re-fire record on main's key");
+  assert.equal(REFIRED.exec(comment)?.[2], undefined, "no breaker tag");
+  assert.equal(parseOutcomeMarker(comment), null, "a re-fire is no lane outcome, so stop-retries never counts it");
+  assert.deepEqual(run.calls.at(-1).body, { from: "agent-ready" });
+});
+
+test("refireStale skips an issue a hold on the Work status field alone holds, and one whose field cannot be read", async () => {
+  for (const [statusOf, why] of [
+    [async (number, names) => [...names, "needs-human"], "skipped: held by needs-human"],
+    [async (number, names) => [...names, "status: needs-decision"], "skipped: held by status: needs-decision"],
+    [async () => {
+      throw new Error("#77's Work status could not be read: HTTP 502");
+    }, "skipped: the Work status could not be read"],
+  ]) {
+    const run = staleFetch({ labels: ["work-class: read-only"] });
+    assert.equal(await refire(run, LIMIT_DEFAULTS, staleField(run.calls), statusOf), why);
+    assert.deepEqual(writes(run.calls), [], why);
+  }
+  const unread = staleFetch();
+  assert.equal(await refire(unread, LIMIT_DEFAULTS, staleField(unread.calls, { state: new Error("HTTP 502") })), "skipped: the Work status could not be read");
+  assert.deepEqual(writes(unread.calls), []);
+});
+
+test("refireStale reads holds through the real Work status reader: a field-only hold or an unread field skips", async () => {
+  for (const [fields, why] of [
+    [{ 77: { state: "needs-human" } }, "skipped: held by needs-human"],
+    [{ 77: { state: "needs-owner-decision" } }, "skipped: held by status: needs-decision"],
+    [{ 77: new Error("HTTP 502") }, "skipped: the Work status could not be read"],
+  ]) {
+    const run = staleFetch({ labels: ["work-class: read-only"] });
+    assert.equal(await refire(run, LIMIT_DEFAULTS, staleField(run.calls), fieldReader(fields)), why);
+    assert.deepEqual(writes(run.calls), [], why);
+  }
+});
+
+test("refireStale backs off to the sweep past limits.limit-stops-per-issue re-fires since the admission or a report", async () => {
+  const two = [record("2026-11-01T10:30:00Z"), record("2026-11-01T11:00:00Z")];
+  // The App's own restarts after each record.
+  const events = [HUMAN_SET, fieldSet(STALE_APP, "2026-11-01T10:30:02Z"), fieldSet(STALE_APP, "2026-11-01T11:00:02Z")];
+  const spent = staleFetch({ comments: two });
+  assert.match(await refire(spent, { ...LIMIT_DEFAULTS, "limit-stops-per-issue": 2 }, staleField(spent.calls, { events })), /^skipped: 2 re-fires/);
+  assert.deepEqual(writes(spent.calls), []);
+  const left = staleFetch({ comments: two });
+  assert.match(await refire(left, { ...LIMIT_DEFAULTS, "limit-stops-per-issue": 3 }, staleField(left.calls, { events })), /^re-fired/);
+  // A listed human's agent-ready set, or a run that reported, after them resets the count; the App's own set does not.
+  const human = staleFetch({ comments: two });
+  assert.match(await refire(human, { ...LIMIT_DEFAULTS, "limit-stops-per-issue": 2 }, staleField(human.calls, { events: [...events, fieldSet(1, "2026-11-01T12:00:00Z")] })), /^re-fired/);
+  const app = staleFetch({ comments: two });
+  assert.match(await refire(app, { ...LIMIT_DEFAULTS, "limit-stops-per-issue": 2 }, staleField(app.calls, { events: [...events, fieldSet(STALE_APP, "2026-11-01T12:00:00Z")] })), /^skipped: 2 re-fires/);
+  const reported = staleFetch({ comments: [...two, record("2026-11-01T11:30:00Z", "<!-- work-resolve-issue outcome=retry run=5 -->\nretry")] });
+  assert.match(await refire(reported, { ...LIMIT_DEFAULTS, "limit-stops-per-issue": 2 }, staleField(reported.calls, { events })), /^re-fired/);
+  // A breaker trip's record is the kill switch's, not a stale re-fire.
+  const breaker = staleFetch({ comments: [record("2026-11-01T10:30:00Z", `<!-- work-unblock refired ${MAIN_BLOBS.join("-")} breaker -->\ntrip`), two[1]] });
+  assert.match(await refire(breaker, { ...LIMIT_DEFAULTS, "limit-stops-per-issue": 2 }, staleField(breaker.calls, { events })), /^re-fired/);
+});
+
+// The record and the App's set land in the same second: the set still
+// finishes that record, so it counts toward the bound.
+test("refireStale counts a record whose App set shares its second", async () => {
+  const at = "2026-11-01T11:00:00Z";
+  const run = staleFetch({ comments: [record(at)] });
+  assert.match(await refire(run, { ...LIMIT_DEFAULTS, "limit-stops-per-issue": 1 }, staleField(run.calls, { events: [HUMAN_SET, fieldSet(STALE_APP, at)] })), /^skipped: 1 re-fires/);
+  assert.deepEqual(writes(run.calls), []);
+});
+
+test("refireStale finishes a record whose restart did not land, without a second record", async () => {
+  const run = staleFetch({ comments: [record("2026-11-01T11:00:00Z")] });
+  assert.match(await refire(run, { ...LIMIT_DEFAULTS, "limit-stops-per-issue": 1 }), /^re-fired/);
+  assert.deepEqual(writes(run.calls), ["RESTART /issues/77"]);
+});
+
+test("refireStale does nothing when the files match main's, the issue is closed, held, off agent-ready, or never admitted", async () => {
+  for (const [why, options, field, reason] of [
+    ["files match", { runBlobs: MAIN_BLOBS }, {}, /workflow files are main's/],
+    ["closed", { state: "closed" }, {}, /the issue is closed/],
+    ["field at ready", {}, { state: "ready" }, /not agent-ready/],
+    ["field unset", {}, { state: null }, /not agent-ready/],
+    ["held", { labels: ["needs-human"] }, {}, /held by needs-human/],
+    ["no admission", {}, { events: [fieldSet(42, "2026-11-01T10:00:00Z")] }, /no admission record or listed human's agent-ready set/],
+  ]) {
+    const run = staleFetch(options);
+    assert.match(await refire(run, LIMIT_DEFAULTS, staleField(run.calls, field)), reason, why);
+    assert.deepEqual(writes(run.calls), [], why);
+  }
+  const run = staleFetch();
+  assert.match(await refireStale(staleGitHub(run.fetch), "/repos/o/r", 77, { workflowSha: "", bot: STALE_BOT, humans: new Set(), limits: LIMIT_DEFAULTS }), /names no workflow commit/);
+  assert.deepEqual(run.calls, []);
+});
+
+// The App's own admission record admits the issue as a listed human's set does.
+test("refireStale re-fires an issue the App's admission record admitted", async () => {
+  const admitted = { id: 3, user: { id: STALE_APP, login: STALE_BOT }, body: recordBody({ actorId: STALE_APP, title: "t", body: "b" }), created_at: "2026-11-01T10:00:00Z", updated_at: "2026-11-01T10:00:00Z" };
+  const run = staleFetch({ comments: [admitted] });
+  assert.match(await refire(run, LIMIT_DEFAULTS, staleField(run.calls, { events: [] })), /^re-fired/);
+});
+
+test("main on a workflow-stale stop re-fires through refireStale and reads no outcome", async () => {
+  await withDir({ "trusted.json": JSON.stringify({ version: 1, actors: [{ kind: "human", id: 1 }] }) }, async (dir) => {
+    const run = staleFetch();
+    assert.equal(await main({ env: { ...env(dir), DIMENSION_SKIP: "workflow-stale", GITHUB_WORKFLOW_SHA: RUN_SHA, TRUSTED_ACTORS: join(dir, "trusted.json"), APP_SENDER_ID: String(STALE_APP) }, fetch: run.fetch, field: staleField(run.calls) }), 0);
+    assert.deepEqual(writes(run.calls), ["POST /comments", "RESTART /issues/77"]);
+  });
+  await withDir({}, async (dir) => {
+    const { fetch } = staleFetch();
+    assert.equal(await main({ env: { ...env(dir), DIMENSION_SKIP: "stale" }, fetch }), 1, "an unknown skip reason fails");
+  });
+});
+
+// One hold set for the lane, which work-unblock's sweep reads too: every hold
+// on it stops the immediate re-fire, the owner-only ones included.
+test("refireStale re-fires nothing on any of the lane's holds", async () => {
+  assert.ok(LANE_HOLDS.has("attended") && LANE_HOLDS.has("host-run") && LANE_HOLDS.has("security: outside-actor") && LANE_HOLDS.has("work-class: untrusted-provenance") && LANE_HOLDS.has("provenance: untrusted"));
+  for (const hold of LANE_HOLDS) {
+    const run = staleFetch({ labels: [hold] });
+    assert.equal(await refire(run), `skipped: held by ${hold}`, hold);
+    assert.deepEqual(writes(run.calls), [], hold);
+  }
+});
+
+// A person who changes the field between the read and the write wins.
+test("refireStale leaves a person's change standing when the restart finds the field moved", async () => {
+  const run = staleFetch();
+  assert.equal(await refire(run, LIMIT_DEFAULTS, staleField(run.calls, { restarted: false })), "skipped: the Work status changed before the re-fire");
+  assert.deepEqual(writes(run.calls), ["POST /comments", "RESTART /issues/77"]);
+});
+
+// workStatusField's restart reads the state again right before the writer's
+// restart (write-status.mjs statusWriter `restart`, stubbed here), and a moved
+// state or the writer's `held` answer is a person's change that stands.
+test("workStatusField's restart calls the writer's restart only while the state still reads `from`", async () => {
+  const run = async (fields, { from = "agent-ready", answer = { outcome: "written" } } = {}) => {
+    const restarted = [];
+    const github = withFields(async (method, path) => {
+      throw new Error(`unexpected ${method} ${path}`);
+    }, fields);
+    const field = workStatusField({
+      github,
+      repository: "o/r",
+      config: STATUS_CONFIG,
+      reader: fieldReaderOver(github),
+      fieldEvents: async () => [],
+      restart: async (number) => {
+        restarted.push(number);
+        return answer;
+      },
+    });
+    return { done: await field.restart(77, from), restarted };
+  };
+  assert.deepEqual(await run({ 77: { state: "agent-ready" } }), { done: true, restarted: [77] });
+  assert.deepEqual(await run({ 77: { state: "needs-human" } }), { done: false, restarted: [] }, "a hold set since the caller's read stands");
+  assert.deepEqual(await run({ 77: { state: "agent-ready" } }, { answer: { outcome: "held" } }), { done: false, restarted: [77] }, "the writer's held answer stands");
+  assert.deepEqual(await run({}, { from: null }), { done: true, restarted: [77] }, "an unset field the App's removal left is restarted");
+  assert.deepEqual(await run({}), { done: false, restarted: [] }, "an unset field is no agent-ready restart");
+  assert.equal(workStatusField({ config: null }).id, null, "no config reads nothing");
 });

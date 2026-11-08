@@ -66,7 +66,7 @@ jobs:
       issues: read # the PR's labels, comments and label events
       pull-requests: read # the PR and its files
     steps:
-      - name: Aggregate gate results
+      - name: Aggregate lane results
         env:
           FORCE_RED: ${{ needs.check-force-red.result }}
         run: |

@@ -1,7 +1,8 @@
 name: Collect base activity
 description: >
   Copy what an activity runs out of the base checkout before the PR head
-  replaces it: a script's whole directory to $RUNNER_TEMP/base-script, or for
+  replaces it: a script's whole directory to $RUNNER_TEMP/base-script, with
+  the base .github/scripts/lib/ to $RUNNER_TEMP/lib for its ../lib/ imports, or for
   a skill the base plugins/ and .claude-plugin/ to
   $RUNNER_TEMP/base-marketplace, plus the plugins to install, prompt (with its
   changed-paths) and claude_args (with read access to the marketplace copy,
@@ -89,7 +90,8 @@ inputs:
       only (ci-context included, and one that hands on a patch with no
       prepare mode, review-threads, dependency-review or merge-base), never
       a gate; checks, self-checks and verify-scripts only in a skill that
-      hands on a patch with no prepare mode, such as an issue lane's.
+      hands on a patch with no prepare mode, such as an issue lane's, and
+      tidy only in an issue lane's.
     required: false
     default: claude-code-action
 
@@ -145,6 +147,18 @@ runs:
         esac
         mkdir -p "$SCRIPT_DIR"
         cp -R "$BASE_PATH/$(dirname "$SCRIPT")/." "$SCRIPT_DIR/"
+        # The lanes' shared modules, which a script imports as ../lib/.
+        if [[ -d $BASE_PATH/.github/scripts/lib ]]; then
+          mkdir -p "$RUNNER_TEMP/lib"
+          cp -R "$BASE_PATH/.github/scripts/lib/." "$RUNNER_TEMP/lib/"
+        fi
+        # The branch activity reader, which address-feedback.mjs listActivity
+        # loads as ../pr-merge/merge-holds.mjs, and report-outcome.mjs imports
+        # for the outside-actor hold label.
+        if [[ -f $BASE_PATH/.github/scripts/pr-merge/merge-holds.mjs ]]; then
+          mkdir -p "$RUNNER_TEMP/pr-merge"
+          cp "$BASE_PATH/.github/scripts/pr-merge/merge-holds.mjs" "$RUNNER_TEMP/pr-merge/"
+        fi
 
     - name: Stage the base marketplace and the skill prompt
       id: skill
@@ -169,6 +183,8 @@ runs:
         CI_DIR: ${{ runner.temp }}/lane-ci
         WORKSPACE: ${{ github.workspace }}
         ISSUE_NUMBER: ${{ inputs.issue-number }}
+        RUN_ID: ${{ github.run_id }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
         LAUNCHER: ${{ inputs.launcher }}
         STAGE: ${{ runner.temp }}/lane-stage
       run: |
@@ -198,6 +214,12 @@ runs:
           for config in .shellcheckrc .markdownlint-cli2.jsonc .github/requirements-ci.txt; do
             [ ! -f "$BASE_PATH/$config" ] || { mkdir -p "$dir/$(dirname "$config")" && cp "$BASE_PATH/$config" "$dir/$config"; }
           done
+          # check-changed-skills.sh --merge-base runs the skill checker from
+          # this copy, which sources and reads files beside itself.
+          if [ -d "$BASE_PATH/plugins/skill-quality/scripts" ]; then
+            mkdir -p "$dir/plugins/skill-quality"
+            cp -R "$BASE_PATH/plugins/skill-quality/scripts" "$dir/plugins/skill-quality/"
+          fi
           for check in "${checks[@]}"; do
             script=${check%% *}
             flags=${check#"$script"}
@@ -230,13 +252,15 @@ runs:
         # so the files a script reads beside itself come along. Each runs
         # through a wrapper that starts in the checkout, refuses an argument
         # naming a path outside it (a script may print what it reads), unsets
-        # GH_TOKEN and GITHUB_TOKEN in the script's own environment (an
-        # ancestor's /proc/<pid>/environ still holds them), and keeps git from
-        # loading system, global or hook and fsmonitor programs. As for the
+        # GH_TOKEN and GITHUB_TOKEN in the script's own environment (no Bash
+        # process above it holds them either: run-claude-cli's steps set
+        # neither, and the write runner's skill settings clear both), and
+        # keeps git from loading system, global or hook and fsmonitor
+        # programs. As for the
         # checks, <dir> is where the copy is written and <at> where it runs.
         # Sets verify_wrappers and verify_prompt.
         stage_verify() {
-          local dir=$1 at=$2 script unit rest verifier commands=""
+          local dir=$1 at=$2 script unit rest verifier fragment_branch commands=""
           verify_wrappers=()
           [[ $at =~ ^/[A-Za-z0-9_./-]+$ && $WORKSPACE =~ ^/[A-Za-z0-9_./-]+$ ]] ||
             fail "the verify-scripts copy or workspace has a name a rule cannot carry"
@@ -258,6 +282,15 @@ runs:
             fi
             verifier=bin/$(basename "$script" .sh)
             [ ! -e "$dir/$verifier" ] || fail "two verify-scripts share a file name"
+            # An issue lane's checkout is detached, so new-changelog-fragment
+            # names the fragment after the lane branch shape, from the run's
+            # own ids: <lane>/issue-<n>-<run id>-<attempt>.
+            fragment_branch=""
+            if [ "$script" = scripts/new-changelog-fragment.sh ] && [ -n "${ISSUE_NUMBER:-}" ]; then
+              [[ $ISSUE_NUMBER =~ ^[1-9][0-9]*$ && ${RUN_ID:-} =~ ^[1-9][0-9]*$ && ${RUN_ATTEMPT:-} =~ ^[1-9][0-9]*$ ]] ||
+                fail "the issue number, run id or run attempt is not a number"
+              fragment_branch=work-resolve-issue/issue-$ISSUE_NUMBER-$RUN_ID-$RUN_ATTEMPT
+            fi
             {
               printf '#!/usr/bin/env bash\nworkspace=%q\ncopy=%q\n' "$WORKSPACE" "$at/$script"
               printf '%s\n' \
@@ -283,6 +316,9 @@ runs:
                   'HOME=$(mktemp -d) && mkdir "$HOME/.claude" || exit 2' \
                   'export HOME CLAUDE_CONFIG_DIR="$HOME/.claude"'
               fi
+              if [ -n "$fragment_branch" ]; then
+                printf 'export CHANGELOG_FRAGMENT_BRANCH=%q\n' "$fragment_branch"
+              fi
               printf '%s\n' \
                 'bash "$copy" "$@"' \
                 'status=$?' \
@@ -305,6 +341,43 @@ runs:
           if [ -e "$dir/bin/run-test-file" ]; then
             verify_prompt="$verify_prompt Run a test file only through $at/bin/run-test-file <test file>, with the path from the checkout root: it picks the runner, vitest included, and a compound command such as cd <dir>; <command> is refused."
           fi
+        }
+        # run-claude-cli: one more plugin loads from a read-only copy under
+        # .lane/plugins, like the skill's own. Each plugin dir is an
+        # --add-dir too, so it gets the empty server list the skill's own copy
+        # gets. Adds it to plugin_dirs.
+        stage_plugin() {
+          local name=$1 mcp
+          [ -d "$BASE_PATH/plugins/$name" ] || fail "the $name plugin is not in the base"
+          [ -d "$STAGE/plugins/$name" ] || cp -R "$BASE_PATH/plugins/$name" "$STAGE/plugins/"
+          mcp=$STAGE/plugins/$name/.mcp.json
+          [ -e "$mcp" ] || [ -L "$mcp" ] || printf '{"mcpServers":{}}\n' >"$mcp"
+          [ "$name" = "$plugin" ] || [[ " ${plugin_dirs[*]} " == *" .lane/plugins/$name "* ]] || plugin_dirs+=(".lane/plugins/$name")
+        }
+        # run-claude-cli, a skill that hands on a patch: each script the skill
+        # runs gets a rule for its absolute path, bare and double-quoted (its
+        # `!` line runs the quoted form), since a rule matches the words before
+        # its `*` as written. Its shebang fixes the interpreter, so no
+        # `bash <path>` rule.
+        skill_script_rules() {
+          local scripts script
+          case "$1" in
+            ai-slop:audit)
+              scripts=$lane/plugins/ai-slop/skills/audit/scripts
+              # digest-guard.sh is the fix flow's concurrent-edit guard; from
+              # this staged copy it writes only under $lane/scratch.
+              for script in detect.sh rubric-fanout.sh emit-findings.sh emit-fix-record.sh cross-check.sh digest-guard.sh; do
+                allowed+=("Bash($scripts/$script *)" "Bash(\"$scripts/$script\" *)")
+              done
+              # The user-scope target reads the runner's own config.
+              denied+=("Bash($scripts/user-scope.sh *)" "Bash(\"$scripts/user-scope.sh\" *)")
+              ;;
+            code-tidying:tidy-diff)
+              # The token proof each comment deletion carries.
+              scripts=$lane/plugins/code-tidying/skills/tidy-diff/scripts
+              allowed+=("Bash($scripts/change-shape.sh *)" "Bash(\"$scripts/change-shape.sh\" *)")
+              ;;
+          esac
         }
         [[ -z ${ISSUE_NUMBER:-} || $ISSUE_NUMBER =~ ^[1-9][0-9]{0,9}$ ]] || fail "the issue number is malformed"
         subject="a pull request"
@@ -357,12 +430,22 @@ runs:
         fi
         mapfile -t checks < <(jq -r '(.selected.checks // []) + (.selected["self-checks"] // []) | .[]' "$RESOLVED")
         mapfile -t verify < <(jq -r '.selected["verify-scripts"] // [] | .[]' "$RESOLVED")
+        # tidy stages on the launcher only, where an issue lane's patch skill
+        # with no prepare mode runs; anywhere else it would do nothing.
+        tidy=false
+        if jq -e '.selected.tidy != null' "$RESOLVED" >/dev/null; then
+          { [ "$LAUNCHER" = run-claude-cli ] && [ "$edits" = patch ] && [ -z "$PREPARE" ] && [ -n "${ISSUE_NUMBER:-}" ]; } ||
+            fail "tidy: only an issue lane's skill that hands on a patch with no prepare mode, on run-claude-cli, tidies"
+          tidy=true
+        fi
         # Read-only commands such as cat, echo and diff run with no allow
         # rule in every mode, until a deny rule names them
         # (https://code.claude.com/docs/en/permissions#read-only-commands).
         # A skill that edits reads files with Read, Grep and Glob, so these
         # deny every command that can print a file or the environment,
-        # read-only or a text filter.
+        # read-only or a text filter. Last swept: Claude Code 2.1.316 on
+        # 2026-11-01, no command found; how and when to sweep, and where the
+        # result goes, is docs/conventions/pr-pipeline/README.md#claude-code-cli-releases.
         shell_denied=("Bash(echo *)" "Bash(printf *)" "Bash(cat *)" "Bash(head *)" "Bash(tail *)" "Bash(grep *)" "Bash(find *)" "Bash(env *)" "Bash(printenv *)" "Bash(strings *)" "Bash(od *)" "Bash(xxd *)" "Bash(diff *)" "Bash(sed *)" "Bash(awk *)" "Bash(sort *)" "Bash(cut *)" "Bash(tr *)" "Bash(base64 *)" "Bash(nl *)" "Bash(tac *)" "Bash(rev *)" "Bash(uniq *)" "Bash(fold *)" "Bash(column *)" "Bash(jq *)" "Bash(xargs *)" "Bash(more *)" "Bash(less *)" "Bash(wc *)")
         # run-claude-cli: the CLI runs with --restricted in the checkout and
         # reads nothing outside it, so everything the skill reads is staged
@@ -378,9 +461,11 @@ runs:
             fail "run-claude-cli: only a read skill runs on the launcher, ci-context included, or one that hands on a patch with no prepare mode, review-threads, dependency-review or merge-base"
           [ "$GATING" = advisory ] || fail "run-claude-cli: a gate skill's verdict is not read from the launcher"
           # Their wrappers run through Bash, which only the patch skill with
-          # no prepare mode gets with rules of its own.
-          if ((${#checks[@]} + ${#verify[@]})) && { [ "$edits" != patch ] || [ -n "$PREPARE" ]; }; then
-            fail "run-claude-cli: checks, self-checks and verify-scripts run only in a skill that hands on a patch with no prepare mode"
+          # no prepare mode gets with rules of its own, and ci-context bare.
+          # ci-context takes verify-scripts alone: its checks are the PR's own.
+          if ((${#checks[@]})) && { [ "$edits" != patch ] || [ -n "$PREPARE" ]; } ||
+            { ((${#verify[@]})) && [ "$PREPARE" != ci-context ] && { [ "$edits" != patch ] || [ -n "$PREPARE" ]; }; }; then
+            fail "run-claude-cli: checks, self-checks and verify-scripts run only in a skill that hands on a patch with no prepare mode, and verify-scripts under ci-context"
           fi
           [[ $WORKSPACE =~ ^/[A-Za-z0-9_./-]+$ && $STAGE =~ ^/[A-Za-z0-9_./-]+$ ]] ||
             fail "the workspace or the stage directory has a name a rule cannot carry"
@@ -414,6 +499,16 @@ runs:
             allowed+=(Bash Edit Write Agent)
             denied+=("Edit(./.lane/ci/**)" "Write(./.lane/ci/**)")
             preamble="$preamble Run every step the skill instructions name. Your scratchpad directory is $lane/scratch: put every temporary or state file there. The context file is $lane/ci/context.json. Leave every fix uncommitted in the working tree: the runner turns it into a patch that a later job pushes."
+            # verify-scripts: a base copy of each listed script behind its
+            # wrapper, the copy the skill is told to run in place of the
+            # checkout's (ci-ci.md, "A digest pin the pull request moved").
+            # Bash is bare here, so the wrappers need no rule of their own and
+            # nothing enforces the route: review of the patch is the control.
+            if ((${#verify[@]})); then
+              stage_verify "$STAGE/verify" "$lane/verify"
+              denied+=("Edit(./.lane/verify/**)" "Write(./.lane/verify/**)" "NotebookEdit(./.lane/verify/**)")
+              preamble="$preamble The runner's repository scripts, base copies the pull request cannot change, each run by exactly its wrapper path with the script's own arguments: ${verify_wrappers[*]}. Run one of these scripts only through its wrapper, never the checkout's copy."
+            fi
           fi
           # A skill that hands on a patch with no prepare mode (fix-docs) gets
           # Bash, which runs only what an allow rule below names: the lane
@@ -433,8 +528,9 @@ runs:
             [[ $SCHEMA_DIR =~ ^/[A-Za-z0-9_./-]+$ ]] || fail "the verdict schema directory has a name a rule cannot carry"
             mkdir -p "$STAGE/dependency" "$SCHEMA_DIR"
             cp "$DEPENDENCY_DIR/dependency.json" "$STAGE/dependency/dependency.json"
-            # The verdict job validates the same shape (apply-dependency-verdict.mjs).
-            printf '%s\n' '{"type":"object","properties":{"verdict":{"enum":["merge","fix","close","escalate"]},"reasons":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"string","minLength":1,"maxLength":500}},"evidence":{"type":"array","maxItems":20,"items":{"type":"string","minLength":1,"maxLength":300}}},"required":["verdict","reasons","evidence"],"additionalProperties":false}' \
+            # The verdict job validates the same shape (apply-dependency-verdict.mjs);
+            # each item's `not` pattern is its UNPLAIN_PATTERN.
+            printf '%s\n' '{"type":"object","properties":{"verdict":{"enum":["merge","fix","close","escalate"]},"owner_reason":{"enum":["intent","design","security","cost","none"]},"reasons":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"string","minLength":1,"maxLength":500,"not":{"pattern":"[\\u0000-\\u001f\\u007f]|```|~~~|<!--|-->|(^|[^A-Za-z0-9`/])@[A-Za-z0-9][A-Za-z0-9._-]*([^A-Za-z0-9._/-]|$)"}}},"evidence":{"type":"array","maxItems":20,"items":{"type":"string","minLength":1,"maxLength":300,"not":{"pattern":"[\\u0000-\\u001f\\u007f]|```|~~~|<!--|-->|(^|[^A-Za-z0-9`/])@[A-Za-z0-9][A-Za-z0-9._-]*([^A-Za-z0-9._/-]|$)"}}}},"required":["verdict","owner_reason","reasons","evidence"],"additionalProperties":false}' \
               >"$SCHEMA_DIR/verdict.schema.json"
             tools+=(Edit Write Agent)
             allowed+=(Edit Write Agent "Edit(./.lane/scratch/**)")
@@ -463,23 +559,7 @@ runs:
             # directory, so that directory gets its own.
             allowed+=(Edit Write Agent "Edit(./.lane/scratch/**)")
             denied+=("NotebookEdit(./.lane/plugins/**)" "Bash(git *)" "${shell_denied[@]}")
-            # Each script the skill runs gets a rule for its absolute path,
-            # bare and double-quoted (its `!` line runs the quoted form), since
-            # a rule matches the words before its `*` as written. Its shebang
-            # fixes the interpreter, so no `bash <path>` rule.
-            case "$SKILL" in
-              ai-slop:audit)
-                scripts=$lane/plugins/$plugin/skills/audit/scripts
-                for script in detect.sh rubric-fanout.sh emit-findings.sh emit-fix-record.sh cross-check.sh; do
-                  allowed+=("Bash($scripts/$script *)" "Bash(\"$scripts/$script\" *)")
-                done
-                # The fix flow's concurrent-edit guard digests each file into
-                # a state file under the scratch directory.
-                allowed+=("Bash(sha256sum *)" "Bash(mkdir -p $lane/scratch/*)")
-                # The user-scope target reads the runner's own config.
-                denied+=("Bash($scripts/user-scope.sh *)" "Bash(\"$scripts/user-scope.sh\" *)")
-                ;;
-            esac
+            skill_script_rules "$SKILL"
             preamble="$preamble Run every step the skill instructions name. Your scratchpad directory is $lane/scratch: put every temporary or state file there. Leave every change uncommitted in the working tree: the runner turns it into a patch that a later job pushes. Run each shell command as one plain command per call, a script by the absolute path the skill names: no variables, cd, ;, &&, a pipe, a command substitution or an interpreter, and redirect output only into $lane/scratch."
             # An issue lane's skill reads the work it resumes and checks its
             # own change with git, through git-read, a wrapper staged under
@@ -536,6 +616,19 @@ runs:
               allowed+=("Bash($lane/git/git-read *)")
               denied+=("Edit(./.lane/git/**)" "Write(./.lane/git/**)" "NotebookEdit(./.lane/git/**)")
               preamble="$preamble Read the repository's state and history only with $lane/git/git-read status, diff, log or show and their arguments, each as one plain command; it refuses --output, --no-index and a path outside the checkout, and no other git command runs."
+              # The paths apply-issue-patch refuses (patch-rules.json's issue
+              # row), built from protected-paths.mjs's path rules and denied to
+              # the file tools, Bash redirects included: a run whose change
+              # needs one is denied at its first write and stops, instead of
+              # finishing and being refused at the push. Wrapper subprocesses
+              # are not covered (https://code.claude.com/docs/en/permissions#read-and-edit),
+              # so apply-issue-patch still refuses every path itself.
+              protected=$(node "$BASE_PATH/.github/scripts/apply-patch/deny-rules.mjs" "$BASE_PATH" issue) ||
+                fail "cannot build the issue row's protected-path rules"
+              mapfile -t protected <<<"$protected"
+              denied+=("${protected[@]}")
+              patterns=$(printf '%s\n' "${protected[@]}" | sed 's/^Edit(\(.*\))$/\1/' | paste -sd ',' - | sed 's/,/, /g')
+              preamble="$preamble The lane cannot push a change to a path these patterns match, from the checkout root, and the file tools are denied them: $patterns. When the issue's change needs such a path, which you may see before your first edit or learn from a denied write, stop at once without working around it: write work-outcome.json with exit stopped and a reason that starts with patch-protected-path: and names the path."
             fi
             # The check and verify-script copies go to .lane/checks and
             # .lane/verify, which the runner makes read-only, and are denied
@@ -575,11 +668,49 @@ runs:
               printf '#!/usr/bin/env bash\nexport FEEDBACK_THREADS=%q FEEDBACK_LOG=%q FEEDBACK_SCRATCH=%q FEEDBACK_WORKSPACE=%q\nexec bash %q "$@"\n' \
                 "$lane/feedback/threads.json" "$lane/feedback/state/replies.jsonl" "$lane/scratch" "$WORKSPACE" "$lane/feedback/feedback-thread.sh" >"$STAGE/feedback/bin/feedback-thread"
               chmod +x "$STAGE/feedback/bin/feedback-thread"
-              allowed+=("Bash($tool *)" "Bash(\"$tool\" *)")
+              # chmod -x only removes a bit; apply-patch's review-threads row
+              # refuses a new executable bit and admits a mode change only
+              # back to the merge base's (new-exec-bit, pr-mode-revert).
+              allowed+=("Bash($tool *)" "Bash(\"$tool\" *)" "Bash(chmod -x *)")
               for file in threads.json run.json feedback-thread.sh "bin/**" "state/**"; do
                 denied+=("Edit(./.lane/feedback/$file)" "Write(./.lane/feedback/$file)" "NotebookEdit(./.lane/feedback/$file)")
               done
-              preamble="$preamble The review-thread tool is $tool: run it by exactly this path as $tool list, $tool check-paths <path>... and $tool record <thread-id> <file>, with each disposition file in $lane/scratch. The tool posts and commits nothing: a later job pushes your uncommitted fix and posts what you record."
+              preamble="$preamble The review-thread tool is $tool: run it by exactly this path as $tool list, $tool notes, $tool check-paths <path>... and $tool record <thread-id> <file>, with each disposition file in $lane/scratch. The tool posts and commits nothing: a later job pushes your uncommitted fix and posts what you record. To revert an executable bit the pull request added, run chmod -x on that file: the fix carries the mode, and only a mode back to the base's is pushed."
+              # The fresh fixer round past the round cap: the select job's
+              # fixed brief (address-feedback.mjs FRESH_ROUND_BRIEF), never
+              # text a head, a finding or a model wrote.
+              retry=$(jq -r '.retry.brief // empty' "$FEEDBACK_DIR/threads.json")
+              [ -z "$retry" ] || preamble="$preamble $retry"
+            fi
+            # tidy: an issue lane's skill tidies its own change before its
+            # last check run, with the entry skill and its passes and no other
+            # skill. Each one's plugin loads read-only beside the skill's own,
+            # and each script a tidy skill runs gets its rules. The preamble
+            # names the cutoffs and the turn budget from the base config; the
+            # skill measures its change against them.
+            if [ "$tidy" = true ]; then
+              mapfile -t tidy_skills < <(jq -r '.selected.tidy | [.entry] + .passes | .[]' "$RESOLVED")
+              ((${#tidy_skills[@]})) || fail "tidy: the resolved config names no tidy skill"
+              for tidy_skill in "${tidy_skills[@]}"; do
+                [[ $tidy_skill =~ ^[a-z0-9-]+:[a-z0-9-]+$ ]] || fail "tidy: a skill must be <plugin>:<skill>"
+                [ -f "$BASE_PATH/plugins/${tidy_skill%%:*}/skills/${tidy_skill#*:}/SKILL.md" ] || fail "tidy: $tidy_skill is not in the base"
+                stage_plugin "${tidy_skill%%:*}"
+                allowed+=("Skill($tidy_skill)")
+                skill_script_rules "$tidy_skill"
+              done
+              [ -z "$(find "$STAGE/plugins" -type l -print -quit)" ] || fail "a tidy skill's plugin holds a symbolic link"
+              share=$(jq -r '.selected.tidy["turn-share"]' "$RESOLVED")
+              max_turns=$(jq -r '.selected.models["max-turns"] // empty' "$RESOLVED")
+              [[ $share =~ ^[1-9][0-9]?$ && $max_turns =~ ^[1-9][0-9]*$ ]] || fail "tidy: the turn share or the run's turn cap is missing"
+              tidy_turns=$((max_turns * share / 100))
+              ((tidy_turns > 0)) || fail "tidy: the turn share leaves tidy no turn"
+              shared=$(jq -r '.selected.tidy.cutoffs["shared-paths"] | join(" ")' "$RESOLVED")
+              [[ $shared =~ ^[A-Za-z0-9_./\ -]*$ ]] || fail "tidy: a shared path has a name the prompt cannot carry"
+              cutoffs=$(jq -r '.selected.tidy.cutoffs | [.["max-files"], .["max-lines"], .["max-areas"]] | map(tostring) | join(" ")' "$RESOLVED")
+              [[ $cutoffs =~ ^[1-9][0-9]*\ [1-9][0-9]*\ [1-9][0-9]*$ ]] || fail "tidy: a cutoff is not a count"
+              read -r max_files max_lines max_areas <<<"$cutoffs"
+              passes="${tidy_skills[*]:1}"
+              preamble="$preamble Tidy cutoffs: at most $max_files changed files, $max_lines changed lines and $max_areas areas, and no change under these shared paths: ${shared:-none}. Tidy entry: ${tidy_skills[0]}; the skills it may call: ${passes:-none}. Tidy turn budget: $tidy_turns of this run's $max_turns turns."
             fi
           fi
           # web-access with `any`: the research plugins load from .lane/ too,
@@ -591,13 +722,7 @@ runs:
             tools+=(WebFetch WebSearch)
             if jq -e '.selected["web-access"].domains == "any"' "$RESOLVED" >/dev/null; then
               for research in discovery knowledge; do
-                [ -d "$BASE_PATH/plugins/$research" ] || fail "web-access: the $research plugin is not in the base"
-                [ -d "$STAGE/plugins/$research" ] || cp -R "$BASE_PATH/plugins/$research" "$STAGE/plugins/"
-                # Each plugin dir is an --add-dir too, so it gets the empty
-                # server list the skill's own copy gets.
-                mcp=$STAGE/plugins/$research/.mcp.json
-                [ -e "$mcp" ] || [ -L "$mcp" ] || printf '{"mcpServers":{}}\n' >"$mcp"
-                [ "$research" = "$plugin" ] || plugin_dirs+=(".lane/plugins/$research")
+                stage_plugin "$research"
               done
               [ -z "$(find "$STAGE/plugins" -type l -print -quit)" ] || fail "a research plugin holds a symbolic link"
               allowed+=("WebFetch(domain:*)" WebSearch "Skill(discovery:read-docs)" "Skill(discovery:research)" "Skill(knowledge:docpage-digest)" "Skill(knowledge:map-corpus)")
@@ -656,6 +781,7 @@ runs:
             if [ "$PREPARE" = ci-context ]; then
               [[ $CI_DIR =~ ^/[A-Za-z0-9_./-]+$ ]] || fail "the CI context directory has a name a rule cannot carry"
               [ -f "$CI_DIR/context.json" ] || fail "ci-context: the runner wrote no context file"
+              ((${#verify[@]} == 0)) || fail "ci-context: verify-scripts stage on run-claude-cli only"
               chmod -R a-w "$CI_DIR"
               mkdir -p "$SCRATCH"
               allowed="$allowed,Bash,Edit,Write,Agent,Read(/$CI_DIR/**),Edit(/$SCRATCH/**)"
@@ -746,7 +872,7 @@ runs:
               if [ -n "${web_hosts:-}" ]; then
                 system_prompt="$system_prompt This run may search the web and read pages only on these hosts: $web_hosts. The docs scripts /discovery:read-docs runs are not available in this run, so read a page on one of those hosts with WebFetch, and cite each page you read."
               else
-                system_prompt="$system_prompt This run may read web pages: read each external source through /discovery:read-docs, /discovery:research, /knowledge:docpage-digest or /knowledge:map-corpus."
+                system_prompt="$system_prompt This run may read web pages: read each external source through /discovery:read-docs, /discovery:research --unattended, /knowledge:docpage-digest or /knowledge:map-corpus."
               fi
             fi
             # The checks run from a base copy outside the working directory.

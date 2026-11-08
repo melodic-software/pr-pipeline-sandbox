@@ -10,7 +10,10 @@ name: pr-run-activity-read
 # one Claude secret per call: the caller's first call passes the role's API
 # key and hands off on an empty key or the launcher's handoff (a credit stop,
 # or a 401 or 402), and its second call, started by a job that reads this
-# run's jobs, passes the OAuth token.
+# run's jobs, passes the OAuth token. With the caller's fallback-ready true,
+# the second call hands off the same way (a limit stop, a credit stop, or a
+# 401 or 402), and its third call, started the same way, passes the central
+# fallback token, FALLBACK_CLAUDE_CODE_OAUTH_TOKEN, and never hands off.
 # Secrets are scrubbed per workflow run, so this file references no App key.
 # Only the broker-check job, which runs no PR head code, requests an OIDC
 # token; the run job that runs head code holds neither. Write activities run
@@ -51,10 +54,16 @@ on:
         required: false
         type: string
         default: ""
-      app-label:
+      app-field-id:
         description: >-
-          Issue mode: the one label the lanes App may apply to start the lane.
-          Empty keeps every App event stopped.
+          Issue mode: the issue field the lanes App may set to app-field-option
+          to start the lane. Either empty keeps every App event stopped.
+        required: false
+        type: string
+        default: ""
+      app-field-option:
+        description: >-
+          Issue mode: the single-select option of app-field-id that starts the lane.
         required: false
         type: string
         default: ""
@@ -80,8 +89,31 @@ on:
           or `handoff` for the second, which runs on claude-code-oauth-token
           and names why in its lane record. `handoff` says only that the
           first call handed off as this run's jobs show it, for a caller that
-          reads that rather than the first call's outputs. Issue mode takes
-          empty or `handoff`.
+          reads that rather than the first call's outputs. `fallback` for the
+          third, which runs on fallback-claude-code-oauth-token after the
+          second call handed off. Issue mode takes empty, `handoff` or
+          `fallback`.
+        required: false
+        type: string
+        default: ""
+      key-credit-job:
+        description: >-
+          The first call only: the key job's name for ci-workflows
+          check-key-credit, the activity's own (`fix-ci`, `resolve-issue`), so
+          the activities of one caller file keep separate credit-stop markers.
+          broker-check reads the key's credit history before any model turn,
+          and a credit stop inside vars.KEY_CREDIT_WINDOW_HOURS skips the key:
+          the call hands off at once and the caller's next call runs on the
+          subscription. Empty runs no gate.
+        required: false
+        type: string
+        default: ""
+      fallback-ready:
+        description: >-
+          The second call only: `true` when the caller runs a third call on
+          the fallback token, so the subscription leg may hand off to it, as
+          run-claude-cli's fallback-ready. The caller sets it from a job that
+          runs no head code; empty or `false` keeps the second call the last.
         required: false
         type: string
         default: ""
@@ -192,14 +224,28 @@ on:
         required: false
         type: string
         default: ""
-    # A caller passes one of the two: its first call the API key, its
-    # fallback call the OAuth token.
+      caller-releases-lease:
+        description: >-
+          Issue mode: `true` when the caller ends the lane lease itself, from
+          the lease-comment-id output, in the write runner call that opens the
+          PR; the report job then releases it only for a call that handed off
+          or set neither scan-issue-run-started nor scan-reuse-branch.
+        required: false
+        type: boolean
+        default: false
+    # A caller passes one of the three: its first call the API key, its
+    # second call the OAuth token, its third call the fallback token.
     secrets:
       claude-code-oauth-token:
         description: Claude Code OAuth token for skill activities.
         required: false
       claude-api-key:
         description: The role's Claude Console API key, for a PR-mode skill's first call.
+        required: false
+      fallback-claude-code-oauth-token:
+        description: >-
+          The central fallback subscription's OAuth token, the org secret
+          FALLBACK_CLAUDE_CODE_OAUTH_TOKEN passed by name, for the third call.
         required: false
       # Read only by the scan job's decode step, under its environment, which
       # supplies the value; a caller passes it by name, never inherit.
@@ -212,7 +258,8 @@ on:
     outputs:
       head-sha:
         description: >-
-          The run job's head-sha output: the PR head its trigger gate passed. Set
+          The run job's head-sha output: the PR head its trigger gate passed,
+          empty when that head is not the caller's (a supersede). Set
           before any head code ran, but the run job's runner is hostile and can
           forge it, so no caller may trust it for a decision; take the head from
           a job that ran no head code (pr-unblock's fix-ci-context or
@@ -268,6 +315,12 @@ on:
           The SHA-256 of the review-thread replies the scan job uploaded, from
           the bytes it uploaded. Only the scan job sets it.
         value: ${{ jobs.scan.outputs.feedback-sha256 }}
+      feedback-disputed:
+        description: >-
+          `true` when the review-thread replies the scan job uploaded hold an
+          INCORRECT reply or a line that is not JSON, else empty. Only the
+          scan job sets it, from the bytes it uploaded.
+        value: ${{ jobs.scan.outputs.feedback-disputed }}
       dependency-attempt:
         description: >-
           The run attempt in the artifact name
@@ -324,6 +377,13 @@ on:
           Issue mode: the earlier run's lane branch this run resumed; empty
           otherwise.
         value: ${{ jobs.issue-fields.outputs.resume-branch }}
+      scan-prune-branches:
+        description: >-
+          Issue mode: the space-separated lane branches of the issue's stopped
+          runs, with no pull request, that the earlier-work check named for
+          the caller's prune job to delete; empty otherwise. The prune job
+          re-checks each.
+        value: ${{ jobs.issue-fields.outputs.prune-branches }}
       # From run-claude-cli and the credential steps, never from model text,
       # but set by the run job, which head code can forge: no caller starts
       # its fallback call on them.
@@ -340,10 +400,27 @@ on:
       handed-off:
         description: >-
           `true` when the first call's key was empty or its key leg handed
-          off (run-claude-cli's handoff: a credit stop, or a 401 or 402), so
-          it skipped the scan job, uploaded nothing, recorded no lane outcome
-          and posted no check, and the fallback call runs the activity.
+          off (run-claude-cli's handoff: a credit stop, or a 401 or 402), or
+          the second call's subscription leg handed off (with fallback-ready:
+          a limit stop, a credit stop, or a 401 or 402), so it skipped the
+          scan job, uploaded nothing, recorded no lane outcome and posted no
+          check, and the next call runs the activity.
         value: ${{ jobs.run.outputs.handed-off }}
+      # Set by broker-check, which runs no model, so a caller may act on them.
+      skip-reason:
+        description: >-
+          `kill-switch` when the broker refused the check because a lanes kill
+          switch is on, so no lane ran; empty otherwise.
+        value: ${{ jobs.broker-check.outputs.skip-reason }}
+      lease:
+        description: >-
+          Issue mode: `held` when broker-check posted this call's lane lease,
+          `already-leased` when it backed off; empty otherwise.
+        value: ${{ jobs.broker-check.outputs.lease }}
+      lease-comment-id:
+        description: >-
+          Issue mode, lease `held`: the lease comment's id, for the caller's release.
+        value: ${{ jobs.broker-check.outputs.lease-comment-id }}
 
 permissions: {}
 
@@ -356,8 +433,12 @@ jobs:
   # (scripts/check-read-caller-keys.sh). It runs only default-branch-tip code
   # and never checks out the PR head. A local kill-switch stop skips the broker
   # call and ends green, so the run job's own kill-switch step stops the lane
-  # neutral; any broker answer but an allow, or none, fails this job, which
-  # skips the run job and fails the check.
+  # neutral. A broker kill-switch refusal (a switch turned on after this run
+  # read its variables) also ends green, with skip-reason kill-switch, which
+  # skips the run job and every job after it but report, which posts the
+  # check neutral on a pull_request run. Any other broker answer but an allow, or none, fails this
+  # job, which skips the run job and fails the check. issues: write is for the issue
+  # lease alone, posted before any model turn (CONTRACT.md "Lease protocol").
   broker-check:
     if: >-
       !(github.event_name == 'pull_request'
@@ -365,13 +446,27 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
+      actions: read # the key-credit gate lists this repository's credit-stop markers
       contents: read
       id-token: write
+      issues: write
     # "Re-run failed jobs" reuses a successful broker-check and its outputs,
     # so the run job also checks that the allow came from its own attempt.
     outputs:
-      allowed: ${{ steps.broker.outcome == 'success' }}
+      allowed: ${{ steps.broker.outcome == 'success' && steps.broker.outputs.allowed == 'true' }}
+      skip-reason: ${{ steps.broker.outputs.skip-reason }}
       attempt: ${{ github.run_attempt }}
+      lease: ${{ steps.lease.outputs.lease }}
+      lease-comment-id: ${{ steps.lease.outputs.lease-comment-id }}
+      blocked: ${{ steps.recheck-blockers.outcome == 'success' && steps.recheck-blockers.outputs.proceed != 'true' }}
+      skip-key: ${{ steps.credit.outputs.skip-key }}
+    env:
+      API_BUDGET_TOKEN: github-token
+      npm_config_audit: "false"
+      npm_config_fetch_timeout: "60000"
+      npm_config_fund: "false"
+      # npm's fetch timeout and retries, from the one file that sets them.
+      npm_config_globalconfig: ${{ github.workspace }}/.base/.github/npm-fetch.npmrc
     steps:
       - name: Assert the default branch is set
         env:
@@ -382,10 +477,23 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve main's tip
+        id: tip
+        env:
+          TIP_BRANCH: ${{ github.event.repository.default_branch }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
+              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
+            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
+            sleep "$((RANDOM % (2 * i + 1)))"
+          done
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+
       - name: Check out the default branch tip
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
 
@@ -394,6 +502,14 @@ jobs:
         with:
           node-version: 24
           package-manager-cache: false
+
+      # The blocker re-check below reads the issue's Work status through
+      # resolve-config.mjs, whose packages only the resolve-config action
+      # installs; this job does not run it.
+      - name: Install resolve-config's packages
+        if: inputs.issue-number != '' && inputs.fallback == ''
+        timeout-minutes: 5
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund --prefix .base/.github/actions/resolve-config
 
       - name: Check the kill switch
         id: kill
@@ -414,6 +530,141 @@ jobs:
           audience: ${{ vars.LANES_BROKER_AUDIENCE }}
           lane: ${{ inputs.lane }}
           activity: ${{ inputs.activity }}
+          kill-switch-ok: true
+
+      # The key-credit gate (ci-workflows select-model-credential, its start
+      # call: check-key-credit's one artifact-list call for the marker the
+      # caller uploads after a key leg's credit stop), on the first call
+      # alone. Every failure runs the key: skip-key is then empty. Probing is
+      # off. A marker is forgeable by any same-repository workflow; a forged
+      # one only moves the call to the subscription leg: plan capacity, no
+      # credential.
+      - name: Read the key's credit history
+        id: credit
+        if: >-
+          steps.broker.outcome == 'success' && steps.broker.outputs.allowed == 'true'
+          && inputs.key-credit-job != '' && inputs.fallback == ''
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: melodic-software/ci-workflows/.github/actions/select-model-credential@5b5110ae015183e900dd098c631d4dcc68904067 # 5b5110a 2026-11-06
+        with:
+          leg: start
+          key-job: ${{ inputs.key-credit-job }}
+          window-hours: ${{ vars.KEY_CREDIT_WINDOW_HOURS }}
+          reset-at: ${{ vars.KEY_CREDIT_RESET_AT }}
+          probe-minutes: "0"
+
+      # The skipped key's secret name, from the role as run-claude-cli names
+      # it (`issue-lane` gives ISSUE_LANE_CLAUDE_API_KEY).
+      - name: Name the skipped key
+        id: skipped-key
+        if: steps.credit.outputs.skip-key == 'true'
+        env:
+          ROLE: ${{ inputs.role }}
+        run: |
+          [[ $ROLE =~ ^[a-z][a-z0-9-]*$ ]] || { echo "::error::the role is not lower-case kebab"; exit 1; }
+          name=${ROLE^^}
+          echo "name=${name//-/_}_CLAUDE_API_KEY" >>"$GITHUB_OUTPUT"
+
+      # The skipped key leg's lane record: outcome skip, class credit-stop,
+      # handed off, so leg counts before and after the gate compare.
+      - name: Report the skipped key leg
+        if: steps.credit.outputs.skip-key == 'true'
+        continue-on-error: true
+        uses: melodic-software/ci-workflows/.github/actions/report-lane-outcome@6b9c640bf209c0c7e76f1111c5d18c96707348a2 # 6b9c640 2026-11-02
+        with:
+          outcome: skipped
+          lane: ${{ inputs.lane }}
+          lane-id: ${{ inputs.lane }}
+          credential: ${{ steps.skipped-key.outputs.name }}
+          known-failure-class: credit-stop
+          handoff: "true"
+
+      # Issue mode, after the broker's allow and before any model turn: claim
+      # the issue with a lease comment only, held by the lanes App identity,
+      # through the tracker's claim (no `gh api user`, which this
+      # installation token cannot call). The earliest live lease wins, so a
+      # live local claim makes this run back off: lease=already-leased, and
+      # the run job's go step stops the model, with a comment on the issue
+      # saying so. Any other failure fails the job. The TTL outlives the run
+      # job; the report job, or the caller in caller-releases-lease mode, ends
+      # it early.
+      - name: Claim the issue with a lane lease
+        id: lease
+        if: inputs.issue-number != '' && steps.broker.outcome == 'success' && steps.broker.outputs.allowed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue-number }}
+          HOLDER: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+          TRACKER: .base/plugins/work-items/tools/work-item-tracker/work-item-tracker.sh
+          CLAUDE_PROJECT_DIR: ${{ github.workspace }}/.base
+        run: |
+          # Each `gh api` call keeps its rate-limit reading for the job-end
+          # api-budget notice (.github/actions/log-api-budget).
+          # shellcheck source=/dev/null
+          { . .base/.github/actions/log-api-budget/api-budget.bash 2>/dev/null && api_budget_wrap_gh github-token; } || true
+          [[ $ISSUE_NUMBER =~ ^[1-9][0-9]*$ && $HOLDER =~ ^[1-9][0-9]*$ && $TIMEOUT_MINUTES =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::the issue number, lanes App sender id or timeout is not a positive integer"
+            exit 1
+          }
+          rc=0
+          out="$(bash "$TRACKER" claim "github:$REPO#$ISSUE_NUMBER" --lease-only --holder "$HOLDER" \
+            --ttl-hours $(((TIMEOUT_MINUTES + 59) / 60 + 1)) --session-id "run-$GITHUB_RUN_ID")" || rc=$?
+          if [ "$rc" -eq 7 ]; then
+            echo "::notice::already-leased: a live lease on #$ISSUE_NUMBER predates this run's, so no model runs"
+            echo "lease=already-leased" >>"$GITHUB_OUTPUT"
+            note="already-leased: another session holds a live lease on #$ISSUE_NUMBER, so run $GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID ran no model."
+            echo "$note" >>"$GITHUB_STEP_SUMMARY"
+            # The issue's own report of the back-off; no report-outcome runs for it.
+            gh api "repos/$REPO/issues/$ISSUE_NUMBER/comments" -f body="$note" --jq .id >/dev/null ||
+              echo "::warning::could not comment the already-leased back-off on #$ISSUE_NUMBER"
+            exit 0
+          fi
+          [ "$rc" -eq 0 ] || exit "$rc"
+          id="$(jq -r '.lease_comment_id' <<<"$out")"
+          [[ $id =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::the claim returned no lease comment id; the lease expires at its TTL"
+            exit 1
+          }
+          echo "lease=held" >>"$GITHUB_OUTPUT"
+          echo "lease-comment-id=$id" >>"$GITHUB_OUTPUT"
+
+      # Issue mode, once the run holds its slot and its lease: the caller's
+      # admit job checked the issue's blockers before the slot wait, which
+      # can last an hour, so a blocker added since is read here, by the same
+      # check-blockers.mjs in its RECHECK mode (one blocked_by read unless
+      # only closed blockers are listed). An open blocker, or a read that
+      # fails, stops the run as admit's does: no model turn, no outcome
+      # marker, agent-ready kept, and work-unblock's sweep re-fires the issue
+      # once no blocker is open, matching the stop step below by name. The
+      # report job ends the lease. The first call alone checks: a later leg
+      # runs only after this one handed off.
+      - name: Re-check the issue's blockers in the slot
+        id: recheck-blockers
+        if: inputs.issue-number != '' && inputs.fallback == '' && steps.lease.outputs.lease == 'held'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue-number }}
+          TRUSTED_ACTORS_PATH: .base/.github/standards/trusted-actors/trusted-actors.json
+          LANES_APP_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
+          RECHECK: "true"
+        run: node .base/.github/scripts/work-resolve-issue/check-blockers.mjs
+
+      # work-unblock's sweep matches this step's name, run, in the job listing
+      # (label-unblocked.mjs didNoWork `blocked`).
+      - name: Stop on an open blocker
+        if: steps.recheck-blockers.outcome == 'success' && steps.recheck-blockers.outputs.proceed != 'true'
+        run: echo "an open blocker, or blockers that cannot be read, stop the run before any model turn"
+
+      - name: Log the API budget at the end
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: ./.base/.github/actions/log-api-budget # zizmor: ignore[self-repository]
+        with:
+          tokens: github-token
 
   # Job-level evidence of the broker's allow for a caller's handoff read
   # (.github/scripts/lib/handoff-evidence.sh): this job succeeds only on
@@ -432,12 +683,15 @@ jobs:
 
   run:
     needs: broker-check
-    # The lanes App's own pull_request events never start a lane.
+    # The lanes App's own pull_request events never start a lane, and nor does
+    # a broker kill-switch refusal.
     if: >-
       !(github.event_name == 'pull_request'
       && format('{0}', github.event.sender.id) == vars.AUTOMATION_LANES_APP_SENDER_ID)
+      && needs.broker-check.outputs.skip-reason == ''
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ inputs.timeout-minutes }}
+    cache-mode: read
     permissions:
       contents: read
       pull-requests: read
@@ -451,7 +705,7 @@ jobs:
     # ci-status, pr-merge, apply-patch, or a workflow_run trigger).
     outputs:
       base-sha: ${{ steps.trusted-base.outputs.commit }}
-      head-sha: ${{ steps.gate.outputs.head-sha }}
+      head-sha: ${{ steps.gated-head.outputs.superseded != 'true' && steps.gate.outputs.head-sha || '' }}
       pr-number: ${{ steps.gate.outputs.pr-number }}
       gate-reason: >-
         ${{ steps.kill.outputs.proceed != 'true' && steps.kill.outputs.reason
@@ -459,12 +713,14 @@ jobs:
         || '' }}
       can-commit: ${{ steps.config.outputs.can-commit }}
       # A skill that took no model turn fails. The scan job's verdict reads
-      # it. A skill runs on one of act-key and act-token.
+      # it. A skill runs on one of act-key, act-token and act-fallback.
       act-outcome: >-
-        ${{ (steps.act-key.outcome == 'success' || steps.act-token.outcome == 'success')
+        ${{ (steps.act-key.outcome == 'success' || steps.act-token.outcome == 'success'
+        || steps.act-fallback.outcome == 'success')
         && steps.act-turns.outcome != 'success' && 'failure'
         || steps.act-key.outcome != 'skipped' && steps.act-key.outcome
         || steps.act-token.outcome != 'skipped' && steps.act-token.outcome
+        || steps.act-fallback.outcome != 'skipped' && steps.act-fallback.outcome
         || steps.act-script.outcome }}
       # For the scan job's verdict. go and the gate fields come from steps
       # before any head code; skip-reason, dirty-tree and patch-collected
@@ -484,21 +740,42 @@ jobs:
       reuse-branch: ${{ steps.issue-prior.outputs.reuse-branch }}
       resume-branch: ${{ steps.issue-prior.outputs.resume-branch }}
       resume-tip: ${{ steps.issue-prior.outputs.resume-tip }}
+      prune-branches: ${{ steps.issue-prior.outputs.prune-branches }}
       # run-claude-cli sets lane-class and handoff after it restores the step
       # files, so the leg cannot set them; the presence steps run before it.
-      lane-class: ${{ steps.act-key.outputs.lane-class || steps.act-token.outputs.lane-class }}
-      credential-present: ${{ steps.key-present.outputs.present || steps.token-present.outputs.present }}
-      handed-off: ${{ steps.key-present.outputs.present == 'false' || steps.act-key.outputs.handoff == 'true' }}
+      lane-class: ${{ steps.act-key.outputs.lane-class || steps.act-token.outputs.lane-class || steps.act-fallback.outputs.lane-class }}
+      credential-present: ${{ steps.key-present.outputs.present || steps.token-present.outputs.present || steps.fallback-present.outputs.present }}
+      # An empty credential hands on as a handoff does: an empty key to the
+      # second call, an empty subscription token to the third when the caller
+      # runs one (fallback-ready).
+      handed-off: ${{ steps.key-present.outputs.present == 'false' || steps.act-key.outputs.handoff == 'true' || steps.act-token.outputs.handoff == 'true' || steps.token-present.outputs.present == 'false' && inputs.fallback-ready == 'true' }}
+      # The lane record's class and reset, for the report job's check run,
+      # which limit-stop.mjs reads, as pr-run-activity-write.yml's lane-class.
+      # A forged limit stop can only restart the lane after a reset
+      # limit-stop.mjs clamps to at least `limits.reset-clamp-min` hours away,
+      # at most `limits.limit-stops-per-head` times on one head.
+      record-class: ${{ steps.lane-record.outputs.failure-class }}
+      record-resets: ${{ steps.lane-record.outputs.resets-at }}
+      record-turns: ${{ steps.lane-record.outcome == 'success' && steps.act-turns.outputs.turns || '' }}
+      record-max-turns: ${{ steps.lane-record.outcome == 'success' && steps.config.outputs.max-turns || '' }}
+      record-models: ${{ steps.lane-record.outcome == 'success' && steps.act-turns.outputs.models || '' }}
+      record-profile: ${{ steps.lane-record.outcome == 'success' && steps.config.outputs.profile || '' }}
+      # The lane-outcome JSON itself, empty when the step wrote none; the
+      # report-check-run action validates it before the check run carries it.
+      record: ${{ steps.lane-record.outputs.record }}
       # Set after head code ran, for the scan job alone: each payload's byte
       # count and the sealed bundle, never a workflow_call output.
       carry-reply-bytes: ${{ steps.carry.outputs.reply-bytes }}
       carry-act-turns-bytes: ${{ steps.carry.outputs.act-turns-bytes }}
       carry-patch-bytes: ${{ steps.carry.outputs.patch-bytes }}
+      carry-patch-scan: ${{ steps.carry.outputs.patch-scan }}
       carry-replies-bytes: ${{ steps.carry.outputs.replies-bytes }}
       carry-dependency-verdict-bytes: ${{ steps.carry.outputs.dependency-verdict-bytes }}
       carry-work-outcome-bytes: ${{ steps.carry.outputs.work-outcome-bytes }}
       carry-lane-bytes: ${{ steps.carry.outputs.lane-bytes }}
       carry-sealed-length: ${{ steps.seal.outputs.sealed-length }}
+      # Set after the model ran, so forgeable: post.mjs checks every row.
+      api-failures: ${{ steps.api-failures.outputs.api-failures }}
       carry-sealed-1: ${{ steps.seal.outputs.sealed-1 }}
       carry-sealed-2: ${{ steps.seal.outputs.sealed-2 }}
       carry-sealed-3: ${{ steps.seal.outputs.sealed-3 }}
@@ -519,26 +796,33 @@ jobs:
           DISPATCHER_RUN_ID: ${{ inputs.dispatcher-run-id }}
           TRUSTED_BASE: ${{ inputs.trusted-base }}
           FALLBACK: ${{ inputs.fallback }}
+          FALLBACK_READY: ${{ inputs.fallback-ready }}
         run: |
           # Issue mode runs only on the issues event that names that issue,
           # trusting the default branch tip, with none of the PR inputs and
-          # a fallback only as handoff; the config step below holds it to
+          # a fallback only as handoff or fallback; the config step below holds it to
           # patch mode.
           if [ -n "$ISSUE_NUMBER" ] || [ "$EVENT_NAME" = issues ]; then
             if ! [[ $ISSUE_NUMBER =~ ^[1-9][0-9]{0,9}$ ]] || [ "$EVENT_NAME" != issues ] ||
               [ "$ISSUE_NUMBER" != "$EVENT_ISSUE" ] || [ "$TRUSTED_BASE" != default-tip ] ||
-              [ -n "$PR_NUMBER$DISPATCHER_RUN_ID" ] || [ "${FALLBACK:-handoff}" != handoff ]; then
-              echo "::error::issue mode needs an issues event, the event's issue number, trusted-base default-tip, no pr-number or dispatcher-run-id, and a fallback of empty or handoff"
+              [ -n "$PR_NUMBER$DISPATCHER_RUN_ID" ] || { [ "${FALLBACK:-handoff}" != handoff ] && [ "$FALLBACK" != fallback ]; }; then
+              echo "::error::issue mode needs an issues event, the event's issue number, trusted-base default-tip, no pr-number or dispatcher-run-id, and a fallback of empty, handoff or fallback"
               exit 1
             fi
           fi
           case "$FALLBACK" in
-            "" | credit-stop | no-key | handoff) ;;
+            "" | credit-stop | no-key | handoff | fallback) ;;
             *)
-              echo "::error::the fallback input must be empty, credit-stop, no-key or handoff"
+              echo "::error::the fallback input must be empty, credit-stop, no-key, handoff or fallback"
               exit 1
               ;;
           esac
+          # Only the second call may let its subscription leg hand off.
+          case "$FALLBACK" in "" | fallback) ok="" ;; *) ok="true false" ;; esac
+          if [ -n "$FALLBACK_READY" ] && [[ " $ok " != *" $FALLBACK_READY "* ]]; then
+            echo "::error::fallback-ready must be empty, or true or false on the second call"
+            exit 1
+          fi
           if ! [[ $APP_SENDER_ID =~ ^[1-9][0-9]*$ ]]; then
             echo "::error::the AUTOMATION_LANES_APP_SENDER_ID variable must hold the lanes App bot's numeric user id"
             exit 1
@@ -548,6 +832,19 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve main's tip
+        id: tip
+        env:
+          TIP_BRANCH: ${{ github.event.repository.default_branch }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
+              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
+            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
+            sleep "$((RANDOM % (2 * i + 1)))"
+          done
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+
       # The kill switch and the trigger gate run from the default branch tip,
       # never from a base the PR chose. Full history lets the next check test
       # the gated base SHA's ancestry.
@@ -555,7 +852,7 @@ jobs:
         id: base
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ steps.tip.outputs.sha }}
           path: .base
           fetch-depth: 0
           persist-credentials: false
@@ -595,6 +892,9 @@ jobs:
       - name: Check the trigger
         id: gate
         if: steps.kill.outputs.proceed == 'true'
+        env:
+          API_BUDGET_TOKEN: github-token
+          API_BUDGET_SCRIPT: check-trigger
         uses: ./.base/.github/actions/check-trusted-trigger # zizmor: ignore[self-repository]
         with:
           trusted-actors-path: .base/.github/standards/trusted-actors/trusted-actors.json
@@ -612,11 +912,13 @@ jobs:
           dispatcher-workflow: .github/workflows/pr-unblock-dispatch.yml
           run-dispatcher-workflow: ${{ inputs.feedback-context-sha256 != '' && '.github/workflows/pr-feedback-dispatch.yml' || '' }}
           run-dispatcher-upstreams: ${{ inputs.feedback-context-sha256 != '' && '.github/workflows/pr-review-hosted.yml .github/workflows/pr-review-security-hosted.yml' || '' }}
+          # Or a listed human's review comment, relayed (ADR 0088).
+          run-dispatcher-relay: ${{ inputs.feedback-context-sha256 != '' && '.github/workflows/pr-review-comment-relay.yml' || '' }}
           # A dispatcher sends pr-refine.yml for the pr-refine lane, pr-unblock.yml otherwise.
           dispatched-workflow: ${{ inputs.lane == 'pr-refine' && '.github/workflows/pr-refine.yml' || '.github/workflows/pr-unblock.yml' }}
-          # Issue mode reads no PR: the account that applied the label, and
-          # any re-runner, must be listed as a human; the lanes App passes
-          # only by applying the caller's app-label.
+          # Issue mode reads no PR: the account that set the field, and any
+          # re-runner, must be listed as a human; the lanes App passes only by
+          # setting the caller's app-field-id to app-field-option.
           denied-actor-ids: ${{ inputs.issue-number != '' && vars.AUTOMATION_LANES_APP_SENDER_ID || '' }}
           # Issue mode: the App that may apply the label; a dispatched run: the
           # App whose review run vouches for a pr-feedback-dispatch.yml
@@ -626,26 +928,29 @@ jobs:
             && vars.AUTOMATION_LANES_APP_SENDER_ID || '' }}
           require-pr: ${{ inputs.issue-number == '' }}
           require-kind: ${{ inputs.issue-number != '' && 'human' || '' }}
-          app-label: ${{ inputs.issue-number != '' && inputs.app-label || '' }}
+          app-field-id: ${{ inputs.issue-number != '' && inputs.app-field-id || '' }}
+          app-field-option: ${{ inputs.issue-number != '' && inputs.app-field-option || '' }}
 
       # The caller's head-sha came from a job that ran no head code, and its
       # context, patch and check are bound to it. A trigger gate that read
-      # another head (the PR moved since) fails the run here, before the head
-      # is checked out; the report job then posts failure on the caller's head.
+      # another head (the PR moved since) supersedes the run here, before the
+      # head is checked out: every later step is skipped and the run's head-sha
+      # stays empty, so the report job takes a trigger decline's skip.
       - name: Assert the gated head is the caller's
+        id: gated-head
         if: steps.gate.outputs.proceed == 'true' && inputs.head-sha != ''
         env:
           CALLER_HEAD: ${{ inputs.head-sha }}
           HEAD_SHA: ${{ steps.gate.outputs.head-sha }}
         run: |
           if [ "$HEAD_SHA" != "$CALLER_HEAD" ]; then
-            echo "::error::the PR head the trigger gate read is not the head the caller gated; a later dispatch reads the new head"
-            exit 1
+            echo "::notice::superseded: the PR head moved; a later dispatch reads the new head"
+            echo "superseded=true" >>"$GITHUB_OUTPUT"
           fi
 
       - name: Assert the base is on the default branch
         id: trusted-base
-        if: steps.gate.outputs.proceed == 'true'
+        if: steps.gate.outputs.proceed == 'true' && steps.gated-head.outputs.superseded != 'true'
         uses: ./.base/.github/actions/check-trusted-base # zizmor: ignore[self-repository]
         with:
           base-sha: ${{ steps.gate.outputs.base-sha }}
@@ -655,6 +960,9 @@ jobs:
       - name: Resolve the config
         id: config
         if: steps.trusted-base.outcome == 'success'
+        env:
+          API_BUDGET_TOKEN: github-token
+          API_BUDGET_SCRIPT: resolve-config
         uses: ./.base/.github/actions/resolve-config # zizmor: ignore[self-repository]
         with:
           lane: ${{ inputs.lane }}
@@ -788,6 +1096,7 @@ jobs:
           fi
           role=${ROLE^^}
           echo "key-name=${role//-/_}_CLAUDE_API_KEY" >>"$GITHUB_OUTPUT"
+          echo "token-name=${role//-/_}_CLAUDE_CODE_OAUTH_TOKEN" >>"$GITHUB_OUTPUT"
 
       # Issue mode: a run that waited in its concurrency slot keeps the
       # workflow files of its label event, and the apply job of the same run
@@ -797,8 +1106,10 @@ jobs:
       # sweep compares too), so this checks the same rule against the default branch
       # checkout first. On a difference it sets stale=true and ends green: no
       # model turn, no outcome marker, and go=false skips every later step and
-      # caller job. The stop step below marks the run for work-unblock's hourly
-      # sweep, which re-fires the issue on main's files. A commit the checkout
+      # every caller job that needs the model's work. The stop step below marks the run: the caller's
+      # resolve-issue-stale job reads it, and its report-outcome re-fires the
+      # issue at once on main's files, or work-unblock's hourly sweep does when
+      # that report cannot (report-outcome.mjs refireStale). A commit the checkout
       # cannot read is left to the broker. This file is called by a local path,
       # so it runs from the caller's commit.
       - name: Check the run's workflow files against main
@@ -819,14 +1130,15 @@ jobs:
           fi
           for path in "$caller" .github/workflows/pr-run-activity-write.yml; do
             if [ "$(git -C .base rev-parse -q --verify "$WORKFLOW_SHA:$path")" != "$(git -C .base rev-parse -q --verify "HEAD:$path")" ]; then
-              echo "::warning::workflow-stale: $path differs from main's tip, so the broker would refuse this run's apply job; no model ran, and work-unblock's sweep re-fires the issue on main's files"
+              echo "::warning::workflow-stale: $path differs from main's tip, so the broker would refuse this run's apply job; no model ran, and the run's report-outcome re-fires the issue on main's files"
               echo "stale=true" >>"$GITHUB_OUTPUT"
               exit 0
             fi
           done
 
-      # work-unblock's sweep matches this step's name, run, in the job listing:
-      # a green run that stopped here did no work and is re-fired.
+      # The caller's resolve-issue-stale job and work-unblock's sweep match this
+      # step's name, run, in the job listing: a run that stopped here did no
+      # work and is re-fired.
       - name: Stop on stale workflow files
         if: steps.workflow-current.outputs.stale == 'true'
         run: echo "workflow-stale; the run stops before any model turn"
@@ -840,30 +1152,52 @@ jobs:
       # marker is turn-cap, stopped, limited or funding for a run whose lane branch
       # passes the same tip check and is not behind the default branch, the
       # model runs on that branch's tip instead (resume-branch, resume-tip,
-      # resume-cause); a branch behind it starts fresh from the default tip.
+      # resume-cause); a branch behind it starts fresh from the default tip
+      # (stale-branch, stale-tip, and stale-noted when a lanes App comment
+      # already names it). With the model running or a branch reused, it also
+      # names the issue's stopped runs' branches with no pull request in any
+      # state, past the branch it picked (prune-branches), for
+      # work-resolve-issue.yml's prune job to delete. A run that backed off
+      # on another session's lease, or that an open blocker stopped, skips
+      # this check, so it names no branch for the caller's report-outcome to
+      # open a PR from.
       - name: Check for an earlier run's work on the issue
         id: issue-prior
         if: >-
           inputs.issue-number != '' && steps.config.outputs.applies == 'true'
           && steps.config.outputs.kind == 'skill'
           && steps.workflow-current.outputs.stale != 'true'
+          && needs.broker-check.outputs.lease != 'already-leased'
+          && needs.broker-check.outputs.blocked != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ inputs.issue-number }}
           TRUSTED_ACTORS_PATH: .base/.github/standards/trusted-actors/trusted-actors.json
         run: node .base/.github/scripts/work-resolve-issue/report-outcome.mjs --find-prior
 
+      # Issue mode: broker-check found a live lease older than its own, so
+      # another session holds the issue and the run stops before any model turn.
+      - name: Stop on an existing issue lease
+        if: steps.config.outputs.applies == 'true' && needs.broker-check.outputs.lease == 'already-leased'
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue-number }}
+        run: |
+          echo "::warning::already-leased: another session holds a live lease on #$ISSUE_NUMBER; the run stops before any model turn"
+
       # Whether the activity runs: it applies, and in issue mode neither stale
-      # workflow files nor an earlier run's work stops it. Every step below
-      # that touches the activity keys on this.
+      # workflow files, an earlier run's work, another session's lease nor an
+      # open blocker (broker-check's in-slot re-check) stops it. Every step
+      # below that touches the activity keys on this.
       - name: Decide whether the activity runs
         id: go
         if: steps.config.outputs.applies == 'true'
         env:
           PRIOR: ${{ steps.issue-prior.outputs.proceed }}
           STALE: ${{ steps.workflow-current.outputs.stale }}
+          LEASE: ${{ needs.broker-check.outputs.lease }}
+          BLOCKED: ${{ needs.broker-check.outputs.blocked }}
         run: |
-          if [ "$PRIOR" = false ] || [ "$STALE" = true ]; then
+          if [ "$PRIOR" = false ] || [ "$STALE" = true ] || [ "$LEASE" = already-leased ] || [ "$BLOCKED" = true ]; then
             echo "run=false" >>"$GITHUB_OUTPUT"
           else
             echo "run=true" >>"$GITHUB_OUTPUT"
@@ -994,6 +1328,8 @@ jobs:
       # closes an issue may fail this step red.
       - name: Select the trusted PR text
         if: steps.go.outputs.run == 'true' && steps.config.outputs.reads-untrusted == 'true' && inputs.issue-number == ''
+        env:
+          API_BUDGET_TOKEN: github-token
         uses: ./.base/.github/actions/select-trusted-text # zizmor: ignore[self-repository]
         with:
           pr-number: ${{ steps.gate.outputs.pr-number }}
@@ -1026,34 +1362,45 @@ jobs:
       # select-trusted-text's author and edit rules keep, so a listed
       # maintainer's recorded decision reaches the skill. The lanes App's own
       # comments are left out, and so is any comment created or edited after
-      # the label that started the run was last added; a title or body
+      # the issue was admitted (the admission record, else the field write
+      # that started the run, TRIGGER_AT and TRIGGER_SENDER_ID); a title or body
       # changed since fails the step. Runs from the base copy, with the job's
       # read-only token, before the checkout below replaces it.
       - name: Write the issue for the skill
+        id: write-issue
         if: >-
           steps.go.outputs.run == 'true' && inputs.issue-number != ''
           && steps.config.outputs.kind == 'skill'
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          API_BUDGET_TOKEN: github-token
           ISSUE_NUMBER: ${{ inputs.issue-number }}
           ISSUE_FILE: ${{ runner.temp }}/lane-stage/scratch/issue.json
           TRUSTED_ACTORS_PATH: .base/.github/standards/trusted-actors/trusted-actors.json
           LANES_APP_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
-          LABEL_SENDER_ID: ${{ format('{0}', github.event.sender.id) }}
-          LABEL_NAME: ${{ github.event.label.name }}
-          LABEL_EVENT_AT: ${{ github.event.issue.updated_at }}
+          TRIGGER_SENDER_ID: ${{ format('{0}', github.event.sender.id) }}
+          TRIGGER_AT: ${{ github.event.issue.updated_at }}
           # A resumed run's summary of the branch it continues (issue-prior).
           RESUME_BRANCH: ${{ steps.issue-prior.outputs.resume-branch }}
           RESUME_TIP: ${{ steps.issue-prior.outputs.resume-tip }}
           RESUME_CAUSE: ${{ steps.issue-prior.outputs.resume-cause }}
+          # A fresh run's stale lane branch, at the tip issue-prior checked
+          # (issue-prior), whose commits the model reads as data.
+          STALE_BRANCH: ${{ steps.issue-prior.outputs.stale-branch }}
+          STALE_TIP: ${{ steps.issue-prior.outputs.stale-tip }}
           BASE_SHA: ${{ steps.trusted-base.outputs.commit }}
-        run: node .base/.github/scripts/work-resolve-issue/write-issue.mjs
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          # The issue lane's web hosts as admission reads them (resolve-config issueLaneWebHostsFromBase).
+          ISSUE_LANE_WEB_HOSTS=$(yq -o=json -I=0 '(.activities."resolve-issue"."web-access" | select(.enabled == true) | .domains) // []' ".base/$CONFIG_PATH")
+          export ISSUE_LANE_WEB_HOSTS
+          node .base/.github/scripts/work-resolve-issue/write-issue.mjs
 
       # run-claude-cli refuses to run without these root-owned settings, which
       # need sudo, so they are written before the runner is isolated.
       - name: Apply the Claude managed settings
         if: steps.launch.outcome == 'success' && steps.go.outputs.run == 'true'
-        uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@d02b8697e092705153f0996549b05f95a446bb52 # v0.65.0
+        uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@2476d5dde8979eab34374150b7e4b0a2b99f4e88 # 2476d5d 2026-10-29
 
       # Nothing after this step needs sudo or docker.
       - name: Isolate the runner
@@ -1087,17 +1434,34 @@ jobs:
       # clean otherwise; the mode check reads each launcher leg. The sealer and its public key go with it: the head
       # checkout replaces .base, and the head's own key file is the PR's.
       # Head code can rewrite either copy, as it can the collector's; a
-      # forged sealer gains nothing the model job does not already hold.
+      # forged sealer gains nothing the model job does not already hold. It
+      # runs after a failed earlier step too (a write-issue refusal), so the
+      # carry step can still seal lane.json naming why the run never started.
       - name: Copy the patch collector and the output sealer from the base
-        if: steps.go.outputs.run == 'true'
+        if: always() && steps.go.outputs.run == 'true'
         env:
           DEST: ${{ runner.temp }}/read-patch
           SEAL_DIR: ${{ runner.temp }}/seal-lane-output
         run: |
           mkdir -p "$DEST" "$SEAL_DIR"
           cp .base/.github/scripts/read-patch/collect-patch.sh .base/.github/scripts/read-patch/check-permission-mode.sh "$DEST/"
+          cp .base/lib/publish-gate.mjs "$DEST/"
           cp .base/.github/actions/seal-lane-output/action.yml .base/.github/actions/seal-lane-output/seal.mjs \
             .base/.github/lane-keys/scan-carrier.pub "$SEAL_DIR/"
+
+      # The act-turns step's script, copied before the head checkout replaces
+      # .base, with its SHA-256, which that step checks its copy against
+      # before it loads it. The same step runs in pr-run-activity-write.yml.
+      - name: Copy the act-turns script from the base
+        id: act-turns-bin
+        if: always() && steps.go.outputs.run == 'true'
+        env:
+          DEST: ${{ runner.temp }}/act-turns-bin
+        run: |
+          mkdir -p "$DEST"
+          cp .base/.github/scripts/lib/act-turns.mjs "$DEST/"
+          sum=$(sha256sum <"$DEST/act-turns.mjs")
+          echo "sha256=${sum%% *}" >>"$GITHUB_OUTPUT"
 
       # merge-base: the base's merge scripts, its version-bump script, the
       # step around them and the context writer, never the head's, each with
@@ -1125,6 +1489,23 @@ jobs:
             exit 1
           fi
           echo "no-progress=$no_progress" >>"$GITHUB_OUTPUT"
+
+      # Every job-token call this job makes is above, from base code, so the
+      # budget is logged here, before the head checkout replaces .base: no
+      # step after head code loads an action from a checkout. The trusted
+      # base's dispatch read (gh in a composite action) and the prior-work
+      # check (report-outcome's own fetch) go through no counted client.
+      - name: Log the API budget before the head checkout
+        id: api-budget
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: ./.base/.github/actions/log-api-budget # zizmor: ignore[self-repository]
+        with:
+          tokens: github-token
+          outside: >-
+            ${{ steps.trusted-base.outcome != 'skipped' && !contains(fromJSON('["issues","pull_request"]'), github.event_name) && 'trusted-base:pulls' || '' }}
+            ${{ steps.issue-prior.outcome != 'skipped' && 'issue-prior:report-outcome' || '' }}
 
       # Issue mode checks out the trusted base, the default branch tip, or on
       # a resume the tip of the earlier run's lane branch that issue-prior
@@ -1289,40 +1670,57 @@ jobs:
       # references one Claude secret. The first call runs on the role's API
       # key (act-key); with its key empty, or on the launcher's handoff (a
       # credit stop, or a 401 or 402), it hands off, and the caller's
-      # fallback call runs on the role's OAuth token (act-token). Only
-      # whether the secret is set leaves these steps, never its value.
+      # second call runs on the role's OAuth token (act-token). With
+      # fallback-ready true that leg hands off too, and the caller's third
+      # call runs on the central fallback token (act-fallback), the last leg.
+      # Only whether the secret is set leaves these steps, never its value.
+      # Each is ci-workflows select-model-credential's leg call: the key leg
+      # is held off when broker-check's credit read skipped the key, and the
+      # subscription leg checks the caller's fallback input as its reason.
+      # Whether the subscription leg may hand off stays the caller's
+      # fallback-ready, so no fallback-set is passed.
       - name: Check the API key
         id: key-present
         if: >-
           steps.launch.outcome == 'success' && steps.go.outputs.run == 'true'
           && inputs.fallback == ''
-        env:
-          PRESENT: ${{ secrets.claude-api-key != '' }}
-          SECRET_NAME: ${{ steps.launch.outputs.key-name }}
-        run: |
-          if [ "$PRESENT" = true ]; then
-            echo "present=true" >>"$GITHUB_OUTPUT"
-          else
-            echo "::warning::$SECRET_NAME is empty; the caller's fallback call runs the activity on the subscription token"
-            echo "present=false" >>"$GITHUB_OUTPUT"
-          fi
-          echo "started-at=$(date +%s)" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/select-model-credential@5b5110ae015183e900dd098c631d4dcc68904067 # 5b5110a 2026-11-06
+        with:
+          leg: key
+          role: ${{ inputs.role }}
+          credential-set: ${{ secrets.claude-api-key != '' }}
+          selected: ${{ needs.broker-check.outputs.skip-key == 'true' && 'subscription' || '' }}
 
       - name: Check the OAuth token
         id: token-present
         if: >-
           steps.launch.outcome == 'success' && steps.go.outputs.run == 'true'
-          && inputs.fallback != ''
-        env:
-          PRESENT: ${{ secrets.claude-code-oauth-token != '' }}
-        run: |
-          if [ "$PRESENT" = true ]; then
-            echo "present=true" >>"$GITHUB_OUTPUT"
-          else
-            echo "::warning::the role's OAuth token is empty; the activity does not run"
-            echo "present=false" >>"$GITHUB_OUTPUT"
-          fi
-          echo "started-at=$(date +%s)" >>"$GITHUB_OUTPUT"
+          && inputs.fallback != '' && inputs.fallback != 'fallback'
+        uses: melodic-software/ci-workflows/.github/actions/select-model-credential@5b5110ae015183e900dd098c631d4dcc68904067 # 5b5110a 2026-11-06
+        with:
+          leg: subscription
+          role: ${{ inputs.role }}
+          credential-set: ${{ secrets.claude-code-oauth-token != '' }}
+          reason: ${{ inputs.fallback }}
+
+      - name: Check the fallback token
+        id: fallback-present
+        if: >-
+          steps.launch.outcome == 'success' && steps.go.outputs.run == 'true'
+          && inputs.fallback == 'fallback'
+        uses: melodic-software/ci-workflows/.github/actions/select-model-credential@5b5110ae015183e900dd098c631d4dcc68904067 # 5b5110a 2026-11-06
+        with:
+          leg: fallback
+          role: ${{ inputs.role }}
+          credential-set: ${{ secrets.fallback-claude-code-oauth-token != '' }}
+
+      # The leg's start time, for the lane record.
+      - name: Record when the leg starts
+        id: leg-start
+        if: >-
+          steps.key-present.outcome == 'success' || steps.token-present.outcome == 'success'
+          || steps.fallback-present.outcome == 'success'
+        run: echo "at=$(date +%s)" >>"$GITHUB_OUTPUT"
 
       # continue-on-error keeps a launcher failure, which run-claude-cli
       # reports by failing its step, from ending the job before the reply,
@@ -1338,7 +1736,7 @@ jobs:
         if: steps.key-present.outputs.present == 'true'
         continue-on-error: true
         timeout-minutes: ${{ fromJSON(steps.launch.outputs.step-minutes || '50') }}
-        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@d02b8697e092705153f0996549b05f95a446bb52 # v0.65.0
+        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@b8bdd7fa2319b2457cbbef32c5348c394b9bc3f6 # b8bdd7f 2026-11-04
         env:
           # No work may outlive the result message the launcher reads.
           CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
@@ -1385,12 +1783,20 @@ jobs:
           MODE: ${{ steps.config.outputs.permission-mode }}
         run: bash "$RUNNER_TEMP/read-patch/check-permission-mode.sh"
 
+      # A fixed-name step the caller's handoff job reads through the jobs API
+      # (handoff-evidence.sh credit-stop) to upload the key's credit-stop
+      # marker: it runs only on run-claude-cli's handoff-reason, which the
+      # launcher sets after the leg ends, and writes nothing.
+      - name: Mark a key credit stop
+        if: always() && steps.act-key.outputs.handoff-reason == 'credit-stop'
+        run: echo "::notice::the key leg hit a credit stop; the caller uploads its credit-stop marker"
+
       - name: Run the skill on the OAuth token
         id: act-token
         if: steps.token-present.outputs.present == 'true'
         continue-on-error: true
         timeout-minutes: ${{ fromJSON(steps.launch.outputs.step-minutes || '50') }}
-        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@d02b8697e092705153f0996549b05f95a446bb52 # v0.65.0
+        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@b8bdd7fa2319b2457cbbef32c5348c394b9bc3f6 # b8bdd7f 2026-11-04
         env:
           CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
           LD_LIBRARY_PATH: ""
@@ -1416,13 +1822,59 @@ jobs:
           json-schema-file: >-
             ${{ steps.config.outputs.prepare == 'dependency-review'
             && format('{0}/lane-dependency-schema/verdict.schema.json', runner.temp) || '' }}
+          # The caller's, from a job that ran no head code: true lets a limit
+          # stop, a credit stop or a 401 or 402 hand off to the third call.
+          fallback-ready: ${{ inputs.fallback-ready }}
           leg-timeout-minutes: ${{ steps.launch.outputs.leg-minutes }}
 
       - name: Check the OAuth token leg's permission mode
         id: mode-token
-        if: always() && (steps.act-token.outcome == 'success' || steps.act-token.outcome == 'failure')
+        if: >-
+          always() && (steps.act-token.outcome == 'success' || steps.act-token.outcome == 'failure')
+          && steps.act-token.outputs.handoff != 'true'
         env:
           EXECUTION_FILE: ${{ steps.act-token.outputs.execution-file }}
+          MODE: ${{ steps.config.outputs.permission-mode }}
+        run: bash "$RUNNER_TEMP/read-patch/check-permission-mode.sh"
+
+      - name: Run the skill on the fallback token
+        id: act-fallback
+        if: steps.fallback-present.outputs.present == 'true'
+        continue-on-error: true
+        timeout-minutes: ${{ fromJSON(steps.launch.outputs.step-minutes || '50') }}
+        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@b8bdd7fa2319b2457cbbef32c5348c394b9bc3f6 # b8bdd7f 2026-11-04
+        env:
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+          LD_LIBRARY_PATH: ""
+          TRUSTED_CONTEXT_FILE: >-
+            ${{ steps.config.outputs.reads-untrusted == 'true'
+            && format('{0}/.lane/trusted-context.json', github.workspace) || '' }}
+        with:
+          lane: ${{ inputs.activity }}
+          role: ${{ inputs.role }}
+          prompt-file: ${{ github.workspace }}/.lane/prompt.md
+          preamble: ${{ steps.stage.outputs.preamble }}
+          fallback-token: ${{ secrets.fallback-claude-code-oauth-token }}
+          model: ${{ steps.config.outputs.model }}
+          effort: ${{ steps.config.outputs.effort }}
+          max-turns: ${{ steps.config.outputs.max-turns }}
+          permission-mode: ${{ steps.config.outputs.permission-mode }}
+          tools: ${{ steps.stage.outputs.tools }}
+          allowed-tools: ${{ steps.stage.outputs.allowed-tools }}
+          disallowed-tools: ${{ steps.stage.outputs.disallowed-tools }}
+          plugin-dirs: ${{ steps.stage.outputs.plugin-dirs }}
+          # dependency-review returns its verdict as structured output, to
+          # the schema the stage wrote from the base; no other activity has one.
+          json-schema-file: >-
+            ${{ steps.config.outputs.prepare == 'dependency-review'
+            && format('{0}/lane-dependency-schema/verdict.schema.json', runner.temp) || '' }}
+          leg-timeout-minutes: ${{ steps.launch.outputs.leg-minutes }}
+
+      - name: Check the fallback token leg's permission mode
+        id: mode-fallback
+        if: always() && (steps.act-fallback.outcome == 'success' || steps.act-fallback.outcome == 'failure')
+        env:
+          EXECUTION_FILE: ${{ steps.act-fallback.outputs.execution-file }}
           MODE: ${{ steps.config.outputs.permission-mode }}
         run: bash "$RUNNER_TEMP/read-patch/check-permission-mode.sh"
 
@@ -1436,9 +1888,11 @@ jobs:
         if: >-
           always() && ((steps.act-key.outcome == 'success' || steps.act-key.outcome == 'failure')
           && steps.act-key.outputs.handoff != 'true'
-          || steps.act-token.outcome == 'success' || steps.act-token.outcome == 'failure')
+          || (steps.act-token.outcome == 'success' || steps.act-token.outcome == 'failure')
+          && steps.act-token.outputs.handoff != 'true'
+          || steps.act-fallback.outcome == 'success' || steps.act-fallback.outcome == 'failure')
         env:
-          EXECUTION_FILE: ${{ steps.act-key.outputs.execution-file || steps.act-token.outputs.execution-file }}
+          EXECUTION_FILE: ${{ steps.act-key.outputs.execution-file || steps.act-token.outputs.execution-file || steps.act-fallback.outputs.execution-file }}
           REPLY_DIR: ${{ runner.temp }}/skill-reply
         run: |
           mkdir -p "$REPLY_DIR"
@@ -1459,9 +1913,11 @@ jobs:
           always() && steps.config.outputs.prepare == 'dependency-review'
           && ((steps.act-key.outcome == 'success' || steps.act-key.outcome == 'failure')
           && steps.act-key.outputs.handoff != 'true'
-          || steps.act-token.outcome == 'success' || steps.act-token.outcome == 'failure')
+          || (steps.act-token.outcome == 'success' || steps.act-token.outcome == 'failure')
+          && steps.act-token.outputs.handoff != 'true'
+          || steps.act-fallback.outcome == 'success' || steps.act-fallback.outcome == 'failure')
         env:
-          EXECUTION_FILE: ${{ steps.act-key.outputs.execution-file || steps.act-token.outputs.execution-file }}
+          EXECUTION_FILE: ${{ steps.act-key.outputs.execution-file || steps.act-token.outputs.execution-file || steps.act-fallback.outputs.execution-file }}
           REPLY_DIR: ${{ runner.temp }}/skill-reply
         run: |
           mkdir -p "$REPLY_DIR"
@@ -1487,80 +1943,31 @@ jobs:
         if: >-
           always() && ((steps.act-key.outcome == 'success' || steps.act-key.outcome == 'failure')
           && steps.act-key.outputs.handoff != 'true'
-          || steps.act-token.outcome == 'success' || steps.act-token.outcome == 'failure')
+          || (steps.act-token.outcome == 'success' || steps.act-token.outcome == 'failure')
+          && steps.act-token.outputs.handoff != 'true'
+          || steps.act-fallback.outcome == 'success' || steps.act-fallback.outcome == 'failure')
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          EXECUTION_FILE: ${{ steps.act-key.outputs.execution-file || steps.act-token.outputs.execution-file }}
+          EXECUTION_FILE: ${{ steps.act-key.outputs.execution-file || steps.act-token.outputs.execution-file || steps.act-fallback.outputs.execution-file }}
           REPLY_DIR: ${{ runner.temp }}/skill-reply
+          ACT_TURNS_MODULE: ${{ runner.temp }}/act-turns-bin/act-turns.mjs
+          ACT_TURNS_SHA256: ${{ steps.act-turns-bin.outputs.sha256 }}
         with:
           retries: 0
+          # .github/scripts/lib/act-turns.mjs, loaded from the bytes checked
+          # against the base copy's hash. It writes no step summary: the scan
+          # job's summary step shows act-turns.json after the leak scan.
           script: |
-            const fs = require('fs');
-            const { EXECUTION_FILE, REPLY_DIR } = process.env;
-            // Head code could have planted one; only this step's copy is uploaded.
-            fs.rmSync(`${REPLY_DIR}/act-turns.json`, { force: true });
-            let messages = [];
-            try {
-              messages = JSON.parse(fs.readFileSync(EXECUTION_FILE, 'utf8'));
-            } catch (error) {
-              core.setFailed(`No readable execution file: ${error.code ?? error.name}`);
+            const { createHash } = require('crypto');
+            const { readFileSync } = require('fs');
+            const { ACT_TURNS_MODULE, ACT_TURNS_SHA256, EXECUTION_FILE, REPLY_DIR } = process.env;
+            const source = readFileSync(ACT_TURNS_MODULE);
+            if (!ACT_TURNS_SHA256 || createHash('sha256').update(source).digest('hex') !== ACT_TURNS_SHA256) {
+              core.setFailed('act-turns: the staged script does not match the copy taken from the base');
               return;
             }
-            const result = messages.filter((m) => m.type === 'result').at(-1) ?? {};
-            const textOf = (content) =>
-              typeof content === 'string' ? content : (content ?? []).map((block) => block?.text ?? '').join('\n');
-            const stderr = messages
-              .filter((m) => m.type === 'user')
-              .map((m) => textOf(m.message?.content))
-              .filter((text) => text.includes('<local-command-stderr>'));
-            const models = Object.keys(result.modelUsage ?? {});
-            const diag = {
-              subtype: result.subtype == null ? null : String(result.subtype).slice(0, 100),
-              is_error: result.is_error ?? null,
-              num_turns: result.num_turns ?? null,
-              duration_ms: result.duration_ms ?? null,
-              models: models.slice(0, 10).map((name) => name.slice(0, 100)),
-              // The CLI's own report of a failed slash command expansion: the
-              // first 4, each cut to 2000 characters; local_command_stderr_total
-              // counts them all.
-              local_command_stderr: stderr.slice(0, 4).map((text) => text.slice(0, 2000)),
-              local_command_stderr_total: stderr.length,
-              // The first 20 calls the permission mode denied, each with its tool
-              // name cut to 100 characters and its command, file_path, path or
-              // pattern cut to 300, so a denial can be diagnosed; denied_total
-              // counts them all. Entries drop from the end until denied serializes
-              // to at most 8192 bytes (a JSON-escaped control character is 6 bytes).
-              denied: (() => {
-                const kept = (result.permission_denials ?? []).slice(0, 20).map((d) => {
-                  const i = d?.tool_input ?? {};
-                  const input = i.command ?? i.file_path ?? i.path ?? i.pattern ?? null;
-                  return { tool_name: String(d?.tool_name ?? '').slice(0, 100), input: input == null ? null : String(input).slice(0, 300) };
-                });
-                while (Buffer.byteLength(JSON.stringify(kept), 'utf8') > 8192) kept.pop();
-                return kept;
-              })(),
-              denied_total: (result.permission_denials ?? []).length,
-            };
-            // The written file stays within the 32768-byte cap the scan job
-            // carries it under: the oldest stderr entries drop first,
-            // then denials from the end.
-            let turns = `${JSON.stringify(diag, null, 2)}\n`;
-            while (Buffer.byteLength(turns, 'utf8') > 32768 && (diag.local_command_stderr.length > 0 || diag.denied.length > 0)) {
-              if (diag.local_command_stderr.length > 0) diag.local_command_stderr.shift();
-              else diag.denied.pop();
-              turns = `${JSON.stringify(diag, null, 2)}\n`;
-            }
-            fs.mkdirSync(REPLY_DIR, { recursive: true });
-            // The summary step shows it after the leak scan.
-            fs.writeFileSync(`${REPLY_DIR}/act-turns.json`, turns);
-            // JSON escapes newlines, so no field can start a workflow command.
-            core.info(JSON.stringify({ subtype: diag.subtype, is_error: diag.is_error, num_turns: diag.num_turns, models: models.length }));
-            if (!(diag.num_turns > 0) || models.length === 0) {
-              core.setFailed(
-                'no-model-turn: the skill ended without a model turn, so it did nothing; ' +
-                  'the step summary and the skill-reply artifact hold the result fields and any local-command stderr',
-              );
-            }
+            const { runStep } = await import(`data:text/javascript;base64,${source.toString('base64')}`);
+            await runStep({ core, executionFile: EXECUTION_FILE, replyDir: REPLY_DIR });
 
       # Issue mode: the API error a failed leg ended on, from the execution
       # file's result fields, never model text, for report-outcome's funding
@@ -1571,10 +1978,11 @@ jobs:
         if: >-
           always() && inputs.issue-number != ''
           && (steps.act-key.outcome == 'failure' && steps.act-key.outputs.handoff != 'true'
-          || steps.act-token.outcome == 'failure')
+          || steps.act-token.outcome == 'failure' && steps.act-token.outputs.handoff != 'true'
+          || steps.act-fallback.outcome == 'failure')
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          EXECUTION_FILE: ${{ steps.act-key.outputs.execution-file || steps.act-token.outputs.execution-file }}
+          EXECUTION_FILE: ${{ steps.act-key.outputs.execution-file || steps.act-token.outputs.execution-file || steps.act-fallback.outputs.execution-file }}
         with:
           retries: 0
           script: |
@@ -1595,22 +2003,27 @@ jobs:
               .join(' ');
             core.setOutput('text', text.replace(/\s+/g, ' ').slice(0, 500));
 
-      # One lane record per run, naming the credential the leg ran on. A
-      # handoff records nothing; the fallback call records the run under a
-      # name that says why it ran (until report-lane-outcome takes the reason
-      # itself, ci-workflows#806). An issue run keeps the lane's own name.
+      # One lane record per leg, naming the credential the leg ran on. A leg
+      # that hands off records itself with handoff true; the fallback call
+      # records the run under a name that says why it ran, and a credit-stop
+      # or no-key call records that reason as fallback-reason. An issue run
+      # keeps the lane's own name.
       - name: Record the launcher's lane outcome
         id: lane-record
         if: >-
-          always() && steps.key-present.outputs.present != 'false' && steps.act-key.outputs.handoff != 'true'
+          always() && steps.key-present.outputs.present != 'false'
           && (steps.act-key.outcome == 'success' || steps.act-key.outcome == 'failure'
-          || steps.act-token.outcome == 'success' || steps.act-token.outcome == 'failure')
-        uses: melodic-software/ci-workflows/.github/actions/report-lane-outcome@d02b8697e092705153f0996549b05f95a446bb52 # v0.65.0
+          || steps.act-token.outcome == 'success' || steps.act-token.outcome == 'failure'
+          || steps.act-fallback.outcome == 'success' || steps.act-fallback.outcome == 'failure')
+        uses: melodic-software/ci-workflows/.github/actions/report-lane-outcome@6b9c640bf209c0c7e76f1111c5d18c96707348a2 # 6b9c640 2026-11-02
         with:
-          outcome: ${{ steps.act-key.outcome != 'skipped' && steps.act-key.outcome || steps.act-token.outcome }}
-          execution-file: ${{ steps.act-key.outputs.execution-file || steps.act-token.outputs.execution-file }}
+          outcome: ${{ steps.act-key.outcome != 'skipped' && steps.act-key.outcome || steps.act-token.outcome != 'skipped' && steps.act-token.outcome || steps.act-fallback.outcome }}
+          execution-file: ${{ steps.act-key.outputs.execution-file || steps.act-token.outputs.execution-file || steps.act-fallback.outputs.execution-file }}
+          log-file: ${{ steps.act-key.outputs.log-file || steps.act-token.outputs.log-file || steps.act-fallback.outputs.log-file }}
           lane: >-
-            ${{ inputs.issue-number != '' && inputs.fallback == 'handoff'
+            ${{ inputs.issue-number != '' && inputs.fallback == 'fallback'
+            && format('{0} (token {1} handed off)', inputs.lane, steps.launch.outputs.token-name)
+            || inputs.issue-number != '' && inputs.fallback == 'handoff'
             && format('{0} (key {1} handed off)', inputs.lane, steps.launch.outputs.key-name)
             || inputs.issue-number != '' && inputs.lane
             || inputs.fallback == 'credit-stop'
@@ -1619,13 +2032,17 @@ jobs:
             && format('{0}/{1} (key {2} is empty)', inputs.lane, inputs.activity, steps.launch.outputs.key-name)
             || inputs.fallback == 'handoff'
             && format('{0}/{1} (key {2} posted no check)', inputs.lane, inputs.activity, steps.launch.outputs.key-name)
+            || inputs.fallback == 'fallback'
+            && format('{0}/{1} (token {2} handed off)', inputs.lane, inputs.activity, steps.launch.outputs.token-name)
             || format('{0}/{1}', inputs.lane, inputs.activity) }}
           lane-id: ${{ inputs.lane }}
-          step-started-at: ${{ steps.key-present.outputs.started-at || steps.token-present.outputs.started-at }}
+          step-started-at: ${{ steps.leg-start.outputs.at }}
           step-timeout-minutes: ${{ steps.launch.outputs.step-minutes }}
-          credential: ${{ steps.act-key.outputs.credential || steps.act-token.outputs.credential }}
+          credential: ${{ steps.act-key.outputs.credential || steps.act-token.outputs.credential || steps.act-fallback.outputs.credential }}
+          fallback-reason: ${{ steps.token-present.outputs.fallback-reason }}
           max-turns: ${{ steps.config.outputs.max-turns }}
-          known-failure-class: ${{ steps.act-key.outputs.lane-class || steps.act-token.outputs.lane-class }}
+          known-failure-class: ${{ steps.act-key.outputs.lane-class || steps.act-token.outputs.lane-class || steps.act-fallback.outputs.lane-class }}
+          handoff: ${{ steps.act-key.outputs.handoff == 'true' || steps.act-token.outputs.handoff == 'true' }}
 
       - name: Run the script activity
         id: act-script
@@ -1700,9 +2117,10 @@ jobs:
         if: >-
           always() && steps.go.outputs.run == 'true' && steps.config.outputs.applied-by-patch != ''
           && (job.status == 'success'
-          && (steps.launch.outcome != 'success' || steps.act-key.outcome == 'success' || steps.act-token.outcome == 'success')
+          && (steps.launch.outcome != 'success' || steps.act-key.outcome == 'success' || steps.act-token.outcome == 'success'
+          || steps.act-fallback.outcome == 'success')
           || inputs.issue-number != ''
-          && (steps.mode-key.outcome == 'success' || steps.mode-token.outcome == 'success'))
+          && (steps.mode-key.outcome == 'success' || steps.mode-token.outcome == 'success' || steps.mode-fallback.outcome == 'success'))
         env:
           HEAD_SHA: ${{ steps.start.outputs.sha }}
           FROM_TREE: ${{ steps.config.outputs.prepare == 'merge-base' && steps.merge.outputs.conflict-tree || '' }}
@@ -1742,21 +2160,43 @@ jobs:
           always() && inputs.issue-number != '' && steps.go.outputs.run == 'true'
           && steps.config.outputs.kind == 'skill'
           && steps.key-present.outputs.present != 'false' && steps.act-key.outputs.handoff != 'true'
+          && steps.act-token.outputs.handoff != 'true'
+          && !(steps.token-present.outputs.present == 'false' && inputs.fallback-ready == 'true')
         env:
           SCRATCH_OUTCOME: ${{ github.workspace }}/.lane/scratch/work-outcome.json
           OUT_DIR: ${{ runner.temp }}/work-outcome
-          LANE_CLASS: ${{ steps.act-key.outputs.lane-class || steps.act-token.outputs.lane-class }}
-          LANE_RESETS: ${{ steps.act-key.outputs.lane-resets || steps.act-token.outputs.lane-resets }}
-          # The run's turn cap, so a turn-cap stop names it.
+          # A run whose issue file was not written never started: issue-edited
+          # when the issue changed after its label (write-issue's refused
+          # output), issue-edited-trusted when only listed accounts changed
+          # it, issue-file for any other cause, so report-outcome names it.
+          LANE_CLASS: >-
+            ${{ steps.write-issue.outputs.refused == 'edited-trusted' && 'issue-edited-trusted'
+            || steps.write-issue.outputs.refused == 'edited' && 'issue-edited'
+            || steps.write-issue.outcome == 'failure' && 'issue-file'
+            || steps.act-key.outputs.lane-class || steps.act-token.outputs.lane-class
+            || steps.act-fallback.outputs.lane-class }}
+          LANE_RESETS: ${{ steps.act-key.outputs.lane-resets || steps.act-token.outputs.lane-resets || steps.act-fallback.outputs.lane-resets }}
+          # The run's turn cap, so a turn-cap stop names it, and the turns it
+          # took, so a done run past the cap says so in its PR.
           LANE_MAX_TURNS: ${{ steps.config.outputs.max-turns }}
+          LANE_TURNS: ${{ steps.act-turns.outputs.turns }}
           # The branch a resumed run continued, which still holds the work
           # when the run left no change of its own.
           LANE_RESUME: ${{ steps.issue-prior.outputs.resume-branch }}
+          # The stale lane branch this run started fresh past, when no lanes
+          # App comment names it yet, so report-outcome names it once.
+          LANE_STALE: ${{ steps.issue-prior.outputs.stale-noted == 'false' && steps.issue-prior.outputs.stale-branch || '' }}
           # A run that exited non-zero, and the API error it ended on, so a
           # funding stop is named as one (report-outcome readFunding).
-          LANE_FAILED: ${{ steps.act-key.outcome == 'failure' || steps.act-token.outcome == 'failure' }}
+          LANE_FAILED: ${{ steps.act-key.outcome == 'failure' || steps.act-token.outcome == 'failure' || steps.act-fallback.outcome == 'failure' }}
           LANE_API_STATUS: ${{ steps.act-error.outputs.status }}
           LANE_ERROR_TEXT: ${{ steps.act-error.outputs.text }}
+          # The secret NAME the leg ran on (run-claude-cli's credential, never
+          # the value) and the closed fallback reason, both as the lane record
+          # takes them; each is left out of lane.json when empty, and
+          # report-outcome re-checks both before its marker names them.
+          LANE_CREDENTIAL: ${{ steps.act-key.outputs.credential || steps.act-token.outputs.credential || steps.act-fallback.outputs.credential }}
+          LANE_FALLBACK: ${{ steps.token-present.outputs.fallback-reason }}
         run: |
           mkdir -p "$OUT_DIR"
           rm -f "$OUT_DIR/work-outcome.json" "$OUT_DIR/lane.json"
@@ -1764,10 +2204,12 @@ jobs:
             head -c 49152 "$SCRATCH_OUTCOME" >"$OUT_DIR/work-outcome.json"
           fi
           jq -n --arg class "$LANE_CLASS" --arg resets "$LANE_RESETS" \
-            --arg max_turns "$LANE_MAX_TURNS" --arg resume "$LANE_RESUME" \
+            --arg max_turns "$LANE_MAX_TURNS" --arg turns "$LANE_TURNS" --arg resume "$LANE_RESUME" --arg stale "$LANE_STALE" \
             --arg failed "$LANE_FAILED" --arg status "$LANE_API_STATUS" --arg error_text "$LANE_ERROR_TEXT" \
-            '{branch: "", class: $class, resets: $resets, "max-turns": $max_turns, resume: $resume,
-              failed: $failed, "api-error-status": $status, "error-text": $error_text}' >"$OUT_DIR/lane.json"
+            --arg credential "${LANE_CREDENTIAL-}" --arg fallback "${LANE_FALLBACK-}" \
+            '{branch: "", class: $class, resets: $resets, "max-turns": $max_turns, turns: $turns, resume: $resume, stale: $stale,
+              failed: $failed, "api-error-status": $status, "error-text": $error_text}
+              + ({credential: $credential, fallback: $fallback} | with_entries(select(.value != "")))' >"$OUT_DIR/lane.json"
 
       # The reply, the run fields, the patch, a review-threads skill's
       # replies or a dependency-review skill's verdict, and in issue mode the
@@ -1777,7 +2219,13 @@ jobs:
       # private key. This step stages each payload within its cap
       # and sets its byte count; an absent payload sets nothing, and one
       # over its cap sets only its byte count, which the scan job refuses as
-      # too large. The seal step then seals the staged copies (the sealer
+      # too large. A patch over its cap never reaches that job's leak scan,
+      # so this step runs the same scan on it before removing the copy, and
+      # patch-scan says which refusal the scan job gives: clean (no block and
+      # no binary hunk, whose bytes a text scan cannot read) retries, and hit,
+      # for a block, a binary hunk or a scan that failed, holds. Head code may
+      # forge clean, which only turns that hold into a retry; this step adds no
+      # token. The seal step then seals the staged copies (the sealer
       # copied from the base, placed where a uses: can reach it) into at
       # most five chunks of 98304 characters, each fitting one environment
       # variable, bound to this run and the run job. Every output here is
@@ -1802,9 +2250,20 @@ jobs:
           OUTCOME_DIR: ${{ inputs.issue-number != '' && format('{0}/work-outcome', runner.temp) || '' }}
           CARRY_DIR: ${{ runner.temp }}/carry
           SEAL_DIR: ${{ runner.temp }}/seal-lane-output
+          PATCH_GATE: ${{ runner.temp }}/read-patch/publish-gate.mjs
         run: |
           rm -rf "$CARRY_DIR"
           mkdir -p "$CARRY_DIR"
+          patch_is_clean() {
+            timeout 120 node --input-type=module -e '
+              import { readFileSync } from "node:fs";
+              import { pathToFileURL } from "node:url";
+              const { scanLeak } = await import(pathToFileURL(process.env.PATCH_GATE).href);
+              const bytes = readFileSync(process.argv[1]);
+              const held = scanLeak(bytes, { diff: true }).block || /^GIT binary patch$/m.test(bytes.toString("latin1"));
+              process.exit(held ? 1 : 0);
+            ' "$1"
+          }
           carry() {
             local name=$1 file=$2 copy=$CARRY_DIR/$3 cap=$4 bytes
             if [ -L "$file" ] || [ ! -f "$file" ]; then return 0; fi
@@ -1812,6 +2271,14 @@ jobs:
             bytes=$(stat -c %s "$copy")
             echo "$name-bytes=$bytes" >>"$GITHUB_OUTPUT"
             if [ "$bytes" -gt "$cap" ]; then
+              if [ "$name" = patch ]; then
+                if patch_is_clean "$copy"; then
+                  echo "patch-scan=clean" >>"$GITHUB_OUTPUT"
+                else
+                  echo "patch-scan=hit" >>"$GITHUB_OUTPUT"
+                  echo "::error::the oversize patch holds a credential shape or a binary hunk, or its scan failed, so it may carry a credential"
+                fi
+              fi
               rm -f "$copy"
               echo "::error::too-large: the $name is $bytes bytes, over its $cap-byte cap, so nothing is published"
             fi
@@ -1848,15 +2315,51 @@ jobs:
           job-id: run
           max-chunks: 5
 
+      # The failed GitHub API calls this job's scripts recorded (recordFailure
+      # in retry-fetch.mjs and rate-guard.mjs), for the report job's lane run
+      # report comment. The model shares RUNNER_TEMP and could plant or change
+      # the file, and PATH with it, so only rows of the recorded shape pass,
+      # each distinct row once, with the rest counted as dropped. post.mjs checks
+      # them again, folds each path into its template and only then caps the
+      # rows at 50, so many failures on distinct ids cannot crowd out a later,
+      # different one. The 64 KiB read bounds the output.
+      - name: Carry the failed API calls to the report job
+        id: api-failures
+        if: always()
+        continue-on-error: true
+        env:
+          FAILURES: ${{ runner.temp }}/lane-run-report/api-failures.jsonl
+        run: |
+          none='{"rows":[],"dropped":0}'
+          rows=$none
+          if [ -f "$FAILURES" ] && [ ! -L "$FAILURES" ]; then
+            rows=$(head -c 65536 "$FAILURES" | jq -cRn '
+              [inputs | select(length > 0)] as $lines
+              | ([$lines[] | (try fromjson catch null)
+                | select(type == "object"
+                  and (.method | type) == "string" and (.method | test("\\A(GET|POST|PATCH|PUT|DELETE)\\z"))
+                  and (.path | type) == "string" and (.path | test("\\A/[A-Za-z0-9/_.-]{1,200}\\z"))
+                  and (.status | type) == "number" and .status == (.status | floor)
+                  and .status >= 0 and .status <= 599)
+                | {method, path, status}]
+                | reduce .[] as $r ([]; if index([$r]) then . else . + [$r] end)) as $rows
+              | {rows: $rows, dropped: (($lines | length) - ($rows | length))}') || rows=$none
+          fi
+          echo "api-failures=${rows:-$none}" >>"$GITHUB_OUTPUT"
+
       # The launcher steps fail softly. A run that handed off ends green and
       # leaves the activity to the fallback call; any other skill run that
       # got as far as the credential steps and left no launcher success fails
       # here, after its outcome and partial patch were carried.
       - name: Fail without a result
         if: >-
-          always() && (steps.key-present.outcome == 'success' || steps.token-present.outcome == 'success')
+          always() && (steps.key-present.outcome == 'success' || steps.token-present.outcome == 'success'
+          || steps.fallback-present.outcome == 'success')
           && steps.key-present.outputs.present != 'false' && steps.act-key.outputs.handoff != 'true'
+          && steps.act-token.outputs.handoff != 'true'
+          && !(steps.token-present.outputs.present == 'false' && inputs.fallback-ready == 'true')
           && steps.act-key.outcome != 'success' && steps.act-token.outcome != 'success'
+          && steps.act-fallback.outcome != 'success'
         run: |
           echo "::error::the skill's launcher run left no result"
           exit 1
@@ -1894,6 +2397,9 @@ jobs:
       resume-tip: ${{ steps.checked.outputs.resume-tip }}
       base-sha: ${{ steps.checked.outputs.base-sha }}
       start-sha: ${{ steps.checked.outputs.start-sha }}
+      prune-branches: ${{ steps.checked.outputs.prune-branches }}
+    env:
+      API_BUDGET_TOKEN: github-token
     steps:
       # Each field through env. issue-run-started is set first, alone, so a
       # refused field still leaves it; claimed says a branch is named.
@@ -1909,10 +2415,11 @@ jobs:
           RESUME_BRANCH: ${{ needs.run.outputs.resume-branch }}
           RESUME_TIP: ${{ needs.run.outputs.resume-tip }}
           BASE_SHA: ${{ needs.run.outputs.base-sha }}
+          PRUNE_BRANCHES: ${{ needs.run.outputs.prune-branches }}
         with:
           retries: 0
           script: |
-            const { LANE, ISSUE_NUMBER, STARTED, REUSE_BRANCH, RESUME_BRANCH, RESUME_TIP, BASE_SHA } = process.env;
+            const { LANE, ISSUE_NUMBER, STARTED, REUSE_BRANCH, RESUME_BRANCH, RESUME_TIP, BASE_SHA, PRUNE_BRANCHES } = process.env;
             const SHA = /^[0-9a-f]{40}$/;
             const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const BRANCH = new RegExp(`^${escape(LANE)}/issue-${escape(ISSUE_NUMBER)}-[1-9][0-9]*-[1-9][0-9]*$`);
@@ -1931,19 +2438,47 @@ jobs:
             if (REUSE_BRANCH !== '' && (STARTED !== 'false' || RESUME_BRANCH !== '' || RESUME_TIP !== '')) return bad('reuse-branch');
             if ((RESUME_BRANCH === '') !== (RESUME_TIP === '') || (RESUME_TIP !== '' && STARTED !== 'true')) return bad('resume-tip');
             if (STARTED === 'true' && BASE_SHA === '') return bad('base-sha');
+            // Branches to prune: at most 20 distinct lane branches of the
+            // issue, none of them the reuse or resume branch. The checked step
+            // publishes only the names the re-derived earlier-work check also
+            // names, and the prune job re-checks each against GitHub before
+            // deleting.
+            const prune = PRUNE_BRANCHES === '' ? [] : PRUNE_BRANCHES.split(' ');
+            if (prune.length > 20 || new Set(prune).size !== prune.length
+              || prune.some((name) => !BRANCH.test(name) || name === REUSE_BRANCH || name === RESUME_BRANCH)) return bad('prune-branches');
             core.setOutput('claimed', REUSE_BRANCH !== '' || RESUME_BRANCH !== '' ? 'true' : 'false');
             core.setOutput('reuse-branch', REUSE_BRANCH);
             core.setOutput('resume-branch', RESUME_BRANCH);
             core.setOutput('resume-tip', RESUME_TIP);
             core.setOutput('base-sha', BASE_SHA);
+            core.setOutput('prune-branches', PRUNE_BRANCHES);
+
+      - name: Resolve main's tip
+        id: tip
+        if: >-
+          steps.issue.outcome == 'success' && github.event.repository.default_branch != ''
+          && (steps.issue.outputs.claimed == 'true' || steps.issue.outputs.prune-branches != '')
+        continue-on-error: true
+        env:
+          TIP_BRANCH: ${{ github.event.repository.default_branch }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
+              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
+            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
+            sleep "$((RANDOM % (2 * i + 1)))"
+          done
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
 
       - name: Check out the default branch tip
         id: base
-        if: steps.issue.outcome == 'success' && steps.issue.outputs.claimed == 'true' && github.event.repository.default_branch != ''
+        if: >-
+          steps.issue.outcome == 'success' && github.event.repository.default_branch != ''
+          && (steps.issue.outputs.claimed == 'true' || steps.issue.outputs.prune-branches != '') && steps.tip.outputs.sha != ''
         continue-on-error: true
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
 
@@ -1974,7 +2509,10 @@ jobs:
           GITHUB_OUTPUT=$PRIOR_OUT node .base/.github/scripts/work-resolve-issue/report-outcome.mjs --find-prior
 
       # A branch claim must be what the re-derived check chose, field for
-      # field; with no claim there is nothing to re-derive.
+      # field; with no claim there is nothing to re-derive. A branch to prune
+      # is published only when the re-derived check names it too, so a forged
+      # list deletes nothing the check would spare; a failed re-derive
+      # publishes none.
       - name: Publish the checked issue fields
         id: checked
         if: >-
@@ -1987,16 +2525,22 @@ jobs:
           RESUME_BRANCH: ${{ steps.issue.outputs.resume-branch }}
           RESUME_TIP: ${{ steps.issue.outputs.resume-tip }}
           BASE_SHA: ${{ steps.issue.outputs.base-sha }}
+          PRUNE_BRANCHES: ${{ steps.issue.outputs.prune-branches }}
           PRIOR_OUT: ${{ runner.temp }}/issue-prior
         run: |
+          prior() { [ ! -f "$PRIOR_OUT" ] || sed -n "s/^$1=//p" "$PRIOR_OUT" | tail -n 1; }
           if [ "$CLAIMED" = true ]; then
-            prior() { sed -n "s/^$1=//p" "$PRIOR_OUT" | tail -n 1; }
             if [ "$(prior reuse-branch)" != "$REUSE_BRANCH" ] || [ "$(prior resume-branch)" != "$RESUME_BRANCH" ] ||
               [ "$(prior resume-tip)" != "$RESUME_TIP" ]; then
               echo "::error::bad-output: the run job's lane branch is not the one the earlier-work check chooses; nothing is published"
               exit 1
             fi
           fi
+          prune=""
+          derived=" $(prior prune-branches) "
+          for name in $PRUNE_BRANCHES; do
+            [[ $derived == *" $name "* ]] && prune="${prune:+$prune }$name"
+          done
           {
             echo "checked=true"
             echo "reuse-branch=$REUSE_BRANCH"
@@ -2004,7 +2548,19 @@ jobs:
             echo "resume-tip=$RESUME_TIP"
             echo "base-sha=$BASE_SHA"
             echo "start-sha=${RESUME_TIP:-$BASE_SHA}"
+            echo "prune-branches=$prune"
           } >>"$GITHUB_OUTPUT"
+
+      # The action lives in the .base checkout, which a run that claims no
+      # branch and names none to prune never makes; with no checkout this job
+      # made no API call to log.
+      - name: Log the API budget at the end
+        if: always() && steps.base.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: ./.base/.github/actions/log-api-budget # zizmor: ignore[self-repository]
+        with:
+          tokens: github-token
 
   # Everything the run job hands on leaves here, on a fresh VM that ran no
   # model or head code, with no id-token, no cache and nothing from the run
@@ -2043,6 +2599,7 @@ jobs:
       && needs.run.outputs.handed-off != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    cache-mode: read
     environment: pr-pipeline-scan-carrier
     permissions:
       contents: read
@@ -2057,6 +2614,7 @@ jobs:
       outcome-uploaded: ${{ steps.outcome-upload.outcome == 'success' && 'true' || '' }}
       feedback-attempt: ${{ steps.feedback-upload.outcome == 'success' && github.run_attempt || '' }}
       feedback-sha256: ${{ steps.feedback-upload.outcome == 'success' && steps.leak-scan.outputs.replies-sha256 || '' }}
+      feedback-disputed: ${{ steps.feedback-upload.outcome == 'success' && steps.leak-scan.outputs.replies-disputed || '' }}
       dependency-attempt: ${{ steps.dependency-upload.outcome == 'success' && github.run_attempt || '' }}
       dependency-sha256: ${{ steps.dependency-upload.outcome == 'success' && steps.leak-scan.outputs.verdict-sha256 || '' }}
       dependency-verdict: ${{ steps.dependency-upload.outcome == 'success' && steps.leak-scan.outputs.dependency-verdict || '' }}
@@ -2064,10 +2622,14 @@ jobs:
       # output, held to its closed set, so a forged one can only hand the
       # PR to a person.
       collect-refused: ${{ steps.decode.outputs.collect-refused == 'true' && 'true' || '' }}
-      # Set only by this job's own steps: a refused patch over its cap, or
-      # any other refusal; a forged run job output can only add one.
+      # Set only by this job's own steps: `patch`, an oversize patch the carry
+      # step scanned clean; `fault`, a scan fault after the patch's text was
+      # judged, with no binary hunk's bytes unread, or in a run that left no
+      # patch; `output`, any other refusal. A forged run job output can add
+      # one, or forge that clean and turn an oversize hold into a retry.
       refused: >-
         ${{ steps.decode.outputs.refused
+        || steps.leak-scan.outputs.refused
         || (steps.open.outcome == 'failure' || steps.decode.outcome == 'failure' || steps.leak-scan.outcome == 'failure') && 'output'
         || '' }}
     steps:
@@ -2099,12 +2661,26 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve main's tip
+        id: tip
+        if: needs.run.outputs.go == 'true' && needs.run.outputs.carry-sealed-length != ''
+        env:
+          TIP_BRANCH: ${{ github.event.repository.default_branch }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
+              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
+            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
+            sleep "$((RANDOM % (2 * i + 1)))"
+          done
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+
       - name: Check out the default branch tip
         id: base
         if: needs.run.outputs.go == 'true' && needs.run.outputs.carry-sealed-length != ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
           sparse-checkout: |
@@ -2176,6 +2752,7 @@ jobs:
           REPLY_BYTES: ${{ needs.run.outputs.carry-reply-bytes }}
           ACT_TURNS_BYTES: ${{ needs.run.outputs.carry-act-turns-bytes }}
           PATCH_BYTES: ${{ needs.run.outputs.carry-patch-bytes }}
+          PATCH_SCAN: ${{ needs.run.outputs.carry-patch-scan }}
           REPLIES_BYTES: ${{ needs.run.outputs.carry-replies-bytes }}
           DEPENDENCY_VERDICT_BYTES: ${{ needs.run.outputs.carry-dependency-verdict-bytes }}
           WORK_OUTCOME_BYTES: ${{ needs.run.outputs.carry-work-outcome-bytes }}
@@ -2201,6 +2778,7 @@ jobs:
               ACT_OUTCOME: OUTCOME,
               DIRTY_TREE: ['true', 'false'],
               PATCH_COLLECTED: ['written', 'empty', 'refused'],
+              PATCH_SCAN: ['clean', 'hit'],
               KILL_REASON: NAME,
               TRIGGER_REASON: NAME,
               GATE_REASON: NAME,
@@ -2249,8 +2827,9 @@ jobs:
                 const bytes = Number(bytesText);
                 if (bytes > cap) {
                   // A lockfile fix over the patch cap never lands: the verdict
-                  // job names it (refused `patch`).
-                  if (name === 'patch') core.setOutput('refused', 'patch');
+                  // job names it (refused `patch`). Only the carry step's clean
+                  // scan makes it that; any other patch here holds (`output`).
+                  if (name === 'patch') core.setOutput('refused', env.PATCH_SCAN === 'clean' ? 'patch' : 'output');
                   refuse(`too-large: the ${name} is ${bytes} bytes, over its ${cap}-byte cap; nothing is published`);
                 }
                 if (size !== bytes) refuse(`payload-mismatch: the ${name} does not match its byte count; nothing is published`);
@@ -2290,6 +2869,56 @@ jobs:
               core.setFailed(error instanceof Refused ? error.message : `payload-mismatch: the outputs could not be decoded (${error.name}); nothing is published`);
             }
 
+      # The upload scanner and its gate, from the default branch tip through
+      # the API (as leak-scan loads the gate), into a fresh directory under
+      # RUNNER_TEMP: the gated head's checkout next replaces the workspace,
+      # .base included, so no scan here loads code from it. It runs on every
+      # run, a gate stop included, since the verdict upload follows its scan;
+      # a failure here leaves no scanner, and that scan then withholds the
+      # verdict.
+      - name: Stage the upload scanner
+        id: stage-scanner
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CALLS_FILE: ${{ runner.temp }}/scan-stage-calls
+        with:
+          retries: 2
+          retry-exempt-status-codes: 400,401,403,404,422,429
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            // Each request's count, written before it is sent, for the job-end notice.
+            let calls = 0;
+            const sent = () => {
+              try {
+                fs.writeFileSync(process.env.CALLS_FILE, `${++calls}\n`);
+              } catch {}
+            };
+            const branch = context.payload.repository?.default_branch;
+            if (typeof branch !== 'string' || branch === '') throw new Error('no default branch');
+            sent();
+            const tip = (await github.rest.repos.getBranch({ ...context.repo, branch })).data?.commit?.sha;
+            if (typeof tip !== 'string' || !/^[0-9a-f]{40}$/.test(tip)) throw new Error('no default branch tip');
+            const dest = path.join(process.env.RUNNER_TEMP, 'scan-gate');
+            fs.mkdirSync(dest);
+            // The scanner may import node: builtins and the gate; the gate only builtins.
+            const files = [
+              ['lib/publish-gate.mjs', []],
+              ['.github/actions/scan-upload/scan-upload.mjs', ['../../../lib/publish-gate.mjs']],
+            ];
+            for (const [file, allowed] of files) {
+              sent();
+              const { data } = await github.rest.repos.getContent({ ...context.repo, path: file, ref: tip });
+              const source = Buffer.from(data.content, 'base64').toString('utf8');
+              const specifiers = [...source.matchAll(/\bfrom\s*['"]([^'"]+)['"]|^\s*import\s*['"]([^'"]+)['"]|\bimport\s*\(\s*['"]?([^'")]*)/gm)].map((match) => match[1] ?? match[2] ?? match[3]);
+              if (specifiers.some((name) => !name.startsWith('node:') && !allowed.includes(name))) throw new Error(`${file} imports more than it may`);
+              fs.mkdirSync(path.join(dest, path.dirname(file)), { recursive: true });
+              fs.writeFileSync(path.join(dest, file), source, { flag: 'wx', mode: 0o444 });
+            }
+            core.info(`upload scanner from ${tip}`);
+
       # The gated head's objects, fresh: the patch applies onto them; in
       # issue mode the start commit the issue step checked. A merge-base
       # patch is measured from a conflict tree GitHub does not hold, so it is
@@ -2321,7 +2950,15 @@ jobs:
       # step naming the pattern, never the value, and says to rotate it; a
       # patch that does not apply, or a scan that does not finish (the
       # timeout included), fails it with no rotation; every upload and
-      # summary after it needs clean == 'true'. The one broad label, a
+      # summary after it needs clean == 'true'. A pattern block writes only
+      # the rule, the scanned file name or a fixed placeholder, and the line
+      # number to this step's summary, never any of the match. Those two faults find no
+      # credential, so they set refused=fault, which retries, once the patch's
+      # text was judged with no binary hunk's bytes unread, or when the run
+      # left no patch; any other fault holds, and a timeout sets no output, so
+      # it holds too. A 5xx from the gate's two API calls retries in the step,
+      # so a blip does not hold an unjudged patch for a person; a rate-limit
+      # status does not. The one broad label, a
       # password or secret assignment, is a warning naming the kind of
       # source, never a path.
       - name: Scan the outputs for credentials
@@ -2336,8 +2973,11 @@ jobs:
           # The caller's input, never a run job output: a merge-base patch is
           # read as text only.
           TEXT_PATCH: ${{ inputs.merge-conflict-tree != '' }}
+          CALLS_FILE: ${{ runner.temp }}/scan-leak-calls
         with:
-          retries: 0
+          retries: 2
+          # The action's default list, plus the rate limit it leaves out.
+          retry-exempt-status-codes: 400,401,403,404,422,429
           script: |
             const fs = require('fs');
             const os = require('os');
@@ -2345,9 +2985,14 @@ jobs:
             const crypto = require('crypto');
             const { pathToFileURL } = require('url');
             const { execFileSync } = require('child_process');
-            const { HEAD_SHA, REPLY_DIR, PATCH_FILE, GITHUB_WORKSPACE, TEXT_PATCH } = process.env;
-            // The one findSecret label that warns instead of blocking.
-            const WARN_ONLY = 'password or secret assignment';
+            const { HEAD_SHA, REPLY_DIR, PATCH_FILE, GITHUB_WORKSPACE, TEXT_PATCH, CALLS_FILE } = process.env;
+            // Each request's count, written before it is sent, for the job-end notice.
+            let calls = 0;
+            const sent = () => {
+              try {
+                fs.writeFileSync(CALLS_FILE, `${++calls}\n`);
+              } catch {}
+            };
             // A regular file's bytes, a link's target text; anything else holds none.
             const read = (file) => {
               let stat;
@@ -2360,22 +3005,27 @@ jobs:
               return stat.isFile() ? fs.readFileSync(file) : null;
             };
             let hit = null;
+            let scratch = null;
+            let judged = false;
+            let binary = false;
             try {
               if (!/^[0-9a-f]{40}$/.test(HEAD_SHA ?? '')) throw new Error('no head');
-              const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'leak-scan-'));
+              scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'leak-scan-'));
               // The gate's commit, from this job's own token: the default
               // branch's tip now, never a run job output, which head code with
               // sudo on that runner could have forged.
               const branch = context.payload.repository?.default_branch;
               if (typeof branch !== 'string' || branch === '') throw new Error('no default branch');
+              sent();
               const tip = (await github.rest.repos.getBranch({ ...context.repo, branch })).data?.commit?.sha;
               if (typeof tip !== 'string' || !/^[0-9a-f]{40}$/.test(tip)) throw new Error('no default branch tip');
+              sent();
               const { data } = await github.rest.repos.getContent({ ...context.repo, path: 'lib/publish-gate.mjs', ref: tip });
               const source = Buffer.from(data.content, 'base64').toString('utf8');
               const specifiers = [...source.matchAll(/\bfrom\s*['"]([^'"]+)['"]|^\s*import\s*['"]([^'"]+)['"]|\bimport\s*\(\s*['"]?([^'")]*)/gm)].map((match) => match[1] ?? match[2] ?? match[3]);
               if (specifiers.some((name) => !name.startsWith('node:'))) throw new Error('the gate imports more than node builtins');
               fs.writeFileSync(path.join(scratch, 'publish-gate.mjs'), source);
-              const { findSecret, SECRET_PATTERNS } = await import(pathToFileURL(path.join(scratch, 'publish-gate.mjs')).href);
+              const { WARN_ONLY, scanLeak, changedBytes, hitFingerprint } = await import(pathToFileURL(path.join(scratch, 'publish-gate.mjs')).href);
               // git with no global or system config, in a fresh bare repository
               // that borrows at most the checkout's objects and nothing else
               // from its .git (collect-patch.sh runs the same way).
@@ -2414,7 +3064,20 @@ jobs:
               const lane = keep(`${REPLY_DIR}/lane.json`, 'lane.json');
               core.setOutput('dir', out);
               if (patch) core.setOutput('patch-sha256', crypto.createHash('sha256').update(patch).digest('hex'));
-              if (replies) core.setOutput('replies-sha256', crypto.createHash('sha256').update(replies).digest('hex'));
+              if (replies) {
+                core.setOutput('replies-sha256', crypto.createHash('sha256').update(replies).digest('hex'));
+                // adjudicate-feedback's gate: a reply that leaves its thread
+                // open (adjudicate-feedback.mjs DISPUTED), or a line that is
+                // not JSON, which the adjudicator's own checks refuse.
+                const disputed = replies.toString('utf8').split('\n').filter((line) => line.trim() !== '').some((line) => {
+                  try {
+                    return ['INCORRECT', 'UNCERTAIN', 'VALID-defer'].includes(JSON.parse(line)?.disposition);
+                  } catch {
+                    return true;
+                  }
+                });
+                core.setOutput('replies-disputed', disputed ? 'true' : '');
+              }
               if (verdict) {
                 core.setOutput('verdict-sha256', crypto.createHash('sha256').update(verdict).digest('hex'));
                 // review-dependency.mjs VERDICTS: the field the push job's gate
@@ -2428,117 +3091,25 @@ jobs:
                 }
                 core.setOutput('dependency-verdict', ['merge', 'fix', 'close', 'escalate'].includes(value) ? value : '');
               }
-              // A credential format blocks and asks for rotation. The one broad
-              // label, an assignment that may be a test fixture, only warns, and
-              // only on a plain line. Each line is judged on its own: every
-              // blocking pattern on the raw line, then findSecret (which adds the
-              // gate's normalized copy). When findSecret names the assignment,
-              // its matches are blanked and the line read again, and each match
-              // is read again with its = and : blanked. A line whose assignment
-              // sits beside markup or escapes the gate folds (a tag, an entity,
-              // a doubled backslash: publish-gate.mjs normalize(), lines 60-66),
-              // or whose assignment only the folded copy shows, blocks under its
-              // own label: blanking cannot be trusted there. findSecret on the
-              // whole text runs too, and any credential label from it blocks.
-              const HIDDEN = 'assignment hidden by markup or escapes';
-              const blocking = SECRET_PATTERNS.filter(([label]) => label !== WARN_ONLY);
-              const warnPattern = SECRET_PATTERNS.find(([label]) => label === WARN_ONLY)?.[1];
-              const warnOne = warnPattern && new RegExp(warnPattern.source, warnPattern.flags.replace('g', ''));
-              const warnAll = warnPattern && new RegExp(warnPattern.source, `${warnPattern.flags.replace('g', '')}g`);
-              const folds = (line) => /<[^<>]*>/.test(line) || /&#?\w+;/.test(line) || line.includes('\\\\');
-              const credential = (label) => ({ block: label, credential: true });
-              const classifyLine = (line) => {
-                const raw = blocking.find(([, re]) => re.test(line));
-                if (raw) return credential(raw[0]);
-                const first = findSecret(line);
-                if (!first) return {};
-                if (first[0] !== WARN_ONLY || !warnPattern) return credential(first[0]);
-                const again = findSecret(line.replace(warnAll, (match) => ' '.repeat(match.length)));
-                if (again && again[0] !== WARN_ONLY) return credential(again[0]);
-                for (const [match] of line.matchAll(warnAll)) {
-                  const inside = findSecret(match.replace(/[:=]/g, ' '));
-                  if (inside && inside[0] !== WARN_ONLY) return credential(inside[0]);
-                }
-                if (again || folds(line) || !warnOne.test(line)) return { block: HIDDEN, credential: false };
-                return { warn: true };
-              };
-              const classify = (text) => {
-                let warn = false;
-                for (const line of text.split(/\r?\n/)) {
-                  const result = classifyLine(line);
-                  if (result.block) return result;
-                  warn ||= Boolean(result.warn);
-                }
-                const whole = findSecret(text);
-                if (whole && whole[0] !== WARN_ONLY) return credential(whole[0]);
-                return { warn };
-              };
-              // Two more passes, on credential formats only (owner ruling Q37),
-              // each blocking with the label and the rotation line:
-              // - UTF-16LE: the text with its NUL bytes removed, so a token
-              //   written two bytes a character reads as one. #8532 reads a
-              //   NUL as a space to keep line numbers (b9e9475b3a); here it is
-              //   removed, since a space between every character would split
-              //   the token again.
-              // - Split lines: each pair of adjacent lines joined with no
-              //   separator, counting only a match that straddles the join of
-              //   a pattern neither line matches alone, so a token cut across
-              //   two lines is caught and nothing a single line holds is
-              //   judged twice. The OpenAI key pattern (any sk- and 20 token
-              //   characters) and the R2 key pair pattern (a 32-hex and a
-              //   64-hex token on one line) are left out of this pass: joining
-              //   a line that ends in an sk- word to the next line's first
-              //   word matches the first, adjacent md5 and sha256 lines match
-              //   the second, and a false block fails fix-ci closed and asks
-              //   for a rotation. In the patch the pair is hunk
-              //   lines with their +, - or space prefix removed and the file
-              //   headers dropped, or a token split inside an added hunk
-              //   would join as "...ab+cd..." and never match.
-              const straddles = (left, right) => {
-                const joined = left + right;
-                for (const [label, re] of blocking) {
-                  if (label === 'OpenAI key' || label === 'R2 key pair' || re.test(left) || re.test(right)) continue;
-                  for (const match of joined.matchAll(new RegExp(re.source, `${re.flags.replace('g', '')}g`))) {
-                    if (match.index < left.length && match.index + match[0].length > left.length) return label;
-                  }
-                }
-                return null;
-              };
-              const credentialIn = (text) => {
-                for (const line of text.split(/\r?\n/)) {
-                  const raw = blocking.find(([, re]) => re.test(line));
-                  if (raw) return raw[0];
-                }
-                const found = findSecret(text);
-                return found && found[0] !== WARN_ONLY ? found[0] : null;
-              };
-              const HUNK_HEADER = /^(?:\+\+\+|---) /;
-              const deeper = (text, diff) => {
-                const plain = text.replace(/\0/g, '');
-                if (plain !== text) {
-                  const label = credentialIn(plain);
-                  if (label) return label;
-                }
-                let lines = plain.split(/\r?\n/);
-                if (diff) lines = lines.filter((line) => /^[-+ ]/.test(line) && !HUNK_HEADER.test(line)).map((line) => line.slice(1));
-                for (let i = 0; i + 1 < lines.length; i += 1) {
-                  const label = straddles(lines[i], lines[i + 1]);
-                  if (label) return label;
-                }
-                return null;
-              };
-              // Each source has a kind, which names no model-chosen text.
+              // The gate's scanLeak: per-line credential formats, the warn-only
+              // assignment, then the UTF-16LE and split-line passes. A
+              // credential format blocks and asks for rotation; the one broad
+              // label only warns, on a plain line. Each source has a kind,
+              // which names no model-chosen text.
+              // A block keeps its fingerprint (hitFingerprint: rule, file,
+              // line, none of the match) for the summary;
+              // a gate without it, or a throw in it, keeps none.
               const warned = new Set();
-              const judge = (kind, bytes, how = (b) => classify(b.toString('latin1')), diff = false) => {
+              const files = new Map([[reply, 'reply.txt'], [turns, 'act-turns.json'], [patch, 'patch.diff'], [replies, 'replies.jsonl'], [verdict, 'dependency-verdict.json'], [outcome, 'work-outcome.json'], [lane, 'lane.json']]);
+              const judge = (kind, bytes, diff = false) => {
                 if (hit || !bytes) return;
-                const { block, credential: format, warn } = how(bytes);
+                const { block, credential: format, warn } = scanLeak(bytes, { diff });
                 if (block) {
                   hit = { label: block, credential: format };
-                  return;
-                }
-                const deep = deeper(bytes.toString('latin1'), diff);
-                if (deep) hit = { label: deep, credential: true };
-                else if (warn) warned.add(kind);
+                  try {
+                    if (typeof hitFingerprint === 'function') hit.fingerprint = hitFingerprint(bytes, block, files.get(bytes) ?? 'a file the patch makes', { diff });
+                  } catch {}
+                } else if (warn) warned.add(kind);
               };
               judge('the reply', reply);
               judge('the reply', turns);
@@ -2546,7 +3117,8 @@ jobs:
               judge('the verdict', verdict);
               judge('the outcome', outcome);
               judge('lane.json', lane);
-              judge('the patch', patch, undefined, true);
+              judge('the patch', patch, true);
+              judged = true;
               // A merge-base patch applies to a conflict tree only the apply job
               // rebuilds, so it is held to text hunks, whose every added byte
               // the text scan above read; a binary hunk blocks.
@@ -2561,6 +3133,7 @@ jobs:
               // not apply blocks. A missing or blank patch file is no patch: the
               // collector writes none for no change.
               if (!hit && TEXT_PATCH !== 'true' && patch && patch.toString('latin1').trim() !== '') {
+                binary = /^GIT binary patch$/m.test(patch.toString('latin1'));
                 const head = repo('head', true);
                 const apply = repo('apply', false);
                 apply(['index-pack', '--stdin'], head(['pack-objects', '--stdout', '-q'], head(['rev-list', '--objects', '--no-walk', HEAD_SHA])));
@@ -2570,24 +3143,28 @@ jobs:
                   apply(['apply', '--cached', '--binary', '-'], patch);
                   made = apply(['write-tree']).toString('latin1').trim();
                 } catch {
-                  hit = { label: 'the patch does not apply to the head', credential: false };
+                  hit = { label: 'the patch does not apply to the head', credential: false, fault: true };
                 }
-                const fields = made ? apply(['diff-tree', '-r', '-z', '--no-renames', HEAD_SHA, made]).toString('latin1').split('\0') : [];
-                for (let i = 0; i + 1 < fields.length; i += 2) {
-                  const [, mode, , sha] = fields[i].replace(/^:/, '').split(' ');
-                  judge('the patch', Buffer.from(fields[i + 1], 'latin1'));
-                  if (/^(100644|100755|120000)$/.test(mode)) judge('the patch', apply(['cat-file', 'blob', sha]));
-                }
+                if (made) for (const bytes of changedBytes(apply, HEAD_SHA, made)) judge('the patch', bytes);
               }
               if (!hit) {
                 for (const kind of warned) core.warning(`leak-scan: ${WARN_ONLY} in ${kind}; not blocking, check it is no real credential`);
               }
             } catch (error) {
-              hit = { label: `no finished scan (${error.name})`, credential: false };
+              // A throw after a hit never replaces it: the hit still holds.
+              hit ??= { label: `no finished scan (${error.name})`, credential: false, fault: true };
+            } finally {
+              if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
             }
             core.setOutput('clean', hit ? 'false' : 'true');
             if (hit) {
-              core.setFailed(`leak-scan: ${hit.label}; nothing is uploaded or summarized${hit.credential ? '\nrotate this credential' : ''}`);
+              if (hit.fault && !binary && (judged || !read(PATCH_FILE))) core.setOutput('refused', 'fault');
+              if (hit.fingerprint && process.env.GITHUB_STEP_SUMMARY) {
+                try {
+                  fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `### leak-scan blocked the outputs\n\n${hit.fingerprint}\n`);
+                } catch {}
+              }
+              core.setFailed(`leak-scan: ${hit.label}; nothing is uploaded, and the job summary gets only the rule, the scanned file name or a fixed placeholder, and the line, never any of the match${hit.credential ? '\nrotate this credential' : ''}`);
             }
 
       # After the scan: model text and run fields, as data, from the scan's
@@ -2638,7 +3215,7 @@ jobs:
           path: |
             ${{ steps.leak-scan.outputs.dir }}/reply.txt
             ${{ steps.leak-scan.outputs.dir }}/act-turns.json
-          retention-days: 7
+          retention-days: 3
           if-no-files-found: error
           overwrite: false
 
@@ -2649,7 +3226,7 @@ jobs:
         with:
           name: patch-${{ inputs.lane }}-${{ inputs.activity }}-${{ github.run_attempt }}${{ inputs.model-rung == '1' && '-rung-up' || '' }}
           path: ${{ steps.leak-scan.outputs.dir }}/patch.diff
-          retention-days: 7
+          retention-days: 3
           if-no-files-found: error
           overwrite: false
 
@@ -2677,7 +3254,7 @@ jobs:
         with:
           name: dependency-verdict-${{ inputs.lane }}-${{ inputs.activity }}-${{ github.run_attempt }}
           path: ${{ steps.leak-scan.outputs.dir }}/dependency-verdict.json
-          retention-days: 7
+          retention-days: 3
           if-no-files-found: error
           overwrite: false
 
@@ -2748,7 +3325,14 @@ jobs:
       # Only after every step above succeeded: a run that stopped before head
       # code skipped the scan and still posts its skip; a scan hit leaves no
       # verdict, which the report job reads as a failure.
+      - name: Scan the upload for credentials
+        id: scan-upload
+        env:
+          SCAN_PATHS: ${{ runner.temp }}/verdict/verdict.json
+        run: node "$RUNNER_TEMP/scan-gate/.github/actions/scan-upload/scan-upload.mjs"
+
       - name: Upload the verdict
+        if: steps.scan-upload.outputs.clean == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verdict-${{ inputs.lane }}-${{ inputs.activity }}-${{ github.run_attempt }}${{ inputs.model-rung == '1' && '-rung-up' || '' }}
@@ -2757,21 +3341,44 @@ jobs:
           if-no-files-found: error
           overwrite: false
 
-  # PR mode: the scan job's refusal, as an artifact a job that succeeds
-  # uploads. A failed scan fails the caller's job for this whole workflow, and
-  # no documentation says a failed job's outputs reach a workflow_call
-  # caller, so the reply and verdict jobs download this marker by name
-  # instead (address-feedback.mjs scanRefusal). The scan's own result decides
-  # it (a failed or cancelled scan published nothing); the scan's outputs
-  # only name an oversize patch. It reads nothing from the run job, so head
-  # code can only fail the scan or add a marker, either of which hands the
-  # round to a person. always(), since cancelled() is true once the scan was
+      # The hub's api-calls notice, in log-api-budget's shape, written here
+      # since this job holds the scan-carrier key and loads no other action
+      # from a checkout. Its only job-token calls are the two github-script
+      # steps' branch and content reads, each counted into its step's file
+      # before it is sent; a 5xx retry inside github-script is not, so the
+      # count is a floor.
+      - name: Log the API calls at the end
+        if: always()
+        continue-on-error: true
+        run: |
+          # No file: that step sent nothing, so 0 for it.
+          calls=0
+          for file in scan-stage-calls scan-leak-calls; do
+            n=0
+            [[ -f $RUNNER_TEMP/$file ]] && n=$(<"$RUNNER_TEMP/$file")
+            [[ $n =~ ^[0-9]{1,6}$ ]] || n=0
+            calls=$((calls + 10#$n))
+          done
+          echo "::notice title=api-calls::github-token=$calls not-modified=0 graphql=0"
+
+  # The scan job's refusal, as an artifact a job that succeeds uploads. A
+  # failed scan fails the caller's job for this whole workflow, and no
+  # documentation says a failed job's outputs reach a workflow_call caller,
+  # so the reply and verdict jobs download this marker by name instead
+  # (address-feedback.mjs scanRefusal), and in issue mode so does
+  # report-outcome, which names the refusal in the issue's hand-back. The
+  # scan's own result decides it (a failed or cancelled scan published
+  # nothing); the scan's outputs only name a refusal that retries, an oversize
+  # patch or a scan fault, and anything else writes `output`, which holds. It
+  # reads nothing from the run job, so head code can fail the scan, add a
+  # marker that hands the round to a person, or forge the carry step's clean
+  # scan and get the retry a clean oversize patch gets. always(), since
+  # cancelled() is true once the scan was
   # cancelled, and !cancelled() would skip that arm.
   scan-refusal:
     needs: scan
     if: >-
-      always() && inputs.issue-number == ''
-      && (needs.scan.result == 'failure' || needs.scan.result == 'cancelled')
+      always() && (needs.scan.result == 'failure' || needs.scan.result == 'cancelled')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -2779,7 +3386,7 @@ jobs:
     steps:
       - name: Write the scan refusal marker
         env:
-          REFUSED: ${{ needs.scan.outputs.refused == 'patch' && 'patch' || 'output' }}
+          REFUSED: ${{ needs.scan.outputs.refused == 'patch' && 'patch' || needs.scan.outputs.refused == 'fault' && 'fault' || 'output' }}
           MARKER: ${{ runner.temp }}/scan-refused/scan-refused-${{ github.run_attempt }}${{ inputs.model-rung == '1' && '-rung-up' || '' }}.txt
         run: |
           mkdir -p "$(dirname "$MARKER")"
@@ -2810,17 +3417,39 @@ jobs:
       && github.event.repository.default_branch != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    cache-mode: read
     permissions:
       contents: read
+    env:
+      API_BUDGET_TOKEN: github-token
+      npm_config_audit: "false"
+      npm_config_fetch_timeout: "60000"
+      npm_config_fund: "false"
+      # npm's fetch timeout and retries, from the one file that sets them.
+      npm_config_globalconfig: ${{ github.workspace }}/.base/.github/npm-fetch.npmrc
     steps:
+      - name: Resolve main's tip
+        id: tip
+        continue-on-error: true
+        env:
+          TIP_BRANCH: ${{ github.event.repository.default_branch }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
+              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
+            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
+            sleep "$((RANDOM % (2 * i + 1)))"
+          done
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
       # Code from the default branch tip the event names; the checked base
       # is only data the diff step fetches.
       - name: Check out the default branch tip
+        if: steps.tip.outputs.sha != ''
         id: base
         continue-on-error: true
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
 
@@ -2840,6 +3469,14 @@ jobs:
       # is unauthenticated, so it reads only a public repository. The data
       # sits under the workspace, since run-claude-cli's --restricted reads
       # nothing outside it.
+      # write-issue.mjs reads the Work status field events and config through
+      # resolve-config.mjs, whose packages the resolve-config action below
+      # installs only after this pass.
+      - name: Install resolve-config's packages for the summary pass
+        if: steps.node.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund --prefix .base/.github/actions/resolve-config
       - name: Write the reused branch's diff and issue for the summary pass
         id: summary-data
         if: steps.node.outcome == 'success'
@@ -2854,11 +3491,13 @@ jobs:
           ISSUE_FILE: ${{ github.workspace }}/.summary/issue.json
           TRUSTED_ACTORS_PATH: .base/.github/standards/trusted-actors/trusted-actors.json
           LANES_APP_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
-          LABEL_SENDER_ID: ${{ format('{0}', github.event.sender.id) }}
-          LABEL_NAME: ${{ github.event.label.name }}
-          LABEL_EVENT_AT: ${{ github.event.issue.updated_at }}
+          TRIGGER_SENDER_ID: ${{ format('{0}', github.event.sender.id) }}
+          TRIGGER_AT: ${{ github.event.issue.updated_at }}
+          CONFIG_PATH: ${{ inputs.config-path }}
         run: |
           export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+          ISSUE_LANE_WEB_HOSTS=$(yq -o=json -I=0 '(.activities."resolve-issue"."web-access" | select(.enabled == true) | .domains) // []' ".base/$CONFIG_PATH")
+          export ISSUE_LANE_WEB_HOSTS
           if ! [[ $ISSUE_NUMBER =~ ^[1-9][0-9]{0,9}$ ]] || ! [[ $BASE_SHA =~ ^[0-9a-f]{40}$ ]] ||
             ! [[ $REUSE_BRANCH =~ ^work-resolve-issue/issue-${ISSUE_NUMBER}-[1-9][0-9]*-[1-9][0-9]*$ ]]; then
             echo "::error::the summary pass needs this issue's lane branch and a base commit"
@@ -2938,7 +3577,7 @@ jobs:
         id: summary-settings
         if: steps.summary-prompt.outcome == 'success'
         continue-on-error: true
-        uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@d02b8697e092705153f0996549b05f95a446bb52 # v0.65.0
+        uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@2476d5dde8979eab34374150b7e4b0a2b99f4e88 # 2476d5d 2026-10-29
 
       - name: Isolate the runner
         id: isolate
@@ -2949,7 +3588,8 @@ jobs:
           install-subprocess-isolation: "true"
 
       # One launcher step per secret, as in the run job: the first call's
-      # pass runs on the API key, a fallback call's on the OAuth token. The
+      # pass runs on the API key, the second call's on the OAuth token and the
+      # third call's on the central fallback token. The
       # model reads the data files and nothing else: Read is its one tool,
       # and the default branch checkout and process files are denied.
       - name: Summarize the reused branch on the API key
@@ -2957,7 +3597,7 @@ jobs:
         if: steps.isolate.outcome == 'success' && inputs.fallback == ''
         continue-on-error: true
         timeout-minutes: 15
-        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@d02b8697e092705153f0996549b05f95a446bb52 # v0.65.0
+        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@b8bdd7fa2319b2457cbbef32c5348c394b9bc3f6 # b8bdd7f 2026-11-04
         env:
           CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
         with:
@@ -2980,10 +3620,10 @@ jobs:
 
       - name: Summarize the reused branch on the OAuth token
         id: summary-token
-        if: steps.isolate.outcome == 'success' && inputs.fallback != ''
+        if: steps.isolate.outcome == 'success' && inputs.fallback != '' && inputs.fallback != 'fallback'
         continue-on-error: true
         timeout-minutes: 15
-        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@d02b8697e092705153f0996549b05f95a446bb52 # v0.65.0
+        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@b8bdd7fa2319b2457cbbef32c5348c394b9bc3f6 # b8bdd7f 2026-11-04
         env:
           CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
         with:
@@ -3004,16 +3644,69 @@ jobs:
           json-schema-file: ${{ runner.temp }}/reuse-summary-schema.json
           leg-timeout-minutes: "10"
 
+      - name: Summarize the reused branch on the fallback token
+        id: summary-fallback
+        if: steps.isolate.outcome == 'success' && inputs.fallback == 'fallback'
+        continue-on-error: true
+        timeout-minutes: 15
+        uses: melodic-software/ci-workflows/.github/actions/run-claude-cli@b8bdd7fa2319b2457cbbef32c5348c394b9bc3f6 # b8bdd7f 2026-11-04
+        env:
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+        with:
+          lane: summarize-reuse
+          role: ${{ inputs.role }}
+          prompt-file: ${{ github.workspace }}/.summary/prompt.md
+          preamble: You run unattended as a CI lane's read-only summary pass, and no one can answer a question.
+          fallback-token: ${{ secrets.fallback-claude-code-oauth-token }}
+          model: ${{ steps.summary-models.outputs.model }}
+          effort: ${{ steps.summary-models.outputs.effort }}
+          max-turns: ${{ steps.summary-models.outputs.max-turns }}
+          permission-mode: dontAsk
+          tools: Read
+          allowed-tools: Read(./.summary/**)
+          disallowed-tools: |
+            Read(./.base/**)
+            Read(//proc/**)
+          json-schema-file: ${{ runner.temp }}/reuse-summary-schema.json
+          leg-timeout-minutes: "10"
+
+      # The leg's transcript, failed legs included, sealed to the transcript
+      # key and kept 7 days for the puller; a failed upload never fails the job.
+      - name: Upload the sealed transcript
+        if: always() && (steps.summary-key.outputs.execution-file || steps.summary-token.outputs.execution-file || steps.summary-fallback.outputs.execution-file) != ''
+        continue-on-error: true
+        uses: ./.base/.github/actions/upload-lane-transcript # zizmor: ignore[self-repository]
+        with:
+          execution-file: ${{ steps.summary-key.outputs.execution-file || steps.summary-token.outputs.execution-file || steps.summary-fallback.outputs.execution-file }}
+          public-key: ${{ vars.LANE_TRANSCRIPT_PUBLIC_KEY }}
+          job-id: reuse-summary-${{ inputs.issue-number }}-${{ inputs.fallback == '' && 'key' || inputs.fallback == 'fallback' && 'fallback' || 'token' }}
+
+      # The summary leg's lane-outcome record: its credential, outcome and
+      # durationMs.
+      - name: Record the summary leg
+        if: always() && (steps.summary-key.outcome != 'skipped' || steps.summary-token.outcome != 'skipped' || steps.summary-fallback.outcome != 'skipped')
+        continue-on-error: true
+        uses: melodic-software/ci-workflows/.github/actions/report-lane-outcome@6b9c640bf209c0c7e76f1111c5d18c96707348a2 # 6b9c640 2026-11-02
+        with:
+          outcome: ${{ steps.summary-key.outcome != 'skipped' && steps.summary-key.outcome || steps.summary-token.outcome != 'skipped' && steps.summary-token.outcome || steps.summary-fallback.outcome }}
+          execution-file: ${{ steps.summary-key.outputs.execution-file || steps.summary-token.outputs.execution-file || steps.summary-fallback.outputs.execution-file }}
+          log-file: ${{ steps.summary-key.outputs.log-file || steps.summary-token.outputs.log-file || steps.summary-fallback.outputs.log-file }}
+          lane: summarize-reuse
+          lane-id: summarize-reuse
+          credential: ${{ steps.summary-key.outputs.credential || steps.summary-token.outputs.credential || steps.summary-fallback.outputs.credential }}
+          known-failure-class: ${{ steps.summary-key.outputs.lane-class || steps.summary-token.outputs.lane-class || steps.summary-fallback.outputs.lane-class }}
+          max-turns: ${{ steps.summary-models.outputs.max-turns }}
+
       # The summary file: issue, branch and tip are runner values from before
       # the model ran; output is the launcher's structured output, model
       # text, parsed by jq (null when it does not parse). report-outcome uses
       # it only for the PR's title and body text.
       - name: Collect the reused branch's summary
         id: summary-collect
-        if: steps.summary-key.outcome == 'success' || steps.summary-token.outcome == 'success'
+        if: steps.summary-key.outcome == 'success' || steps.summary-token.outcome == 'success' || steps.summary-fallback.outcome == 'success'
         continue-on-error: true
         env:
-          OUTPUT_FILE: ${{ steps.summary-key.outputs.structured-output-file || steps.summary-token.outputs.structured-output-file }}
+          OUTPUT_FILE: ${{ steps.summary-key.outputs.structured-output-file || steps.summary-token.outputs.structured-output-file || steps.summary-fallback.outputs.structured-output-file }}
           ISSUE_NUMBER: ${{ inputs.issue-number }}
           REUSE_BRANCH: ${{ needs.issue-fields.outputs.reuse-branch }}
           TIP: ${{ steps.summary-data.outputs.tip }}
@@ -3029,8 +3722,18 @@ jobs:
             '{version: 1, issue: $issue, branch: $branch, tip: $tip, output: ($output | try fromjson catch null)}' \
             >"$OUT_DIR/reuse-summary.json"
 
+      - name: Scan the upload for credentials
+        id: scan-upload
+        if: >-
+          steps.summary-collect.outcome == 'success'
+        continue-on-error: true
+        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        with:
+          path: ${{ runner.temp }}/reuse-summary/reuse-summary.json
+
       - name: Upload the reused branch's summary
-        if: steps.summary-collect.outcome == 'success'
+        if: >-
+          (steps.summary-collect.outcome == 'success') && steps.scan-upload.outputs.clean == 'true'
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -3040,27 +3743,48 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
+      - name: Log the API budget at the end
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: ./.base/.github/actions/log-api-budget # zizmor: ignore[self-repository]
+        with:
+          tokens: github-token
+
   report:
-    needs: [broker-check, run, scan]
+    needs: [broker-check, run, issue-fields, scan, summary]
     # Fork PRs get a read-only GITHUB_TOKEN that cannot write checks, and the
     # lanes App's own pull_request events skip the run job. Issue mode has no
     # PR head to post a check on, and a run that handed off leaves the check
-    # to the caller's fallback call.
+    # to the caller's fallback call. In issue mode this job only ends the lane
+    # lease broker-check posted, whatever the other jobs' results, unless the
+    # caller ends it: in caller-releases-lease mode, a call that did not hand
+    # off and whose issue-fields job set issue-run-started or reuse-branch
+    # (the outputs the caller's report-outcome runs on) leaves it to the
+    # caller's write runner, and every other call releases it here.
     if: >-
-      always() && inputs.issue-number == '' && needs.run.outputs.handed-off != 'true'
+      always() && (inputs.issue-number == '' && needs.run.outputs.handed-off != 'true'
       && !(github.event_name == 'pull_request'
       && github.event.pull_request.head.repo.full_name != github.repository)
       && !(github.event_name == 'pull_request'
       && format('{0}', github.event.sender.id) == vars.AUTOMATION_LANES_APP_SENDER_ID)
+      || inputs.issue-number != '' && needs.broker-check.outputs.lease == 'held'
+      && needs.broker-check.outputs.lease-comment-id != ''
+      && !(inputs.caller-releases-lease && needs.run.outputs.handed-off != 'true'
+      && (needs.issue-fields.outputs.issue-run-started == 'true'
+      || needs.issue-fields.outputs.reuse-branch != '')))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # issues: write lets check-signed-commits add its label and comment. Every
-    # caller job grants it; no job that runs the model holds it.
+    # issues: write lets check-signed-commits add its label and comment, and
+    # in issue mode end the lane lease. Every caller job grants it; no job
+    # that runs the model holds it.
     permissions:
       checks: write
       contents: read
       issues: write
       pull-requests: read
+    env:
+      API_BUDGET_TOKEN: github-token
     steps:
       # The default branch tip, never the run job's base-sha or the event's
       # base SHA: a hostile run job could forge the one, and a PR into another
@@ -3075,15 +3799,29 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve main's tip
+        id: tip
+        env:
+          TIP_BRANCH: ${{ github.event.repository.default_branch }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
+              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
+            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
+            sleep "$((RANDOM % (2 * i + 1)))"
+          done
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+
       - name: Check out the default branch tip
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ steps.tip.outputs.sha }}
           path: .base
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Node
+        if: inputs.issue-number == ''
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
@@ -3093,6 +3831,7 @@ jobs:
       # already a failure, or a neutral superseded-sha on a cancel, in
       # report-check-run's decision.
       - name: Download the verdict
+        if: inputs.issue-number == ''
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -3105,15 +3844,25 @@ jobs:
       # failure.
       - name: Read the PR's current head SHA
         id: pr-head
-        if: always()
+        if: always() && inputs.issue-number == ''
         env:
           PR_NUMBER: ${{ inputs.pr-number || github.event.pull_request.number }}
           RUN_PR_NUMBER: ${{ needs.run.outputs.pr-number }}
           GH_TOKEN: ${{ github.token }}
+          READ_PR_FAILURE: warning
         run: |
+          # Each `gh api` call keeps its rate-limit reading for the job-end
+          # api-budget notice (.github/actions/log-api-budget).
+          # shellcheck source=/dev/null
+          { . .base/.github/actions/log-api-budget/api-budget.bash 2>/dev/null && api_budget_wrap_gh github-token; } || true
+          # read_pr_fields reads a transient fault once more and never a rate
+          # limit (outage posture element 1); a read that still fails warns and
+          # leaves the head empty.
+          # shellcheck source=/dev/null
+          . .base/.github/scripts/pr-unblock/read-pr-head.bash
           sha=""
-          if [[ $PR_NUMBER =~ ^[1-9][0-9]*$ ]]; then
-            sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha) || sha=""
+          if [[ $PR_NUMBER =~ ^[1-9][0-9]*$ ]] && read_pr_fields "$PR_NUMBER" .head.sha; then
+            sha=$pr_fields
           fi
           if ! [[ $sha =~ ^[0-9a-f]{40}$ ]]; then
             echo "No PR head SHA read"
@@ -3133,7 +3882,8 @@ jobs:
       # run head posts failure on it. Any other value or a mismatched PR
       # number posts failure on the trusted head, never on the run's SHA. With no trusted head nothing is posted
       # and the step fails. An empty run head (the run stopped before its
-      # trigger gate passed) never posts failure, which babysit would read as
+      # trigger gate passed, or the gate read a head other than the caller's,
+      # a supersede) never posts failure, which babysit would read as
       # a merge blocker: after the broker-check job's refusal, which includes
       # its own kill switch read (a trusted decision no run job output can
       # write, and one a switch flipped mid-run cannot change here), it keeps
@@ -3148,7 +3898,7 @@ jobs:
       # the fallback call posts that check.
       - name: Choose the head the check is posted on
         id: head
-        if: always()
+        if: always() && inputs.issue-number == ''
         env:
           RUN_HEAD: ${{ needs.run.outputs.head-sha }}
           CALLER_HEAD: ${{ inputs.head-sha }}
@@ -3156,6 +3906,7 @@ jobs:
           API_HEAD: ${{ steps.pr-head.outputs.sha }}
           PR_MISMATCH: ${{ steps.pr-head.outputs.pr-mismatch }}
           TRUSTED_SKIP: ${{ needs.broker-check.outputs.allowed != 'true' }}
+          BROKER_STOP: ${{ needs.broker-check.outputs.skip-reason == 'kill-switch' }}
           POST_DECLINE: ${{ inputs.post-decline }}
         run: |
           out() { printf 'post=true\nsha=%s\nforged=%s\n' "$1" "$2" >>"$GITHUB_OUTPUT"; }
@@ -3165,6 +3916,8 @@ jobs:
             valid "$gated" || gated=$EVENT_HEAD
             if [ "$TRUSTED_SKIP" = true ] || [ "$POST_DECLINE" = false ] || ! valid "$gated"; then
               out "" false
+              # The broker's kill-switch refusal skipped the run job: neutral.
+              if [ "$BROKER_STOP" = true ]; then echo "not-run-reason=kill-switch" >>"$GITHUB_OUTPUT"; fi
             else
               out "$gated" false
               echo "not-run-reason=not-assessed" >>"$GITHUB_OUTPUT"
@@ -3196,11 +3949,13 @@ jobs:
       - name: Check the lane's commits are signed
         id: signed
         if: >-
+          inputs.issue-number == '' && (
           always()
           && needs.run.outputs.can-commit == 'true'
           && steps.pr-head.outputs.number != ''
           && steps.head.outputs.sha != ''
           && steps.head.outputs.forged == 'false'
+          )
         uses: ./.base/.github/actions/check-signed-commits # zizmor: ignore[self-repository]
         with:
           pr-number: ${{ steps.pr-head.outputs.number }}
@@ -3211,16 +3966,20 @@ jobs:
       # the dispatch ref, which is not the PR's commit, so nothing is posted.
       - name: Note that no check is posted without a head SHA
         if: >-
+          inputs.issue-number == '' && (
           always() && github.event_name != 'pull_request'
           && steps.head.outputs.post == 'true' && steps.head.outputs.sha == ''
+          )
         run: echo "The run job gated no head SHA, so no check run is posted." >>"$GITHUB_STEP_SUMMARY"
 
       # A forged head or PR posts failure on the trusted head: the run result
       # reads failure and the head disagrees with the verdict's.
       - name: Post the check run
         if: >-
+          inputs.issue-number == '' && (
           always() && steps.head.outputs.post == 'true'
           && !(github.event_name != 'pull_request' && steps.head.outputs.sha == '')
+          )
         uses: ./.base/.github/actions/report-check-run # zizmor: ignore[self-repository]
         with:
           lane: ${{ inputs.lane }}
@@ -3238,6 +3997,13 @@ jobs:
           not-run-reason: ${{ steps.head.outputs.not-run-reason }}
           act-outcome: ${{ needs.run.outputs.act-outcome }}
           gate-reason: ${{ steps.head.outputs.forged != 'true' && needs.run.outputs.gate-reason || '' }}
+          lane-class: ${{ needs.run.outputs.record-class }}
+          lane-resets: ${{ needs.run.outputs.record-resets }}
+          lane-turns: ${{ needs.run.outputs.record-turns }}
+          lane-max-turns: ${{ needs.run.outputs.record-max-turns }}
+          lane-models: ${{ needs.run.outputs.record-models }}
+          lane-profile: ${{ needs.run.outputs.record-profile }}
+          lane-outcome: ${{ needs.run.outputs.record }}
           head-sha: ${{ steps.head.outputs.sha }}
           pr-head-sha: ${{ steps.pr-head.outputs.sha }}
           can-commit: ${{ needs.run.outputs.can-commit }}
@@ -3247,3 +4013,65 @@ jobs:
           base-path: .base
           head-sha-fallback: ${{ github.event.pull_request.head.sha || github.sha }}
           github-token: ${{ github.token }}
+
+      # Issue mode: the lease handle comes only from broker-check, which ran
+      # before any model turn. A failure warns and leaves the lease to expire
+      # at its TTL without failing the job.
+      - name: Release the lane lease
+        if: always() && inputs.issue-number != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue-number }}
+          HOLDER: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
+          LEASE_COMMENT_ID: ${{ needs.broker-check.outputs.lease-comment-id }}
+          TRACKER: .base/plugins/work-items/tools/work-item-tracker/work-item-tracker.sh
+          CLAUDE_PROJECT_DIR: ${{ github.workspace }}/.base
+        run: |
+          [[ $ISSUE_NUMBER =~ ^[1-9][0-9]*$ && $LEASE_COMMENT_ID =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::the issue number or lease comment id is not a positive integer"
+            exit 1
+          }
+          bash "$TRACKER" release "github:$REPO#$ISSUE_NUMBER" --lease-comment-id "$LEASE_COMMENT_ID" --holder "$HOLDER" || {
+            echo "::warning::could not release the lane lease on #$ISSUE_NUMBER; it expires at its TTL"
+            exit 1
+          }
+
+      # One comment per lane run on the PR (lane-run-report/post.mjs), found
+      # by a marker naming the activity, run id, model rung and leg, so a
+      # re-run edits it. A checked-out base without the script, or a failed
+      # post, warns and leaves the job green. A broker kill-switch refusal ran
+      # no lane, so it posts none.
+      - name: Post the lane run report comment
+        if: always() && needs.broker-check.outputs.skip-reason != 'kill-switch'
+        continue-on-error: true
+        env:
+          LANE: ${{ inputs.lane }}
+          ACTIVITY: ${{ inputs.activity }}
+          RUN_ID: ${{ github.run_id }}
+          MODEL_RUNG: ${{ inputs.model-rung }}
+          LEG: ${{ inputs.fallback }}
+          PULL: ${{ steps.pr-head.outputs.number }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_RESULT: ${{ needs.run.result }}
+          ACT_OUTCOME: ${{ needs.run.outputs.act-outcome }}
+          PUSHED_COMMIT: ''
+          READ_LANE: 'true'
+          API_FAILURES: ${{ needs.run.outputs.api-failures }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          script=.base/.github/scripts/lane-run-report/post.mjs
+          if [ ! -f "$script" ]; then
+            echo "::warning::the checked-out base has no lane run report script; no comment is posted"
+            exit 0
+          fi
+          node "$script"
+
+      - name: Log the API budget at the end
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: ./.base/.github/actions/log-api-budget # zizmor: ignore[self-repository]
+        with:
+          tokens: github-token

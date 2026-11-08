@@ -11,9 +11,21 @@ import { pathToFileURL } from "node:url";
 const WORKFLOWS = ".github/workflows";
 const READ_WORKFLOW = `${WORKFLOWS}/pr-run-activity-read.yml`;
 // The one job of the read workflow that may name id-token. It runs no PR head
-// code, so it may only check out the default branch tip.
+// code, so it may only check out the default branch tip: by name, or as the
+// SHA an unconditional tip step before it resolves from this repository's refs.
 const CHECK_JOB = "broker-check";
 const TIP_REF = "${{ github.event.repository.default_branch }}";
+const TIP_STEP_REF = "${{ steps.tip.outputs.sha }}";
+const TIP_BRANCHES = new Set(["main", TIP_REF]);
+const TIP_RUN = [
+  'until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |',
+  "    awk -v ref=\"refs/heads/$TIP_BRANCH\" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do",
+  '  ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }',
+  '  sleep "$((RANDOM % (2 * i + 1)))"',
+  "done",
+  'echo "sha=$sha" >>"$GITHUB_OUTPUT"',
+  "",
+].join("\n");
 const REPOSITORY = "melodic-software/claude-code-plugins";
 // A job-level `uses:` naming one of this repository's workflows, in local
 // (`./`) or remote (`owner/repo/...@ref`) form.
@@ -23,22 +35,40 @@ const WORKFLOW_USES = new RegExp(
 );
 const APP_KEY = /automation_lanes_app_private_key|app-private-key/i;
 const APP_KEY_INPUTS = new Set(["app-private-key", "private-key"]);
-// Secrets a read run may name, compared lower-cased with `-` read as `_`.
-// pr_unblock_claude_code_oauth_token is the pr-unblock role's Claude Code OAuth
-// token, the same kind of credential as claude_code_oauth_token under the
-// role's name; pr-unblock.yml's fix-ci-subscription read job runs on it.
-// claude_api_key, pr_unblock_claude_api_key and issue_lane_claude_api_key are
-// a role's Claude Console API key, which fix-ci's and resolve-issue's first
-// read jobs run on.
-const ALLOWED_SECRETS = new Set([
+// Secrets any file of a read run may name, compared lower-cased with `-` read
+// as `_`. claude_api_key is a Claude Console API key, which fix-ci's and
+// resolve-issue's first read jobs run on. fallback_claude_code_oauth_token is
+// the central fallback subscription's token, the same kind of credential for
+// every role: each lane's third read call runs on it, and its handoff job reads
+// whether it is set.
+const SHARED_SECRETS = new Set([
+  "fallback_claude_code_oauth_token",
   "claude_code_oauth_token",
-  "pr_unblock_claude_code_oauth_token",
-  "issue_lane_claude_code_oauth_token",
   "claude_api_key",
-  "pr_unblock_claude_api_key",
-  "issue_lane_claude_api_key",
   "github_token",
 ]);
+// A role's Claude Code OAuth token and Claude Console API key, the same kinds
+// of credential as claude_code_oauth_token and claude_api_key under the role's
+// name.
+const PR_UNBLOCK_SECRETS = new Set([
+  "pr_unblock_claude_code_oauth_token",
+  "pr_unblock_claude_api_key",
+]);
+const ISSUE_LANE_SECRETS = new Set([
+  "issue_lane_claude_code_oauth_token",
+  "issue_lane_claude_api_key",
+]);
+// By file name, every workflow whose run reaches the read workflow, mapped to
+// the role secrets it may name beside SHARED_SECRETS. A file of the run that
+// is not one of these workflows may name SHARED_SECRETS alone.
+const CALLER_SECRETS = new Map([
+  ["pr-refine.yml", PR_UNBLOCK_SECRETS],
+  ["pr-unblock.yml", PR_UNBLOCK_SECRETS],
+  ["work-resolve-issue.yml", ISSUE_LANE_SECRETS],
+]);
+const ROLE_SECRETS = new Set(
+  [...CALLER_SECRETS.values()].flatMap((names) => [...names]),
+);
 const KEY = "references the App key";
 // The one other secret a read run may name: the scan-carrier private key. In
 // the read workflow, only as the private-key input of the scan job's step that
@@ -142,6 +172,13 @@ if (!files.has(READ_WORKFLOW)) {
   // through every reusable workflow those runs call.
   callers = walk(READ_WORKFLOW, callersOf);
   callers.delete(READ_WORKFLOW);
+  for (const file of callers) {
+    if (!CALLER_SECRETS.has(path.basename(file))) {
+      offenders.push(
+        `${file}: its run reaches ${READ_WORKFLOW}, but CALLER_SECRETS in scripts/check-read-caller-keys.mjs has no entry for it`,
+      );
+    }
+  }
   for (const file of [READ_WORKFLOW, ...callers]) {
     for (const reached of walk(file, (f) => files.get(f)?.callees ?? [])) {
       runFiles.add(reached);
@@ -171,8 +208,10 @@ function expressions(text) {
 }
 
 // What an expression does with the secrets context that a read run may not.
-// carrier: the expression is the scan-carrier input's whole value.
-function secretFindings(expression, carrier = false) {
+// scope: the role secrets the file may name (own) and the finding for a role
+// secret outside them (outside). carrier: the expression is the scan-carrier
+// input's whole value.
+function secretFindings(expression, scope, carrier = false) {
   const code = expression.replace(/'(?:[^']|'')*'/g, "''");
   const findings = [];
   for (const match of code.matchAll(/(?<![\w.-])secrets\b/gi)) {
@@ -181,17 +220,20 @@ function secretFindings(expression, carrier = false) {
     const named = /^\s*\.\s*([A-Za-z_][\w-]*)/.exec(rest);
     if (named) {
       const name = named[1];
+      const normalized = name.toLowerCase().replaceAll("-", "_");
       if (APP_KEY.test(name)) {
         findings.push(KEY);
-      } else if (name.toLowerCase().replaceAll("-", "_") === CARRIER_SECRET) {
+      } else if (normalized === CARRIER_SECRET) {
         if (!carrier) {
           findings.push(
             `reads secrets.${name} outside the read workflow's ${CARRIER_JOB}-job open-lane-output private-key input and the ${CARRIER_INPUT} entry a read-workflow call passes`,
           );
         }
-      } else if (
-        !ALLOWED_SECRETS.has(name.toLowerCase().replaceAll("-", "_"))
-      ) {
+      } else if (ROLE_SECRETS.has(normalized)) {
+        if (!scope.own.has(normalized)) {
+          findings.push(`reads secrets.${name}, ${scope.outside}`);
+        }
+      } else if (!SHARED_SECRETS.has(normalized)) {
         findings.push(
           `reads secrets.${name}, which is not on the read-run allowlist`,
         );
@@ -273,6 +315,28 @@ function carrierPassesOf(doc) {
 
 const CHECKOUT_WITH = new Set(["ref", "path", "persist-credentials"]);
 
+// A checkout of the tip step's SHA is the default branch tip only when the step
+// is the canonical script on main or the default branch, and neither it nor the
+// checkout is conditional or may fail soft: an empty ref checks out the event's.
+function isTipCheckout(values, index) {
+  const checkout = values[index];
+  const tip = values.find((value) => value?.id === "tip");
+  const env = tip?.env ?? {};
+  return (
+    checkout.with?.ref === TIP_STEP_REF &&
+    values.indexOf(tip) !== -1 &&
+    values.indexOf(tip) < index &&
+    tip.uses === undefined &&
+    tip.run === TIP_RUN &&
+    Object.keys(env).sort().join() === "GIT_TERMINAL_PROMPT,TIP_BRANCH" &&
+    TIP_BRANCHES.has(env.TIP_BRANCH) &&
+    String(env.GIT_TERMINAL_PROMPT) === "0" &&
+    [tip, checkout].every(
+      (step) => step.if === undefined && step["continue-on-error"] === undefined,
+    )
+  );
+}
+
 // The read workflow's shape: an empty top-level grant, an explicit
 // permissions map on every job, and a broker-check job made of steps whose
 // checkouts can only fetch this repository's default branch tip.
@@ -306,8 +370,10 @@ function checkReadShape(file, doc, lineCounter) {
       `${file}:${lineOf(job)}: the ${CHECK_JOB} job must be steps, not a reusable-workflow call`,
     );
   }
-  for (const step of yaml.isSeq(steps) ? steps.items : []) {
-    const value = step?.toJSON?.();
+  const items = yaml.isSeq(steps) ? steps.items : [];
+  const values = items.map((step) => step?.toJSON?.());
+  for (const [index, step] of items.entries()) {
+    const value = values[index];
     if (
       typeof value?.uses !== "string" ||
       !/^actions\/checkout@/i.test(value.uses.trim())
@@ -316,7 +382,7 @@ function checkReadShape(file, doc, lineCounter) {
     }
     const withKeys = Object.keys(value.with ?? {});
     if (
-      value.with?.ref !== TIP_REF ||
+      (value.with?.ref !== TIP_REF && !isTipCheckout(values, index)) ||
       withKeys.some((key) => !CHECKOUT_WITH.has(key))
     ) {
       offenders.push(
@@ -331,6 +397,17 @@ function check(file) {
   const checkJob = checkJobOf(file, doc);
   const carrierPair = carrierPairOf(file, doc);
   const carrierPasses = carrierPassesOf(doc);
+  const name = path.basename(file);
+  const scope = callers.has(file)
+    ? {
+        own: CALLER_SECRETS.get(name) ?? new Set(),
+        outside: `which is in neither the shared read-run set nor ${name}'s CALLER_SECRETS entry`,
+      }
+    : {
+        own: new Set(),
+        outside:
+          "a role secret, which only a caller with that role in CALLER_SECRETS may name",
+      };
   const carrierEnvironment =
     file === READ_WORKFLOW
       ? doc.getIn(["jobs", CARRIER_JOB], true)?.get?.("environment", true)
@@ -419,7 +496,7 @@ function check(file) {
         const carrier =
           (node === carrierPair?.value && text === CARRIER_VALUE) ||
           carrierPasses.has(node);
-        for (const what of secretFindings(expression, carrier)) {
+        for (const what of secretFindings(expression, scope, carrier)) {
           report(lineAt(node, text, at), what);
         }
       }

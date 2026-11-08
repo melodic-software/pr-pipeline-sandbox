@@ -11,7 +11,7 @@ effort, turn budget) and the App token grant. The config's contract is the
 |---|---|---|
 | `lane` | empty | The lane, its workflow's file stem; required unless `model-route` is set |
 | `activity` | empty | The activity to select from the lane's slots |
-| `model-route` | empty | A run that is no lane activity (`verify-pr`, `review-code`, `review-security`, `triage-issue`, `summarize-reuse`, `adjudicate-feedback`): resolve only its models profile. Set it or `lane`, not both |
+| `model-route` | empty | A run that is no lane activity (`verify-pr`, `review-code`, `review-security`, `triage-issue`, `summarize-reuse`, `adjudicate-feedback`, and `resolve-issue` for the upkeep and release intake model jobs): resolve only its models profile. Set it or `lane`, not both |
 | `base-path` | `.base` | The base-SHA checkout; every config, schema and vocabulary read is under it |
 | `config-path` | `docs/conventions/pr-pipeline.yaml` | The config, relative to `base-path`; for test callers only |
 | `output-path` | required | Where the `ResolvedConfig` JSON file is written |
@@ -29,6 +29,20 @@ effect grants ([`effect-grants.json`](effect-grants.json)) and patch rules
 ([`patch-rules.json`](patch-rules.json), validated by
 [`patch-rules.schema.json`](patch-rules.schema.json)) ship in this folder, which a lane runs from its
 own base checkout.
+
+## Central lane grants
+
+[`lane-grants.json`](lane-grants.json) holds one row per repository the lanes token broker admits,
+keyed by repository id ([ADR 0085](../../../docs/adr/0085-run-org-lanes-from-ci-workflows-under-one-lanes-app-with-central-grants.md)
+Decision 2): `repository` (a label for readers; the id is the key), `lanes` (each lane the
+repository may run, mapping each activity to its effect, which `effect-grants.json` turns into
+permissions), `trusted-actors` (actors trusted in that repository beyond the trusted-actor list,
+in its `actors` entry shape) and `ci-workflows-commits` (the ci-workflows commits whose lane
+reusables may mint). A repository with no row, or a lane or activity missing from its row, gets no
+token. Today's rows reproduce what each repository's own configuration grants; this action does
+not read the file, and the broker reads it only after its one-time change (ADR 0085 Decision 7).
+No lane patch can change it or the trusted-actor list: every [patch rules](patch-rules.json) row
+refuses both (`lane-grants`).
 
 ## What it rejects
 
@@ -93,20 +107,29 @@ and mergeability all come from one response when its first read settles. A `labe
 predicate always reads labels from that response, never from the payload, so a hold added after
 the event still holds a queued run.
 
-On an `issues` event there is no PR: `labeled` maps to the `labeled` event, labels come from the
-issue in the payload (a `labels-absent` predicate reads `GET /issues/{n}` instead).
+On an `issues` event there is no PR: `labeled` and `field_added` map to the events of the same name,
+labels come from the issue in the payload (a `labels-absent` predicate reads `GET /issues/{n}`
+instead), and with `models.issue-status` set the trusted Work status is folded into them as
+`read-status.mjs` `statusLabels` does, so a field-only `agent-ready` matches `labels: [agent-ready]`.
 
 ## Output
 
 The file at `output-path` holds `version`, `source` (`base-path`, `config-path`), `lane` (name,
 stage, enabled, and every slot resolved), `selected` (the requested activity's slot, or null),
-`loop`, `limits` and `merge`. A slot whose activity sets `applied-by` carries it. Every default is applied: `scope` `diff`, `enabled` true, `loop` 2 and 3,
+`loop`, `review-threads`, `limits` and `merge`. A slot whose activity sets `applied-by` carries it. Every default is applied: `scope` `diff`, `enabled` true, `loop` 2 and 3,
+`review-threads.reviewer-ids` `[]`,
 the `limits` ([README, Limits](../../../docs/conventions/pr-pipeline/README.md#limits)),
 `merge.rung` `off`, `stack-landing` `manual`. A skill slot carries `models`: its profile name and
 that profile's `model`, `effort` (null when unset), `subagent-model` (`inherit` when unset) and
 `max-turns`, from its activity's route, else `models.default-profile`, else, with no `models`
-block, the built-in `standard` profile (model `default`, 75 turns); at input `model-rung` 1 the
-profile's `escalate-to` replaces it, one rung at most; a script slot carries `models`
+block, the built-in `standard` profile (model `opus`, 75 turns); a model outside `haiku`,
+`sonnet` and `opus` resolves to `opus`. That excludes the frontier aliases `fable` and `best` on
+purpose: the lanes run no frontier model until the owner sets a Fable allowance for them, and the
+schema refuses both on a profile (`pr-pipeline.schema.json`, `model` and `subagent-model`), so
+this rule catches a config that reached the resolver unchecked. The upstream alias list is
+[model-config, Model aliases](https://code.claude.com/docs/en/model-config#model-aliases), as of
+2026-10-31; recheck when an alias is added or retired. At input `model-rung` 1 the
+profile's `escalate-to` replaces that profile, one rung at most; a script slot carries `models`
 null. A skill slot with input `issue`, in a config with `models.issue-dimensions`, also carries
 `issue-dimensions` and `timeout-minutes`, and its `max-turns` is the dimensions' turn cap; its
 Complexity's `complexity-profiles` entry, when there is one, replaces the route's profile. The
@@ -116,8 +139,22 @@ earlier resolve read. A value counts only when its latest setter is a listed hum
 trusted-actor list or the lanes App, and a field with no counted value reads as small, medium or
 known; an option no entry maps fails the step (`unmapped-dimension`); an applying slot becomes
 `research-first`, `probe-first` or `split-required` in that order
-([README, Models](../../../docs/conventions/pr-pipeline/README.md#models)). A slot's `applies-when` replaces its activity's. `merge.diff-check.denied-paths` always
-gains the config path and the trusted-actor list.
+([README, Models](../../../docs/conventions/pr-pipeline/README.md#models)). `dimensions.mjs`
+reads them; beside it, `issue-status.mjs` collapses an issue's labels to its
+`models.issue-status` state and reads its Work status field under the same setter rule plus
+`bot-setters` for every state but agent-ready, failing on an option no entry maps
+(`unmapped-status`); no slot uses it yet. `resolve-config.mjs`'s `fieldEvents` reads an issue's
+field events with actor, time and values, and `fieldSetters` folds them to each field's latest
+setter. `write-status.mjs` holds the state writer (`statusWriter`, whose `set` and
+`leaveAgentReady` throw `StatusWriteError`). `read-status.mjs` hands the
+status-label readers outside resolve (the WIP cap, born-triaged, intake re-entry, the triage
+sweep, work-unblock) the issue's labels as that field decides them: a trusted field state replaces
+the queue labels, hold labels and agent-ready stay. An unset field leaves the labels, and so does
+an unset `models.issue-status`; a failed read, a read past the reader's limit, or a config that
+cannot be loaded throws `StatusReadError`. Its `statusEvents` adds the field's changes to the REST events as label events,
+and `resolve-config.mjs`'s `issuesByStatus` lists open issues by trusted field state, or by label
+where the field is unset. A slot's `applies-when` replaces its activity's. `merge.diff-check.denied-paths` resolves
+to the config's own list, with nothing added.
 
 The lane's slots are its leaves: each composite is replaced by its children, depth first in list
 order. A leaf is enabled only when the lane, every slot on its path and its own slot are; it must
@@ -153,12 +190,15 @@ Step outputs: `enabled` and `slots` (a JSON list of names); with `activity`, als
 only when the leaf sets it, and `issue-dimensions` and `timeout-minutes` only when the slot reads
 issue dimensions. `args` is free text and stays in the file.
 
-`claude-args` is `--model <alias>` unless the model is `default`, then `--max-turns <n>`, then
+`claude-args` is `--model <alias>`, then `--max-turns <n>`, then
 `--effort <level>` when the profile sets one; `settings-json` is
-`{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"<alias>"}}`, or empty for `inherit`. Both are built only
+`{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"<alias>"}}`, or empty for `inherit`, which upstream treats
+the same as unset. The variable is a default a spawn's `model` or an agent's frontmatter outranks:
+[sub-agents, Choose a model](https://code.claude.com/docs/en/sub-agents#choose-a-model), as of
+2026-10-31; recheck when that section changes the variable's rank or its `inherit` value.
+`claude-args` and `settings-json` are built only
 from schema enums and an integer, and the step fails on any other `claude-args` shape. `model` and
-`effort` are the same values for a caller on ci-workflows' `run-claude-cli`: `model` is the alias,
-or empty for `default`, which that action cannot pass, so such a caller fails on an empty `model`;
+`effort` are the same values for a caller on ci-workflows' `run-claude-cli`: `model` is the alias;
 `effort` is empty when the profile sets none. A script gets all six model outputs empty.
 
 With `model-route` the step resolves no lane: the file holds `version`, `source`, `route` and

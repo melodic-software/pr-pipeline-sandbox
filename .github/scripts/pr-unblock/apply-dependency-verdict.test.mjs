@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 
 import { apply, main, validateRun } from "./apply-dependency-verdict.mjs";
+import { escalationRoute, ROUTES, stopSkip } from "./escalation-routes.mjs";
+import { tempDir } from "../../../lib/test-tmp.mjs";
 
 const HEAD = "a".repeat(40);
 const FIX = "f".repeat(40);
@@ -13,6 +14,7 @@ const APP = 337595936;
 
 const output = (overrides = {}) => ({
   verdict: "merge",
+  owner_reason: "none",
   reasons: ["The major bump drops Node 18; this repository pins Node 24."],
   evidence: [".node-version:1"],
   ...overrides,
@@ -69,10 +71,9 @@ const lock = (version, resolved = `https://registry.npmjs.org/x/-/x-${version}.t
     null,
     2,
   );
-const plugin = (version, extra = {}) => JSON.stringify({ name: "p", version, ...extra }, null, 2);
 const reqs = (version, hash) => `numpy==${version} \\\n    --hash=sha256:${hash.repeat(64)}\n    # via onnxruntime\n`;
-const BEFORE = { "package.json": pkg("^1.0.0"), "package-lock.json": lock("1.0.0"), "requirements.txt": reqs("2.5.3", "a"), "plugin.json": plugin("1.0.0"), "CHANGELOG.md": "# Changelog\n" };
-const AFTER = { "package.json": pkg("^2.0.0"), "package-lock.json": lock("2.0.0"), "requirements.txt": reqs("2.5.4", "b"), "plugin.json": plugin("1.0.1"), "CHANGELOG.md": "# Changelog\n\n## 1.0.1\n" };
+const BEFORE = { "package.json": pkg("^1.0.0"), "package-lock.json": lock("1.0.0"), "requirements.txt": reqs("2.5.3", "a") };
+const AFTER = { "package.json": pkg("^2.0.0"), "package-lock.json": lock("2.0.0"), "requirements.txt": reqs("2.5.4", "b") };
 const nameOf = (path) => path.slice(path.lastIndexOf("/") + 1);
 
 // Dependabot's own commit: its account ids, web-flow, a valid signature.
@@ -95,9 +96,23 @@ const appCommit = (files, overrides = {}) => ({
   files,
 });
 
+// Each commit pushed on its own by its author, Dependabot's first creating the
+// branch, newest first as the activity API lists it.
+const pusherOf = (item) =>
+  item.commit?.author?.name === "dependabot[bot]"
+    ? { login: "dependabot[bot]", id: 49699333, type: "Bot" }
+    : item.author?.id === APP
+      ? { login: "lanes[bot]", id: APP, type: "Bot" }
+      : { login: "github-actions[bot]", id: 41898282, type: "Bot" };
+const pushedOneByOne = (commits) =>
+  commits
+    .map((item, i) => ({ activity_type: i ? "push" : "branch_creation", before: i ? commits[i - 1].sha : "0".repeat(40), after: item.sha, actor: pusherOf(item) }))
+    .reverse();
+
 // `texts` maps `${ref}:${path}` to a file's text, else BEFORE at HEAD and
 // AFTER anywhere else; `modes` maps a path to its tree entry, else a regular
-// file; `details` maps a sha to its commit with files.
+// file; `details` maps a sha to its commit with files; `activity` is the head
+// branch's push history.
 function fakeApi({
   head = HEAD,
   state = "open",
@@ -113,10 +128,11 @@ function fakeApi({
   texts = {},
   modes = {},
   config = CONFIG,
+  activity = pushedOneByOne(commits),
 } = {}) {
   // State persists across calls, so a second apply() is a re-run.
-  const calls = { comments: [], closed: [], issues: [] };
-  const pull = { number: 7, state, head: { sha: head }, commits: commits.length, labels: labels.map((name) => ({ name })), body, title: "bump x from 1.0.0 to 2.0.0" };
+  const calls = { comments: [], closed: [], issues: [], activity: [] };
+  const pull = { number: 7, state, head: { sha: head, ref: "dependabot/npm_and_yarn/x-2.0.0" }, commits: commits.length, labels: labels.map((name) => ({ name })), body, title: "bump x from 1.0.0 to 2.0.0" };
   const api = {
     calls,
     pull,
@@ -126,6 +142,10 @@ function fakeApi({
     compare: async () => compare,
     listPullFiles: async () => files,
     listPullCommits: async () => commits,
+    listActivity: async (ref) => {
+      calls.activity.push(ref);
+      return activity;
+    },
     getCommit: async (sha) => {
       if (!details[sha]) throw new Error(`GET commit ${sha} returned 404`);
       return details[sha];
@@ -158,7 +178,7 @@ function fakeApi({
     },
     createIssue: async (fields) => {
       calls.issues.push(fields);
-      const issue = { number: 99, user: { id: APP }, body: fields.body };
+      const issue = { number: 99, user: { id: APP }, body: fields.body, type: { name: fields.type } };
       issues.push(issue);
       return issue;
     },
@@ -181,6 +201,9 @@ test("validateRun accepts the runner's record and refuses anything off the templ
     runOf({ head_sha: "nope" }),
     runOf({ output: null }),
     runOf({ output: output({ verdict: "ship-it" }) }),
+    runOf({ output: output({ owner_reason: "risk" }) }),
+    runOf({ output: output({ owner_reason: "Intent" }) }),
+    runOf({ output: output({ owner_reason: null }) }),
     runOf({ output: output({ reasons: [] }) }),
     runOf({ output: output({ reasons: ["x".repeat(501)] }) }),
     runOf({ output: output({ reasons: ["ping @someone"] }) }),
@@ -201,6 +224,27 @@ test("validateRun accepts the runner's record and refuses anything off the templ
   ];
   for (const run of bad) {
     assert.throws(() => validateRun(run, 7), /invalid/i, JSON.stringify(run).slice(0, 120));
+  }
+});
+
+// A pin: the lookahead-free UNPLAIN_PATTERN must accept and refuse exactly
+// what the checks before it did, over every non-empty string of up to five
+// characters drawn from the ones that decide a mention or a fence.
+test("the plain-prose check refuses the same @-mentions and fences as the lookahead checks it replaced", () => {
+  const before = (text) =>
+    !/[\u0000-\u001f\u007f]/.test(text) && !/```|~~~|<!--|-->/.test(text) && !/(^|[^A-Za-z0-9`/])@[A-Za-z0-9](?![A-Za-z0-9._-]*\/)/.test(text);
+  const accepts = (text) => {
+    try {
+      validateRun(runOf({ output: output({ reasons: [text] }) }), 7);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  let texts = [""];
+  for (let length = 1; length <= 5; length++) {
+    texts = texts.flatMap((text) => [..."@a._-/` "].map((char) => text + char));
+    for (const text of texts) assert.equal(accepts(text), before(text), JSON.stringify(text));
   }
 });
 
@@ -302,6 +346,8 @@ test("close files the ignore issue, then closes the pull request", async () => {
   const result = await go(api, runOf({ output: output({ verdict: "close" }) }));
   assert.equal(result.escalationReason, "");
   assert.equal(api.calls.issues.length, 1);
+  assert.equal(api.calls.issues[0].title, "Decide whether dependabot.yml ignores the update closed in #7");
+  assert.equal(api.calls.issues[0].type, "Task");
   assert.match(api.calls.issues[0].body, /ignore:/);
   assert.match(api.calls.issues[0].body, /#7/);
   assert.deepEqual(api.calls.closed, [7]);
@@ -462,7 +508,7 @@ test("a merge verdict on a review-only dependency must quote each matched contro
   assert.equal((await go(two, runOf({ controls: [CONTROL, "docs/y.md#z"], output: cited }))).escalationReason, "dependency-control-uncited");
   // No control to cite: a merge stands, and a non-merge verdict is not checked.
   assert.equal((await go(fakeApi(), runOf())).escalationReason, "");
-  assert.equal((await go(fakeApi(), runOf({ controls: [CONTROL], output: output({ verdict: "escalate" }) }))).escalationReason, "dependency-escalate");
+  assert.equal((await go(fakeApi(), runOf({ controls: [CONTROL], output: output({ verdict: "escalate" }) }))).escalationReason, "dependency-escalate-none");
 });
 
 test("validateRun refuses a run.json without a list of controls", () => {
@@ -484,9 +530,33 @@ test("a security update is never closed: it escalates", async () => {
   assert.equal((await go(flagged, runOf({ security: true, output: output({ verdict: "close" }) }))).escalationReason, "dependency-security-close");
 });
 
-test("escalate hands the pull request to a person", async () => {
-  const api = fakeApi();
-  assert.equal((await go(api, runOf({ output: output({ verdict: "escalate" }) }))).escalationReason, "dependency-escalate");
+test("escalate with an owner reason holds for a person on a stop that carries that reason", async () => {
+  for (const code of ["intent", "design", "security", "cost"]) {
+    const result = await go(fakeApi(), runOf({ output: output({ verdict: "escalate", owner_reason: code }) }));
+    assert.equal(result.escalationReason, `dependency-escalate-${code}`, code);
+    // report-escalation.sh writes the stop-reason marker from the row's owner-reason.
+    assert.equal(escalationRoute(result.escalationReason), "hold", code);
+    assert.equal(ROUTES[result.escalationReason]["owner-reason"], code, code);
+  }
+});
+
+test("escalate with owner reason none goes to the session-builder queue, never to a person", async () => {
+  const env = mainFiles({ verdict: output({ verdict: "escalate", owner_reason: "none" }) });
+  const result = await outcome(env);
+  assert.equal(result.escalation, "dependency-escalate-none");
+  assert.equal(result.skip, stopSkip("dependency-escalate-none"));
+  assert.equal(result.skip, "lane-stopped");
+  assert.equal(escalationRoute("dependency-escalate-none"), "fail");
+  assert.equal(ROUTES["dependency-escalate-none"].label, "needs-session");
+  assert.equal(Object.hasOwn(ROUTES["dependency-escalate-none"], "owner-reason"), false);
+});
+
+test("a verdict without owner_reason is refused as invalid, so the lane acts on none of it", async () => {
+  const { owner_reason: _, ...missing } = output({ verdict: "escalate" });
+  assert.throws(() => validateRun(runOf({ output: missing }), 7), /fields are not the template's/);
+  const result = await outcome(mainFiles({ verdict: missing }));
+  assert.equal(result.escalation, "dependency-invalid");
+  assert.match(result.comments[0], /verdict=invalid/);
 });
 
 test("a pull request that is no longer open gets nothing", async () => {
@@ -506,7 +576,7 @@ test("a re-run that finds its own round marker posts nothing again", async () =>
 // job's dependency-verdict.json, each held to the SHA-256 its own job recorded.
 const sha256 = (text) => createHash("sha256").update(text).digest("hex");
 function mainFiles({ context = runOf(), verdict = output(), env = {} } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), "apply-dependency-"));
+  const dir = tempDir("apply-dependency-");
   const { output: _, ...fields } = context;
   const contextText = `${JSON.stringify(fields)}\n`;
   writeFileSync(join(dir, "context.json"), contextText);
@@ -575,7 +645,7 @@ test("main acts on a context and a verdict each matching the SHA-256 its job rec
 // head is still the select job's.
 // The scan-refusal job's marker, as the write runner downloads it.
 const marker = (kind) => {
-  const dir = mkdtempSync(join(tmpdir(), "scan-refused-"));
+  const dir = tempDir("scan-refused-");
   writeFileSync(join(dir, "scan-refused-1.txt"), `${kind}\n`);
   return { SCAN_REFUSED_DIR: dir, SCAN_REFUSED_READ: "success" };
 };
@@ -600,11 +670,13 @@ test("main counts a round with no verdict and skips no-model-turn only on the sc
     ["a marker download that failed", { SCAN_REFUSED_DIR: "/nonexistent", SCAN_REFUSED_READ: "failure" }, fakeApi(), "dependency-invalid"],
   ]) {
     const result = await outcome(mainFiles({ verdict: null, env }), api);
-    assert.deepEqual([result.escalation, result.skip], [want, "awaiting-human"], why);
+    // Both end in a failing status (lane-stopped): dependency-invalid for a
+    // same-head retry, dependency-fix-not-landed in the session-builder queue.
+    assert.deepEqual([result.escalation, result.skip], [want, "lane-stopped"], why);
     assert.equal(result.comments.length, 1, `${why}: the round counts`);
   }
   // An empty marker directory is no refusal.
-  const empty = mkdtempSync(join(tmpdir(), "scan-refused-"));
+  const empty = tempDir("scan-refused-");
   assert.deepEqual(Object.values(await outcome(mainFiles({ verdict: null, env: { SCAN_REFUSED_DIR: empty, SCAN_REFUSED_READ: "success" } }))).slice(0, 2), ["", "no-model-turn"]);
   // A scan output outside its closed set fails the job.
   await assert.rejects(main(mainFiles({ env: { DEPENDENCY_PATCH_STATE: "true" } }), { api: fakeApi(), log: () => {} }), /scan output/);
@@ -659,10 +731,49 @@ test("a merge verdict on a lanes App commit with a plain version bump in package
   const api = mergeWith([modified("package.json"), modified("package-lock.json")]);
   assert.deepEqual(await go(api, mergeRun()), { escalationReason: "", skipReason: "" });
   assert.match(api.calls.comments[0], /verdict=merge/);
+  assert.deepEqual(api.calls.activity, ["dependabot/npm_and_yarn/x-2.0.0"]);
 });
 
-test("a merge verdict admits the version-bump commit and refuses any other unproven commit", async () => {
-  const bump = {
+// The install-script pin commit apply-dependency-pin pushes, with no fix round
+// before it: the merge verdict at its head is marked when only that pin moved.
+const CLI = "@anthropic-ai/claude-code";
+const pinPkg = (pin) => JSON.stringify({ name: "p", devDependencies: { [CLI]: "2.1.317" }, allowScripts: { [`${CLI}@${pin}`]: true } }, null, 2);
+test("a merge verdict on a lanes App install-script pin commit is marked for merge; any other pin is refused", async () => {
+  const texts = (pin) => ({ [`${HEAD}:package.json`]: pinPkg("2.1.316"), [`${FIX}:package.json`]: pinPkg(pin) });
+  const api = mergeWith([modified("package.json")], { texts: texts("2.1.317") });
+  assert.deepEqual(await go(api, mergeRun()), { escalationReason: "", skipReason: "" });
+  assert.match(api.calls.comments[0], /verdict=merge/);
+  await refused(mergeWith([modified("package.json")], { texts: texts("2.1.318") }), "a pin the manifest does not name");
+  await refused(mergeWith([modified("package.json")], { texts: texts("*") }), "a wildcard pin");
+});
+
+test("a merge verdict escalates when the branch's push history is unreadable, and never marks a merge", async () => {
+  const files = [modified("package.json"), modified("package-lock.json")];
+  await refused(fakeApi({ head: FIX, commits: [dependabotCommit(HEAD), appCommit(files)], details: { [FIX]: appCommit(files) }, activity: null }), "listActivity resolved null");
+  const failing = mergeWith(files);
+  failing.listActivity = async () => {
+    throw new Error("the branch's push history runs past 20 pages");
+  };
+  await assert.rejects(go(failing, mergeRun()), /past 20 pages/);
+  assert.doesNotMatch(failing.calls.comments.join("\n"), /verdict=merge/);
+});
+
+test("a merge verdict on a lanes App push carrying a Dependabot-authored commit under its tip is refused", async () => {
+  const mid = "c".repeat(40);
+  const forged = { ...dependabotCommit(mid), parents: [{ sha: HEAD }] };
+  const app = { ...appCommit([modified("package.json")]), parents: [{ sha: mid }] };
+  const texts = { [`${mid}:package.json`]: BEFORE["package.json"] };
+  const branch = (activity) => fakeApi({ head: FIX, commits: [dependabotCommit(HEAD), forged, app], details: { [FIX]: app }, texts, activity });
+  const dependabot = { login: "dependabot[bot]", id: 49699333, type: "Bot" };
+  const lane = { login: "lanes[bot]", id: APP, type: "Bot" };
+  const created = { activity_type: "branch_creation", before: "0".repeat(40), after: HEAD, actor: dependabot };
+  await refused(branch([{ activity_type: "push", before: HEAD, after: FIX, actor: lane }, created]), "the App pushed Dependabot's commit");
+  const own = [{ activity_type: "push", before: mid, after: FIX, actor: lane }, { activity_type: "push", before: HEAD, after: mid, actor: dependabot }, created];
+  assert.equal((await go(branch(own), mergeRun())).escalationReason, "", "each commit in its own author's push");
+});
+
+test("a merge verdict refuses a github-actions[bot] commit, even one the fix rule passes, and any other unproven commit", async () => {
+  const actions = {
     sha: FIX,
     author: { id: 41898282 },
     committer: { id: 19864447 },
@@ -673,13 +784,9 @@ test("a merge verdict admits the version-bump commit and refuses any other unpro
       verification: { verified: true, reason: "valid" },
     },
     parents: [{ sha: HEAD }],
-    files: [modified("plugins/p/.claude-plugin/plugin.json"), modified("plugins/p/CHANGELOG.md")],
+    files: [modified("package.json"), modified("package-lock.json")],
   };
-  const ok = fakeApi({ head: FIX, commits: [dependabotCommit(HEAD), bump], details: { [FIX]: bump } });
-  assert.equal((await go(ok, mergeRun())).escalationReason, "", "the version-bump commit");
-  // A version-bump commit whose plugin.json gains anything but a version.
-  const hooks = { [`${FIX}:plugins/p/.claude-plugin/plugin.json`]: plugin("1.0.1", { hooks: { PreToolUse: [{ command: "node steal.js" }] } }) };
-  await refused(fakeApi({ head: FIX, commits: [dependabotCommit(HEAD), bump], details: { [FIX]: bump }, texts: hooks }), "a bump adding hooks");
+  await refused(fakeApi({ head: FIX, commits: [dependabotCommit(HEAD), actions], details: { [FIX]: actions } }), "a github-actions[bot] commit");
   // Dependabot's author text without its account ids is not Dependabot's.
   const text = { ...dependabotCommit(FIX), author: { id: 5 }, parents: [{ sha: HEAD }], files: [modified("src/x.js")] };
   await refused(fakeApi({ head: FIX, commits: [dependabotCommit(HEAD), text], details: { [FIX]: text } }), "Dependabot's text only");

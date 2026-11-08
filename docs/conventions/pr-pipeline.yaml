@@ -334,8 +334,9 @@ activities:
     reads-untrusted: true
     inputs: [issue]
     applies-when:
-      events: [labeled]
-      # The agent-ready label alone admits the issue, whoever added it; the
+      events: [field_added]
+      # Work status set to agent-ready admits the issue; it counts only when
+      # a listed human or the lanes App set it (models.issue-status); the
       # trigger gate checks that a listed human or the lanes App added it.
       # No `work-class:` label admits or refuses it. A person decides an
       # issue carrying one of these labels, so it starts nothing.
@@ -392,6 +393,18 @@ activities:
     # Reads PR bodies, labels and comments for holds.
     reads-untrusted: true
     inputs: [pr, head-sha]
+  enable-auto-merge:
+    # Turns on GitHub's native auto-merge (squash, at the head it read) for
+    # each open lanes App pull request into main that carries no hold, while
+    # the gate's lane has room, and turns it off on an armed one that now
+    # carries a hold. No model. The enable-auto-merge job of
+    # .github/workflows/pr-merge.yml runs it.
+    script: .github/scripts/pr-merge/enable-auto-merge.mjs
+    effect: merge
+    gating: advisory
+    # Reads PR bodies, labels and comments for holds.
+    reads-untrusted: true
+    inputs: [pr, head-sha]
   apply-conflict-patch:
     # Merges the base tip resolve-conflicts-select pinned into the head it
     # gated, applies resolve-conflicts's patch to the conflict tree, and
@@ -433,6 +446,41 @@ activities:
       # person with write access asked for.
       labels-absent: [do-not-merge]
       draft: [false]
+  resolve-feedback-threads:
+    # main's activity, disabled here: this repository's grant row holds no
+    # grant for it, so a disabled slot keeps pr-unblock.yml's write job a clean
+    # skip on a person's pull request instead of a mint failure.
+    script: .github/scripts/pr-unblock/resolve-threads.mjs
+    effect: mutate-branch
+    checkout: base
+    gating: advisory
+    reads-untrusted: true
+    inputs: [pr]
+    applies-when:
+      labels-absent: [do-not-merge, "security: outside-actor"]
+      draft: [false]
+  sync-shared-copies:
+    # main's activity, disabled here: this repository registers no shared copies
+    # (scripts/shared-copies.txt holds comments only) and has no grant for it.
+    script: .github/scripts/pr-unblock/sync-shared-copies.sh
+    effect: read
+    gating: advisory
+    reads-untrusted: true
+    inputs: [pr, base-sha, head-sha]
+    applies-when:
+      labels-absent: [do-not-merge, "security: outside-actor"]
+      draft: [false]
+  apply-shared-copies:
+    # Paired with sync-shared-copies, disabled here for the same reason.
+    script: .github/scripts/apply-patch/apply-patch.mjs
+    prepare: apply-patch
+    effect: mutate-branch
+    gating: advisory
+    reads-untrusted: true
+    inputs: [pr, head-sha, base-sha]
+    applies-when:
+      labels-absent: [do-not-merge, "security: outside-actor"]
+      draft: [false]
   apply-dependency-patch:
     # Applies review-dependency's patch, on a fix verdict only, to the head
     # the select job gated and pushes it as one commit with [dependabot skip],
@@ -459,6 +507,8 @@ lanes:
     stage: merge
     slots:
       - activity: merge-pr
+      # In its own job of pr-merge.yml, with its own token.
+      - activity: enable-auto-merge
   work-resolve-issue:
     stage: work
     slots:
@@ -488,6 +538,9 @@ lanes:
         needs: [address-feedback]
       - activity: publish-feedback
         needs: [address-feedback, apply-feedback-patch]
+      # Disabled here: this repository has no grant for it.
+      - activity: resolve-feedback-threads
+        enabled: false
       # Started by pr-unblock-dispatch.yml for review-tier Dependabot PRs.
       - activity: review-dependency
       # Run after review-dependency, each in its own job with its own token:
@@ -502,6 +555,12 @@ lanes:
       # Runs after fix-ci, in its own job with its own token.
       - activity: apply-patch
         needs: [fix-ci]
+      # Disabled here: no shared copies are registered and no grant is held.
+      - activity: sync-shared-copies
+        enabled: false
+      - activity: apply-shared-copies
+        enabled: false
+        needs: [sync-shared-copies]
       # Hands the pull request to a person when any of the others escalates.
       - activity: report-escalation
         needs: [resolve-conflicts, apply-conflict-patch, address-feedback, publish-feedback, review-dependency, apply-dependency-verdict, fix-ci, apply-patch]
@@ -543,20 +602,21 @@ lanes:
       - activity: review-gate
       - activity: audit-env
 
-# The version 1 activities' max-turns, as profiles (schema version 2).
+# The version 1 activities' max-turns, as profiles (schema version 2). The
+# schema admits no `default` model; the config reader resolved it to opus.
 models:
   profiles:
     standard:
-      model: default
+      model: opus
       max-turns: 75
     turns-10:
-      model: default
+      model: opus
       max-turns: 10
     turns-6:
-      model: default
+      model: opus
       max-turns: 6
     turns-5:
-      model: default
+      model: opus
       max-turns: 5
     # main's fix-ci profile: a worker on code at the verifier's effort, from
     # the multi-agent role map.
@@ -665,6 +725,69 @@ models:
       knowable: run
       # Only an experiment answers it: skip until a probe has (probe-first).
       unknown: probe-first
+  # Sandbox: main's models.issue-status block unchanged (the org-level Work
+  # status field, visibility all), so this repository's work-resolve-issue.yml
+  # starts on the same `field_added` event as main's.
+  issue-status:
+    field-id: 48484079
+    bot-setters:
+      - id: 41898282
+        login: "github-actions[bot]"
+      - id: 300666570
+        login: "melodic-standards-sync[bot]"
+      - id: 288071998
+        login: "melodic-ai[bot]"
+      - id: 296023097
+        login: "melodic-software-github-iac[bot]"
+      - id: 300690090
+        login: "melodic-ci-runner-host[bot]"
+      - id: 302525172
+        login: "melodic-ci-runner-observer[bot]"
+      - id: 315045210
+        login: "melodic-claude-lanes-repin[bot]"
+      - id: 337859524
+        login: "melodic-release[bot]"
+    field-events-since: "2026-11-07T09:45:00Z"
+    options:
+      "84879216": needs-triage
+      "84879217": needs-reporter-info
+      "84879218": needs-owner-decision
+      "84879219": needs-spec
+      "84879220": agent-ready
+      "86380002": confirmed
+      "86380003": ready
+      "86380004": deferred
+      "86380005": needs-human
+    labels:
+      needs-triage:
+        - needs-triage
+      needs-reporter-info:
+        - "status: needs-info"
+      needs-owner-decision:
+        - "status: needs-decision"
+        - needs-owner-decision
+      needs-spec:
+        - needs-spec
+      agent-ready:
+        - agent-ready
+      confirmed:
+        - "status: confirmed"
+      ready:
+        - "status: ready"
+      deferred:
+        - admission-deferred
+      needs-human:
+        - needs-human
+    order:
+      - needs-human
+      - needs-owner-decision
+      - needs-spec
+      - needs-reporter-info
+      - agent-ready
+      - deferred
+      - ready
+      - confirmed
+      - needs-triage
 
 # Sandbox: main's limits block, so a turn cap keeps agent-ready and resumes.
 limits:
@@ -713,8 +836,13 @@ merge:
   # Sandbox only: live, so the pr-merge cases really enqueue. Main stays
   # report-only until the owner flips it.
   report-only: false
-  # Schema version 2 requires it at a rung above off. The sandbox's pr-merge
-  # gate predates the verifier verdict and does not read it.
+  # Sandbox: the merge job lists, scores and enqueues the lanes App's pull
+  # requests too (gate), as this repository's lane did before the upstream
+  # pr-merge.yml sync; main's native auto-merge path also relies on main's
+  # ci-status reading the pr-verify verdict in the merge queue, which this
+  # repository's pr-require-checks.yml does not. The enable-auto-merge job
+  # still arms them in both modes.
+  lane-prs: gate
   require-verifier-verdict: true
   diff-check:
     denied-paths:

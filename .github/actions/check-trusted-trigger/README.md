@@ -22,12 +22,16 @@ condition 1 and the actor and author parts of condition 2).
 | `dispatcher-workflow` | empty | The workflow path that run must have; empty stops every dispatcher-sent run |
 | `run-dispatcher-workflow` | empty | The workflow path a dispatcher run started by `workflow_run` must have; empty stops every such run |
 | `run-dispatcher-upstreams` | empty | Space-separated workflow paths that dispatcher's upstream run may have; empty stops every such run |
+| `run-dispatcher-relay` | empty | The workflow path of a review-comment relay that dispatcher's upstream run may have instead; empty accepts no relay |
 | `expected-upstream-head` | empty | For a job after pr-unblock's model job, the head that job gated; set on any path but a `workflow_run` dispatcher, it stops the run |
-| `lanes-app-id` | empty | The lanes App bot's user id: an upstream it started vouches, and only its commits may follow `expected-upstream-head` |
+| `pushed-commit` | empty | With `expected-upstream-head`, the commit apply-feedback-patch pushed onto it, the one other head the PR may be at; set without it, or not a lowercase SHA, it stops the run |
+| `lanes-app-id` | empty | The lanes App bot's user id: an upstream it started vouches |
 | `dispatched-workflow` | empty | The workflow path this dispatched run must have; empty stops every dispatcher-sent run |
 | `require-pr` | `true` | `false` checks only the actors and reads no PR |
 | `require-kind` | empty | `human` narrows the actor-only checks to actors listed as `kind: human` |
 | `app-label` | empty | With `require-kind: human`, the one label the lanes App may apply to an issue to start the lane |
+| `app-field-id`, `app-field-option` | empty | With `require-kind: human`, the issue field and single-select option the lanes App may set (`field_added`) to start the lane; both or neither |
+| `fault-reason` | empty | `true` writes reason `read-fault` for a stop that a read GitHub failed to answer caused (a 5xx or 429, a rate-guard stop, or no answer); `proceed` stays `false`, and a refusal on an answer GitHub gave keeps its reason |
 | `reconciler-workflow` | empty | The lost-run reconciler's workflow path: a `github-actions[bot]` re-run proceeds only as its recorded re-run; empty stops every such re-run |
 
 ## Rules
@@ -42,7 +46,9 @@ condition 1 and the actor and author parts of condition 2).
   after 5, 10, 20 and 25 s until its `head.sha` equals its branch ref; if they never agree, or
   the branch ref is missing, the lane stops with `head-lag` rather than gate a stale head, which
   `report-check-run` posts as a `superseded-sha` skip, since the push that moved the branch is
-  gated by its own run; a failed read stops with `no-pr`. A fork's ref is not read.
+  gated by its own run. When that skip lands on the PR's current head instead, the
+  address-feedback tick sends the round once more (`feedback-dispatch.mjs` `sweepRefused`); a
+  failed read stops with `no-pr`. A fork's ref is not read.
 - **Dispatcher-sent `workflow_dispatch`.** A dispatch made with `GITHUB_TOKEN` names
   `github-actions[bot]` (id 41898282) as sender, actor and triggering actor, and nothing on the
   run names who started the dispatcher. When `sender.id` is 41898282 and `dispatcher-run-id` is
@@ -52,7 +58,8 @@ condition 1 and the actor and author parts of condition 2).
     through `GET /actions/runs/{github.run_id}`, has `path` equal to `dispatched-workflow` and
     `event` `workflow_dispatch`;
   - its `repository` is this repository and its `path` equals `dispatcher-workflow`;
-  - its `head_branch` is the default branch, and no tag has that name
+  - its `head_branch` is the default branch (a `pull_request_target` dispatcher: see below), and
+    no tag has that name
     (`GET /git/ref/tags/{default branch}` answers 404), so the name cannot stand for a tag;
   - its `head_sha` is an ancestor of the branch tip: the tip SHA is resolved once through
     `GET /git/ref/heads/{default branch}`, and `GET /compare/{head_sha}...{tip SHA}` reports
@@ -82,11 +89,40 @@ condition 1 and the actor and author parts of condition 2).
     listed in `run-dispatcher-upstreams`, `event` `pull_request`, `repository` and
     `head_repository` both this repository, an `actor` and `triggering_actor` that are the lanes
     App (`lanes-app-id`) or a listed human, and `head_sha` equal to the PR's current head. With
-    `expected-upstream-head`, `head_sha` must equal it instead, and every commit of
-    `GET /compare/<it>...<PR head>` (status `ahead`, untruncated) must have the lanes App as
-    `author`, `web-flow` as `committer`, a `valid` verified signature, and a committer date no
-    earlier than this run's creation: a commit GitHub signed for an App token during this run. A
-    human, foreign, unsigned or older commit stops the run. It does not prove which lane made it.
+    `expected-upstream-head`, `head_sha` must equal it instead, and the PR head must be it or
+    `pushed-commit`, the commit this run's apply-feedback-patch job pushed. Any other head stops
+    the run, a verified lanes App commit included: a signature proves an App token made a commit,
+    not that this run's push job did.
+  - an upstream whose `path` equals `run-dispatcher-relay` (`pr-review-comment-relay.yml`, which a
+    person's new review comment starts) is accepted in place of a review run when its `event` is
+    `pull_request_review_comment`, its `pull_requests` name the PR (an empty list stops the run),
+    and its `actor` and `triggering_actor` are both listed humans; the lanes App never vouches for
+    it. The repository and head checks above apply unchanged. The relay's `GITHUB_REF` is the
+    PR's merge ref, so its file is treated as PR-controlled and only these run facts, which GitHub
+    sets, are trusted ([ADR 0088](../../../docs/adr/0088-relay-a-listed-humans-review-comment-to-the-feedback-dispatcher.md)).
+
+  A dispatcher run whose `event` is `pull_request_target` reports the PR's branch and head as
+  `head_branch` and `head_sha`, so it is checked the same way, except:
+  - this run's `path` must be `.github/workflows/pr-refine.yml`, whatever `dispatched-workflow`
+    says;
+  - its `head_repository` is this repository, and in place of the branch check one entry of its
+    `pull_requests` has this PR's `number`, `base.ref` the default branch, `base.repo.id` and
+    `head.repo.id` this repository's id, and `head.ref` equal to its `head_branch` (an empty list
+    stops the run; the entry's head SHA is not compared);
+  - its `actor` and `triggering_actor` are each the lanes App (`lanes-app-id`) or a listed human,
+    and a re-run attempt still needs a listed human;
+  - its record is named `pr-unblock-target-dispatched-<40-hex commit>-<this run's id>`, and the
+    tag and ancestry checks read that commit, read after the record, in place of `head_sha`.
+    Since 2025-12-08 a `pull_request_target` run takes its workflow file and checkout commit
+    from the default branch, so only that branch's dispatcher can upload the record
+    ([ADR 0090](../../../docs/adr/0090-let-a-pull-request-target-dispatcher-start-pr-refine.md)).
+
+  Each record name is read only for its own dispatcher event.
+
+  Feedback dispatch stays person-only: a `pr-feedback-dispatch.yml` run re-run by
+  `github-actions[bot]` fails the `kind: human` re-runner rule above, so the lost-run reconciler
+  never re-runs one. The half-hourly sweep in `.github/scripts/pr-unblock/feedback-dispatch.mjs`
+  recovers a run an outage lost with a fresh attempt-1 run, which this check already trusts.
 
   The record can land after this run's gate starts, so the gate waits for it. Each read takes the
   dispatcher run's `status` first, then its artifacts, so an upload between the two reads is not
@@ -118,12 +154,14 @@ condition 1 and the actor and author parts of condition 2).
   re-runner below. With `require-kind: human`, the
   sender and the re-runner must be listed as `kind: human`. Any `require-pr` value other than `true` or `false`, or `require-kind` value other
   than empty or `human`, stops with `no-pr`.
-- **App label (`app-label`).** On an `issues` event with `require-kind: human` whose sender is
-  `lanes-app-id`, the label event must be `labeled` with exactly that label, or it stops with
-  `bot-actor`; the label alone admits the issue, and no comment or edit history is read. An
-  event with no issue number stops with `untrusted-actor`. The re-runner, read as below, must be
-  the App (its id listed) or a listed human, not denied, or it stops with `untrusted-rerunner`. Empty keeps the App denied on
-  every event.
+- **App label or field (`app-label`, `app-field-id` and `app-field-option`).** On an `issues`
+  event with `require-kind: human` whose sender is `lanes-app-id`, the event must be `labeled`
+  with exactly `app-label`, or `field_added` setting field `app-field-id` to option
+  `app-field-option`, or it stops with `bot-actor`; that event alone admits the issue, and no
+  comment or edit history is read. An event with no issue number stops with `untrusted-actor`.
+  The re-runner, read as below, must be the App (its id listed) or a listed human, not denied,
+  or it stops with `untrusted-rerunner`. With `app-label` empty and the field pair unset (either
+  id empty or not a positive integer), the App is denied on every event.
 - **`workflow_run`.** Same repository when `workflow_run.head_repository.full_name` equals the
   repository. The PR is looked up from the run's head SHA, because `pull_requests` is empty for
   more than forks: exactly one open same-repository PR whose head is still that SHA, or `no-pr`.
@@ -143,12 +181,13 @@ condition 1 and the actor and author parts of condition 2).
   check is replaced by a check of the lost-run reconciler's record; the event's actors and the PR
   author are still checked as above. It proceeds only when every one of these holds, and any
   failed read or condition stops with `untrusted-rerunner`:
-  - `github-actions[bot]` (41898282) is not in `denied-actor-ids`, `GITHUB_RUN_ATTEMPT` is `2`,
+  - `github-actions[bot]` (41898282) is not in `denied-actor-ids`, `GITHUB_RUN_ATTEMPT` is `2`
+    or `3` (`RECONCILER_ATTEMPT_CAP` in `check-trusted-trigger.mjs`, owner decision Q-RERUN3),
     and the payload names the repository's default branch;
-  - this run's attempt 2, read through `GET /actions/runs/{github.run_id}/attempts/2`, has that
+  - this run's attempt, read through `GET /actions/runs/{github.run_id}/attempts/{attempt}`, has that
     `id` and `run_attempt`, `triggering_actor.id` 41898282, this repository, a 40-hex `head_sha`
     and a `run_started_at`;
-  - `GET /actions/artifacts?name=reconcile-rerun-<run id>-2-<head_sha>&per_page=100`, up to ten
+  - `GET /actions/artifacts?name=reconcile-rerun-<run id>-<attempt>-<head_sha>&per_page=100`, up to ten
     pages, lists an
     artifact with exactly that name, `expired` `false`, and a `created_at` no later than the
     attempt's `run_started_at`, whose `workflow_run.id` names a run that has that `id`, this
@@ -169,20 +208,23 @@ condition 1 and the actor and author parts of condition 2).
   after 5 s and then refused.
 
   The same record vouches for the upstream run on the `workflow_run` path. When
-  `reconciler-workflow` is set, `workflow_run.run_attempt` is `2` and
+  `reconciler-workflow` is set, `workflow_run.run_attempt` is `2` or `3` and
   `workflow_run.triggering_actor.id` is 41898282, that actor need not be listed; `sender` and
   `workflow_run.actor` still must be. Every check above then runs against the upstream run,
   `workflow_run.id` in place of `github.run_id`, and any failure stops with `untrusted-actor`.
-  The reconciler records each re-run that makes attempt 2 of a CI run this lane runs after. A
-  github-actions[bot] upstream at any other attempt, or with no record, stops with
+  The reconciler records each re-run that makes attempt 2 of a CI run this lane runs after, and
+  re-runs a passed `pr-require-checks` run whose spec changed after its pass at attempt 2 too,
+  recorded as attempt 3. A github-actions[bot] upstream at any other attempt, or with no record
+  naming its attempt, stops with
   `untrusted-actor`. This run's own re-runner is then checked as above.
 
   `ci-status-rerun-workflow` adds a second recorder for the upstream run only:
   `pr-feedback-dispatch.yml`'s `rerun-ci-status` job, which uploads
   `rerun-ci-status-<run id>-<attempt>-<head_sha>` immediately before it re-runs a ci-status job,
-  naming the attempt that re-run starts. A github-actions[bot] upstream at attempt 2 or later is
-  checked as above against `GET /actions/runs/{id}/attempts/{attempt}` and that name (at attempt 2
-  the reconciler's name is read first), except that the recording run's `event` must be
+  naming the attempt that re-run starts. Its upstream is a completed review run or a completed
+  `pr-review-approved.yml` relay of an approval by a listed human. A github-actions[bot] upstream at attempt 2 or later is
+  checked as above against `GET /actions/runs/{id}/attempts/{attempt}` and that name (at attempts 2
+  and 3 the reconciler's name is read first), except that the recording run's `event` must be
   `workflow_run` and its `actor` is not checked, since such a run runs the default branch's file,
   and the window runs from the record: the run started no later than the artifact's `created_at`,
   and the attempt started at most ten minutes after it. The job can poll for ten minutes before
@@ -194,9 +236,14 @@ condition 1 and the actor and author parts of condition 2).
   re-run, or within ten minutes of an upload whose re-run then failed, takes that attempt and is
   vouched for; that includes a same-repository PR branch's workflow granted `actions: write`. It
   re-runs only that run at that head, and `sender`, `workflow_run.actor` and the PR author must
-  still be listed. The recorder records only when the review run that started it is at attempt 1
-  or was re-run by an actor listed as `kind: human` in the default branch's list; another
-  re-runner's re-run of ci-status goes ahead unrecorded and is refused here. This check does not
+  still be listed. The recorder records only when the review run that started it is at attempt 1,
+  was re-run by an actor listed as `kind: human` in the default branch's list, or is the lost-run
+  reconciler's attempt 2 whose `reconcile-rerun-<run id>-2-<head_sha>` record passes the
+  reconciler re-run check above, at attempt 2 only, as the reconciler re-runs a review once (`reconcilerRecordVouches`, run through
+  `reconciler-record.mjs`); another re-runner's re-run of ci-status goes ahead unrecorded and is
+  refused here. A relay
+  upstream is recorded only at attempt 1, whose triggering actor is the reviewer, a listed human;
+  a relay re-run re-runs nothing. This check does not
   repeat that one: the record's listing names neither the review run nor its re-runner.
 
   Residuals: whether one run can write another run's artifacts is unverified, as for the
@@ -238,7 +285,7 @@ that cannot stops it with `untrusted-rerunner`.
 | Output | Values |
 |---|---|
 | `proceed` | `true` or `false` |
-| `reason` | `ok`, `fork`, `no-pr`, `head-lag`, `untrusted-base`, `bot-actor`, `untrusted-actor`, `untrusted-rerunner`, `untrusted-author`, `list-unreadable` |
+| `reason` | `ok`, `fork`, `no-pr`, `head-lag`, `untrusted-base`, `bot-actor`, `untrusted-actor`, `untrusted-rerunner`, `untrusted-author`, `list-unreadable`, or `read-fault` with `fault-reason: true` |
 | `pr-number`, `head-ref`, `head-sha`, `base-sha` | The resolved PR; empty unless `proceed` is `true` |
 
 Reasons are checked in the order list and denied ids, event and PR, head lag, fork, base, denied actor, actor,

@@ -3,12 +3,13 @@ import { test } from "node:test";
 
 import { createRateLimitLatch } from "../../actions/log-api-budget/rate-guard.mjs";
 import { budgetedFetch } from "./request-budget.mjs";
+import { tempDir } from "../../../lib/test-tmp.mjs";
 
-// Each test gets its own latch on its own clock, so one test's limit neither
-// stops the next nor fails this process.
-const budgeted = (options) =>
+// Each test gets its own latch on its own clock and log, so one test's limit
+// neither stops the next nor fails this process; `fail` sees the latch fail the step.
+const budgeted = ({ fail = () => {}, ...options }) =>
   budgetedFetch({
-    latch: createRateLimitLatch({ now: options.now ?? (() => Date.now()), log: () => {}, fail: () => {}, limits: () => ({}), stopFile: null }),
+    latch: createRateLimitLatch({ now: options.now ?? (() => Date.now()), log: options.log ?? (() => {}), fail, hold: false, limits: () => ({}), stopFile: null }),
     ...options,
   });
 
@@ -89,9 +90,9 @@ function clock(startSeconds) {
 
 test("a 403 or 429 logs GitHub's message and retry-after", async () => {
   const gh = github([
-    { status: 403, body: '{"message":"You have exceeded a secondary rate limit."}', headers: { "retry-after": "60", ...rate(3000) } },
+    { status: 403, body: '{"message":"You have exceeded a secondary rate limit."}', headers: { "retry-after": "10", ...rate(3000) } },
     { status: 200, body: "{}", headers: rate(2999) },
-    { status: 429, body: "not json", headers: { ...rate(0), "x-ratelimit-reset": String(RESET + 120) } },
+    { status: 429, body: "not json", headers: { ...rate(0), "x-ratelimit-reset": String(RESET + 40) } },
     { status: 200, body: "{}", headers: rate(4999) },
   ]);
   const lines = [];
@@ -100,19 +101,19 @@ test("a 403 or 429 logs GitHub's message and retry-after", async () => {
   assert.equal((await budget.fetch("https://api.example/repos/o/r/x", { headers: {} })).status, 200);
   assert.equal((await budget.fetch("https://api.example/repos/o/r/y", { headers: {} })).status, 200);
   assert.equal(lines.filter((line) => line.startsWith("::warning::GET returned")).length, 2);
-  assert.equal(lines[0], '::warning::GET returned 403: message="You have exceeded a secondary rate limit." retry-after=60 remaining=3000');
+  assert.equal(lines[0], '::warning::GET returned 403: message="You have exceeded a secondary rate limit." retry-after=10 remaining=3000');
   assert.ok(lines.includes('::warning::GET returned 429: message="" retry-after=none remaining=0'));
 });
 
 test("a 403 with remaining 0 waits past x-ratelimit-reset and is sent once more", async () => {
   const gh = github([limited({ "x-ratelimit-reset": String(RESET) }), { status: 200, body: '{"ok":true}', headers: rate(4999) }]);
-  const time = clock(RESET - 300);
+  const time = clock(RESET - 45);
   const budget = budgeted({ fetch: gh.fetch, log: () => {}, ...time });
   const response = await budget.fetch("https://api.example/repos/o/r/actions/runs", { headers: {} });
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { ok: true });
-  // 300 s to the reset, plus one second so the retry lands after it.
-  assert.deepEqual(time.slept, [301_000]);
+  // 45 s to the reset, plus one second so the retry lands after it.
+  assert.deepEqual(time.slept, [46_000]);
   assert.equal(gh.sent.length, 2);
   assert.equal(gh.sent[1].url, gh.sent[0].url);
   assert.deepEqual(budget.counts, { rest: 2, notModified: 0, graphql: 0 });
@@ -125,9 +126,60 @@ test("a 429 with retry-after waits retry-after seconds", async () => {
   ]);
   const time = clock(RESET - 3000);
   const budget = budgeted({ fetch: gh.fetch, log: () => {}, ...time });
-  assert.equal((await budget.fetch("https://api.example/repos/o/r/x", { method: "POST", headers: {}, body: "{}" })).status, 200);
+  assert.equal((await budget.fetch("https://api.example/repos/o/r/x", { headers: {} })).status, 200);
   assert.deepEqual(time.slept, [31_000]);
-  assert.equal(gh.sent[1].init.body, "{}");
+  assert.equal(gh.sent[1].url, gh.sent[0].url);
+});
+
+// Element 1 of the outage posture (docs/outage-posture-audit.md): a
+// non-idempotent write is never sent again, a rate limit included.
+test("a rate-limited write is returned at once, marked rateLimited, and never sent again", async () => {
+  const writes = [
+    ["https://api.example/repos/o/r/issues/7/comments", { method: "POST", headers: {}, body: '{"body":"x"}' }],
+    ["https://api.example/repos/o/r/issues/7", { method: "PATCH", headers: {}, body: "{}" }],
+    ["https://api.example/graphql", { method: "POST", headers: {}, body: JSON.stringify({ query: "mutation { a }" }) }],
+  ];
+  for (const [url, init] of writes) {
+    const gh = github([
+      { status: 429, body: "{}", headers: { ...rate(10), "retry-after": "30" } },
+      { status: 201, body: "{}", headers: rate(9) },
+    ]);
+    const lines = [];
+    let failed = 0;
+    const time = clock(RESET - 3000);
+    const budget = budgeted({ fetch: gh.fetch, log: (line) => lines.push(line), fail: () => (failed += 1), ...time });
+    const response = await budget.fetch(url, init);
+    assert.equal(response.status, 429, `${init.method} ${url}`);
+    assert.equal(response.rateLimited, true, `${init.method} ${url}`);
+    assert.equal(failed, 1, `${init.method} ${url}: a refusal not sent again fails the step`);
+    assert.equal(gh.sent.length, 1, `${init.method} ${url}`);
+    assert.deepEqual(time.slept, [], `${init.method} ${url}`);
+    assert.ok(lines.some((line) => line.startsWith("::error::") && line.includes("not sent again")), `${init.method} ${url}`);
+  }
+});
+
+test("a rate-limited GraphQL query is a read, so it waits and is sent once more", async () => {
+  const gh = github([
+    { status: 403, body: '{"message":"You have exceeded a secondary rate limit."}', headers: { ...rate(3000, "graphql"), "retry-after": "20" } },
+    { status: 200, body: '{"data":{}}', headers: rate(2999, "graphql") },
+  ]);
+  const time = clock(RESET - 3000);
+  const budget = budgeted({ fetch: gh.fetch, log: () => {}, ...time });
+  const body = JSON.stringify({ query: "query { viewer { login } }" });
+  assert.equal((await budget.fetch("https://api.example/graphql", { method: "POST", headers: {}, body })).status, 200);
+  assert.deepEqual(time.slept, [21_000]);
+  assert.equal(gh.sent.length, 2);
+});
+
+test("a reset more than a minute away is past the wait budget and is not waited on", async () => {
+  const gh = github([limited({ "x-ratelimit-reset": String(RESET) }), { status: 200, body: "{}", headers: rate(4999) }]);
+  const time = clock(RESET - 61);
+  const budget = budgeted({ fetch: gh.fetch, log: () => {}, ...time });
+  const response = await budget.fetch("https://api.example/repos/o/r/x", { headers: {} });
+  assert.equal(response.status, 403);
+  assert.equal(response.rateLimited, true);
+  assert.deepEqual(time.slept, []);
+  assert.equal(gh.sent.length, 1);
 });
 
 test("a secondary limit with no retry-after waits one minute", async () => {
@@ -142,7 +194,7 @@ test("a secondary limit with no retry-after waits one minute", async () => {
 });
 
 // The only guessed stop short enough to wait out is the documented minute; a
-// primary limit with no time is guessed at an hour, past the default cap.
+// primary limit with no time is guessed at an hour, past the cap.
 test("a primary limit with no reset header, a guessed hour, is not waited on or resent", async () => {
   const gh = github([{ status: 403, body: '{"message":"API rate limit exceeded for installation."}', headers: {} }]);
   const time = clock(RESET - 3000);
@@ -167,19 +219,38 @@ test("a reset past the wait cap fails at once and names the reset", async () => 
 
 test("waits are capped across the whole run, not per call", async () => {
   const gh = github([
-    limited({ "retry-after": "200", "x-ratelimit-remaining": "5" }),
+    limited({ "retry-after": "40", "x-ratelimit-remaining": "5" }),
     { status: 200, body: "{}", headers: rate(4999) },
-    limited({ "retry-after": "200", "x-ratelimit-remaining": "5" }),
+    limited({ "retry-after": "40", "x-ratelimit-remaining": "5" }),
   ]);
   const time = clock(RESET - 3000);
-  const budget = budgeted({ fetch: gh.fetch, log: () => {}, ...time, maxWaitMs: 360_000 });
+  const budget = budgeted({ fetch: gh.fetch, log: () => {}, ...time });
   assert.equal((await budget.fetch("https://api.example/repos/o/r/x", { headers: {} })).status, 200);
   assert.equal((await budget.fetch("https://api.example/repos/o/r/y", { headers: {} })).status, 403);
-  assert.deepEqual(time.slept, [201_000]);
+  assert.deepEqual(time.slept, [41_000]);
   assert.equal(gh.sent.length, 3);
 });
 
-test("a second rate limit after the wait is returned, with no third request", async () => {
+// Element 1 of the outage posture: the guard fails the step only on a
+// rate limit the read is not sent again after.
+test("a rate-limited read it waits out and sends again fails nothing; one past the wait budget fails the step", async () => {
+  const graphql = JSON.stringify({ query: "query { viewer { login } }" });
+  const reads = [
+    ["https://api.example/repos/o/r/x", { headers: {} }, "core"],
+    ["https://api.example/graphql", { method: "POST", headers: {}, body: graphql }, "graphql"],
+  ];
+  for (const [url, init, resource] of reads) {
+    for (const [secondsToReset, status, failures] of [[45, 200, 0], [61, 403, 1]]) {
+      let failed = 0;
+      const gh = github([limited(rate(0, resource)), { status: 200, body: "{}", headers: rate(4999, resource) }]);
+      const budget = budgeted({ fetch: gh.fetch, log: () => {}, fail: () => (failed += 1), ...clock(RESET - secondsToReset) });
+      assert.equal((await budget.fetch(url, init)).status, status, `${url} ${secondsToReset}s`);
+      assert.equal(failed, failures, `${url} ${secondsToReset}s`);
+    }
+  }
+});
+
+test("a second rate limit past the wait budget is returned, with no third request", async () => {
   const gh = github([limited({ "x-ratelimit-reset": String(RESET) }), limited({ "x-ratelimit-reset": String(RESET + 3600) })]);
   const time = clock(RESET - 60);
   const budget = budgeted({ fetch: gh.fetch, log: () => {}, ...time });
@@ -239,7 +310,7 @@ const PULLS = "https://api.example/repos/o/r/commits/db53ee51744631cd5ee03d76bf8
 test("a GET answered 500 is sent again after a backoff and the next answer returned", async () => {
   const gh = github([{ status: 500 }, { status: 200, body: '[{"number":7}]', headers: rate(3994) }]);
   const time = clock(RESET - 3000);
-  const budget = budgeted({ fetch: gh.fetch, log: () => {}, random: () => 0, ...time });
+  const budget = budgeted({ fetch: gh.fetch, log: () => {}, random: () => 0.5, ...time });
   const response = await budget.fetch(PULLS, { headers: {} });
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), [{ number: 7 }]);
@@ -247,13 +318,62 @@ test("a GET answered 500 is sent again after a backoff and the next answer retur
   assert.equal(gh.sent.length, 2);
 });
 
-test("a GET that keeps answering 503 returns the fourth 503", async () => {
-  const gh = github([{ status: 503 }, { status: 503 }, { status: 503 }, { status: 503 }, { status: 200 }]);
+test("a GET that keeps answering 503 returns the third 503", async () => {
+  const gh = github([{ status: 503 }, { status: 503 }, { status: 503 }, { status: 200 }]);
   const time = clock(RESET - 3000);
-  const budget = budgeted({ fetch: gh.fetch, log: () => {}, random: () => 0, ...time });
+  const budget = budgeted({ fetch: gh.fetch, log: () => {}, random: () => 0.5, ...time });
   assert.equal((await budget.fetch(PULLS, { headers: {} })).status, 503);
-  assert.deepEqual(time.slept, [1000, 2000, 4000]);
-  assert.equal(gh.sent.length, 4);
+  assert.deepEqual(time.slept, [1000, 2000]);
+  assert.equal(gh.sent.length, 3);
+});
+
+test("a GraphQL query answered 502 is sent again; a GraphQL mutation answered 502 is returned at once", async () => {
+  const graphql = "https://api.example/graphql";
+  const query = github([{ status: 502 }, { status: 200, body: '{"data":{}}', headers: rate(4000, "graphql") }]);
+  const time = clock(RESET - 3000);
+  const reads = budgeted({ fetch: query.fetch, log: () => {}, random: () => 0.5, ...time });
+  const body = JSON.stringify({ query: "query($n: Int!) { viewer { login } }", variables: { n: 1 } });
+  assert.equal((await reads.fetch(graphql, { method: "POST", headers: {}, body })).status, 200);
+  assert.equal(query.sent.length, 2);
+  assert.deepEqual(time.slept, [1000]);
+
+  const mutation = github([{ status: 502 }, { status: 200 }]);
+  const writes = budgeted({ fetch: mutation.fetch, log: () => {}, random: () => 0, ...clock(RESET - 3000) });
+  const write = JSON.stringify({ query: "  mutation { addComment(input: {}) { clientMutationId } }" });
+  assert.equal((await writes.fetch(graphql, { method: "POST", headers: {}, body: write })).status, 502);
+  assert.equal(mutation.sent.length, 1);
+
+  // A mutation behind a comment or a fragment definition is sent once too.
+  for (const document of ["# arm it\nmutation { a }", "fragment F on PullRequest { id }\nmutation { a { ...F } }"]) {
+    const gh = github([{ status: 502 }, { status: 200 }]);
+    const budget = budgeted({ fetch: gh.fetch, log: () => {}, random: () => 0, ...clock(RESET - 3000) });
+    assert.equal((await budget.fetch(graphql, { method: "POST", headers: {}, body: JSON.stringify({ query: document }) })).status, 502);
+    assert.equal(gh.sent.length, 1, document);
+  }
+});
+
+// A document can hold several operations and the request picks one by
+// operationName (https://spec.graphql.org/October2021/#sec-Executing-Requests),
+// so a document that starts with a query can still run a mutation. A mutation
+// is never resent: one that names any mutation or subscription, or any request
+// that names an operation, is sent once.
+test("a document that starts with a query but holds a mutation, or names an operation, answered 502 is returned at once", async () => {
+  const arm = "query Read { viewer { login } }\nmutation Arm($id: ID!) { enablePullRequestAutoMerge(input: { pullRequestId: $id }) { clientMutationId } }";
+  const bodies = [
+    { query: arm, operationName: "Arm", variables: { id: "PR_1" } },
+    { query: arm, variables: { id: "PR_1" } },
+    { query: "{ viewer { login } }\nsubscription Watch { viewer { login } }" },
+    { query: "query Read { viewer { login } }", operationName: "Read" },
+  ];
+  for (const request of bodies) {
+    const gh = github([{ status: 502 }, { status: 200, body: '{"data":{}}' }]);
+    const time = clock(RESET - 3000);
+    const budget = budgeted({ fetch: gh.fetch, log: () => {}, random: () => 0, ...time });
+    const body = JSON.stringify(request);
+    assert.equal((await budget.fetch("https://api.example/graphql", { method: "POST", headers: {}, body })).status, 502, body);
+    assert.equal(gh.sent.length, 1, body);
+    assert.deepEqual(time.slept, [], body);
+  }
 });
 
 test("a POST answered 500 is returned at once", async () => {
@@ -269,7 +389,7 @@ test("each response's rate-limit headers are appended as a reading under API_BUD
   const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
   const { join } = await import("node:path");
   const { tmpdir } = await import("node:os");
-  const dir = mkdtempSync(join(tmpdir(), "request-budget-"));
+  const dir = tempDir("request-budget-");
   const saved = { token: process.env.API_BUDGET_TOKEN, temp: process.env.RUNNER_TEMP };
   process.env.API_BUDGET_TOKEN = "github-token";
   process.env.RUNNER_TEMP = dir;
@@ -283,7 +403,7 @@ test("each response's rate-limit headers are appended as a reading under API_BUD
     await budget.fetch("https://api.example/repos/o/r/b");
     assert.equal(
       readFileSync(join(dir, "api-budget", "github-token"), "utf8"),
-      "200 5000 4000 1000 1792378942 core\n403 5000 3999 1001 1792378942 core\n",
+      "200 5000 4000 1000 1792378942 core other\n403 5000 3999 1001 1792378942 core other\n",
     );
   } finally {
     for (const [key, value] of [["API_BUDGET_TOKEN", saved.token], ["RUNNER_TEMP", saved.temp]]) {

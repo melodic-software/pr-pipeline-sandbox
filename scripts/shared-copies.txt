@@ -1,0 +1,2 @@
+# The sandbox registers no shared copies. address-feedback's select step reads
+# this file from the base checkout, and fails on a missing one.

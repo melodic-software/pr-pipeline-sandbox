@@ -80,19 +80,34 @@ inputs:
       human, at the PR's current head. Empty stops every such dispatcher.
     required: false
     default: ""
+  run-dispatcher-relay:
+    description: >
+      The workflow path of a review-comment relay a workflow_run dispatcher's
+      upstream may have instead. It must be a pull_request_review_comment run
+      of this repository naming the PR in its pull_requests, started (and any
+      re-run) by a listed human, never the lanes App, at the PR's current
+      head. Empty accepts no relay.
+    required: false
+    default: ""
   expected-upstream-head:
     description: >
       For a job after pr-unblock's model job, the head that job was gated on.
       With a workflow_run dispatcher the upstream must have reviewed it, and
-      every commit from it to the PR's current head must be a
-      signature-verified commit the lanes App authored. Empty keeps the
-      current-head rule; set on any other path, it stops the run.
+      the PR must be at it or at pushed-commit. Empty keeps the current-head
+      rule; set on any other path, it stops the run.
+    required: false
+    default: ""
+  pushed-commit:
+    description: >
+      With expected-upstream-head, the commit apply-feedback-patch pushed onto
+      it, the one other head the PR may be at; empty when it pushed none. Set
+      without expected-upstream-head, or not a lowercase SHA, it stops the run.
     required: false
     default: ""
   lanes-app-id:
     description: >
       The lanes App bot's numeric user id: an upstream review it started
-      vouches, and only its commits may follow expected-upstream-head.
+      vouches.
     required: false
     default: ""
   dispatched-workflow:
@@ -105,8 +120,9 @@ inputs:
   reconciler-workflow:
     description: >
       The workflow path of the lost-run reconciler. A re-run github-actions[bot]
-      started proceeds only as that workflow's recorded re-run of this run's
-      first attempt (the README's reconciler section). Empty keeps every
+      started proceeds only as that workflow's recorded re-run, at attempt 2
+      or 3 with a record naming that attempt (the README's reconciler
+      section). Empty keeps every
       github-actions[bot] re-run stopped with untrusted-rerunner.
     required: false
     default: ""
@@ -133,6 +149,29 @@ inputs:
       event stopped.
     required: false
     default: ""
+  app-field-id:
+    description: >
+      With require-kind human on an issues event, the issue field the lanes
+      App (lanes-app-id) may set to app-field-option to start the lane
+      (field_added), with that App or a listed human as re-runner. Needs
+      app-field-option; either empty or not a positive integer keeps every
+      App field event stopped.
+    required: false
+    default: ""
+  app-field-option:
+    description: >
+      The single-select option id of app-field-id that starts the lane.
+    required: false
+    default: ""
+  fault-reason:
+    description: >
+      `true` writes reason `read-fault` for a stop a read GitHub failed to
+      answer caused (a 5xx or 429, a rate-guard stop, or no answer), where
+      the reason is otherwise the one a refusal at that read gives. proceed
+      stays `false` either way, and a refusal on an answer GitHub gave keeps
+      its reason. Empty keeps every stop's own reason.
+    required: false
+    default: ""
   require-pr:
     description: >
       `true` gates a PR as described above. `false` checks only the actors
@@ -147,7 +186,7 @@ outputs:
     description: "`true` when the lane may proceed, otherwise `false`."
     value: ${{ steps.check.outputs.proceed }}
   reason:
-    description: "`ok`, `fork`, `no-pr`, `head-lag`, `untrusted-base`, `bot-actor`, `untrusted-actor`, `untrusted-rerunner`, `untrusted-author` or `list-unreadable`."
+    description: "`ok`, `fork`, `no-pr`, `head-lag`, `untrusted-base`, `bot-actor`, `untrusted-actor`, `untrusted-rerunner`, `untrusted-author`, `list-unreadable`, or `read-fault` with fault-reason `true`."
     value: ${{ steps.check.outputs.reason }}
   pr-number:
     description: The resolved PR number; empty unless proceed is `true`.
@@ -180,13 +219,18 @@ runs:
         DISPATCHER_WORKFLOW: ${{ inputs.dispatcher-workflow }}
         RUN_DISPATCHER_WORKFLOW: ${{ inputs.run-dispatcher-workflow }}
         RUN_DISPATCHER_UPSTREAMS: ${{ inputs.run-dispatcher-upstreams }}
+        RUN_DISPATCHER_RELAY: ${{ inputs.run-dispatcher-relay }}
         EXPECTED_UPSTREAM_HEAD: ${{ inputs.expected-upstream-head }}
+        PUSHED_COMMIT: ${{ inputs.pushed-commit }}
         LANES_APP_ID: ${{ inputs.lanes-app-id }}
         DISPATCHED_WORKFLOW: ${{ inputs.dispatched-workflow }}
         RECONCILER_WORKFLOW: ${{ inputs.reconciler-workflow }}
         CI_STATUS_RERUN_WORKFLOW: ${{ inputs.ci-status-rerun-workflow }}
         REQUIRE_KIND: ${{ inputs.require-kind }}
         APP_LABEL: ${{ inputs.app-label }}
+        APP_FIELD_ID: ${{ inputs.app-field-id }}
+        APP_FIELD_OPTION: ${{ inputs.app-field-option }}
         REQUIRE_PR: ${{ inputs.require-pr }}
+        FAULT_REASON: ${{ inputs.fault-reason }}
         REPOSITORY: ${{ github.repository }}
       run: node "$GITHUB_ACTION_PATH/check-trusted-trigger.mjs"

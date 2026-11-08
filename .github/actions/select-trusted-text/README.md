@@ -37,9 +37,13 @@ empty title and a null body) and counts it under `edited-by-untrusted`. REST `up
 used.
 
 That query covers bodies only, so the PR title has its own rule: the PR's `timelineItems` of type
-`RENAMED_TITLE_EVENT` are read page by page (the same 50-page cap). When any rename's `actor` is
-null or not listed, the title is withheld (empty) and counted once under `edited-by-untrusted`;
-the body still follows the edit rule above.
+`RENAMED_TITLE_EVENT` are read page by page (the same 50-page cap). When the PR author is listed,
+their first page comes in the same request as the first page of `closingIssuesReferences`; later
+pages of each are read on their own. The renames are weighed only when the title could be kept.
+When any rename's `actor` is null or not listed, the title is withheld (empty) and counted once
+under `edited-by-untrusted`; the body still follows the edit rule above. A page of either GraphQL
+connection that comes back with no node list is a failed read. The exported `titleRenamers` is that
+one rename read; pr-verify's `resolve-pr.mjs` uses it under its own, latest-renamer rule.
 
 `selectTrustedIssueComments` applies the same author and edit rules to one issue's comments; the
 issue lane's `write-issue.mjs` uses it to give the model only trusted comments beside the issue.
@@ -53,12 +57,12 @@ The file at `output-path` holds `pr` (number, head and base SHA, author id, titl
 
 The log gets one line, `select-trusted-text: dropped total=<n> {<counts>}`. Dropped text is never
 written or logged. When it cannot run (an unreadable list, a malformed input, any failed read,
-including a GraphQL error on any of its three queries), the step exits 1 and leaves no
+including a GraphQL error on any of its queries), the step exits 1 and leaves no
 file, so a lane never reads a partial context and the model step does not run. Unlike the gates,
 which exit 0 with `proceed=false`, a failure here is an error a human should see.
 
 Kept text is still data to the model, never instructions
-([`untrusted-content`](../../../docs/conventions/untrusted-content/README.md)): a listed bot can
+([`untrusted-content`](../../../docs/contracts/untrusted-content/README.md)): a listed bot can
 quote text a stranger wrote, and the model can fetch unfiltered comments itself. ADR 0049's
 Consequences record both.
 

@@ -1,14 +1,15 @@
 // Runs the action's `run:` script with a curl stand-in that answers the OIDC
 // request and the broker, and records the broker request body. The expected
-// body is the broker contract: `{lane, activity, pr_number?, issue_number?, dispatcher_run_id?}`,
+// body is the broker contract: `{lane, activity, pr_number?, issue_number?, release?,
+// dispatcher_run_id?, expected_upstream_head?, pushed_commit?}`,
 // numbers as JSON integers (pr-run-activity.md, run job step 6; the broker's
 // parseBody).
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
+import { tempDir } from "../../../lib/test-tmp.mjs";
 
 const ACTION = new URL("./action.yml", import.meta.url);
 const REPO_ID = "1277265216";
@@ -78,7 +79,7 @@ let root;
 let bin;
 
 before(() => {
-  root = mkdtempSync(path.join(tmpdir(), "request-lane-token-"));
+  root = tempDir("request-lane-token-");
   bin = path.join(root, "bin");
   mkdirSync(bin);
   writeFileSync(path.join(bin, "curl"), FAKE_CURL);
@@ -90,7 +91,8 @@ before(() => {
 after(() => rmSync(root, { recursive: true, force: true }));
 
 // Each answer makes the broker's next reply that HTTP status, with that JSON
-// body (the mint below when absent) and that header block; the last repeats.
+// body (the mint below when absent, with `mint`'s fields added) and that
+// header block; the last repeats.
 // No answer is one 200 mint.
 // A `compare` input is the GitHub compare response the action reads; absent,
 // the compare request fails.
@@ -143,7 +145,7 @@ function request({ compare, ...inputs }, ...answers) {
   (answers.length ? answers : [{}]).forEach((answer, i) => {
     const base = path.join(answersDir, String(i + 1));
     writeFileSync(`${base}.status`, answer.status ?? "200");
-    writeFileSync(`${base}.json`, JSON.stringify(answer.body ?? mint));
+    writeFileSync(`${base}.json`, JSON.stringify(answer.body ?? { ...mint, ...answer.mint }));
     writeFileSync(`${base}.headers`, answer.headers ?? "HTTP/2 200\r\ncontent-type: application/json\r\n\r\n");
   });
   const compareFile = path.join(dir, "compare.json");
@@ -190,16 +192,17 @@ const GITHUB_UNAVAILABLE = {
   body: { error: "unavailable", reason: "github-unavailable", detail: "GET /repos/melodic-software/claude-code-plugins failed with status 403" },
 };
 const ISSUE_LANE = { LANE: "work-resolve-issue", ACTIVITY: "resolve-issue", PR_NUMBER: "", ISSUE_NUMBER: "77" };
-// The brief's backoff: 60 s, 120 s and 240 s, each with up to 20 s of jitter,
-// at most 8 minutes of waiting in all.
-const BACKOFF = [60, 120, 240];
+// The outage posture's element 1 (docs/outage-posture-audit.md): at most 3
+// requests, capped backoff with full jitter (0-20 s, then 0-40 s), and at most
+// 60 s of waiting in all.
+const BACKOFF = [20, 40];
 const JITTER = 20;
-const BUDGET = 480;
+const BUDGET = 60;
 
 function assertBackoff(sleeps, count) {
   assert.equal(sleeps.length, count, `sleeps: ${sleeps}`);
   sleeps.forEach((s, i) => {
-    assert.ok(s >= BACKOFF[i] && s <= BACKOFF[i] + JITTER, `sleep ${i + 1} is ${s}`);
+    assert.ok(s >= 0 && s <= BACKOFF[i], `sleep ${i + 1} is ${s}`);
   });
   assert.ok(sleeps.reduce((a, b) => a + b, 0) <= BUDGET);
 }
@@ -214,11 +217,11 @@ test("a 503 github-unavailable is retried after backoff, with a fresh OIDC token
   assert.doesNotMatch(run.stdout, /::error::/);
 });
 
-test("a 503 github-unavailable on every attempt fails red after three retries", () => {
+test("a 503 github-unavailable on every attempt fails red after three requests", () => {
   const run = request(ISSUE_LANE, GITHUB_UNAVAILABLE);
   assert.equal(run.status, 1);
-  assert.equal(run.auth.length, 4);
-  assertBackoff(run.sleeps, 3);
+  assert.equal(run.auth.length, 3);
+  assertBackoff(run.sleeps, 2);
   assert.equal(
     run.output,
     "failure-reason=lane-token-denied: the broker answered 503 with reason github-unavailable: GET /repos/melodic-software/claude-code-plugins failed with status 403\n",
@@ -226,19 +229,19 @@ test("a 503 github-unavailable on every attempt fails red after three retries", 
 });
 
 test("a Retry-After header longer than the backoff sets the wait", () => {
-  const run = request(ISSUE_LANE, { ...GITHUB_UNAVAILABLE, headers: "HTTP/2 503\r\nRetry-After: 200\r\n\r\n" }, {});
+  const run = request(ISSUE_LANE, { ...GITHUB_UNAVAILABLE, headers: "HTTP/2 503\r\nRetry-After: 45\r\n\r\n" }, {});
   assert.equal(run.status, 0, run.stdout);
-  assert.deepEqual(run.sleeps, [200]);
+  assert.deepEqual(run.sleeps, [45]);
 });
 
 test("a Retry-After with a leading zero is read as decimal seconds", () => {
-  const run = request(ISSUE_LANE, { ...GITHUB_UNAVAILABLE, headers: "HTTP/2 503\r\nRetry-After: 090\r\n\r\n" }, {});
+  const run = request(ISSUE_LANE, { ...GITHUB_UNAVAILABLE, headers: "HTTP/2 503\r\nRetry-After: 045\r\n\r\n" }, {});
   assert.equal(run.status, 0, run.stdout);
-  assert.deepEqual(run.sleeps, [90]);
+  assert.deepEqual(run.sleeps, [45]);
 });
 
-test("a Retry-After past the 8-minute budget fails red at once", () => {
-  const run = request(ISSUE_LANE, { ...GITHUB_UNAVAILABLE, headers: "HTTP/2 503\r\nretry-after: 600\r\n\r\n" }, {});
+test("a Retry-After past the 1-minute budget fails red at once", () => {
+  const run = request(ISSUE_LANE, { ...GITHUB_UNAVAILABLE, headers: "HTTP/2 503\r\nretry-after: 61\r\n\r\n" }, {});
   assert.equal(run.status, 1);
   assert.equal(run.auth.length, 1);
   assert.deepEqual(run.sleeps, []);
@@ -262,7 +265,7 @@ const rateLimited = (retryAfter) => ({
 });
 
 // GitHub: with a retry-after header, do not retry until that many seconds
-// have passed. Below the 60 s ladder step, so the ladder would wait longer.
+// have passed. Above the 0-20 s first backoff step, so the backoff would wait less.
 test("a 503 github-rate-limited waits its Retry-After plus jitter, not the backoff ladder", () => {
   const run = request(ISSUE_LANE, rateLimited(30), {});
   assert.equal(run.status, 0, run.stdout);
@@ -272,30 +275,40 @@ test("a 503 github-rate-limited waits its Retry-After plus jitter, not the backo
   assert.match(run.output, /^mint-id=5550001-1$/m);
 });
 
-test("a 503 github-rate-limited on every attempt fails red after three retries", () => {
-  const run = request(ISSUE_LANE, rateLimited(30));
+test("a 503 github-rate-limited on every attempt fails red after three requests, its waits within the budget", () => {
+  const run = request(ISSUE_LANE, rateLimited(20));
   assert.equal(run.status, 1);
-  assert.equal(run.auth.length, 4);
-  assert.equal(run.sleeps.length, 3);
+  assert.equal(run.auth.length, 3);
+  assert.equal(run.sleeps.length, 2);
+  assert.ok(run.sleeps.every((s) => s >= 20), `sleeps: ${run.sleeps}`);
+  assert.ok(run.sleeps.reduce((a, b) => a + b, 0) <= BUDGET, `sleeps: ${run.sleeps}`);
   assert.match(run.output, /^failure-reason=lane-token-denied: the broker answered 503 with reason github-rate-limited: GET \/repos/m);
 });
 
-// GitHub's guidance without a retry-after header: wait at least one minute.
-test("a 503 github-rate-limited with no Retry-After waits a minute plus jitter", () => {
+// GitHub's guidance without a retry-after header: wait at least one minute,
+// the whole budget, so no jitter fits.
+test("a 503 github-rate-limited with no Retry-After waits a minute", () => {
   const run = request(ISSUE_LANE, { ...rateLimited(30), headers: "HTTP/2 503\r\n\r\n" }, {});
   assert.equal(run.status, 0, run.stdout);
-  assert.equal(run.sleeps.length, 1);
-  assert.ok(run.sleeps[0] >= 60 && run.sleeps[0] <= 60 + JITTER, `sleep is ${run.sleeps[0]}`);
+  assert.deepEqual(run.sleeps, [60]);
 });
 
-test("a github-rate-limited wait that ends inside the 8-minute budget is taken, its jitter cut to fit", () => {
-  const run = request(ISSUE_LANE, rateLimited(470), {});
+test("a second github-rate-limited answer whose wait would pass the budget is not waited", () => {
+  const run = request(ISSUE_LANE, { ...rateLimited(30), headers: "HTTP/2 503\r\n\r\n" }, rateLimited(1), {});
+  assert.equal(run.status, 1);
+  assert.equal(run.auth.length, 2);
+  assert.deepEqual(run.sleeps, [60]);
+  assert.match(run.output, /reason github-rate-limited: .*, past the 1-minute retry budget$/m);
+});
+
+test("a github-rate-limited wait that ends inside the 1-minute budget is taken, its jitter cut to fit", () => {
+  const run = request(ISSUE_LANE, rateLimited(50), {});
   assert.equal(run.status, 0, run.stdout);
   assert.equal(run.sleeps.length, 1);
-  assert.ok(run.sleeps[0] >= 470 && run.sleeps[0] <= BUDGET, `sleep is ${run.sleeps[0]}`);
+  assert.ok(run.sleeps[0] >= 50 && run.sleeps[0] <= BUDGET, `sleep is ${run.sleeps[0]}`);
 });
 
-test("a github-rate-limited Retry-After past the 8-minute budget fails at once, naming the limit and its reset", () => {
+test("a github-rate-limited Retry-After past the 1-minute budget fails at once, naming the limit and its reset", () => {
   const before = Math.floor(Date.now() / 1000);
   const run = request(ISSUE_LANE, rateLimited(BUDGET + 1), {});
   const afterRun = Math.ceil(Date.now() / 1000);
@@ -303,12 +316,64 @@ test("a github-rate-limited Retry-After past the 8-minute budget fails at once, 
   assert.equal(run.auth.length, 1);
   assert.deepEqual(run.sleeps, []);
   const match =
-    /^failure-reason=lane-token-denied: the broker answered 503 with reason github-rate-limited: GET \/repos\/melodic-software\/claude-code-plugins failed with status 403; GitHub's secondary rate limit \(core\) resets at (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ), past the 8-minute retry budget$/m.exec(
+    /^failure-reason=lane-token-denied: the broker answered 503 with reason github-rate-limited: GET \/repos\/melodic-software\/claude-code-plugins failed with status 403; GitHub's secondary rate limit \(core\) resets at (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ), past the 1-minute retry budget$/m.exec(
       run.output,
     );
   assert.ok(match, run.output);
   const reset = Date.parse(match[1]) / 1000;
   assert.ok(reset >= before + BUDGET + 1 && reset <= afterRun + BUDGET + 1, `reset ${match[1]}`);
+});
+
+// Outage posture element 1: a wait past the budget is an unknown that holds
+// under element 2, not a sleep and, for a caller that opts in, not a red.
+test("with rate-limit-hold-ok, a github-rate-limited Retry-After past the budget holds green with a notice and no token", () => {
+  const run = request({ ...ISSUE_LANE, RATE_LIMIT_HOLD_OK: "true" }, rateLimited(BUDGET + 1), {});
+  assert.equal(run.status, 0, run.stdout);
+  assert.equal(run.auth.length, 1, "one broker request, no resend");
+  assert.deepEqual(run.sleeps, [], "no wait past the budget is taken");
+  assert.equal(run.output, "skip-reason=rate-limited\n", "skip-reason set, no token or failure-reason");
+  assert.match(
+    run.stdout,
+    /^::notice title=Lane token hold::lane-token-held: the broker answered 503 github-rate-limited after its retries; GitHub's secondary rate limit \(core\) resets at \S+, past the 1-minute retry budget; this run takes no token/m,
+  );
+  assert.doesNotMatch(run.stdout, /::error::/);
+  assert.match(run.summary, /^- lane-token-held: /m);
+});
+
+test("with rate-limit-hold-ok, github-rate-limited on all three requests holds green after waits within the budget", () => {
+  const run = request({ ...ISSUE_LANE, RATE_LIMIT_HOLD_OK: "true" }, rateLimited(20));
+  assert.equal(run.status, 0, run.stdout);
+  assert.equal(run.auth.length, 3);
+  assert.ok(run.sleeps.reduce((a, b) => a + b, 0) <= BUDGET, `sleeps: ${run.sleeps}`);
+  assert.equal(run.output, "skip-reason=rate-limited\n");
+});
+
+test("without rate-limit-hold-ok, the same rate limit past the budget still fails red", () => {
+  const run = request(ISSUE_LANE, rateLimited(BUDGET + 1), {});
+  assert.equal(run.status, 1);
+  assert.match(run.stdout, /^::error::lane-token-denied: /m);
+  assert.doesNotMatch(run.output, /skip-reason/);
+});
+
+test("with rate-limit-hold-ok, github-unavailable and mint-unavailable still fail red", () => {
+  for (const answer of [GITHUB_UNAVAILABLE, { status: "503", body: { reason: "mint-unavailable", detail: "d" } }]) {
+    const run = request({ ...ISSUE_LANE, RATE_LIMIT_HOLD_OK: "true" }, answer);
+    assert.equal(run.status, 1, `${answer.body.reason}: ${run.stdout}`);
+    assert.doesNotMatch(run.output, /skip-reason/);
+  }
+});
+
+test("check mode with rate-limit-hold-ok holds a rate limit past the budget with no allow", () => {
+  const run = request({ ...CHECK, RATE_LIMIT_HOLD_OK: "true" }, rateLimited(BUDGET + 1));
+  assert.equal(run.status, 0, run.stdout);
+  assert.equal(run.output, "skip-reason=rate-limited\n");
+});
+
+test("a rate-limit-hold-ok other than true or false fails before the broker request", () => {
+  const run = request({ ...ISSUE_LANE, RATE_LIMIT_HOLD_OK: "yes" }, rateLimited(BUDGET + 1));
+  assert.equal(run.status, 1);
+  assert.equal(run.auth.length, 0);
+  assert.match(run.stdout, /::error::rate-limit-hold-ok must be true or false/);
 });
 
 // mint-unavailable comes after the broker reserved the job's one mint.
@@ -395,6 +460,96 @@ test("without superseded-ok, a 403 workflow-modified still fails red", () => {
     run.output,
     "failure-reason=lane-token-denied: the broker answered 403 with reason workflow-modified: .github/workflows/pr-merge.yml differs from refs/heads/main\n",
   );
+});
+
+// The 403 pr-merge run 40747727299 logged when the breaker turned the
+// repository kill switch on after the run had read its variables.
+const KILLED = {
+  status: "403",
+  body: { reason: "kill-switch", detail: 'not-false: the repository CLAUDE_LANES_REPO_DISABLED is set and not exactly "false"' },
+};
+const KILLED_ERROR =
+  'lane-token-denied: the broker answered 403 with reason kill-switch: not-false: the repository CLAUDE_LANES_REPO_DISABLED is set and not exactly "false"';
+
+test("with kill-switch-ok, a 403 kill-switch ends green with a notice, skip-reason kill-switch and no token", () => {
+  const run = request({ ...MERGE, KILL_SWITCH_OK: "true" }, KILLED);
+  assert.equal(run.status, 0, run.stdout);
+  assert.match(run.stdout, /^::notice::lane-token-stopped: the broker refused the token because a lanes kill switch is on/m);
+  assert.doesNotMatch(run.stdout, /::error::/);
+  assert.equal(run.output, "skip-reason=kill-switch\n");
+  assert.equal(run.auth.length, 1);
+});
+
+test("with kill-switch-ok, any other denial reason still fails red", () => {
+  const run = request({ ...MERGE, KILL_SWITCH_OK: "true" }, { status: "403", body: { reason: "already-minted" } });
+  assert.equal(run.status, 1);
+  assert.equal(run.output, "failure-reason=lane-token-denied: the broker answered 403 with reason already-minted\n");
+});
+
+test("with kill-switch-ok, a kill-switch reason on a status other than 403 still fails red", () => {
+  const run = request({ ...MERGE, KILL_SWITCH_OK: "true" }, { ...KILLED, status: "500" });
+  assert.equal(run.status, 1);
+  assert.doesNotMatch(run.output, /skip-reason/);
+});
+
+test("without kill-switch-ok, a 403 kill-switch still fails red as it did in run 40747727299", () => {
+  const run = request(MERGE, KILLED);
+  assert.equal(run.status, 1);
+  assert.match(run.stdout, new RegExp(`^::error::${KILLED_ERROR.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"));
+  assert.equal(run.output, `failure-reason=${KILLED_ERROR}\n`);
+});
+
+test("with kill-switch-ok, an allow still mints the token unchanged", () => {
+  const run = request({ ...MERGE, KILL_SWITCH_OK: "true" });
+  assert.equal(run.status, 0, run.stdout);
+  assert.match(run.output, /^token=ghs_lane$/m);
+  assert.match(run.output, /^mint-id=5550001-1$/m);
+  assert.doesNotMatch(run.output, /skip-reason/);
+});
+
+// The read file's broker-check: the broker's kill-switch refusal (run
+// 41576258964's 403) ends green as a stop with no allow, which the job reads
+// from `allowed`, never from the step's outcome.
+const CHECK = { MODE: "check", EFFECT: "", CONTENTS: "", PULL_REQUESTS: "", ISSUES: "", PR_NUMBER: "" };
+const CHECK_ALLOW = { body: { decision: "allow", lane: "pr-unblock", activity: "resolve-conflicts" } };
+
+test("check mode with kill-switch-ok ends a 403 kill-switch green with skip-reason kill-switch and no allow", () => {
+  const run = request({ ...CHECK, KILL_SWITCH_OK: "true" }, KILLED);
+  assert.equal(run.status, 0, run.stdout);
+  assert.match(run.stdout, /^::notice::lane-check-stopped: the broker refused the check because a lanes kill switch is on, a designed stop;/m);
+  assert.doesNotMatch(run.stdout, /::error::/);
+  assert.equal(run.output, "skip-reason=kill-switch\n");
+  assert.equal(run.body, '{"lane":"pr-unblock","activity":"resolve-conflicts"}');
+});
+
+test("check mode with kill-switch-ok still fails red on any other denial", () => {
+  for (const answer of [{ status: "403", body: { reason: "workflow-modified" } }, { ...KILLED, status: "500" }]) {
+    const run = request({ ...CHECK, KILL_SWITCH_OK: "true" }, answer);
+    assert.equal(run.status, 1, answer.status);
+    assert.match(run.output, /^failure-reason=lane-check-denied: the broker answered /m, answer.status);
+    assert.doesNotMatch(run.output, /skip-reason|allowed/, answer.status);
+  }
+});
+
+test("check mode without kill-switch-ok still fails a 403 kill-switch red, as in run 41576258964", () => {
+  const run = request(CHECK, KILLED);
+  assert.equal(run.status, 1);
+  assert.equal(run.output, `failure-reason=${KILLED_ERROR.replace("lane-token-denied", "lane-check-denied")}\n`);
+});
+
+test("check mode, with or without kill-switch-ok, sets allowed=true on an allow and no skip-reason", () => {
+  for (const ok of ["true", "false"]) {
+    const run = request({ ...CHECK, KILL_SWITCH_OK: ok }, CHECK_ALLOW);
+    assert.equal(run.status, 0, run.stdout);
+    assert.equal(run.output, "allowed=true\n", ok);
+  }
+});
+
+test("a kill-switch-ok other than true or false fails before the broker request", () => {
+  const run = request({ ...MERGE, KILL_SWITCH_OK: "yes" }, KILLED);
+  assert.equal(run.status, 1);
+  assert.match(run.stdout, /::error::kill-switch-ok must be true or false/);
+  assert.equal(run.body, null);
 });
 
 // #7732: the refusal fix-docs got on #7717, a PR that changes a workflow file.
@@ -539,9 +694,9 @@ test("a dispatcher run id is sent as dispatcher_run_id, an integer", () => {
   assert.match(run.output, /^mint-id=5550001-1$/m);
 });
 
-test("an expected upstream head rides with the dispatcher run id as expected_upstream_head", () => {
+test("an expected upstream head rides with the dispatcher run id as expected_upstream_head, with no pushed_commit when nothing was pushed", () => {
   const head = "9".repeat(40);
-  const run = request({ DISPATCHER_RUN_ID: "38155572048", EXPECTED_UPSTREAM_HEAD: head });
+  const run = request({ DISPATCHER_RUN_ID: "38155572048", EXPECTED_UPSTREAM_HEAD: head, PUSHED_COMMIT: "" });
   assert.equal(run.status, 0, run.stdout);
   assert.deepEqual(JSON.parse(run.body), {
     lane: "pr-unblock",
@@ -559,6 +714,43 @@ test("an expected upstream head without a dispatcher run id, or not a SHA, fails
     assert.match(run.stdout, /::error::the expected upstream head must be a commit SHA and ride with a dispatcher run id/);
     assert.equal(run.body, null);
   }
+});
+
+test("a reply-job mint after a push sends the pushed commit as pushed_commit beside expected_upstream_head", () => {
+  const head = "9".repeat(40);
+  const pushed = "0123456789abcdef0123456789abcdef01234567";
+  const run = request({ ACTIVITY: "address-feedback", DISPATCHER_RUN_ID: "38155572048", EXPECTED_UPSTREAM_HEAD: head, PUSHED_COMMIT: pushed });
+  assert.equal(run.status, 0, run.stdout);
+  assert.deepEqual(JSON.parse(run.body), {
+    lane: "pr-unblock",
+    activity: "address-feedback",
+    pr_number: 42,
+    dispatcher_run_id: 38155572048,
+    expected_upstream_head: head,
+    pushed_commit: pushed,
+  });
+  assert.match(run.output, /^token=ghs_lane$/m);
+});
+
+for (const [name, env] of [
+  ["without an expected upstream head", { DISPATCHER_RUN_ID: "38155572048", PUSHED_COMMIT: "a".repeat(40) }],
+  ["in upper case", { DISPATCHER_RUN_ID: "38155572048", EXPECTED_UPSTREAM_HEAD: "9".repeat(40), PUSHED_COMMIT: "A".repeat(40) }],
+  ["one character short", { DISPATCHER_RUN_ID: "38155572048", EXPECTED_UPSTREAM_HEAD: "9".repeat(40), PUSHED_COMMIT: "a".repeat(39) }],
+  ["a branch name", { DISPATCHER_RUN_ID: "38155572048", EXPECTED_UPSTREAM_HEAD: "9".repeat(40), PUSHED_COMMIT: "main" }],
+]) {
+  test(`a pushed commit ${name} fails before the broker request`, () => {
+    const run = request(env);
+    assert.equal(run.status, 1);
+    assert.match(run.stdout, /::error::the pushed commit must be a commit SHA and ride with an expected upstream head/);
+    assert.equal(run.body, null);
+  });
+}
+
+test("check mode refuses a pushed commit before the broker request", () => {
+  const run = request({ MODE: "check", EFFECT: "", CONTENTS: "", PULL_REQUESTS: "", ISSUES: "", PR_NUMBER: "", PUSHED_COMMIT: "a".repeat(40) });
+  assert.equal(run.status, 1);
+  assert.match(run.stdout, /::error::check mode takes no effect, grant, PR or issue number, release, or dispatcher run id/);
+  assert.equal(run.body, null);
 });
 
 // The run job maps this output, and report-check-run appends it to a failed
@@ -622,7 +814,45 @@ for (const [name, inputs] of [
 test("check mode refuses an issue number before the broker request", () => {
   const run = request({ MODE: "check", EFFECT: "", CONTENTS: "", PULL_REQUESTS: "", ISSUES: "", PR_NUMBER: "", ISSUE_NUMBER: "77" });
   assert.equal(run.status, 1);
-  assert.match(run.stdout, /::error::check mode takes no effect, grant, PR or issue number, or dispatcher run id/);
+  assert.match(run.stdout, /::error::check mode takes no effect, grant, PR or issue number, release, or dispatcher run id/);
+  assert.equal(run.body, null);
+});
+
+const RELEASE_LANE = { LANE: "upstream-apply-changelog", ACTIVITY: "apply-changelog-branches", PR_NUMBER: "" };
+
+test("a release is sent as release, a string, with no pr_number or issue_number", () => {
+  const run = request({ ...RELEASE_LANE, RELEASE: "2.1.312" });
+  assert.equal(run.status, 0, run.stdout);
+  assert.deepEqual(JSON.parse(run.body), { lane: "upstream-apply-changelog", activity: "apply-changelog-branches", release: "2.1.312" });
+  assert.match(run.output, /^token=ghs_lane$/m);
+});
+
+for (const value of ["2.1", "2.1.312.1", "v2.1.312", "02.1.312", "2.01.312", "2.1.0312", "2.1.3a", "2.1.312 ", "12345.1.1", "1.1.1234567"]) {
+  test(`a malformed release (${JSON.stringify(value)}) fails red before the broker request`, () => {
+    const run = request({ ...RELEASE_LANE, RELEASE: value });
+    assert.equal(run.status, 1);
+    assert.match(run.stdout, /::error::the release must be one MAJOR\.MINOR\.PATCH/);
+    assert.equal(run.body, null);
+  });
+}
+
+for (const [name, inputs] of [
+  ["a PR number", { PR_NUMBER: "42" }],
+  ["an issue number", { ISSUE_NUMBER: "77" }],
+  ["a dispatcher run id", { DISPATCHER_RUN_ID: "38155572048" }],
+]) {
+  test(`a release with ${name} fails red before the broker request`, () => {
+    const run = request({ ...RELEASE_LANE, RELEASE: "2.1.312", ...inputs });
+    assert.equal(run.status, 1);
+    assert.match(run.stdout, /::error::a release goes without a PR number, issue number or dispatcher run id/);
+    assert.equal(run.body, null);
+  });
+}
+
+test("check mode refuses a release before the broker request", () => {
+  const run = request({ MODE: "check", EFFECT: "", CONTENTS: "", PULL_REQUESTS: "", ISSUES: "", PR_NUMBER: "", RELEASE: "2.1.312" });
+  assert.equal(run.status, 1);
+  assert.match(run.stdout, /::error::check mode takes no effect, grant, PR or issue number, release, or dispatcher run id/);
   assert.equal(run.body, null);
 });
 
@@ -659,6 +889,37 @@ test("an actions grant other than read or empty fails before the broker request"
   assert.equal(run.status, 1);
   assert.match(run.stdout, /::error::the resolved grant's actions must be read or empty/);
   assert.equal(run.body, null);
+});
+
+// The lanes App quota the broker read at the mint: 494 of 5200 left, reset
+// 2026-10-19T17:00:00Z.
+const QUOTA = { rate_limit: { remaining: 494, limit: 5200, reset: 1792429200 } };
+const QUOTA_NOTICE = "::notice title=api-budget::mint lanes-app core remaining=494 used=4706 limit=5200 reset=2026-10-19T17:00:00Z";
+
+test("a mint carrying rate_limit writes a lanes-app api-budget notice and a summary line", () => {
+  const run = request({}, { mint: QUOTA });
+  assert.equal(run.status, 0, run.stdout);
+  assert.ok(run.stdout.split("\n").includes(QUOTA_NOTICE), run.stdout);
+  assert.match(run.summary, /^- Lanes App REST quota at mint: `494` of `5200` remaining, resets `2026-10-19T17:00:00Z`$/m);
+  assert.match(run.output, /^token=ghs_lane$/m);
+});
+
+test("a mint without rate_limit passes and writes no quota notice", () => {
+  const run = request({});
+  assert.equal(run.status, 0, run.stdout);
+  assert.doesNotMatch(run.stdout, /api-budget|lane-token-quota-unread/);
+  assert.doesNotMatch(run.summary, /quota/);
+  assert.match(run.output, /^token=ghs_lane$/m);
+});
+
+test("a malformed rate_limit warns, writes no notice, and still passes", () => {
+  for (const rate_limit of [null, "5200", { remaining: 494, limit: 5200 }, { remaining: "494", limit: 5200, reset: 1 }, { remaining: 6000, limit: 5200, reset: 1 }, { remaining: 1.5, limit: 5200, reset: 1 }, { remaining: 0, limit: 0, reset: 1 }]) {
+    const run = request({}, { mint: { rate_limit } });
+    assert.equal(run.status, 0, `${JSON.stringify(rate_limit)}: ${run.stdout}`);
+    assert.match(run.stdout, /::warning::lane-token-quota-unread: /, JSON.stringify(rate_limit));
+    assert.doesNotMatch(run.stdout, /title=api-budget/);
+    assert.match(run.output, /^token=ghs_lane$/m);
+  }
 });
 
 test("check mode refuses an actions grant before the broker request", () => {
