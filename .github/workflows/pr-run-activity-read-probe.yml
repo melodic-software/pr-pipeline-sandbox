@@ -1,4 +1,4 @@
-name: pr-run-activity-read-probe
+name: PR Run Activity Read Probe
 
 # Test caller of pr-run-activity-read.yml. It passes only the scan-carrier
 # key, which the read runner requires and its scan job alone reads, so no App

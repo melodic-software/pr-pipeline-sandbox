@@ -1,4 +1,4 @@
-name: pr-review-no-bots
+name: PR Review No Bots
 
 # Sandbox control for Phase 9 case 14: the code-review reusable with an empty
 # allowed-bot-sender-ids, so a lanes App push is skipped. docs-only-paths

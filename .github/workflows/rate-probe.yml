@@ -1,4 +1,4 @@
-name: rate-probe
+name: Rate Probe
 
 # Phase 9 case 12 (R-RATE): read the repository's GITHUB_TOKEN core rate-limit
 # use before and after a dispatcher push. GET /rate_limit does not count

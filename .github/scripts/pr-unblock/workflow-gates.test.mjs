@@ -310,7 +310,7 @@ test("pr-feedback-dispatch.yml decides a lane branch's head again after a pull_r
     assert.equal(runs(overrides), false, label);
   }
   const text = readFileSync(new URL("../../workflows/pr-feedback-dispatch.yml", import.meta.url), "utf8");
-  assert.match(text, /\n    workflows: \[[^\]]*\bpr-merge\b[^\]]*\]\n/, "pr-merge is a workflow_run upstream");
+  assert.match(text, /\n    workflows: \[[^\]]*\bPR Merge\b[^\]]*\]\n/, "pr-merge is a workflow_run upstream");
 });
 
 test("pr-feedback-dispatch.yml posts verifier notes only for a pr-verify run of main", () => {

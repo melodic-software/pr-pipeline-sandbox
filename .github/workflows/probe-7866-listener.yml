@@ -1,4 +1,4 @@
-name: probe-7866-listener
+name: Probe 7866 Listener
 
 # Probe for melodic-software/claude-code-plugins#7866: shows that a
 # probe-7866-relay run starts a workflow_run listener from the default branch,
@@ -7,7 +7,7 @@ name: probe-7866-listener
 
 on:
   workflow_run: # zizmor: ignore[dangerous-triggers]
-    workflows: [probe-7866-relay]
+    workflows: [Probe 7866 Relay]
     types: [completed]
 
 permissions: {}
