@@ -41,6 +41,12 @@ source "$WIT_GH_ADAPTER_DIR/../../lib/binding.sh"
 wit_gh_require_seam_lib "$WIT_GH_ADAPTER_DIR/../../lib/gh-version.sh"
 # shellcheck source=../../lib/gh-version.sh
 source "$WIT_GH_ADAPTER_DIR/../../lib/gh-version.sh"
+# In this repository's CI jobs, each gh call keeps its rate-limit reading for
+# the job-end api-budget notice (.github/actions/log-api-budget). Each verb runs
+# as its own process, so the wrap goes here, where every verb sources it. A
+# no-op outside a job and wherever that file is absent (an installed plugin).
+# shellcheck source=/dev/null
+[[ -z "${RUNNER_TEMP:-}" ]] || ! . "${BASH_SOURCE[0]%/*}/../../../../../../.github/actions/log-api-budget/api-budget.bash" 2>/dev/null || api_budget_wrap_gh github-token
 
 # wit_gh_resolve_bot_wrapper — echo the bot wrapper path using consumer-local-first
 # resolution (CONTRACT.md "Identity routing (GitHub adapter)"), mirroring the
@@ -108,8 +114,17 @@ wit_help_if_requested() {
   fi
 }
 
+# wit_write_pause — wait WIT_WRITE_SPACING_S (default 1) before a write, so a
+# verb's consecutive writes stay at least that far apart (README "API budget").
+# Every write path calls it; callers run writes in $(), so no state survives
+# between calls to skip the first wait.
+wit_write_pause() {
+  sleep "${WIT_WRITE_SPACING_S:-1}"
+}
+
 # gh_write <gh-args…> — write op through the bot wrapper when available.
 gh_write() {
+  wit_write_pause
   if [[ -f "$WIT_GH_BOT" ]]; then
     bash "$WIT_GH_BOT" "$@"
   else
@@ -129,8 +144,20 @@ wit_map_gh_error() {
   esac
 }
 
+# wit_require_graphql_session <feature> — exit 3 when the session's GitHub proxy refuses
+# GraphQL, for verbs with no REST form (sub-issue and dependency edges, blockedBy reads).
+wit_require_graphql_session() {
+  if wit_gh_session_refuses_graphql; then
+    printf '%s: %s is unavailable in this Claude Code cloud session: its GitHub proxy refuses GraphQL and this has no REST form\n' \
+      "$(basename "${BASH_SOURCE[${#BASH_SOURCE[@]} - 1]}")" "$1" >&2
+    exit "$EX_CONFIG"
+  fi
+}
+
 # wit_run_gh <writer:write|read> <gh-args…> — run gh (routed by writer), capture
 # stdout to WIT_GH_OUT; on failure print stderr and exit with the mapped code.
+# With WIT_GH_NATIVE_TRY set (wit_run_gh_native) the proxy's GraphQL refusal returns 10
+# instead, so the caller can retry the operation over REST. Other failures still exit.
 wit_run_gh() {
   local writer="$1" err rc errfile
   shift
@@ -144,10 +171,19 @@ wit_run_gh() {
   err="$(<"$errfile")"
   rm -f "$errfile"
   if ((rc != 0)); then
+    if [[ -n "${WIT_GH_NATIVE_TRY:-}" && "$err" == *"$WIT_GH_GRAPHQL_REFUSAL_PREFIX"* ]]; then
+      return 10
+    fi
     printf '%s\n' "$err" >&2
     exit "$(wit_map_gh_error "$err")"
   fi
   WIT_GH_OUT="$(printf '%s' "$WIT_GH_OUT" | wit_strip_cr)"
+}
+
+# wit_run_gh_native <writer> <gh-args…> — wit_run_gh for a GraphQL-backed call with a
+# REST twin; returns 10 when the proxy refused GraphQL, 0 on success.
+wit_run_gh_native() {
+  WIT_GH_NATIVE_TRY=1 wit_run_gh "$@"
 }
 
 # wit_resolve_repo <--repo value or empty> — echo owner/repo (explicit override or
@@ -183,6 +219,7 @@ wit_read_assignees() {
 # depend on the assignment having landed MUST verify with wit_read_assignees.
 wit_add_assignee() {
   local writer="$1"
+  [[ "$writer" == "write" ]] || wit_write_pause # session-identity write skips gh_write
   wit_run_gh "$writer" api --method POST "repos/$2/$3/issues/$4/assignees" \
     -f "assignees[]=$5" --jq '[.assignees[].login]'
 }
@@ -190,6 +227,7 @@ wit_add_assignee() {
 # wit_remove_assignee <writer> <owner> <repo> <number> <login>
 wit_remove_assignee() {
   local writer="$1"
+  [[ "$writer" == "write" ]] || wit_write_pause # session-identity write skips gh_write
   wit_run_gh "$writer" api --method DELETE "repos/$2/$3/issues/$4/assignees" \
     -f "assignees[]=$5" --jq '[.assignees[].login]'
 }
@@ -197,6 +235,7 @@ wit_remove_assignee() {
 # wit_try_remove_assignee <owner> <repo> <number> <login> — best-effort rollback
 # on the session identity; never fails the caller.
 wit_try_remove_assignee() {
+  wit_write_pause
   gh api --method DELETE "repos/$1/$2/issues/$3/assignees" \
     -f "assignees[]=$4" >/dev/null 2>&1 || true
 }
@@ -262,7 +301,8 @@ readonly WIT_ITEM_JQ="$WIT_JQ_DEF_UTC_TS"'{
     else null
     end),
   url: .url,
-  created_at: (.createdAt | wit_utc_ts)
+  created_at: (.createdAt | wit_utc_ts),
+  milestone: (.milestone.title // null)
 }'
 
 # wit_gh_load_wont_do_labels — set WIT_GH_WONT_DO_LABELS (JSON array, lowercased) from
@@ -287,6 +327,36 @@ wit_gh_load_wont_do_labels() {
     echo "github: config.github.wont_do_labels must be an array of non-empty label names" >&2
     exit "$EX_CONFIG"
   fi
+}
+
+# wit_gh_load_status_trust — set WIT_GH_STATUS_TRUST from the binding's optional
+# config.github.status_trust (README "Work status trust"): empty when the key or the
+# binding is absent, else {trusted_actors, model, lanes_app} as one JSON object. Each
+# member must be a non-empty string and each path repo-relative, else exit 3.
+wit_gh_load_status_trust() {
+  local binding ejson
+  WIT_GH_STATUS_TRUST=""
+  binding="$(wit_find_binding)" || return 0
+  ejson="$(wit_effective_binding_json "$binding")" || {
+    echo "github: invalid binding at $binding; run /work-items:setup check" >&2
+    exit "$EX_CONFIG"
+  }
+  WIT_GH_STATUS_TRUST="$(jq -c '(.config.github // {}) as $g
+    | def text: type == "string" and length > 0;
+    def relative: text and (startswith("/") | not) and (split("/") | index("..") | not);
+    if ($g | type) != "object" or ($g | has("status_trust") | not) then null
+    elif ($g.status_trust | type) == "object" and ($g.status_trust.trusted_actors | relative)
+      and ($g.status_trust.model | relative) and ($g.status_trust.lanes_app | text)
+    then $g.status_trust | {trusted_actors, model, lanes_app}
+    else "bad" end' <<<"$ejson")"
+  case "$WIT_GH_STATUS_TRUST" in
+  null) WIT_GH_STATUS_TRUST="" ;;
+  '"bad"')
+    echo "github: config.github.status_trust must set trusted_actors and model (repo-relative paths) and lanes_app (a login)" >&2
+    exit "$EX_CONFIG"
+    ;;
+  *) ;;
+  esac
 }
 
 # wit_gh_annotate_blocker_reasons — stdin: one issue object or an array of them, as
@@ -336,15 +406,19 @@ wit_gh_annotate_blocker_reasons() {
 # wont_do_labels label, and closed blockers whose reason could not be read;
 # blocked_by_wont_do_count counts the won't-do ones.
 # gh >= 2.94 reads through `gh issue view --json` (issueType/blockedBy/parent).
-# Older gh reads REST, the path sandboxed sessions need (README "View item"), and maps
-# the REST shape onto the same fields; type comes from .type, and parent and
-# blockers have no REST field there, so they emit as null and 0.
+# Older gh, a Claude Code cloud session (CLAUDE_CODE_REMOTE=true), and a native read the
+# proxy refuses with its GraphQL 403 all read REST, the path sandboxed sessions need
+# (README "View item"), and map the REST shape onto the same fields; type comes from
+# .type, and parent and blockers have no REST field there, so they emit as null and 0.
 wit_emit_item() {
-  local owner="$1" repo="$2" number="$3"
-  local rest_to_view='{number, title, state, assignees, labels, issueType: .type, url: .html_url, createdAt: .created_at}'
+  local owner="$1" repo="$2" number="$3" native=0
+  local rest_to_view='{number, title, state, assignees, labels, issueType: .type, url: .html_url, createdAt: .created_at, milestone}'
   if wit_gh_has_native_surface; then
-    wit_run_gh read issue view "$number" -R "$owner/$repo" \
-      --json number,title,state,assignees,labels,issueType,blockedBy,parent,url,createdAt
+    wit_run_gh_native read issue view "$number" -R "$owner/$repo" \
+      --json number,title,state,assignees,labels,issueType,blockedBy,parent,url,createdAt,milestone &&
+      native=1
+  fi
+  if ((native)); then
     wit_gh_load_wont_do_labels
     printf '%s' "$WIT_GH_OUT" | wit_gh_annotate_blocker_reasons |
       jq -c --arg sv "$WIT_SCHEMA_VERSION" --arg or "$owner/$repo" "$WIT_ITEM_JQ"
@@ -367,10 +441,15 @@ wit_patch_lease_comment() {
 }
 
 # wit_list_lease_comments <owner> <repo> <number> — JSON array of
-# {id, node_id, body, created_at} for lease-marker comments, ascending id.
+# {id, node_id, body, created_at, author_association, user} for lease-marker
+# comments, ascending id. Only an owner's, member's or collaborator's comment, or a
+# bot's (association NONE; only an App installed on the repository can comment, such
+# as the lane's github-actions[bot] or a gh-bot.sh App), counts: anyone can comment
+# on a public repository.
 wit_list_lease_comments() {
   local owner="$1" repo="$2" number="$3"
   wit_run_gh read api --paginate "repos/$owner/$repo/issues/$number/comments?per_page=100" \
-    --jq '[.[] | select(.body | startswith("<!-- work-item-lease v1")) | {id, node_id, body, created_at}]'
-  jq -cs 'add // []' <<<"$WIT_GH_OUT"
+    --jq '[.[] | select(.body | startswith("<!-- work-item-lease v1")) | {id, node_id, body, created_at, author_association, user: {login: .user.login, type: .user.type}}]'
+  jq -cs 'add // [] | map(select(.author_association == "OWNER" or .author_association == "MEMBER"
+    or .author_association == "COLLABORATOR" or .user.type == "Bot"))' <<<"$WIT_GH_OUT"
 }

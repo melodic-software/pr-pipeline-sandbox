@@ -57,9 +57,8 @@ target_repo="$(wit_resolve_repo "$repo_override")" || exit "$?"
 # On older gh, forwarding `--type` dies with `unknown flag` (exit 1) and
 # `/work-items:track add` on an org repo files nothing. Degrade to the same
 # coarse `type:` label personal/non-org repos already use, and say so.
-native=0
-wit_gh_has_native_surface && native=1
-if [[ -n "$type" ]] && ((!native)); then
+# Also taken after a native create is refused by the cloud proxy's GraphQL 403.
+degrade_type() {
   type_lc="$(printf '%s' "$type" | tr '[:upper:]' '[:lower:]')"
   case "$type_lc" in
   bug | fix) type_label="type: bug" ;;
@@ -78,10 +77,48 @@ if [[ -n "$type" ]] && ((!native)); then
     printf 'create-item.sh: --type requires gh >= 2.94; dropped the type because %s defines no "%s" label\n' \
       "$target_repo" "$type_label" >&2
   fi
+}
+
+native=0
+wit_gh_has_native_surface && native=1
+if [[ -n "$type" ]] && ((!native)); then
+  degrade_type
 fi
 
 label_list=()
 [[ -z "$labels" ]] || IFS=',' read -ra label_list <<<"$labels"
+
+# Sibling dedupe (CONTRACT.md "Verbs"): a child of the parent in the target repo with the
+# same trimmed title, open or closed within 24 hours, is returned instead of a new issue.
+# One GraphQL read, since the subIssues projection list-sub-items reads has no closedAt.
+# A proxy refusal drops to the REST branch, which refuses --parent.
+if ((native)) && [[ -n "$parent" ]]; then
+  wit_require_github_id "$parent" || wit_usage_error "malformed or non-github --parent id: $parent"
+  # shellcheck disable=SC2016  # GraphQL query: $o/$r/$n are GraphQL variables
+  wit_run_gh_native read api graphql \
+    -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){issue(number:$n){subIssues(first:100){nodes{number title state closedAt repository{nameWithOwner}}}}}}' \
+    -f o="$WIT_ID_OWNER" -f r="$WIT_ID_REPO" -F n="$WIT_ID_NUMBER"
+  if (($? == 10)); then
+    native=0
+  else
+    sibling="$(jq -r --arg title "$title" --arg repo "$target_repo" '
+      def trimmed: gsub("^[[:space:]]+|[[:space:]]+$"; "");
+      ($title | trimmed) as $t
+      | [(.data.repository.issue.subIssues.nodes // [])[]
+          | select(((.repository.nameWithOwner // "") | ascii_downcase) == ($repo | ascii_downcase))
+          | select(((.title // "") | trimmed) == $t)
+          | select(.state == "OPEN" or (.closedAt != null
+              and ((.closedAt | sub("\\.[0-9]+"; "") | fromdateiso8601) > now - 86400)))]
+      | (map(select(.state == "OPEN")) + map(select(.state != "OPEN")))[0] // empty
+      | "\(.number) \(.state | ascii_downcase)"' <<<"$WIT_GH_OUT")" || exit "$EX_INTERNAL"
+    if [[ -n "$sibling" ]]; then
+      printf 'create-item: %s already has %s child github:%s#%s titled "%s"; created nothing\n' \
+        "$parent" "${sibling#* }" "$target_repo" "${sibling%% *}" "$title" >&2
+      wit_emit_item "${target_repo%%/*}" "${target_repo##*/}" "${sibling%% *}"
+      exit 0
+    fi
+  fi
+fi
 
 if ((native)); then
   args=(issue create -R "$target_repo" --title "$title" --body "$body")
@@ -105,19 +142,34 @@ if ((native)); then
     args+=(--blocked-by "$blocker_urls")
   fi
 
-  wit_run_gh write "${args[@]}"
-  created_url="${WIT_GH_OUT##*$'\n'}" # last line — gh prints the created URL last
-  number="${created_url##*/}"
-  [[ "$number" =~ ^[0-9]+$ ]] || {
-    printf 'create-item: could not parse created issue URL: %s\n' "$created_url" >&2
-    exit "$EX_INTERNAL"
-  }
-else
+  wit_run_gh_native write "${args[@]}"
+  if (($? == 10)); then
+    # The proxy refused GraphQL before creating anything: retry over REST below.
+    native=0
+    if [[ -n "$type" ]]; then
+      degrade_type
+      # degrade_type may append the type label; rebuild the list the REST branch reads.
+      label_list=()
+      [[ -z "$labels" ]] || IFS=',' read -ra label_list <<<"$labels"
+    fi
+  else
+    created_url="${WIT_GH_OUT##*$'\n'}" # last line — gh prints the created URL last
+    number="${created_url##*/}"
+    [[ "$number" =~ ^[0-9]+$ ]] || {
+      printf 'create-item: could not parse created issue URL: %s\n' "$created_url" >&2
+      exit "$EX_INTERNAL"
+    }
+  fi
+fi
+
+if ((!native)); then
   # `gh issue create` resolves through GraphQL, so sandboxed sessions create over
   # REST (README "View item"). Sub-issue and dependency edges
   # have no REST form here (the dispatcher gates them on the same gh version).
-  [[ -z "$parent" && -z "$blocked_by" ]] ||
-    wit_usage_error "--parent and --blocked-by require gh >= 2.94"
+  if [[ -n "$parent" || -n "$blocked_by" ]]; then
+    wit_require_graphql_session "--parent and --blocked-by"
+    wit_usage_error "--parent and --blocked-by require gh >= 2.94 and a session that allows GraphQL"
+  fi
   rest_args=(api --method POST "repos/$target_repo/issues" -f "title=$title" -f "body=$body")
   for label in ${label_list[@]+"${label_list[@]}"}; do
     rest_args+=(-f "labels[]=$label")

@@ -24,9 +24,13 @@
     "add-sub-item": false,
     "list-items": true,
     "label-provenance": false,
+    "set-fields": false,
+    "get-field-options": false,
+    "get-statuses": false,
     "list-sub-items": false,
     "capabilities": true,
-    "change-link": true
+    "change-link": true,
+    "add-recurrence": false
   },
   "features": {
     "cross_repo_edges": true,

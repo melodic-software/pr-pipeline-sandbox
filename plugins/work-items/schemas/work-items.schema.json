@@ -2,9 +2,17 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/plugins/work-items/schemas/work-items.schema.json",
   "title": "work-items team config",
-  "description": "Schema for a repository's docs/conventions/work-items.yaml, the team layer of the work-items plugin's settings (ADR 0064). A key set here wins over the same key in the plugin's userConfig. Reader: /work-items:triage only; the /work-items:work-loop admission gate reads the objection window's end from the marker comment triage posts.",
+  "description": "Schema for a repository's docs/conventions/work-items.yaml, the team layer of the work-items plugin's settings (ADR 0064). A key set here wins over the same key in the plugin's userConfig. Readers: /work-items:triage for the triage keys (the /work-items:work-loop admission gate reads the objection window's end from the marker comment triage posts; triage_outside_prs has no userConfig layer; triage_stale_reporter_info_days is read by the attention view; triage_cluster has no userConfig layer), every lane that follows reference/ai-disclaimer.md for ai_disclaimer, /work-items:work for work_priority_order and bug_path, /work-items:work's bug path for verification and verification_skills (through lib/read-verification.sh, at the default branch only), /work-items:measure-delivery for delivery_deploy_signal, and /work-items:morning-brief's scripts/morning-brief.sh for morning_brief (a flag beats work-items.local.yaml, which beats this file, which beats the default; contract: docs/contracts/config-cascade/README.md). The tracker seam (tools/work-item-tracker/lib/binding.sh) reads tracker, and work-items.local.yaml beside this file may refine its overridable keys.",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "name": { "type": "string", "minLength": 1, "pattern": "^[^\\u0000-\\u001f\\u007f]+$" },
+    "names": { "type": "array", "items": { "$ref": "#/$defs/name" } },
+    "amount": { "type": "number", "minimum": 0 },
+    "count": { "type": "integer", "minimum": 0 },
+    "percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "owner": { "type": "string", "pattern": "^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$" }
+  },
   "properties": {
     "$schema": { "type": "string" },
     "triage_repro_count": {
@@ -18,6 +26,184 @@
       "minimum": 0,
       "default": 0,
       "description": "Hours after triage marks an item autonomous-eligible during which the work-loop lane does not dispatch it, so a person can object. 0 turns the window off."
+    },
+    "triage_outside_prs": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether the repository takes requests as pull requests from outside contributors. true: the /work-items:triage attention view lists their open pull requests beside the issues. false or absent: it lists no pull request. A pull request named explicitly is triaged either way."
+    },
+    "triage_stale_reporter_info_days": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Days without a reply from a reporter who lacks write access after which /work-items:triage's attention view lists a needs-reporter-info item as a close candidate. Absent (no default): off, and no candidate is listed. Repository layer only; no userConfig option. Listing never closes: only the operator's yes in an attended session closes a candidate, and lanes never close."
+    },
+    "triage_cluster": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How /work-items:triage forms signature clusters: one parent per shared signature, and only the parent can get the autonomous-eligible role label. Repository layer only; no userConfig option. The defaults are provisional until tuned on the first 20 clusters.",
+      "properties": {
+        "signatures": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["error", "symptom", "commit"] },
+          "minItems": 1,
+          "uniqueItems": true,
+          "default": ["error", "symptom", "commit"],
+          "description": "Which shared signatures form a cluster. error: the same error text or failing check; symptom: the same reproduced symptom; commit: the same suspect commit. Absent: all three."
+        },
+        "min_members": {
+          "type": "integer",
+          "minimum": 2,
+          "default": 2,
+          "description": "Open items, the triaged one included, that must share a signature before they form a cluster. Absent: 2."
+        },
+        "parent": {
+          "type": "string",
+          "enum": ["oldest-reproduced", "oldest"],
+          "default": "oldest-reproduced",
+          "description": "Which member becomes the parent. oldest-reproduced: the oldest member with a confirmed reproduction, else the oldest; oldest: the oldest. Absent: oldest-reproduced."
+        }
+      }
+    },
+    "ai_disclaimer": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether autonomous work-items lanes start each tracker item and comment they create with the AI disclaimer (reference/ai-disclaimer.md). false adds no prefix."
+    },
+    "work_priority_order": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^priority:" },
+      "minItems": 1,
+      "uniqueItems": true,
+      "default": ["priority: critical", "priority: high", "priority: medium", "priority: low"],
+      "description": "The priority: label names, highest first, that /work-items:work ranks candidates by within each selection tier before the tier's own order (next_due, the guardrails preference, or oldest-first) breaks ties; the work-loop lane ranks its admitted items the same way. A candidate with no priority: label, or one this list does not name, ranks below every listed label. Quote each item (- \"priority: high\"): an unquoted item parses as a mapping and drops out of the list. Absent: the default list."
+    },
+    "bug_path": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How far /work-items:work runs its bug path, and the fix gate a bug passes before any fix. Repository layer only; no userConfig option. CI mode (--issue <n> --ci) does not read it.",
+      "properties": {
+        "fix_gate": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The seven conditions a bug item passes, in full mode, before /work-items:work dispatches a fix; one that fails stops the run with no fix and no PR, naming the condition. Read from the default branch's committed file, so a branch cannot loosen it. The five floor keys are tighten-only: a false is named and ignored, and the condition stays on.",
+          "properties": {
+            "confirmed_repro": { "enum": [true], "default": true, "description": "Floor. Both reproduction runs showed the named broken state." },
+            "evidence_reviewed": { "enum": [true], "default": true, "description": "Floor. A fresh-context reviewer confirmed the run output shows the named broken state." },
+            "no_fix_artifact": { "enum": [true], "default": true, "description": "Floor. No commit, PR or comment claims a fix; one that does routes to verify-existing-fix instead." },
+            "no_human_claim": { "enum": [true], "default": true, "description": "Floor. No person's comment claims the fix and no one else is assigned; no waiting window." },
+            "root_cause_evidenced": { "enum": [true], "default": true, "description": "Floor. A run, log or trace ties the cause to the symptom; otherwise the root-cause diagnosis runs first." },
+            "before_after_runnable": { "type": "boolean", "default": true, "description": "The reproduction command runs on both the baseline and the patched build (through /app-control:drive when installed). false turns the condition off." },
+            "budget_minutes": { "type": "integer", "minimum": 1, "default": 90, "description": "Minutes the fix is expected to fit; the dispatch brief carries it, and a fix that outgrows it is escalated." },
+            "scope": { "type": "array", "items": { "$ref": "#/$defs/name" }, "minItems": 1, "description": "Path prefixes the fix may touch. Absent: the paths the root cause names." }
+          }
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["full", "investigate"],
+          "default": "full",
+          "description": "full: the whole bug path, through the fix and a draft PR. investigate: the path ends after the root cause, with no branch, no fix and no PR, and posts one marker comment carrying the outcome, the reproduction evidence, the ranked causes and the access that was missing. Absent: full."
+        }
+      }
+    },
+    "verification": {
+      "enum": ["off", "light", "standard", "strict"],
+      "default": "standard",
+      "description": "How much independent checking this plugin's skills run: off, light (skip the verifier dispatch), standard (today's behavior) or strict (run the passes that are optional today). /work-items:work's bug path reads it for the step 2 capture check. Read from the default branch's committed copy only, so a branch cannot lower it. Repository layer only; no userConfig option. Levels: docs/contracts/verification-level/README.md."
+    },
+    "verification_skills": {
+      "type": "object",
+      "additionalProperties": { "enum": ["off", "light", "standard", "strict"] },
+      "description": "Per-skill verification level, keyed by skill name (for example work); an entry beats this file's verification value."
+    },
+    "delivery_deploy_signal": {
+      "type": "string",
+      "enum": ["merge-to-default-branch"],
+      "default": "merge-to-default-branch",
+      "description": "What /work-items:measure-delivery counts as one deployment. merge-to-default-branch: each commit on the default branch's first-parent history is one deployment (a merge commit or a squash landing is one; a rebase landing is one per commit it lands), and one a later commit reverts is a failed deployment. Absent: merge-to-default-branch."
+    },
+    "filing_posture": {
+      "type": "string",
+      "enum": ["manual-only", "allowed"],
+      "default": "manual-only",
+      "description": "Team policy for a scanner's explicit filing argument, such as /bugs:scan --track. manual-only: the scanner files nothing and prints why, and a standing autonomous lane must not file into this tracker. allowed: the explicit argument may file. Neither value makes a bare invocation file. Repository layer only; no userConfig option. Absent: manual-only, unless a filing_posture in the bugs plugin's layers (deprecated, read for one release) supplies it."
+    },
+    "morning_brief": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Settings of /work-items:morning-brief's Cost section.",
+      "properties": {
+        "org": { "$ref": "#/$defs/owner", "description": "GitHub org whose billing and repos the Cost section reads. Default: the repo's owner." },
+        "subscription": { "$ref": "#/$defs/name", "description": "Azure subscription the Cost section reads. Default: az's current one. Keep it out of a public repository's tracked file; set it in work-items.local.yaml." },
+        "actions_included_minutes": { "$ref": "#/$defs/amount", "description": "Actions minutes the org's plan includes each month. Unset: the minutes line is INFO with the amount used." },
+        "actions_included_storage_gb": { "$ref": "#/$defs/amount", "description": "Artifact storage the plan includes, in GB. Unset: the storage line is INFO with the amount used." },
+        "usage_alert_percent": { "$ref": "#/$defs/percent", "description": "Share of an included amount at which a usage line is an ALERT. Default 50." },
+        "log_cap_alert_percent": { "$ref": "#/$defs/percent", "description": "Share of a Log Analytics workspace's daily cap at which its peak day is an ALERT. Default 50." },
+        "forecast_alert": { "$ref": "#/$defs/amount", "description": "Budget forecast above which an Azure budget is an ALERT. Default: the budget's own amount." },
+        "required_budgets": { "$ref": "#/$defs/names", "description": "Azure budgets that must exist and not end within expiry_days." },
+        "anomaly_alert": { "$ref": "#/$defs/name", "description": "The Cost Management anomaly alert that must exist, be enabled and not end within expiry_days. Default: any anomaly alert." },
+        "expiry_days": { "$ref": "#/$defs/count", "description": "Days before a required budget or the anomaly alert ends at which it is an ALERT. Default 30." },
+        "allowed_collaborators": { "$ref": "#/$defs/names", "description": "Direct repo collaborators, besides org admins, who are not an ALERT." },
+        "workflow_read_limit": { "$ref": "#/$defs/count", "description": "Cap on workflow files read for secret triggers in one run. Default 300." },
+        "landed_sample": { "$ref": "#/$defs/count", "description": "PRs the Landed section lists under \"Read these\", spread across the PRs merged since this machine's landed_at. Default 3; 0 lists none." }
+      }
+    },
+    "tracker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "provider", "config"],
+      "description": "The work-item tracker binding: the one active provider the seam (tools/work-item-tracker/CONTRACT.md, Setup) dispatches to. Absent: the seam reads the legacy repo-root JSON binding while the migration runs, with a notice, and stops pointing at /work-items:setup when neither exists. In work-items.local.yaml only config.lease_ttl_hours, config.lease_ttl_minutes, the per-provider auth_email/auth_env keys and docs may be set.",
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "pattern": "^1\\.",
+          "description": "Binding format version; quote it (\"1.0\") so it stays a string. Only major version 1 is read."
+        },
+        "provider": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_-]+$",
+          "description": "The adapter directory name: github, local-markdown, jira, gitea, linear, or a consumer-local adapter."
+        },
+        "docs": {
+          "type": "string",
+          "description": "A free-form pointer naming what this binding is and where its contract lives; the seam never reads it."
+        },
+        "config": {
+          "type": "object",
+          "required": ["lease_ttl_hours"],
+          "description": "Provider-neutral keys, plus one subtree per provider (github, jira, linear, gitea) whose keys the adapter's README documents.",
+          "properties": {
+            "lease_ttl_hours": { "type": "integer", "minimum": 0, "description": "Claim lease lifetime in hours. Required." },
+            "lease_ttl_minutes": { "type": "integer", "minimum": 0, "maximum": 59, "description": "Minutes added to lease_ttl_hours. Absent: 0." },
+            "storage_dir": { "type": "string", "description": "The local-markdown store, required for that provider. A relative path roots at the repository root." },
+            "container_label": { "type": "string", "description": "The label that marks a spec container. Absent or empty: work-map." },
+            "role_labels": {
+              "type": "object",
+              "additionalProperties": { "type": "string" },
+              "description": "Canonical role to label remaps (human-gated, autonomous-eligible, recurring-maintenance, owner-decision); an absent or empty value keeps the default label."
+            },
+            "hold_labels": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Labels that keep an item off the autonomous frontier. Absent or empty: the owner-decision role label, status: needs-info, needs-spec."
+            },
+            "hold_states": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Work status field states that keep an item off the autonomous frontier. Absent or empty: needs-human, needs-owner-decision, needs-reporter-info, needs-spec."
+            },
+            "hold_state_labels": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Labels of the hold states: an item carrying one has its hold decided by its labels, so its Work status adds none. Absent or empty: needs-human, the owner-decision role label, needs-owner-decision, status: needs-info, needs-spec."
+            },
+            "wayfind_label_prefix": { "type": "string", "description": "The label prefix that marks /planning:wayfind map items, which no frontier lists. Absent or empty: wayfind:." },
+            "github": { "type": "object" },
+            "jira": { "type": "object" },
+            "linear": { "type": "object" },
+            "gitea": { "type": "object" }
+          }
+        }
+      }
     }
   }
 }

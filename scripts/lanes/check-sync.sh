@@ -79,6 +79,13 @@ SYNCED=(
   plugins/source-control/scripts/resolve-version-bump-conflict.sh
   plugins/source-control/skills/pull-request/scripts/feedback-thread.sh
   plugins/work-items/scripts/charge-words.json
+  # The tracker the runners claim and release leases through, what it sources
+  # from outside its folder, and the schema its binding error names.
+  plugins/work-items/tools/work-item-tracker
+  plugins/work-items/lib/resolve-convention-home.sh
+  plugins/work-items/skills/triage/scripts/yaml-subset.awk
+  plugins/work-items/schemas/work-items.schema.json
+  plugins/work-items/skills/onboard-adapter/scripts
   scripts/setup-env.sh
   # The read runner's caller-secret gate, and the shadow check the owner runs
   # after the scan-carrier keygen.

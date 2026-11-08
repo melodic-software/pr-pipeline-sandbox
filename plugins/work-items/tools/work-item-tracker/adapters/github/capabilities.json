@@ -13,8 +13,12 @@
     "list-items": true,
     "list-sub-items": true,
     "label-provenance": true,
+    "set-fields": true,
+    "get-field-options": true,
+    "get-statuses": true,
     "capabilities": true,
-    "change-link": true
+    "change-link": true,
+    "add-recurrence": true
   },
   "features": {
     "cross_repo_edges": true,

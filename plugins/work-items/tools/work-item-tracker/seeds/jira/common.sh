@@ -17,32 +17,33 @@ readonly _WIT_JIRA_COMMON_LOADED=1
 WIT_JIRA_ADAPTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly WIT_JIRA_ADAPTER_DIR
 
-# A consumer may shadow this adapter with a local copy (CONTRACT.md "Adapter
-# resolution") while still running the bundled dispatcher; the shared seam libs
-# below then resolve relative to that copy and can be absent. A missing required
-# lib must hard-fail with a clear diagnostic (exit 3 — setup/config error), never
-# let sourcing fail silently and leave a verb emitting a malformed record. Runs
-# before the EX_* constants below exist, so it uses the literal.
+# This seed runs as a copy in the consuming repo (seeds/README.md), where its own
+# ../../lib does not exist; the dispatcher exports WIT_SEAM_LIB_DIR (CONTRACT.md
+# "Adapter resolution") for that case, and ../../lib serves a direct run from the
+# plugin. A missing required lib must hard-fail with a clear diagnostic (exit 3 —
+# setup/config error), never let sourcing fail silently and leave a verb emitting a
+# malformed record. Runs before the EX_* constants below exist, so it uses the literal.
+WIT_JIRA_SEAM_LIB="${WIT_SEAM_LIB_DIR:-$WIT_JIRA_ADAPTER_DIR/../../lib}"
 wit_jira_require_seam_lib() {
   [[ -f "$1" ]] && return 0
   printf 'work-item-tracker jira adapter: required seam library not found: %s\n' "$1" >&2
-  printf '  a shadowed consumer-local adapter must still resolve the bundled seam lib/ directory\n' >&2
+  printf '  set WIT_SEAM_LIB_DIR to the work-item-tracker lib/ directory, or run the adapter through the dispatcher\n' >&2
   exit 3
 }
 
-wit_jira_require_seam_lib "$WIT_JIRA_ADAPTER_DIR/../../lib/id.sh"
-# shellcheck source=../../lib/id.sh
-source "$WIT_JIRA_ADAPTER_DIR/../../lib/id.sh"
-wit_jira_require_seam_lib "$WIT_JIRA_ADAPTER_DIR/../../lib/json.sh"
-# shellcheck source=../../lib/json.sh
-source "$WIT_JIRA_ADAPTER_DIR/../../lib/json.sh"
+wit_jira_require_seam_lib "$WIT_JIRA_SEAM_LIB/id.sh"
+# shellcheck source=../../lib/id.sh disable=SC1091
+source "$WIT_JIRA_SEAM_LIB/id.sh"
+wit_jira_require_seam_lib "$WIT_JIRA_SEAM_LIB/json.sh"
+# shellcheck source=../../lib/json.sh disable=SC1091
+source "$WIT_JIRA_SEAM_LIB/json.sh"
 # binding.sh is sourced (not inherited): the dispatcher runs each verb as a fresh
 # `bash <verb>.sh` subprocess, so only exported env vars cross — not wit_find_binding.
 # The adapter re-locates the binding itself to read its jira-specific config subtree,
 # rather than growing the shared binding.sh with jira keys.
-wit_jira_require_seam_lib "$WIT_JIRA_ADAPTER_DIR/../../lib/binding.sh"
-# shellcheck source=../../lib/binding.sh
-source "$WIT_JIRA_ADAPTER_DIR/../../lib/binding.sh"
+wit_jira_require_seam_lib "$WIT_JIRA_SEAM_LIB/binding.sh"
+# shellcheck source=../../lib/binding.sh disable=SC1091
+source "$WIT_JIRA_SEAM_LIB/binding.sh"
 
 readonly EX_INTERNAL=1
 readonly EX_USAGE=2
@@ -146,11 +147,11 @@ wit_need_jira_config() {
   name="$(basename "${BASH_SOURCE[1]}")"
   binding="$(wit_find_binding)" ||
     {
-      printf '%s: no binding found (.work-item-tracker.json) — see CONTRACT.md Setup\n' "$name" >&2
+      printf '%s: no binding found (tracker: in <home>/work-items.yaml, or the legacy repo-root JSON binding) — see CONTRACT.md Setup\n' "$name" >&2
       exit "$EX_CONFIG"
     }
-  # The effective (team + allowlisted overlay) view: auth_email/auth_env are the
-  # jira keys a per-user overlay may carry — auth identity is per-account —
+  # The effective (team + allowlisted personal override) view: auth_email/auth_env are
+  # the jira keys a personal override may carry — auth identity is per-account —
   # while site/project_keys and the JQL-shaping keys stay team-only.
   ejson="$(wit_effective_binding_json "$binding")" ||
     {
@@ -443,5 +444,6 @@ readonly WIT_JIRA_NORMALIZE_PROGRAM="$WIT_JQ_DEF_UTC_TS"'
     blocked_by_wont_do_count: ([blockers[] | select(done and class == "wont_do")] | length),
     parent_id: (if (.fields.parent.key // null) == null then null else (.fields.parent.key | qualify) end),
     url: ("https://" + $site + "/browse/" + .key),
-    created_at: (.fields.created | wit_utc_ts)
+    created_at: (.fields.created | wit_utc_ts),
+    milestone: null
   }'

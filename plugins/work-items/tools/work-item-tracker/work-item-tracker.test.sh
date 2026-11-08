@@ -3,6 +3,7 @@
 # list-frontier derivation — all against a fake adapter (no network, no gh).
 # test-scope: plugins/work-items/tools/work-item-tracker/adapters/local-markdown/* plugins/work-items/tools/work-item-tracker/adapters/*/capabilities.json
 # test-scope: plugins/work-items/tools/work-item-tracker/lib/id.sh plugins/work-items/tools/work-item-tracker/lib/lease.sh
+# test-scope: plugins/work-items/tools/work-item-tracker/adapters/github/get-field-options.sh plugins/work-items/tools/work-item-tracker/adapters/github/common.sh
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,8 +72,9 @@ assert_eq "unknown verb → exit 2" "2" "$?"
 
 # --- binding errors → exit 3 ---
 
-(cd "$TEST_TMPDIR" && WORK_ITEM_TRACKER_BINDING="$TEST_TMPDIR/nope.json" bash "$DISPATCHER" capabilities >/dev/null 2>&1)
+ERR="$(cd "$TEST_TMPDIR" && WORK_ITEM_TRACKER_BINDING="$TEST_TMPDIR/nope.json" bash "$DISPATCHER" capabilities 2>&1 >/dev/null)"
 assert_eq "missing binding → exit 3" "3" "$?"
+assert_contains "missing binding points at /work-items:setup" "$ERR" "/work-items:setup"
 
 BAD="$TEST_TMPDIR/bad.json"
 printf 'nope\n' >"$BAD"
@@ -163,6 +165,24 @@ ERR="$(run_dispatcher label-provenance "fake:o/r#1" --label agent-ready 2>&1 >/d
 RC_CAPTURE=$?
 assert_eq "undeclared label-provenance verb → exit 6" "6" "$RC_CAPTURE"
 assert_contains "exit-6 stderr names the label-provenance verb" "$ERR" "label-provenance"
+
+# An adapter with no issue fields declares no set-fields key: the verb degrades, never writes.
+ERR="$(run_dispatcher set-fields "fake:o/r#1" --field 1=2 2>&1 >/dev/null)"
+RC_CAPTURE=$?
+assert_eq "undeclared set-fields verb → exit 6" "6" "$RC_CAPTURE"
+assert_contains "exit-6 stderr names the set-fields verb" "$ERR" "set-fields"
+
+# An adapter with no issue fields declares no get-field-options key: the verb reports unsupported.
+ERR="$(run_dispatcher get-field-options --field Size 2>&1 >/dev/null)"
+RC_CAPTURE=$?
+assert_eq "undeclared get-field-options verb → exit 6" "6" "$RC_CAPTURE"
+assert_contains "exit-6 stderr names the get-field-options verb" "$ERR" "get-field-options"
+
+# An adapter that declares no add-recurrence key exits 6 rather than recording anything.
+ERR="$(run_dispatcher add-recurrence "fake:o/r#1" --source-link https://example.com/1 --note seen 2>&1 >/dev/null)"
+RC_CAPTURE=$?
+assert_eq "undeclared add-recurrence verb → exit 6" "6" "$RC_CAPTURE"
+assert_contains "exit-6 stderr names the add-recurrence verb" "$ERR" "add-recurrence"
 
 # --- capabilities passthrough ---
 
@@ -344,9 +364,9 @@ assert_eq "empty --body-file → exit 2" "2" "$?"
 run_skew bodyfake create-item --title t --body-file >/dev/null 2>&1
 assert_eq "--body-file without a value → exit 2" "2" "$?"
 
-# Every bundled branch grammar needs a delimiter after the ref, so `ENG-12oops` never
-# names ENG-12, and its last capture group is the ref.
-for m in "$SCRIPT_DIR"/adapters/*/capabilities.json; do
+# Every bundled and seed branch grammar needs a delimiter after the ref, so `ENG-12oops`
+# never names ENG-12, and its last capture group is the ref.
+for m in "$SCRIPT_DIR"/adapters/*/capabilities.json "$SCRIPT_DIR"/seeds/*/capabilities.json; do
   p="$(jq -r '.change_link.branch_pattern' "$m")"
   a="$(basename "$(dirname "$m")")"
   case "$a" in jira | linear) ref="ENG-12" ;; *) ref="12" ;; esac
@@ -361,6 +381,156 @@ for m in "$SCRIPT_DIR"/adapters/*/capabilities.json; do
     pass "$a grammar needs a delimiter after the ref"
   fi
 done
+
+# --- status-storage: the bundled adapters over fixtures (no network) ---
+# github reads the org issue-field listing through a gh stub; local-markdown declares no
+# get-field-options, so it reports labels without any read.
+STATUS_STUB="$TEST_TMPDIR/status-stub-bin"
+mkdir -p "$STATUS_STUB"
+cat >"$STATUS_STUB/gh" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+  orgs/*/issue-fields)
+    case "$STATUS_FIELDS" in
+    present) printf '%s\n' '[{"data_type":"single_select","id":15462270,"name":"Size","options":[{"id":1,"name":"Small"}]},{"data_type":"single_select","id":48625799,"name":"Work status","options":[{"id":2,"name":"needs-triage"},{"id":3,"name":"agent-ready"}]}]' ;;
+    absent) printf '%s\n' '[{"data_type":"single_select","id":15462270,"name":"Size","options":[{"id":1,"name":"Small"}]}]' ;;
+    *) printf '%s\n' "$STATUS_FIELDS" >&2; exit 1 ;;
+    esac
+    exit 0
+    ;;
+  esac
+done
+exit 90
+EOF
+chmod +x "$STATUS_STUB/gh"
+STATUS_GH_BINDING="$TEST_TMPDIR/status-github.json"
+printf '%s\n' '{"schema_version":"1.0","provider":"github","config":{"lease_ttl_hours":24}}' >"$STATUS_GH_BINDING"
+
+# run_status_github <fixture>: status-storage on the bundled github adapter; stdout to OUT.
+run_status_github() {
+  OUT="$(STATUS_FIELDS="$1" PATH="$STATUS_STUB:$PATH" WORK_ITEM_TRACKER_BINDING="$STATUS_GH_BINDING" \
+    WIT_ADAPTERS_DIR="$SCRIPT_DIR/adapters" bash "$DISPATCHER" status-storage --repo o/r 2>/dev/null)"
+  RC=$?
+}
+
+run_status_github present
+assert_eq "status-storage github, field present → exit 0" "0" "$RC"
+assert_eq "status-storage github, field present → field" "field" "$(jq -r '.storage' <<<"$OUT")"
+assert_eq "status-storage github, field present names the field" "Work status" "$(jq -r '.field' <<<"$OUT")"
+
+run_status_github absent
+assert_eq "status-storage github, field absent → exit 0" "0" "$RC"
+assert_eq "status-storage github, field absent → labels" "labels" "$(jq -r '.storage' <<<"$OUT")"
+assert_eq "status-storage github, labels names no field" "null" "$(jq -r '.field' <<<"$OUT")"
+
+run_status_github "gh: Not Found (HTTP 404)"
+assert_eq "status-storage github, user-owned repo listing → exit 0" "0" "$RC"
+assert_eq "status-storage github, user-owned repo listing → labels" "labels" "$(jq -r '.storage' <<<"$OUT")"
+
+run_status_github "gh: Forbidden (HTTP 403)"
+assert_eq "status-storage github, listing without read:org → exit 0" "0" "$RC"
+assert_eq "status-storage github, listing without read:org → labels" "labels" "$(jq -r '.storage' <<<"$OUT")"
+
+run_status_github "gh: API rate limit exceeded for user ID 1. (HTTP 403)"
+assert_eq "status-storage github, rate-limited 403 → adapter's exit 4" "4" "$RC"
+assert_eq "status-storage github, rate-limited 403 → no answer" "" "$OUT"
+
+run_status_github "To get started with GitHub CLI, please run: gh auth login (not logged in)"
+assert_eq "status-storage github, gh not logged in → adapter's exit 4" "4" "$RC"
+
+run_status_github "dial tcp: connection refused"
+assert_eq "status-storage github, provider unreachable → adapter's exit 8" "8" "$RC"
+assert_eq "status-storage github, provider unreachable → no answer" "" "$OUT"
+
+# --- list-frontier --autonomous: the Work status field adds holds to the label floor ---
+# A fake adapter whose tracker stores status in the field (FIELD_STORAGE=field) or not
+# (labels), and whose get-statuses answers FIELD_STATUSES, or fails when it is `fail`.
+FIELD_DIR="$TEST_TMPDIR/adapters/fieldfake"
+mkdir -p "$FIELD_DIR"
+printf '%s\n' '{"schema_version":"1.0","provider":"fieldfake","verbs":{"list-items":true,"get-field-options":true,"get-statuses":true,"capabilities":true}}' \
+  >"$FIELD_DIR/capabilities.json"
+cat >"$FIELD_DIR/list-items.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '{"schema_version":"1.0","items":[{"id":"fieldfake:o/r#1","state":"open","assignees":[],"labels":["needs-human"],"blocked_by_count":0},{"id":"fieldfake:o/r#2","state":"open","assignees":[],"labels":[],"blocked_by_count":0},{"id":"fieldfake:o/r#3","state":"open","assignees":[],"labels":["needs-spec"],"blocked_by_count":0},{"id":"fieldfake:o/r#4","state":"open","assignees":[],"labels":["provenance: untrusted"],"blocked_by_count":0},{"id":"fieldfake:o/r#5","state":"open","assignees":[],"labels":["agent-ready"],"blocked_by_count":0}],"truncated":false}'
+EOF
+cat >"$FIELD_DIR/get-field-options.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "get-field-options $*" >>"$FIELD_LOG"
+case "$FIELD_STORAGE" in
+field) printf '%s\n' '{"schema_version":"1.0","field":"Work status","options":[{"id":1,"name":"agent-ready"}]}' ;;
+labels) printf '%s\n' '{"schema_version":"1.0","field":"Work status","options":[]}' ;;
+*) echo "provider unreachable" >&2; exit 8 ;;
+esac
+EOF
+cat >"$FIELD_DIR/get-statuses.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "get-statuses $*" >>"$FIELD_LOG"
+[[ "$FIELD_STATUSES" != "fail" ]] || { echo "rate limit" >&2; exit 8; }
+[[ "$FIELD_STATUSES" != "config" ]] || { echo "status_trust: trust list unread" >&2; exit 3; }
+printf '{"schema_version":"1.0","statuses":%s}\n' "$FIELD_STATUSES"
+EOF
+FIELD_BINDING="$TEST_TMPDIR/fieldfake.json"
+printf '%s\n' '{"schema_version":"1.0","provider":"fieldfake","config":{"lease_ttl_hours":24}}' >"$FIELD_BINDING"
+FIELD_LOG="$TEST_TMPDIR/fieldfake.log"
+FIELD_ALL='{"fieldfake:o/r#1":"agent-ready","fieldfake:o/r#2":"needs-human","fieldfake:o/r#3":null,"fieldfake:o/r#4":"agent-ready","fieldfake:o/r#5":"agent-ready"}'
+
+# run_field_frontier <storage> <statuses> [args…]: list-frontier on fieldfake; OUT, ERR.
+run_field_frontier() {
+  : >"$FIELD_LOG"
+  OUT="$(FIELD_STORAGE="$1" FIELD_STATUSES="$2" FIELD_LOG="$FIELD_LOG" WORK_ITEM_TRACKER_BINDING="$FIELD_BINDING" \
+    WIT_ADAPTERS_DIR="$TEST_TMPDIR/adapters" bash "$DISPATCHER" list-frontier "${@:3}" 2>"$TEST_TMPDIR/field.err")"
+  RC=$?
+  ERR="$(<"$TEST_TMPDIR/field.err")"
+}
+ids() { jq -r '[.items[].id | sub("^fieldfake:o/r"; "")] | join(",")' <<<"$OUT"; }
+
+run_field_frontier field "$FIELD_ALL" --autonomous
+assert_eq "field storage: autonomous frontier → exit 0" "0" "$RC"
+assert_eq "a field hold holds; a field ready state frees nothing the labels hold" "#5" "$(ids)"
+assert_contains "the statuses are read for the candidates" "$(cat "$FIELD_LOG")" "get-statuses --field Work status fieldfake:o/r#1"
+
+run_field_frontier labels "$FIELD_ALL" --autonomous
+assert_eq "label storage: the labels decide and no status is read" "#2,#5|0" "$(ids)|$(grep -c get-statuses "$FIELD_LOG")"
+
+run_field_frontier field fail --autonomous
+assert_eq "a failed status read fails closed with the adapter's exit" "8" "$RC"
+assert_eq "a failed status read prints no envelope" "" "$OUT"
+assert_contains "a failed status read says so" "$ERR" "Work status values unread"
+
+run_field_frontier field config --autonomous
+assert_eq "a status read refused for its trust configuration fails closed with exit 3" "3" "$RC"
+assert_eq "a status read refused for its trust configuration prints no envelope" "" "$OUT"
+
+run_field_frontier field '{"fieldfake:o/r#1":null,"fieldfake:o/r#2":"needs-owner-decision","fieldfake:o/r#3":null,"fieldfake:o/r#4":null,"fieldfake:o/r#5":"ready"}' --autonomous
+assert_eq "an answered hold on an item without a hold label drops it from the frontier" "#5" "$(ids)"
+
+run_field_frontier unreachable "$FIELD_ALL" --autonomous
+assert_eq "an unread status storage fails closed with the adapter's exit" "8" "$RC"
+assert_eq "an unread status storage prints no envelope" "" "$OUT"
+
+run_field_frontier field '"x"' --autonomous
+assert_eq "a malformed status answer exits 1" "1" "$RC"
+assert_eq "a malformed status answer prints no envelope" "" "$OUT"
+
+run_field_frontier field "$FIELD_ALL"
+assert_eq "the default frontier reads no status" "#1,#2,#3,#4,#5|" "$(ids)|$(cat "$FIELD_LOG")"
+
+run_field_frontier field '{"fieldfake:o/r#1":"needs-human","fieldfake:o/r#2":"needs-triage","fieldfake:o/r#3":"needs-spec","fieldfake:o/r#4":"needs-triage","fieldfake:o/r#5":"agent-ready"}' --autonomous
+assert_eq "a field that mirrors the labels changes no frontier answer" "#2,#5" "$(ids)"
+
+STATUS_LM_BINDING="$TEST_TMPDIR/status-local-markdown.json"
+jq -n --arg dir "$TEST_TMPDIR/status-lm-items" \
+  '{schema_version:"1.0",provider:"local-markdown",config:{lease_ttl_hours:24,storage_dir:$dir}}' \
+  >"$STATUS_LM_BINDING"
+OUT="$(WORK_ITEM_TRACKER_BINDING="$STATUS_LM_BINDING" WIT_ADAPTERS_DIR="$SCRIPT_DIR/adapters" \
+  bash "$DISPATCHER" status-storage 2>/dev/null)"
+assert_eq "status-storage local-markdown → exit 0" "0" "$?"
+assert_eq "status-storage local-markdown → labels" "labels" "$(jq -r '.storage' <<<"$OUT")"
+assert_eq "status-storage local-markdown schema_version" "1.0" "$(jq -r '.schema_version' <<<"$OUT")"
+
+run_dispatcher status-storage --bogus >/dev/null 2>&1
+assert_eq "status-storage bad flag → exit 2" "2" "$?"
 
 # --- gh version gate is scoped to the native sub-issue/dependency surface ---
 # Provider "github" applies the gate while WIT_ADAPTERS_DIR points at stub verbs:
@@ -429,6 +599,25 @@ assert_contains "old gh: gated --blocked-by names the flag" "$ERR" "--blocked-by
 ERR="$(PATH="$STUB_BIN:$PATH" WORK_ITEM_TRACKER_BINDING="$GH_BINDING" \
   WIT_ADAPTERS_DIR="$GH_ADAPTERS" bash "$DISPATCHER" create-item --title t 2>&1 >/dev/null)"
 assert_not_contains "old gh: plain create-item does not quote the version floor" "$ERR" "2.94"
+
+# A conforming gh in a cloud session (CLAUDE_CODE_REMOTE=true) still gates the edge verbs.
+run_gh_verb_remote() {
+  CLAUDE_CODE_REMOTE=true run_gh_verb "$@"
+}
+printf '#!/usr/bin/env bash\nprintf "gh version 2.94.0 (2026-01-01)\\n"\n' >"$STUB_BIN/gh"
+for v in list-sub-items link-blocks add-sub-item; do
+  assert_eq "remote session: $v gated → exit 3" "3" "$(run_gh_verb_remote "$v" "github:o/r#1")"
+done
+assert_eq "remote session: create-item --parent gated → exit 3" \
+  "3" "$(run_gh_verb_remote create-item --title t --parent "github:o/r#1")"
+assert_eq "remote session: list-frontier dispatches (list-items reads REST)" "0" "$(run_gh_verb_remote list-frontier)"
+assert_eq "remote session: list-frontier --parent gated → exit 3" \
+  "3" "$(run_gh_verb_remote list-frontier --parent "github:o/r#9")"
+assert_eq "remote session: plain create-item dispatches" \
+  "0" "$(run_gh_verb_remote create-item --title t)"
+ERR="$(CLAUDE_CODE_REMOTE=true PATH="$STUB_BIN:$PATH" WORK_ITEM_TRACKER_BINDING="$GH_BINDING" \
+  WIT_ADAPTERS_DIR="$GH_ADAPTERS" bash "$DISPATCHER" add-sub-item "github:o/r#1" --parent "github:o/r#2" 2>&1 >/dev/null)"
+assert_contains "remote session: the gate names the session" "$ERR" "unavailable in this Claude Code cloud session"
 
 # A conforming gh lifts the gate for every verb, including gated flags.
 cat >"$STUB_BIN/gh" <<'EOF'
