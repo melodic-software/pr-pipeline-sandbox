@@ -37,7 +37,7 @@ args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
   case ${args[i]} in
   -X) method=${args[i + 1]} ;;
-  repos/*) endpoint=${args[i]} ;;
+  repos/* | graphql) endpoint=${args[i]} ;;
   body=@*)
     cat "${args[i]#body=@}" >>"$STUB/bodies"
     printf '\n=====\n' >>"$STUB/bodies"
@@ -48,6 +48,17 @@ printf '%s %s\n' "$method" "$endpoint" >>"$STUB/requests"
 case "$method $endpoint" in
 "GET repos/o/r/issues/42") cat "$STUB/issue.json" ;;
 "GET repos/o/r/issues/42/comments") cat "$STUB/comments.json" ;;
+"GET graphql")
+  [[ -f $STUB/fail_graphql ]] && { echo 'stub gh: graphql failed' >&2; exit 1; }
+  # threads.json holds an array of pages; each graphql call serves the next.
+  n=$(cat "$STUB/graphql_n" 2>/dev/null || echo 0)
+  echo $((n + 1)) >"$STUB/graphql_n"
+  if [[ -f $STUB/threads.json ]]; then
+    jq -e ".[$n]" "$STUB/threads.json" || { echo "stub gh: no page $n" >&2; exit 1; }
+  else
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+  fi
+  ;;
 "POST repos/o/r/issues/42/labels")
   [[ -f $STUB/fail_labels ]] && { echo 'stub gh: label POST failed' >&2; exit 1; }
   echo '{}'
@@ -60,6 +71,10 @@ case "$method $endpoint" in
     echo 'stub gh: comment POST failed' >&2
     exit 1
   fi
+  echo '{}'
+  ;;
+"POST repos/o/r/statuses/"*)
+  [[ -f $STUB/fail_status ]] && { echo 'stub gh: status POST failed' >&2; exit 1; }
   echo '{}'
   ;;
 *) echo "stub gh: unexpected $method $endpoint" >&2; exit 1 ;;
@@ -83,20 +98,22 @@ setup() {
   fi
 }
 # run <reason> [head-sha]: runs from the workspace root, as the runner does.
+# MODE, when set, is the script's argument; TARGET_URL passes through.
 run() {
   set +e
   (cd "$STUB/ws" && env PATH="$TMP/bin:$PATH" STUB="$STUB" GH_TOKEN=t \
     GITHUB_REPOSITORY=o/r LANES_BOT_LOGIN="${LBL:-}" PR_NUMBER=42 HEAD_SHA="${2:-$HEAD_A}" \
-    ESCALATION_REASON="$1" "$SUT") >"$STUB/out" 2>&1
+    TARGET_URL="${TARGET_URL:-}" ESCALATION_REASON="$1" "$SUT" ${MODE:+"$MODE"}) >"$STUB/out" 2>&1
   RC=$?
   set -e
 }
 writes() { grep -c '^POST' "$STUB/requests" || true; }
 comment() { printf '[{"body":%s,"user":{"login":"%s","type":"%s"}}]' "$(jq -Rs . <<<"$1")" "$2" "$3"; }
-bot_marker() { comment "$MARKER"$'\n'"<!-- pr-unblock resume-key=$1 -->"$'\nbody' 'melodic-automation-lanes[bot]' Bot; }
+# bot_marker <head> [reason]: the lanes App's escalation comment for that head and reason.
+bot_marker() { comment "$MARKER"$'\n'"<!-- pr-unblock resume-key=$1 -->"$'\nbody\n\n- Reason: `'"${2:-unresolved-conflict}"'`' 'melodic-automation-lanes[bot]' Bot; }
 
-# Rejected reasons: workflow-files is the retired name, the rest are not in the enum.
-for reason in workflow-files bogus '' 'repeat-cap ' REPEAT-CAP; do
+# Rejected reasons: workflow-files and dependency-workflow-held are retired names, the rest are not in the enum.
+for reason in workflow-files dependency-workflow-held bogus '' 'repeat-cap ' REPEAT-CAP; do
   setup '[]' '[]'
   run "$reason"
   check "rejects reason [$reason]: exit" 1 "$([[ $RC -ne 0 ]] && echo 1 || echo 0)"
@@ -104,7 +121,14 @@ for reason in workflow-files bogus '' 'repeat-cap ' REPEAT-CAP; do
 done
 
 # Accepted reasons: one comment, one label, both on the PR.
-for reason in protected-path-conflict workflow-staged repeat-cap unresolved-conflict; do
+for reason in protected-path-conflict workflow-staged unexpected-path-staged repeat-cap unresolved-conflict \
+  feedback-protected-path feedback-round-cap feedback-uncertain feedback-not-landed feedback-invalid \
+  feedback-partial feedback-incomplete feedback-disputed feedback-not-converging \
+  feedback-unadjudicated feedback-question-intent feedback-question-design feedback-question-security \
+  dependency-round-cap dependency-invalid dependency-fix-not-landed dependency-security-close dependency-escalate \
+  dependency-config-unreadable dependency-files-truncated dependency-control-uncited dependency-workflow-unpinned dependency-fix-refused \
+  ci-fix-round-cap ci-fix-empty ci-fix-invalid ci-fix-protected-path ci-fix-not-applied ci-fix-escalated \
+  conflict-patch-invalid conflict-patch-not-applied conflict-patch-protected-path; do
   setup '[]' '[]'
   run "$reason"
   check "$reason: exit 0" 0 "$RC"
@@ -117,8 +141,65 @@ for reason in protected-path-conflict workflow-staged repeat-cap unresolved-conf
   has "$reason: comment says to remove the label" 'remove the `needs-human` label' "$STUB/bodies"
   has "$reason: comment says to dispatch pr-unblock" 'pr-unblock' "$STUB/bodies"
   has "$reason: comment names the PR to dispatch" 'pr-number=42' "$STUB/bodies"
+  case $reason in
+    feedback-*) want=address-feedback ;;
+    dependency-*) want=review-dependency ;;
+    ci-fix-*) want=fix-ci ;;
+    *) want=resolve-conflicts ;;
+  esac
+  has "$reason: comment names the activity to dispatch" "-f pr-number=42 -f activity=$want" "$STUB/bodies"
   has "$reason: label defaults to needs-human" 'labels[]=needs-human' "$STUB/calls"
+  check "$reason: the comment run posts no commit status" 0 "$(grep -c statuses "$STUB/requests" || true)"
 done
+
+ALL_REASONS=(protected-path-conflict workflow-staged unexpected-path-staged repeat-cap unresolved-conflict
+  feedback-protected-path feedback-round-cap feedback-uncertain feedback-not-landed feedback-invalid
+  feedback-partial feedback-incomplete feedback-disputed
+  feedback-unadjudicated feedback-question-intent feedback-question-design feedback-question-security
+  dependency-round-cap dependency-invalid dependency-fix-not-landed dependency-security-close dependency-escalate
+  dependency-config-unreadable dependency-files-truncated dependency-control-uncited dependency-workflow-unpinned dependency-fix-refused
+  ci-fix-round-cap ci-fix-empty ci-fix-invalid ci-fix-protected-path ci-fix-not-applied ci-fix-escalated
+  conflict-patch-invalid conflict-patch-not-applied conflict-patch-protected-path)
+
+# Status mode: a failing pr-unblock/conflict status on the head, only for unresolved-conflict.
+setup '[]' '[]'
+MODE=status TARGET_URL=https://example.test/run/1 run unresolved-conflict
+check "status, unresolved-conflict: exit 0" 0 "$RC"
+check "status, unresolved-conflict: one status POST on the head, nothing else" \
+  "POST repos/o/r/statuses/$HEAD_A" "$(cat "$STUB/requests")"
+has "status, unresolved-conflict: state failure" 'state=failure' "$STUB/calls"
+has "status, unresolved-conflict: context names the conflict" 'context=pr-unblock/conflict' "$STUB/calls"
+has "status, unresolved-conflict: description says CI does not run" \
+  'description=Conflicts with the base branch; CI does not run until they are resolved' "$STUB/calls"
+has "status, unresolved-conflict: links the run" 'target_url=https://example.test/run/1' "$STUB/calls"
+
+setup '[]' '[]'
+MODE=status run unresolved-conflict "$HEAD_B"
+check "status on another head: posted on that head" "POST repos/o/r/statuses/$HEAD_B" "$(cat "$STUB/requests")"
+check "status without TARGET_URL: no target_url" 0 "$(grep -c target_url "$STUB/calls" || true)"
+
+for reason in "${ALL_REASONS[@]}"; do
+  [[ $reason == unresolved-conflict ]] && continue
+  setup '[]' '[]'
+  MODE=status run "$reason"
+  check "status, $reason: exit 0" 0 "$RC"
+  check "status, $reason: no gh call" '' "$(cat "$STUB/calls")"
+done
+
+setup '[]' '[]'
+touch "$STUB/fail_status"
+MODE=status run unresolved-conflict
+check "status POST fails: exit 1" 1 "$([[ $RC -ne 0 ]] && echo 1 || echo 0)"
+
+setup '[]' '[]'
+MODE=status run unresolved-conflict not-a-sha
+check "status, malformed head sha: exit 1" 1 "$([[ $RC -ne 0 ]] && echo 1 || echo 0)"
+check "status, malformed head sha: no gh call" '' "$(cat "$STUB/calls")"
+
+setup '[]' '[]'
+MODE=bogus run unresolved-conflict
+check "unknown mode: exit 1" 1 "$([[ $RC -ne 0 ]] && echo 1 || echo 0)"
+check "unknown mode: no gh call" '' "$(cat "$STUB/calls")"
 
 # The role label resolves from the base tracker config, not from the workspace root.
 setup '[]' '[]' '{"config":{"role_labels":{"human-gated":"status: blocked-human"}}}'
@@ -154,6 +235,13 @@ check "re-run on the same head: no write" 0 "$(writes)"
 setup '[{"name":"needs-human"}]' "$(bot_marker "$HEAD_B")"
 run unresolved-conflict
 check "labeled, marker for another head: comment only" 'POST repos/o/r/issues/42/comments' "$(grep '^POST' "$STUB/requests")"
+
+# Another activity's escalation on the same head is recorded too, so
+# gate-source.mjs reads every reason the label stands for.
+setup '[{"name":"needs-human"}]' "$(bot_marker "$HEAD_A" feedback-disputed)"
+run ci-fix-round-cap
+check "labeled, same head, another reason: comment only" 'POST repos/o/r/issues/42/comments' "$(grep '^POST' "$STUB/requests")"
+has "labeled, same head, another reason: comment names the new reason" 'ci-fix-round-cap' "$STUB/bodies"
 
 setup '[]' "$(bot_marker "$HEAD_A")"
 run unresolved-conflict
@@ -214,9 +302,82 @@ setup '[{"name":"needs-human"}]' "$(comment "$MARKER"$'\n'"<!-- pr-unblock resum
 run unresolved-conflict
 check "marker written by another bot does not count" 'POST repos/o/r/issues/42/comments' "$(grep '^POST' "$STUB/requests")"
 
-setup '[{"name":"needs-human"}]' "$(comment "$MARKER"$'\n'"<!-- pr-unblock resume-key=$HEAD_A -->" 'other-app[bot]' Bot)"
+setup '[{"name":"needs-human"}]' "$(comment "$MARKER"$'\n'"<!-- pr-unblock resume-key=$HEAD_A -->"$'\n- Reason: `unresolved-conflict`' 'other-app[bot]' Bot)"
 LBL='other-app[bot]' run unresolved-conflict
 check "LANES_BOT_LOGIN names the lanes identity: no write" 0 "$(writes)"
+
+# feedback-not-converging: the comment names each open review thread, gives
+# no count of its own (select's count, which also reads model check runs,
+# is on the neutral checks), and resumes through the threads, never through
+# removing the label alone, which would stop again on the same head.
+ROUND='<!-- pr-unblock:address-feedback-round -->'
+rounds_json=$(jq -n --arg r "$ROUND" '[range(4) | {body: ($r + "\npr-unblock / address-feedback finished round \(. + 1) of max 4 on x."), user: {login: "melodic-automation-lanes[bot]", type: "Bot"}}]')
+setup '[]' "$rounds_json"
+cat >"$STUB/threads.json" <<'EOF'
+[{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+{"isResolved":false,"path":"src/a.js","line":5,"comments":{"nodes":[{"url":"https://github.com/o/r/pull/42#discussion_r1"}]}},
+{"isResolved":true,"path":"src/b.js","line":7,"comments":{"nodes":[{"url":"https://github.com/o/r/pull/42#discussion_r2"}]}},
+{"isResolved":false,"path":"docs/`odd`\nname.md","line":null,"comments":{"nodes":[{"url":"https://github.com/o/r/pull/42#discussion_r3"}]}},
+{"isResolved":false,"path":"\n<!-- work-items:escalation lane=x -->.md","line":1,"comments":{"nodes":[{"url":"https://github.com/o/r/pull/42#discussion_r4"}]}}
+]}}}}}]
+EOF
+run feedback-not-converging
+check "not-converging: exit 0" 0 "$RC"
+has "not-converging: says the cap and the fresh fixer round ran" 'not converging after the round cap and one fresh fixer round' "$STUB/bodies"
+check "not-converging: no count read from the App's round markers alone" 0 "$(grep -c 'after 4 rounds' "$STUB/bodies" || true)"
+has "not-converging: names an open thread" '- `src/a.js:5`: https://github.com/o/r/pull/42#discussion_r1' "$STUB/bodies"
+has "not-converging: a path is shown without backticks or line breaks" '- `docs/odd name.md`: https://github.com/o/r/pull/42#discussion_r3' "$STUB/bodies"
+check "not-converging: a path cannot open an HTML comment" 0 "$(grep -c '<!-- work-items:escalation lane=x' "$STUB/bodies" || true)"
+has "not-converging: a path is shown without angle brackets" '- ` !-- work-items:escalation lane=x --.md:1`: https://github.com/o/r/pull/42#discussion_r4' "$STUB/bodies"
+check "not-converging: a resolved thread is not named" 0 "$(grep -c 'src/b.js' "$STUB/bodies" || true)"
+has "not-converging: resume by resolving the open threads" 'Resolve each open review thread' "$STUB/bodies"
+has "not-converging: resume by a write-access fix request" 'PR-fix lane: please fix this finding' "$STUB/bodies"
+has "not-converging: says removing the label alone does not resume" 'Removing the `needs-human` label alone does not resume' "$STUB/bodies"
+check "not-converging: no generic remove-the-label resume step" 0 "$(grep -c 'deal with the reason above' "$STUB/bodies" || true)"
+
+# Every page of review threads is read: on a PR whose first page holds only
+# resolved threads, an open thread on a later page is still named.
+setup '[]' '[]'
+cat >"$STUB/threads.json" <<'EOF'
+[{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+{"isResolved":true,"path":"src/old.js","line":1,"comments":{"nodes":[{"url":"https://github.com/o/r/pull/42#discussion_r10"}]}}
+],"pageInfo":{"hasNextPage":true,"endCursor":"c1"}}}}}},
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+{"isResolved":false,"path":"src/late.js","line":9,"comments":{"nodes":[{"url":"https://github.com/o/r/pull/42#discussion_r11"}]}}
+],"pageInfo":{"hasNextPage":false,"endCursor":"c2"}}}}}}]
+EOF
+run feedback-not-converging
+has "not-converging: asks for the next page by its cursor" 'endCursor=c1' "$STUB/calls"
+has "not-converging: names an open thread from a later page" '- `src/late.js:9`: https://github.com/o/r/pull/42#discussion_r11' "$STUB/bodies"
+check "not-converging: a later page's thread is not reported as none open" 0 "$(grep -c 'none open now' "$STUB/bodies" || true)"
+
+# The read is bounded, since anyone who can comment can add threads: at most
+# 10 pages (1,000 threads), and the comment says when more were not read.
+setup '[]' '[]'
+jq -n '[range(12) | {data: {repository: {pullRequest: {reviewThreads: {
+  nodes: [{isResolved: false, path: "src/p\(.).js", line: 1, comments: {nodes: [{url: "https://github.com/o/r/pull/42#discussion_p\(.)"}]}}],
+  pageInfo: {hasNextPage: true, endCursor: "c\(.)"}}}}}}]' >"$STUB/threads.json"
+run feedback-not-converging
+check "not-converging: reads at most 10 pages of review threads" 10 "$(grep -c '^GET graphql$' "$STUB/requests")"
+has "not-converging: names a thread on the 10th page" '- `src/p9.js:1`' "$STUB/bodies"
+check "not-converging: reads nothing past the 10th page" 0 "$(grep -c 'src/p10.js' "$STUB/bodies" || true)"
+has "not-converging: says threads past the first 1,000 were not read" 'past the first 1,000 were not read' "$STUB/bodies"
+
+# At most 20 open threads are listed, then how many more.
+setup '[]' '[]'
+jq -n '[{data: {repository: {pullRequest: {reviewThreads: {
+  nodes: [range(25) | {isResolved: false, path: "src/t\(.).js", line: 1, comments: {nodes: [{url: "u\(.)"}]}}],
+  pageInfo: {hasNextPage: false, endCursor: null}}}}}}]' >"$STUB/threads.json"
+run feedback-not-converging
+has "not-converging: lists the 20th open thread" '- `src/t19.js:1`: u19' "$STUB/bodies"
+check "not-converging: lists no 21st open thread" 0 "$(grep -c 'src/t20.js' "$STUB/bodies" || true)"
+has "not-converging: says how many more open threads there are" '- and 5 more' "$STUB/bodies"
+
+setup '[]' '[]'
+: >"$STUB/fail_graphql"
+run feedback-not-converging
+check "not-converging, threads unreadable: still escalates" 0 "$RC"
+has "not-converging, threads unreadable: says so" 'could not be read' "$STUB/bodies"
 
 # Input validation.
 setup '[]' '[]'

@@ -1,0 +1,1597 @@
+#!/usr/bin/env bash
+# Self-contained tests for detect.sh (no external test lib; THIS suite's
+# fixtures are built inline in a tmpdir, so no unit-test slop corpus sits in
+# the tree). The eval suite is the deliberate exception: evals/fixtures/ holds
+# committed slop samples, because a prose scenario cannot be checked against
+# the detector and drifted from it three times (#3041). This repo keeps its own
+# audit off them with an excluded_paths glob in .claude/ai-slop.json, and they
+# stay measurable through the same config isolation this suite uses — an empty
+# HOME and CLAUDE_PROJECT_DIR give the shipped defaults back.
+# Per the shell-test-helpers convention, assertion helpers are local.
+set -uo pipefail
+
+# Fixture git isolation: an inherited GIT_DIR/GIT_WORK_TREE/GIT_CONFIG would
+# make the nested-repo fixture operate on the CALLER's repository.
+unset GIT_DIR GIT_WORK_TREE GIT_CONFIG
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DETECT="$SCRIPT_DIR/detect.sh"
+TEST_TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TEST_TMPDIR"' EXIT
+
+# Fixture CONFIG isolation, the same idea as the git isolation above and found
+# the same way: detect.sh resolves its config cascade from $HOME and from
+# CLAUDE_PROJECT_DIR (falling back to the CWD's git toplevel), so running this
+# suite inside a repo that ships `.claude/ai-slop.json` graded the fixtures
+# against THAT repo's taste. Measured: this marketplace disabling rule-em-dash
+# for its own house style turned nine unrelated cases red, each reporting
+# `disabled=1` for a rule the case never mentions. Both layers are pointed at
+# empty directories so a fixture asserts the SHIPPED defaults; the cascade cases
+# below set CLAUDE_PROJECT_DIR per-invocation and still override this.
+export HOME="$TEST_TMPDIR/home"
+export CLAUDE_PROJECT_DIR="$TEST_TMPDIR/noconfig"
+mkdir -p "$HOME" "$CLAUDE_PROJECT_DIR"
+
+# A fixture root that carries a team or overlay config layer must be a git working
+# tree: config-cascade step 2 gives a non-repo root no team or overlay layer.
+make_repo() {
+  git init -q "$1" >/dev/null 2>&1
+}
+
+FAILED=0
+CASE_NUM=0
+SKIPPED=0
+# The total this suite registers when every case runs: PASS + FAIL + SKIP. It is
+# host-independent because every host-conditional branch calls skip() once per
+# assertion it replaces, so a host that cannot build a fixture moves cases
+# between the two counters without changing their sum. Adding or removing a case
+# updates this number, and the Result block names both totals when they disagree.
+EXPECTED_CASES=248
+
+pass() {
+  CASE_NUM=$((CASE_NUM + 1))
+  printf 'PASS: %s\n' "$1"
+}
+# A case whose subject this host cannot build is neither a pass nor a failure.
+# It prints its own visible line and carries its own counter, and never routes
+# through pass(), so a proof this host could not run can never be read off the
+# summary as one that did.
+skip() {
+  SKIPPED=$((SKIPPED + 1))
+  printf 'SKIP (host: %s): %s\n' "$2" "$1"
+}
+
+fail() {
+  CASE_NUM=$((CASE_NUM + 1))
+  FAILED=$((FAILED + 1))
+  printf 'FAIL: %s\n  expected: %s\n  actual:   %s\n' "$1" "$2" "$3" >&2
+}
+assert_exit() {
+  if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1" "exit $2" "exit $3"; fi
+}
+assert_contains() {
+  case "$2" in
+  *"$3"*) pass "$1" ;;
+  *) fail "$1" "contains: $3" "$2" ;;
+  esac
+}
+assert_not_contains() {
+  case "$2" in
+  *"$3"*) fail "$1" "absent: $3" "present" ;;
+  *) pass "$1" ;;
+  esac
+}
+assert_eq() {
+  if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1" "$3" "$2"; fi
+}
+
+EM=$'\xe2\x80\x94'
+CHECKMARK=$'\xe2\x9c\x85'
+WARNSIGN=$'\xe2\x9a\xa0'
+LQUO=$'\xe2\x80\x9c'
+RQUO=$'\xe2\x80\x9d'
+
+# --- Fixtures (built inline) ----------------------------------------------------
+
+SLOP="$TEST_TMPDIR/slop.md"
+cat >"$SLOP" <<EOF
+# A pivotal document
+
+This stands as a testament to the vibrant tapestry of the field ${EM} a
+crucial, groundbreaking interplay that will delve into the intricacies.
+Meticulously bolstered, showcasing renowned and enduring work.
+EOF
+
+CLEAN="$TEST_TMPDIR/clean.md"
+cat >"$CLEAN" <<'EOF'
+# Release notes
+
+The parser now accepts empty input. Tests cover the failure paths one by one.
+See the changelog for upgrade steps. Nothing else changed in this release.
+EOF
+
+ALLRULES="$TEST_TMPDIR/allrules.md"
+cat >"$ALLRULES" <<EOF
+# Every pattern rule
+
+- ${CHECKMARK} an emoji bullet line
+Some ${LQUO}curly quoted${RQUO} text here.
+It is not just fast, but also correct in every case.
+Despite its growth, the project faces significant challenges ahead.
+As of my knowledge cutoff, this was true.
+A leaked marker oaicite:12 sits here.
+See https://example.com/?utm_source=chatgpt for details.
+It serves as a hub. It stands as a marker. It functions as a portal.
+The tool is fast, simple, and reliable. Cheap, quick, and easy too. It reads
+clean, tight, and portable in every shell we tried this week.
+EOF
+
+MARKED="$TEST_TMPDIR/marked.md"
+cat >"$MARKED" <<EOF
+# Marker handling
+
+An exempted line ${EM} with an em dash. <!-- ai-slop-ignore -->
+EOF
+
+REASONED="$TEST_TMPDIR/reasoned.md"
+cat >"$REASONED" <<EOF
+# Markers carrying a reason
+
+A line marker ${EM} with a reason. <!-- ai-slop-ignore: quoting the tell itself -->
+
+<!-- ai-slop-ignore-start: sample block, quoted verbatim -->
+Inside the block ${EM} stays exempt.
+<!-- ai-slop-ignore-end: end of sample -->
+
+After the block, an em dash ${EM} must still be flagged.
+EOF
+
+FENCED="$TEST_TMPDIR/fenced.md"
+cat >"$FENCED" <<EOF
+# Code fences
+
+\`\`\`text
+An em dash inside a fence ${EM} stays exempt. So does ${CHECKMARK}.
+\`\`\`
+
+And one in inline code: \`a ${EM} b\` also stays exempt.
+EOF
+
+FILEMARK="$TEST_TMPDIR/filemark.md"
+cat >"$FILEMARK" <<EOF
+<!-- ai-slop-ignore-file: catalog-style file -->
+Full of em dashes ${EM} and delve, tapestry, pivotal, crucial vocabulary.
+EOF
+
+DOCMARKS="$TEST_TMPDIR/docmarks.md"
+cat >"$DOCMARKS" <<EOF
+# Documents the markers without using them
+
+Opt-outs: \`<!-- ai-slop-ignore -->\` per line, \`<!-- ai-slop-ignore-start -->\`
+and \`<!-- ai-slop-ignore-end -->\` for blocks, \`<!-- ai-slop-ignore-file -->\`
+for whole files. Each takes an optional reason: \`<!-- ai-slop-ignore: why -->\`.
+After the mentions, an em dash ${EM} must still be flagged.
+EOF
+
+# A backticked mention of one marker form must not veto a real marker of another
+# form on the same line. The guard mirrors the line-marker pattern exactly rather
+# than matching any string starting with the marker prefix: when it matched the
+# prefix, this line's genuine suppression was rejected and the operator's own
+# marker was quoted back in the excerpt.
+MIXEDMARK="$TEST_TMPDIR/mixedmark.md"
+cat >"$MIXEDMARK" <<EOF
+# Mentions one form, uses another
+
+Open a block with \`<!-- ai-slop-ignore-start -->\`, em dash ${EM} here. <!-- ai-slop-ignore -->
+EOF
+
+MIDFILEMARK="$TEST_TMPDIR/midfilemark.md"
+cat >"$MIDFILEMARK" <<EOF
+# Content first
+
+An em dash ${EM} before the marker.
+
+<!-- ai-slop-ignore-file: declared late -->
+
+Vocabulary after: delve, tapestry, pivotal.
+EOF
+
+MIDEMOJI="$TEST_TMPDIR/midemoji.md"
+cat >"$MIDEMOJI" <<EOF
+# Emoji in content position
+
+The reaction was ${CHECKMARK} from the whole team.
+EOF
+
+GENPROSE="$TEST_TMPDIR/general-prose.md"
+cat >"$GENPROSE" <<'EOF'
+# General-prose rules
+
+Great question! I hope this helps, and let me know if you need more.
+We did this in order to ship, due to the fact that the deadline slipped.
+It could potentially fail here and might possibly regress there.
+We leverage tools to facilitate work and utilize helpers for the rest.
+EOF
+
+GENPROSENEG="$TEST_TMPDIR/general-prose-neg.md"
+cat >"$GENPROSENEG" <<'EOF'
+# Benign neighbors of the general-prose patterns
+
+Feel free to customize the config for your repo. The run may fail on old
+shells, and a question mark ends each prompt. Sort keys in ascending order to
+keep diffs stable.
+EOF
+
+# Prefix-match false positives: ordinary prose whose words merely BEGIN with a
+# listed phrase, which drew an IMPORTANT-tier rule-chatbot-artifacts finding on
+# prose containing no chat residue at all. The fix is the registry's whole-word flag; these cases
+# are what keeps it.
+WORDBOUND="$TEST_TMPDIR/wordbound.md"
+cat >"$WORDBOUND" <<'EOF'
+# Phrase prefixes inside ordinary words
+
+These are great questions for the reviewer to work through.
+The team found the smoking guns in yesterday's logs.
+EOF
+
+# --- Seed-rule cases -------------------------------------------------------------
+
+out="$(bash "$DETECT" "$SLOP" 2>&1)"
+rc=$?
+assert_exit "slop fixture: exit 0" 0 "$rc"
+assert_contains "slop: em-dash fires" "$out" "Finding: rule=ai-slop/audit/rule-em-dash"
+assert_contains "slop: em-dash condition is zero-tolerance" "$out" "fired=zero-tolerance"
+assert_contains "slop: vocabulary fires" "$out" "Finding: rule=ai-slop/audit/rule-ai-vocabulary"
+assert_contains "slop: vocabulary condition carries threshold" "$out" "threshold 3.0"
+
+out="$(bash "$DETECT" "$CLEAN" 2>&1)"
+rc=$?
+assert_exit "clean fixture: exit 0" 0 "$rc"
+assert_not_contains "clean fixture: no findings from any rule" "$out" "Finding:"
+assert_contains "clean fixture: summary reports zero" "$out" "Summary total: 0 findings"
+
+# --- Full-roster pattern rules ---------------------------------------------------
+
+out="$(bash "$DETECT" "$ALLRULES" 2>&1)"
+assert_contains "roster: emoji-formatting fires on bullet line" "$out" "Finding: rule=ai-slop/audit/rule-emoji-formatting"
+assert_contains "roster: curly-artifacts fires" "$out" "Finding: rule=ai-slop/audit/rule-curly-artifacts"
+assert_contains "roster: negative-parallelism fires" "$out" "Finding: rule=ai-slop/audit/rule-negative-parallelism"
+assert_contains "roster: challenges-conclusion fires" "$out" "Finding: rule=ai-slop/audit/rule-challenges-conclusion"
+assert_contains "roster: knowledge-cutoff fires" "$out" "Finding: rule=ai-slop/audit/rule-knowledge-cutoff-disclaimer"
+assert_contains "roster: citation-artifacts fires" "$out" "Finding: rule=ai-slop/audit/rule-llm-citation-artifacts"
+assert_contains "roster: utm-params fires" "$out" "Finding: rule=ai-slop/audit/rule-utm-params"
+assert_contains "roster: copulative-avoidance density fires" "$out" "Finding: rule=ai-slop/audit/rule-copulative-avoidance"
+# rule-of-three was demoted to the judgment rubric (catalog reclass 2026-08-25):
+# dogfood calibration ended with every residual finding on a load-bearing
+# enumeration, and no surveyed prose linter ships a tricolon rule. The script
+# must neither emit findings nor report a Summary row for it.
+assert_not_contains "roster: rule-of-three is rubric-demoted, no finding" "$out" "rule=ai-slop/audit/rule-rule-of-three"
+
+out="$(bash "$DETECT" "$MIDEMOJI" 2>&1)"
+assert_not_contains "emoji negative: content-position emoji does not fire the formatting rule" "$out" "Finding: rule=ai-slop/audit/rule-emoji-formatting"
+
+# A blockquote prefix is a marker position like a heading or a bullet: the same
+# glyph fired at column zero and passed behind `> `, so a callout was the one
+# shape of decorative emoji the rule could not see. The catalog scope is
+# unchanged: a blockquote callout is a section marker.
+BQEMOJI="$TEST_TMPDIR/bqemoji.md"
+cat >"$BQEMOJI" <<EOF
+# Blockquote emoji
+
+> ${WARNSIGN} note
+> ### ${WARNSIGN} note
+  - ${WARNSIGN} note
+EOF
+out="$(bash "$DETECT" "$BQEMOJI" 2>&1)"
+assert_contains "emoji: blockquote, blockquote-heading, and indented-bullet markers all fire" "$out" "rule=ai-slop/audit/rule-emoji-formatting findings=3"
+
+# The glyph must still follow the last prefix directly, so an emoji sitting in
+# CONTENT position behind a blockquote stays quiet.
+BQNEG="$TEST_TMPDIR/bqneg.md"
+cat >"$BQNEG" <<EOF
+# Blockquote content
+
+> The reaction was ${CHECKMARK} from the team.
+EOF
+out="$(bash "$DETECT" "$BQNEG" 2>&1)"
+assert_not_contains "emoji negative: content-position emoji behind a blockquote does not fire" "$out" "Finding: rule=ai-slop/audit/rule-emoji-formatting"
+
+# A blockquote marker takes at most ONE following space. The rest is the quote's
+# own content, so four more spaces make an indented code block inside the quote
+# and a glyph there is code, not formatting. A greedy run of spaces after the
+# marker swallowed that indentation and reported the code line.
+BQCODE="$TEST_TMPDIR/bqcode.md"
+cat >"$BQCODE" <<EOF
+# Quoted code
+
+>     ${WARNSIGN} literal code inside a quoted code block
+
+> ${WARNSIGN} a real callout
+EOF
+out="$(bash "$DETECT" "$BQCODE" 2>&1)"
+assert_contains "emoji: the real callout in a quote fires" "$out" "rule=ai-slop/audit/rule-emoji-formatting findings=1"
+assert_not_contains "emoji negative: an indented code line inside a quote does not fire" "$out" "literal code"
+
+# --- General-prose rules -----------------------------------------------------------
+
+out="$(bash "$DETECT" "$GENPROSE" 2>&1)"
+assert_contains "general-prose: chatbot-artifacts fires" "$out" "Finding: rule=ai-slop/audit/rule-chatbot-artifacts"
+assert_contains "general-prose: filler-phrases fires" "$out" "Finding: rule=ai-slop/audit/rule-filler-phrases"
+assert_contains "general-prose: stacked-hedging fires" "$out" "Finding: rule=ai-slop/audit/rule-stacked-hedging"
+assert_contains "general-prose: plain-word vocab additions fire the density rule" "$out" "Finding: rule=ai-slop/audit/rule-ai-vocabulary"
+
+out="$(bash "$DETECT" "$GENPROSENEG" 2>&1)"
+assert_not_contains "general-prose negative: benign near-miss phrasing stays quiet" "$out" "Finding:"
+
+out="$(bash "$DETECT" "$WORDBOUND" 2>&1)"
+assert_not_contains "word boundary: 'great questions' does not fire the chat-residue rule" "$out" "Finding:"
+# The true positives must survive the boundary flag — a rule silenced into
+# uselessness would also pass the assertion above.
+WORDBOUNDPOS="$TEST_TMPDIR/wordboundpos.md"
+cat >"$WORDBOUNDPOS" <<'EOF'
+# The real thing
+
+Great question! The retry budget is three attempts.
+Found the smoking gun in the connection pool.
+EOF
+out="$(bash "$DETECT" "$WORDBOUNDPOS" 2>&1)"
+assert_contains "word boundary: the exact phrases still fire" "$out" "rule=ai-slop/audit/rule-chatbot-artifacts findings=2"
+
+GENPROSEOUT="$TEST_TMPDIR/general-prose-out.txt"
+bash "$DETECT" "$GENPROSE" >"$GENPROSEOUT" 2>&1 || true
+bash "$SCRIPT_DIR/emit-findings.sh" --from "$GENPROSEOUT" --out "$TEST_TMPDIR/findings/general-prose.md" --branch test-branch >/dev/null 2>&1
+chatbot_row="$(LC_ALL=C grep -m1 'rule-chatbot-artifacts' "$TEST_TMPDIR/findings/general-prose.md")"
+assert_contains "general-prose: chatbot-artifacts emits at IMPORTANT (crosswalk mirror)" "$chatbot_row" "IMPORTANT"
+filler_row="$(LC_ALL=C grep -m1 'rule-filler-phrases' "$TEST_TMPDIR/findings/general-prose.md")"
+assert_contains "general-prose: filler-phrases emits at SUGGESTION (crosswalk mirror)" "$filler_row" "SUGGESTION"
+
+# --- Quotation exemption (wording vs typography rule classes) --------------------
+# Policy-level exemption: a wording rule never scans quoted material (blockquote
+# lines, double-quoted spans); a typography rule scans it, because byte residue
+# is a defect wherever it sits. Quote-exempt candidates are counted as declined.
+
+QUOTED="$TEST_TMPDIR/quoted.md"
+cat >"$QUOTED" <<EOF
+# Quoted material
+
+> The source says we did this in order to ship on time ${EM} verbatim quote.
+
+The guide bans "in order to" and recommends the shorter form.
+
+Plain prose written in order to trip the wording rule.
+EOF
+out="$(bash "$DETECT" "$QUOTED" 2>&1)"
+assert_contains "quote exemption: unquoted filler still fires" "$out" "rule=ai-slop/audit/rule-filler-phrases findings=1"
+assert_contains "quote exemption: blockquote and quoted-span hits declined" "$out" "rule=ai-slop/audit/rule-filler-phrases findings=1 declined=2"
+assert_contains "quote exemption: typography rule still fires inside the blockquote" "$out" "Finding: rule=ai-slop/audit/rule-em-dash"
+
+# A verbatim quote carrying a typography tell needs a block marker, and the
+# marker lines must sit outside the blockquote: a `> `-prefixed start or end line
+# matches neither marker form. Characterization of existing behavior.
+QUOTEDBLOCK="$TEST_TMPDIR/quotedblock.md"
+cat >"$QUOTEDBLOCK" <<EOF
+# Quoted block markers
+
+> <!-- ai-slop-ignore-start: verbatim quote -->
+> The source says ship ${EM} now.
+> <!-- ai-slop-ignore-end: end of quote -->
+EOF
+out="$(bash "$DETECT" "$QUOTEDBLOCK" 2>&1)"
+assert_contains "quote markers: a quoted start/end pair does not suppress the em dash" "$out" "rule=ai-slop/audit/rule-em-dash findings=1 declined=0"
+
+OUTSIDEBLOCK="$TEST_TMPDIR/outsideblock.md"
+cat >"$OUTSIDEBLOCK" <<EOF
+# Outside block markers
+
+<!-- ai-slop-ignore-start: verbatim quote -->
+> The source says ship ${EM} now.
+<!-- ai-slop-ignore-end: end of quote -->
+EOF
+out="$(bash "$DETECT" "$OUTSIDEBLOCK" 2>&1)"
+assert_contains "quote markers: a start/end pair outside the blockquote suppresses the em dash" "$out" "rule=ai-slop/audit/rule-em-dash findings=0 declined=1 declined_marker=1"
+
+# The dangerous direction: a start outside and a quoted end never closes, so the
+# block runs to the end of the file and a later unquoted em dash is declined.
+UNCLOSED="$TEST_TMPDIR/unclosed.md"
+cat >"$UNCLOSED" <<EOF
+# Unclosed block
+
+<!-- ai-slop-ignore-start: verbatim quote -->
+> The source says ship ${EM} now.
+> <!-- ai-slop-ignore-end: end of quote -->
+
+Later prose ${EM} after the quote.
+EOF
+out="$(bash "$DETECT" "$UNCLOSED" 2>&1)"
+assert_contains "quote markers: a quoted end does not close, declining later prose" "$out" "rule=ai-slop/audit/rule-em-dash findings=0 declined=2 declined_marker=2"
+
+# Extended knowledge-cutoff families (source section words-to-watch): the
+# original ERE missed even the wiki's own example "as of my last knowledge
+# update"; the source-gap half of the section was absent entirely.
+CUTOFF="$TEST_TMPDIR/cutoff.md"
+cat >"$CUTOFF" <<'EOF'
+# Source-gap speculation
+
+As of my last knowledge update, the API had no batch endpoint.
+While specific details are scarce, the rollout continued.
+This is not widely documented behavior.
+The change appears in the provided sources only.
+Based on available information, the flag defaults to off.
+EOF
+out="$(bash "$DETECT" "$CUTOFF" 2>&1)"
+assert_contains "cutoff families: all five source-gap lines fire" "$out" "rule=ai-slop/audit/rule-knowledge-cutoff-disclaimer findings=5"
+
+# rule_allowed_paths: the generalized per-rule exemption (em_dash_allowed_paths
+# stays as the rule-em-dash alias, asserted in the config cascade section).
+# $RAP and this fixture are consumed again by the CRLF-jq section below; moving
+# or deleting this block aborts the suite there under `set -u` rather than
+# quietly vacating those cases.
+RAP="$TEST_TMPDIR/rap-repo"
+mkdir -p "$RAP/.claude"
+make_repo "$RAP"
+cat >"$RAP/.claude/ai-slop.json" <<'EOF'
+{ "rule_allowed_paths": { "rule-filler-phrases": ["quirks/**"] } }
+EOF
+mkdir -p "$RAP/quirks"
+printf '# Quirks\n\nWritten in order to stay exempt here.\n' >"$RAP/quirks/doc.md"
+printf '# Plain\n\nWritten in order to fire here.\n' >"$RAP/plain.md"
+out="$(CLAUDE_PROJECT_DIR="$RAP" bash "$DETECT" "$RAP/quirks/doc.md" "$RAP/plain.md" 2>&1)"
+assert_contains "rule_allowed_paths: unlisted file still fires" "$out" "file=plain.md"
+assert_not_contains "rule_allowed_paths: listed path declines the one rule" "$out" "file=quirks/doc.md"
+assert_contains "rule_allowed_paths: decline counted for the exempted rule" "$out" "rule=ai-slop/audit/rule-filler-phrases findings=1 declined=1"
+
+# rule_allowed() glob-expansion regression: the globs were expanded unquoted, so
+# a cwd where the glob matches real files replaced the configured pattern with
+# that directory's file listing before case-matching ever ran. The decoy cwd
+# below makes `quirks/**` expand (to decoy paths that match nothing under $RAP),
+# which broke the exemption before the read -r -a fix; the nested file also pins
+# that `**` crosses `/` (bash case fnmatch has no FNM_PATHNAME).
+DECOY="$TEST_TMPDIR/rap-decoy"
+mkdir -p "$DECOY/quirks/inner"
+printf 'decoy\n' >"$DECOY/quirks/decoy.txt"
+printf 'decoy\n' >"$DECOY/quirks/inner/decoy.txt"
+mkdir -p "$RAP/quirks/nested"
+printf '# Nested\n\nWritten in order to stay exempt here too.\n' >"$RAP/quirks/nested/deep.md"
+out="$(cd "$DECOY" && CLAUDE_PROJECT_DIR="$RAP" bash "$DETECT" "$RAP/quirks/doc.md" "$RAP/quirks/nested/deep.md" "$RAP/plain.md" 2>&1)"
+assert_not_contains "glob expansion: exemption survives a cwd where the glob expands" "$out" "file=quirks/doc.md"
+assert_not_contains "glob expansion: ** crosses / for nested paths" "$out" "file=quirks/nested/deep.md"
+assert_contains "glob expansion: unlisted file still fires from the decoy cwd" "$out" "file=plain.md"
+assert_contains "glob expansion: both exempt files counted as declined" "$out" "rule=ai-slop/audit/rule-filler-phrases findings=1 declined=2"
+
+# Deliberate widening, pinned as documented behavior: these are shell case-match
+# globs, so `*` also crosses `/` — `sub/*.md` matches `sub/deep/nested.md`. A
+# consumer wanting gitignore-precision single-level matching has no spelling for
+# it; the README states the semantics.
+WIDE="$TEST_TMPDIR/rap-wide"
+mkdir -p "$WIDE/.claude" "$WIDE/sub/deep"
+make_repo "$WIDE"
+cat >"$WIDE/.claude/ai-slop.json" <<'EOF'
+{ "rule_allowed_paths": { "rule-filler-phrases": ["sub/*.md"] } }
+EOF
+printf '# Deep\n\nWritten in order to test star depth.\n' >"$WIDE/sub/deep/nested.md"
+out="$(CLAUDE_PROJECT_DIR="$WIDE" bash "$DETECT" "$WIDE/sub/deep/nested.md" 2>&1)"
+assert_contains "glob semantics: * crosses / (case fnmatch, no FNM_PATHNAME)" "$out" "rule=ai-slop/audit/rule-filler-phrases findings=0 declined=1"
+
+# --- Model-era phrase rule (rule-model-era-phrases) ------------------------------
+# Shipped roster is the ANCHORED forms only (catalog "Model-era additions"): the
+# bare "the unlock" / "honest take" bigrams are recorded-only, with a measured
+# domain-literal false positive behind the decision.
+
+PHRASES_FIX="$TEST_TMPDIR/model-phrases.md"
+cat >"$PHRASES_FIX" <<'EOF'
+# Model phrases
+
+Calibration is the part most people skip.
+The honest take is that this works.
+Small files parse faster, and that's the unlock.
+We quoted "that's the unlock" on this line to document it.
+EOF
+out="$(bash "$DETECT" "$PHRASES_FIX" 2>&1)"
+assert_contains "model phrases: anchored constructions fire per occurrence" "$out" "rule=ai-slop/audit/rule-model-era-phrases findings=3 declined=1"
+assert_contains "model phrases: finding rows name the rule" "$out" "Finding: rule=ai-slop/audit/rule-model-era-phrases"
+
+BAREFIX="$TEST_TMPDIR/bare-phrases.md"
+cat >"$BAREFIX" <<'EOF'
+# Bare forms
+
+The unlock flow starts on the device screen.
+An honest take from a human maintainer follows.
+EOF
+out="$(bash "$DETECT" "$BAREFIX" 2>&1)"
+assert_contains "model phrases: bare bigrams do not fire (anchored roster only)" "$out" "rule=ai-slop/audit/rule-model-era-phrases findings=0 declined=0"
+
+# phrase_add / phrase_remove cascade. The "kiss of death" line discriminates a
+# word-split regression: a reader that split on spaces would break the added
+# fragment into three word alternates and "kiss" alone would match that line too.
+PREPO="$TEST_TMPDIR/phrase-repo"
+mkdir -p "$PREPO/.claude"
+make_repo "$PREPO"
+cat >"$PREPO/.claude/ai-slop.json" <<'EOF'
+{
+  "phrase_add": ["chef.s kiss architecture"],
+  "phrase_remove": ["(the|my) honest take"]
+}
+EOF
+cat >"$PREPO/doc.md" <<'EOF'
+# Doc
+
+Calibration is the part most people skip.
+The honest take is that this works.
+This design is chef's kiss architecture, honestly.
+The kiss of death for caches is a stale key.
+EOF
+out="$(CLAUDE_PROJECT_DIR="$PREPO" bash "$DETECT" "$PREPO/doc.md" 2>&1)"
+assert_contains "phrase config: add fires whole, remove silences, no word-split" "$out" "rule=ai-slop/audit/rule-model-era-phrases findings=2 declined=0"
+
+# Empty roster: every shipped phrase removed. The rule goes inert instead of
+# matching every line (an empty alternation "()" would).
+EMPTYREPO="$TEST_TMPDIR/phrase-empty"
+mkdir -p "$EMPTYREPO/.claude"
+make_repo "$EMPTYREPO"
+cat >"$EMPTYREPO/.claude/ai-slop.json" <<'EOF'
+{ "phrase_remove": ["the part most people skip", "(the|my) honest take", "that.s the unlock"] }
+EOF
+cp "$PHRASES_FIX" "$EMPTYREPO/doc.md"
+out="$(CLAUDE_PROJECT_DIR="$EMPTYREPO" bash "$DETECT" "$EMPTYREPO/doc.md" 2>&1)"
+assert_not_contains "phrase config: emptied roster emits no findings" "$out" "Finding: rule=ai-slop/audit/rule-model-era-phrases"
+assert_contains "phrase config: emptied roster still reports its summary row" "$out" "rule=ai-slop/audit/rule-model-era-phrases findings=0 declined=0"
+
+# Fragment hygiene, both measured failure modes: an invalid ERE fragment is
+# skipped with a note (instead of erroring every grep into a silent findings=0),
+# and an empty-string element is dropped (instead of joining as an empty
+# alternation branch that matches every prose line).
+BADREPO="$TEST_TMPDIR/phrase-bad"
+mkdir -p "$BADREPO/.claude"
+make_repo "$BADREPO"
+cat >"$BADREPO/.claude/ai-slop.json" <<'EOF'
+{ "phrase_add": ["", "broken ("] }
+EOF
+cp "$PHRASES_FIX" "$BADREPO/doc.md"
+out="$(CLAUDE_PROJECT_DIR="$BADREPO" bash "$DETECT" "$BADREPO/doc.md" 2>&1)"
+assert_contains "phrase hygiene: invalid fragment skipped with a note naming it" "$out" "phrase_add fragment is not a valid ERE, skipped: 'broken ('"
+assert_contains "phrase hygiene: shipped roster keeps firing past the bad fragment" "$out" "rule=ai-slop/audit/rule-model-era-phrases findings=3 declined=1"
+out="$(CLAUDE_PROJECT_DIR="$BADREPO" bash "$DETECT" "$CLEAN" 2>&1)"
+assert_not_contains "phrase hygiene: empty-string element does not flood clean prose" "$out" "Finding: rule=ai-slop/audit/rule-model-era-phrases"
+
+# Wholesale replacement includes the empty override: a later layer's explicit
+# `"phrase_add": []` clears the inherited list (key presence decides, not value
+# emptiness). The local overlay is the later layer.
+CLRREPO="$TEST_TMPDIR/phrase-clear"
+mkdir -p "$CLRREPO/.claude"
+make_repo "$CLRREPO"
+cat >"$CLRREPO/.claude/ai-slop.json" <<'EOF'
+{ "phrase_add": ["chef.s kiss architecture"] }
+EOF
+cat >"$CLRREPO/.claude/ai-slop.local.json" <<'EOF'
+{ "phrase_add": [] }
+EOF
+cat >"$CLRREPO/doc.md" <<'EOF'
+# Doc
+
+This design is chef's kiss architecture, honestly.
+EOF
+out="$(CLAUDE_PROJECT_DIR="$CLRREPO" bash "$DETECT" "$CLRREPO/doc.md" 2>&1)"
+assert_contains "phrase config: explicit empty array clears the inherited add list" "$out" "rule=ai-slop/audit/rule-model-era-phrases findings=0 declined=0"
+
+# A layer caught mid-write (valid object, then truncated bytes) is refused
+# whole for the phrase keys, as cascade::list does: jq's exit status guards
+# the read, so the partially parsed values never become the effective roster.
+TRUNCPHRASE="$TEST_TMPDIR/phrase-trunc"
+mkdir -p "$TRUNCPHRASE/.claude"
+make_repo "$TRUNCPHRASE"
+printf '%s\n' '{ "phrase_add": ["chef.s kiss architecture"] }' '{bad' >"$TRUNCPHRASE/.claude/ai-slop.json"
+cp "$CLRREPO/doc.md" "$TRUNCPHRASE/doc.md"
+out="$(CLAUDE_PROJECT_DIR="$TRUNCPHRASE" bash "$DETECT" "$TRUNCPHRASE/doc.md" 2>&1)"
+assert_contains "phrase config: partially parsed layer is refused, no phrase added" "$out" "rule=ai-slop/audit/rule-model-era-phrases findings=0 declined=0"
+
+# disabled_rules covers the new rule like any other.
+DISREPO="$TEST_TMPDIR/phrase-disabled"
+mkdir -p "$DISREPO/.claude"
+make_repo "$DISREPO"
+cat >"$DISREPO/.claude/ai-slop.json" <<'EOF'
+{ "disabled_rules": ["rule-model-era-phrases"] }
+EOF
+cp "$PHRASES_FIX" "$DISREPO/doc.md"
+out="$(CLAUDE_PROJECT_DIR="$DISREPO" bash "$DETECT" "$DISREPO/doc.md" 2>&1)"
+assert_not_contains "phrase config: disabled rule emits no findings" "$out" "Finding: rule=ai-slop/audit/rule-model-era-phrases"
+assert_contains "phrase config: disabled rule reported in summary" "$out" "rule=ai-slop/audit/rule-model-era-phrases findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0 disabled=1"
+
+# --show-config reports the effective roster.
+out="$(CLAUDE_PROJECT_DIR="$PREPO" bash "$DETECT" --show-config 2>&1)"
+assert_contains "show-config: effective phrase roster shown" "$out" "model_phrases=(the part most people skip|that.s the unlock|chef.s kiss architecture)"
+
+# Evidence-grade gate, asserted against the catalog itself: within the
+# Model-era additions section, a locally-observed entry must never be a script
+# rule (the grade's placement gate; keeps the constraint alive through future
+# catalog edits rather than resting on one authoring choice).
+CATALOG_MD="$SCRIPT_DIR/../reference/catalog.md"
+grade_violations="$(awk '/^## Model-era additions/{insec=1} insec && /^### rule-/{slug=$2} insec && /evidence: locally-observed/{lo[slug]=1} insec && /v1: script/{sc[slug]=1} END{for (s in lo) if (s in sc) print s}' "$CATALOG_MD")"
+if [[ -z "$grade_violations" ]]; then
+  pass "catalog gate: no locally-observed entry ships as a script rule"
+else
+  fail "catalog gate: no locally-observed entry ships as a script rule" "no slugs" "$grade_violations"
+fi
+
+# --- Exemptions ------------------------------------------------------------------
+
+out="$(bash "$DETECT" "$MARKED" 2>&1)"
+assert_not_contains "line marker: em dash on marked line not flagged" "$out" "Finding: rule=ai-slop/audit/rule-em-dash"
+assert_contains "line marker: declined count nonzero" "$out" "declined=1"
+
+out="$(bash "$DETECT" "$REASONED" 2>&1)"
+assert_not_contains "reasoned line marker: marked line not flagged" "$out" "line=3"
+assert_not_contains "reasoned block: block interior not flagged" "$out" "line=6"
+assert_contains "reasoned block: -end with a reason still closes the block" "$out" "line=9"
+assert_contains "reasoned markers: line and block interior both declined" "$out" "declined=2"
+
+out="$(bash "$DETECT" "$FENCED" 2>&1)"
+assert_not_contains "fences: fenced and inline-code content not flagged" "$out" "Finding:"
+
+out="$(bash "$DETECT" "$FILEMARK" 2>&1)"
+assert_not_contains "file marker: whole file exempt" "$out" "Finding:"
+assert_contains "file marker: counted as declined file" "$out" "(1 files declined)"
+
+out="$(bash "$DETECT" "$DOCMARKS" 2>&1)"
+assert_contains "marker mentions: backticked docs do not exempt the file" "$out" "Finding: rule=ai-slop/audit/rule-em-dash"
+assert_contains "marker mentions: no decline from prose mentions" "$out" "rule=ai-slop/audit/rule-em-dash findings=1 declined=0"
+
+out="$(bash "$DETECT" "$MIXEDMARK" 2>&1)"
+assert_not_contains "mixed marker line: a mention of another form does not veto a real marker" "$out" "Finding:"
+assert_contains "mixed marker line: the real line marker still declines" "$out" "rule=ai-slop/audit/rule-em-dash findings=0 declined=1"
+
+out="$(bash "$DETECT" "$MIDFILEMARK" 2>&1)"
+assert_not_contains "mid-file file marker: whole file exempt, nothing scanned" "$out" "Finding:"
+assert_contains "mid-file file marker: counted as declined file" "$out" "(1 files declined)"
+
+# --- CLI contract ----------------------------------------------------------------
+
+out="$(bash "$DETECT" --paths-file "$TEST_TMPDIR/nope" 2>&1)"
+rc=$?
+assert_exit "unreadable paths-file: exit 2" 2 "$rc"
+
+out="$(bash "$DETECT" --bogus 2>&1)"
+rc=$?
+assert_exit "unknown option: exit 2" 2 "$rc"
+
+pf="$TEST_TMPDIR/paths.txt"
+printf '%s\n%s\n' "$SLOP" "$CLEAN" >"$pf"
+out="$(bash "$DETECT" --paths-file "$pf" --offset 0 --limit 1 2>&1)"
+assert_contains "chunking: limit 1 scans one file" "$out" "across 1 files scanned"
+
+# --list-targets prints the exact list a scan reads, one `<key><TAB><path>` row
+# per file, after directory expansion and excluded_paths; the key is the file=
+# spelling. Chunk options are ignored so a caller plans over the whole list.
+LT="$TEST_TMPDIR/list-targets"
+mkdir -p "$LT/sub" "$LT/vendor" "$LT/.claude"
+make_repo "$LT"
+printf 'one\n' >"$LT/a.md"
+printf 'two\n' >"$LT/sub/b.md"
+printf 'three\n' >"$LT/vendor/c.md"
+printf '%s\n' '{ "excluded_paths": ["vendor/**"] }' >"$LT/.claude/ai-slop.json"
+git -C "$LT" add -A >/dev/null 2>&1
+TAB=$'\t'
+out="$(CLAUDE_PROJECT_DIR="$LT" bash "$DETECT" --list-targets --offset 0 --limit 1 "$LT" "$LT/missing.md" 2>/dev/null)"
+rc=$?
+assert_exit "list-targets: exit 0" 0 "$rc"
+assert_contains "list-targets: key is the file= spelling, then the path" "$out" "a.md${TAB}$LT/a.md"
+assert_contains "list-targets: a directory target expands" "$out" "sub/b.md${TAB}$LT/sub/b.md"
+assert_not_contains "list-targets: excluded_paths drops the file" "$out" "vendor/c.md"
+assert_not_contains "list-targets: a missing file is dropped" "$out" "missing.md"
+assert_eq "list-targets: offset and limit are ignored, no Summary rows" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" "2"
+out="$(bash "$DETECT" --list-targets --show-config 2>&1)"
+assert_contains "list-targets: --show-config wins" "$out" "Config layers"
+printf '%s\t%s\n' slop.md "$SLOP" >"$TEST_TMPDIR/listed.tsv"
+out="$(bash "$DETECT" --paths-file "$TEST_TMPDIR/listed.tsv" 2>&1)"
+assert_contains "list-targets: its output is a valid --paths-file" "$out" "across 1 files scanned"
+# Only a line with exactly one tab is read as `<key><TAB><path>`; any other line
+# is the path itself, tabs included.
+TABF="$TEST_TMPDIR/tab${TAB}in${TAB}name.md"
+if printf 'x\n' >"$TABF" 2>/dev/null && [[ -f "$TABF" ]]; then
+  printf '%s\n' "$TABF" >"$TEST_TMPDIR/tabpath.txt"
+  out="$(bash "$DETECT" --paths-file "$TEST_TMPDIR/tabpath.txt" 2>&1)"
+  assert_contains "paths-file: a line with two tabs is the whole path" "$out" "across 1 files scanned"
+else
+  skip "paths-file: a line with two tabs is the whole path" "no tab in file names"
+fi
+
+# A --paths-file with no non-blank line scans nothing, rather than the
+# repository listing a bare invocation reads.
+EPREPO="$TEST_TMPDIR/empty-pf-repo"
+mkdir -p "$EPREPO"
+printf 'Tracked %s here.\n' "$EM" >"$EPREPO/tracked.md"
+(
+  cd "$EPREPO" || exit 1
+  git init -q .
+  git add tracked.md 2>/dev/null
+)
+printf '\n\n' >"$TEST_TMPDIR/empty-paths.txt"
+out="$(CLAUDE_PROJECT_DIR="$EPREPO" bash "$DETECT" --paths-file "$TEST_TMPDIR/empty-paths.txt" 2>&1)"
+assert_not_contains "empty paths-file: the repository listing is not scanned" "$out" "tracked.md"
+assert_contains "empty paths-file: stderr says the list is empty" "$out" "lists no paths"
+assert_contains "empty paths-file: zero-file Summary" "$out" "0 findings across 0 files scanned"
+
+# --- Config cascade --------------------------------------------------------------
+
+cfgdir="$TEST_TMPDIR/repo/.claude"
+mkdir -p "$cfgdir"
+make_repo "$TEST_TMPDIR/repo"
+cp "$SLOP" "$TEST_TMPDIR/repo/allowed.md"
+cat >"$cfgdir/ai-slop.json" <<'EOF'
+{
+  "em_dash_allowed_paths": ["allowed.md"],
+  "thresholds": { "ai_vocabulary": 999, "copulative_avoidance": 999 },
+  "disabled_rules": ["rule-significance-inflation"]
+}
+EOF
+out="$(cd "$TEST_TMPDIR/repo" && CLAUDE_PROJECT_DIR="$TEST_TMPDIR/repo" bash "$DETECT" "$TEST_TMPDIR/repo/allowed.md" 2>&1)"
+assert_not_contains "config: em_dash_allowed_paths exempts the document" "$out" "Finding: rule=ai-slop/audit/rule-em-dash"
+assert_not_contains "config: raised threshold silences vocabulary rule" "$out" "Finding: rule=ai-slop/audit/rule-ai-vocabulary"
+assert_not_contains "config: disabled rule emits no findings" "$out" "Finding: rule=ai-slop/audit/rule-significance-inflation"
+assert_contains "config: disabled rule reported in summary" "$out" "rule=ai-slop/audit/rule-significance-inflation findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0 disabled=1"
+
+out="$(CLAUDE_PROJECT_DIR="$TEST_TMPDIR/repo" bash "$DETECT" --show-config 2>&1)"
+assert_contains "show-config: names the supplying layer" "$out" "$cfgdir/ai-slop.json"
+assert_contains "show-config: effective threshold shown" "$out" "threshold_ai_vocabulary=999"
+assert_contains "show-config: disabled rules shown" "$out" "disabled_rules=rule-significance-inflation"
+
+# Config-cascade step 2: a home or non-repo root has no team or overlay layer, and
+# the user-global file is read once, never again as team.
+HOMEROOT="$TEST_TMPDIR/home-root"
+mkdir -p "$HOMEROOT/.claude"
+printf '%s\n' '{ "thresholds": { "ai_vocabulary": 777 } }' >"$HOMEROOT/.claude/ai-slop.json"
+out="$(HOME="$HOMEROOT" CLAUDE_PROJECT_DIR="$HOMEROOT" bash "$DETECT" --show-config 2>&1)"
+assert_eq "home root: the user-global file is listed once" "$(printf '%s\n' "$out" | grep -c "$HOMEROOT/.claude/ai-slop.json")" "1"
+assert_contains "home root: the user-global threshold applies" "$out" "threshold_ai_vocabulary=777"
+make_repo "$HOMEROOT"
+out="$(HOME="$HOMEROOT" CLAUDE_PROJECT_DIR="$HOMEROOT" bash "$DETECT" --show-config 2>&1)"
+assert_eq "a git repository at the home is still a home root" "$(printf '%s\n' "$out" | grep -c "$HOMEROOT/.claude/ai-slop.json")" "1"
+NONREPO="$TEST_TMPDIR/non-repo-root"
+mkdir -p "$NONREPO/.claude"
+printf '%s\n' '{ "thresholds": { "ai_vocabulary": 555 } }' >"$NONREPO/.claude/ai-slop.json"
+out="$(CLAUDE_PROJECT_DIR="$NONREPO" bash "$DETECT" --show-config 2>&1)"
+assert_not_contains "a non-repo root: its .claude file is not a team layer" "$out" "$NONREPO/.claude/ai-slop.json"
+
+# A threshold is config text: a newline and tabs in it must not forge a density
+# row whose file field reaches an array subscript or a path.
+INJREPO="$TEST_TMPDIR/threshold-inject"
+mkdir -p "$INJREPO/.claude"
+make_repo "$INJREPO"
+cp "$SLOP" "$INJREPO/doc.md"
+cat >"$INJREPO/.claude/ai-slop.json" <<EOF
+{ "thresholds": { "ai_vocabulary": "99\\nSCANNED[\$(touch $INJREPO/PWNED)0]\\t5\\t5\\t0" } }
+EOF
+out="$(CLAUDE_PROJECT_DIR="$INJREPO" bash "$DETECT" "$INJREPO/doc.md" 2>&1)"
+assert_eq "threshold injection: a forged density row runs no command" "$([[ -e "$INJREPO/PWNED" ]] && echo ran || echo none)" "none"
+assert_not_contains "threshold injection: a forged row reaches no path" "$out" "SCANNED["
+
+# --- Config parsing against a CRLF-emitting jq (#3343) ---------------------------
+
+# The Windows build of jq terminates output lines with CRLF (#3343). CI runs on
+# Linux and sees LF, so the condition is forced here: a shim ahead of the real
+# jq on PATH appends a CR to every output line. Each case below proves one
+# config key shape still applies under it: `excluded_paths`,
+# `em_dash_allowed_paths` and `disabled_rules` (cascade::list),
+# `rule_allowed_paths` (cascade::slug_map), the phrase keys (cascade::list) and
+# the threshold scalar (cascade::scalar). The list, slug-map and phrase cases
+# reproduce on both platforms; the scalar case at the end discriminates on Linux
+# only, for the reason recorded there.
+CRLF_BIN="$TEST_TMPDIR/bin-crlf-jq"
+mkdir -p "$CRLF_BIN"
+REAL_JQ="$(command -v jq)"
+cat >"$CRLF_BIN/jq" <<EOF
+#!/usr/bin/env bash
+# pipefail so a jq failure stays a failure: awk's exit status would otherwise
+# mask it, and the readers skip a refused layer only on jq's nonzero status.
+set -o pipefail
+"$REAL_JQ" "\$@" | awk '{ printf "%s\r\n", \$0 }'
+EOF
+chmod +x "$CRLF_BIN/jq"
+
+# Pin the shim itself. Without this every case below is green on a Linux
+# runner whether or not the shim is ever selected — an unset exec bit or a
+# PATH-resolution surprise would leave the regression gate decorative, and no
+# Windows workstation can observe that, because its own jq already emits CRLF.
+shim_out="$(PATH="$CRLF_BIN:$PATH" jq -rn '"x"' | od -c)"
+assert_contains "crlf jq: the shim is on PATH and emits a carriage return" "$shim_out" '\r'
+
+crlfdir="$TEST_TMPDIR/crlf-repo/.claude"
+mkdir -p "$crlfdir"
+make_repo "$TEST_TMPDIR/crlf-repo"
+cp "$SLOP" "$TEST_TMPDIR/crlf-repo/allowed.md"
+cp "$SLOP" "$TEST_TMPDIR/crlf-repo/vendored.md"
+cat >"$crlfdir/ai-slop.json" <<'EOF'
+{
+  "excluded_paths": ["vendored.md"],
+  "em_dash_allowed_paths": ["allowed.md"],
+  "thresholds": { "ai_vocabulary": 999, "copulative_avoidance": 999 },
+  "disabled_rules": ["rule-significance-inflation"]
+}
+EOF
+
+out="$(cd "$TEST_TMPDIR/crlf-repo" && PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$TEST_TMPDIR/crlf-repo" \
+  bash "$DETECT" "$TEST_TMPDIR/crlf-repo/vendored.md" 2>&1)"
+assert_contains "crlf jq: excluded_paths still declines the file" "$out" "Declined: file=vendored.md cause=excluded-glob"
+
+out="$(cd "$TEST_TMPDIR/crlf-repo" && PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$TEST_TMPDIR/crlf-repo" \
+  bash "$DETECT" "$TEST_TMPDIR/crlf-repo/allowed.md" 2>&1)"
+assert_not_contains "crlf jq: em_dash_allowed_paths still exempts the document" "$out" "Finding: rule=ai-slop/audit/rule-em-dash"
+# Positive pin alongside the absence check: on its own, `assert_not_contains`
+# would also be satisfied by an accidental whole-file exclusion.
+assert_contains "crlf jq: the em-dash exemption is a decline, not a dropped file" "$out" "rule=ai-slop/audit/rule-em-dash findings=0 declined=1 declined_marker=0 declined_quote=0 declined_config=1 disabled=0"
+assert_contains "crlf jq: disabled_rules still applies" "$out" "rule=ai-slop/audit/rule-significance-inflation findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0 disabled=1"
+
+# rule_allowed_paths under the shim, reusing its own fixture.
+out="$(PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$RAP" bash "$DETECT" "$RAP/quirks/doc.md" "$RAP/plain.md" 2>&1)"
+assert_not_contains "crlf jq: rule_allowed_paths still declines the listed path" "$out" "file=quirks/doc.md"
+assert_contains "crlf jq: rule_allowed_paths decline still counted" "$out" "rule=ai-slop/audit/rule-filler-phrases findings=1 declined=1"
+
+# phrase_add and phrase_remove under the shim: every fragment must still match.
+# The phrase-repo fixture is reused.
+out="$(PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$PREPO" bash "$DETECT" "$PREPO/doc.md" 2>&1)"
+assert_contains "crlf jq: phrase_add and phrase_remove still apply" "$out" "rule=ai-slop/audit/rule-model-era-phrases findings=2 declined=0"
+
+# Anchored on the text that FOLLOWS the value: a bare `=999` substring match
+# passes against `999\r` and would not discriminate.
+#
+# This case discriminates on Linux ONLY. Under Git Bash a one-line scalar read
+# never carried the CR: MSYS command substitution strips one trailing CRLF pair,
+# so the case is green either way on a Windows workstation. The list and
+# slug-map cases above carry the Windows reproduction; this one is here for the
+# runner.
+out="$(PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$TEST_TMPDIR/crlf-repo" bash "$DETECT" --show-config 2>&1)"
+assert_contains "crlf jq: scalar threshold parses without the carriage return" "$out" "threshold_ai_vocabulary=999 (rule"
+
+# The CR strip must not swallow jq's verdict on the layer. jq emits the values it
+# parsed before it meets malformed bytes and then exits nonzero; cascade::scalar
+# reads that status, so a `| tr -d` inside the substitution would replace it with
+# tr's unconditional success and let a half-read layer set the threshold;
+# cascade-read.sh strips the CR after the substitution and skips the layer. The
+# fixture is a valid object followed by a truncated one, which is what a config
+# file caught mid-write looks like.
+truncdir="$TEST_TMPDIR/trunc-repo/.claude"
+mkdir -p "$truncdir"
+make_repo "$TEST_TMPDIR/trunc-repo"
+printf '%s\n' '{ "thresholds": { "ai_vocabulary": 999 } }' '{bad' >"$truncdir/ai-slop.json"
+
+out="$(CLAUDE_PROJECT_DIR="$TEST_TMPDIR/trunc-repo" bash "$DETECT" --show-config 2>&1)"
+assert_contains "malformed layer: the partially parsed threshold is refused" "$out" "threshold_ai_vocabulary=3.0 (rule"
+
+# Same fixture under the CRLF shim: the strip and the status check have to hold at
+# once, which is the combination the pipeline lost.
+out="$(PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$TEST_TMPDIR/trunc-repo" bash "$DETECT" --show-config 2>&1)"
+assert_contains "malformed layer: refused under a CRLF-emitting jq too" "$out" "threshold_ai_vocabulary=3.0 (rule"
+
+# Pin the fixture's premise: a well-formed layer carrying the same value is still
+# honored, so the two cases above are discriminating on the malformation and not
+# on the key going unread for some unrelated reason.
+okdir="$TEST_TMPDIR/trunc-ok-repo/.claude"
+mkdir -p "$okdir"
+make_repo "$TEST_TMPDIR/trunc-ok-repo"
+printf '%s\n' '{ "thresholds": { "ai_vocabulary": 999 } }' >"$okdir/ai-slop.json"
+out="$(CLAUDE_PROJECT_DIR="$TEST_TMPDIR/trunc-ok-repo" bash "$DETECT" --show-config 2>&1)"
+assert_contains "malformed layer: the same value from a well-formed layer still applies" "$out" "threshold_ai_vocabulary=999 (rule"
+
+# --- Portability -----------------------------------------------------------------
+
+a="$(bash "$DETECT" "$ALLRULES" 2>&1)"
+b="$(LC_ALL=C bash "$DETECT" "$ALLRULES" 2>&1)"
+if [[ "$a" == "$b" ]]; then
+  pass "portability: output identical under LC_ALL=C"
+else
+  fail "portability: output identical under LC_ALL=C" "identical" "differs"
+fi
+
+# --- Fences (CommonMark indentation + opener-char tracking) -----------------------
+
+FENCY="$TEST_TMPDIR/fency.md"
+cat >"$FENCY" <<EOF
+# Fences
+
+   \`\`\`text
+   An em dash ${EM} inside an indented fence stays exempt.
+   ~~~
+   Still inside the backtick fence: delve, tapestry ${EM} exempt too.
+   \`\`\`
+
+An em dash ${EM} in prose after the fence closes must flag.
+EOF
+
+out="$(bash "$DETECT" "$FENCY" 2>&1)"
+assert_contains "fences: prose after close still flags" "$out" "rule=ai-slop/audit/rule-em-dash findings=1 "
+assert_not_contains "fences: indented fence content exempt, tilde does not close backtick fence" "$out" "delve"
+
+# --- Fences opened behind a list marker (CommonMark container blocks) -------------
+# A fence may open after a list marker, and its closer is measured against the
+# fence's OWN container indent rather than column zero. Without both halves the
+# opener line was ordinary prose (its em dash fired and its content was scanned)
+# and the indented CLOSER opened a fence of its own, swallowing every line after
+# it. Both fixtures below reproduced exactly that against the old parser.
+
+LISTFENCE="$TEST_TMPDIR/listfence.md"
+cat >"$LISTFENCE" <<EOF
+# Ordered list fence
+
+1. \`\`\`text
+   Inside a fence ${EM} cromulentia stays exempt.
+   \`\`\`
+
+An em dash ${EM} after the closer must flag.
+EOF
+out="$(bash "$DETECT" "$LISTFENCE" 2>&1)"
+assert_contains "ordered-marker fence: prose after the closer still flags" "$out" "line=7"
+assert_not_contains "ordered-marker fence: fenced content stays exempt" "$out" "cromulentia"
+
+BULLETFENCE="$TEST_TMPDIR/bulletfence.md"
+cat >"$BULLETFENCE" <<EOF
+# Bullet list fence
+
+- \`\`\`text
+  Inside a bullet fence ${EM} zephyrantic stays exempt.
+  \`\`\`
+
+An em dash ${EM} after the bullet closer must flag.
+EOF
+out="$(bash "$DETECT" "$BULLETFENCE" 2>&1)"
+assert_contains "bullet-marker fence: prose after the closer still flags" "$out" "line=7"
+assert_not_contains "bullet-marker fence: fenced content stays exempt" "$out" "zephyrantic"
+
+# An opener with no closer reads the whole rest of the file as code. That is the
+# correct parse, but silently scanning nothing is the failure mode this warning
+# exists to make visible; the audit itself still succeeds.
+UNCLOSED="$TEST_TMPDIR/unclosed.md"
+cat >"$UNCLOSED" <<EOF
+# Unclosed fence
+
+\`\`\`text
+An em dash ${EM} inside a fence that never closes.
+EOF
+out="$(bash "$DETECT" "$UNCLOSED" 2>&1)"
+rc=$?
+assert_exit "unclosed fence: the run still exits 0" 0 "$rc"
+assert_contains "unclosed fence: the warning names the opening line" "$out" "code fence opened at line 3"
+assert_contains "unclosed fence: the warning names the file" "$out" "unclosed.md"
+
+# An ordered list marker carries at most nine digits, so a longer run is a
+# number in prose. Without that cap a line beginning with a ten-digit number
+# and a fence opened one, and every line after it was read as code.
+LONGNUM="$TEST_TMPDIR/longnum.md"
+cat >"$LONGNUM" <<EOF
+# Long number
+
+1234567890. \`\`\`text
+
+An em dash ${EM} after it must still flag.
+EOF
+out="$(bash "$DETECT" "$LONGNUM" 2>&1)"
+assert_contains "ordered marker: a ten-digit number does not open a fence" "$out" "rule=ai-slop/audit/rule-em-dash findings=1 "
+
+# A fence opened inside a list item ends with its CONTAINER, not only at a
+# closer. A non-blank line indented less than the item's content column closes
+# the item, and lazy continuation does not reach a fenced block, so that line is
+# document-level prose. Without this the opener swallowed the rest of the file
+# and said so only on stderr, which the purge gate discards on a zero exit, so
+# an em dash could reach a purged path through this shape.
+DEDENT="$TEST_TMPDIR/dedent.md"
+cat >"$DEDENT" <<EOF
+- \`\`\`text
+  inside the item ${EM} stays exempt
+after the item ${EM} must flag
+EOF
+out="$(bash "$DETECT" "$DEDENT" 2>&1)"
+assert_contains "list fence dedent: the dedented line is scanned" "$out" "rule=ai-slop/audit/rule-em-dash findings=1 "
+assert_contains "list fence dedent: it is the line below the item" "$out" "line=3"
+assert_not_contains "list fence dedent: the item's own fenced content stays exempt" "$out" "inside the item"
+assert_not_contains "list fence dedent: a container-ended fence is not reported unclosed" "$out" "is never closed"
+
+# A BLANK line does not end a list item, so the fence survives it and only the
+# dedented paragraph below ends the container.
+DEDENTBLANK="$TEST_TMPDIR/dedentblank.md"
+cat >"$DEDENTBLANK" <<EOF
+1. \`\`\`text
+   inside the item ${EM} stays exempt
+
+after the blank line ${EM} must flag
+EOF
+out="$(bash "$DETECT" "$DEDENTBLANK" 2>&1)"
+assert_contains "list fence dedent: a blank line keeps the fence open" "$out" "rule=ai-slop/audit/rule-em-dash findings=1 "
+assert_contains "list fence dedent: the paragraph below the blank line is scanned" "$out" "line=4"
+assert_not_contains "list fence dedent: content before the blank line stays exempt" "$out" "inside the item"
+
+# The mirror shape. A column-zero fence below the item ends the item FIRST and
+# then opens a document-level block of its own, so what follows it is code.
+DEDENTFENCE="$TEST_TMPDIR/dedentfence.md"
+cat >"$DEDENTFENCE" <<EOF
+- \`\`\`text
+  inside the item
+\`\`\`
+after the new opener ${EM} is code
+EOF
+out="$(bash "$DETECT" "$DEDENTFENCE" 2>&1)"
+assert_contains "list fence dedent: a column-zero fence below the item opens a new block" "$out" "rule=ai-slop/audit/rule-em-dash findings=0 "
+assert_not_contains "list fence dedent: the line inside that new block stays exempt" "$out" "after the new opener"
+assert_contains "list fence dedent: the new block running to EOF is reported unclosed" "$out" "code fence opened at line 3 is never closed"
+
+# A generated region belongs to the script its marker names, which overwrites
+# any edit, so no rule scans it. A backticked mention of the marker opens
+# nothing, and prose after the END line is scanned again.
+GENERATED="$TEST_TMPDIR/generated.md"
+cat >"$GENERATED" <<EOF
+# Generated region
+
+Mentioning \`<!-- BEGIN GENERATED: x -->\` in prose opens nothing ${EM} must flag.
+
+<!-- BEGIN GENERATED: plugin options. Edit plugin.json, then run scripts/sync-plugin-options-docs.py -->
+Inside the region ${EM} zephyrantic stays exempt.
+<!-- END GENERATED: plugin options -->
+
+After the region ${EM} must flag.
+EOF
+out="$(bash "$DETECT" "$GENERATED" 2>&1)"
+assert_contains "generated region: prose outside it flags" "$out" "rule=ai-slop/audit/rule-em-dash findings=2 "
+assert_contains "generated region: the line after END is scanned" "$out" "line=9"
+assert_not_contains "generated region: its content stays exempt" "$out" "zephyrantic"
+
+GENUNCLOSED="$TEST_TMPDIR/genunclosed.md"
+cat >"$GENUNCLOSED" <<EOF
+# Unclosed region
+
+<!-- BEGIN GENERATED: x -->
+An em dash ${EM} in a region that never closes.
+EOF
+out="$(bash "$DETECT" "$GENUNCLOSED" 2>&1)"
+assert_contains "generated region: an unclosed one is reported" "$out" "generated region opened at line 3 is never closed"
+
+# --- Directory target expansion ---------------------------------------------------
+
+DIRT="$TEST_TMPDIR/dirt"
+mkdir -p "$DIRT/sub"
+cat >"$DIRT/a.md" <<EOF
+An em dash ${EM} here.
+EOF
+cat >"$DIRT/sub/b.md" <<EOF
+Another em dash ${EM} here.
+EOF
+
+out="$(bash "$DETECT" "$DIRT" 2>&1)"
+assert_contains "dir target: expands recursively to markdown" "$out" "2 files scanned"
+assert_contains "dir target: findings from nested file" "$out" "sub/b.md"
+
+# The PRIMARY branch — a directory inside a git checkout expands via git
+# ls-files (tracked files only) — needs its own coverage: the fixture above is
+# outside any repo, so it exercises only the find fallback.
+GITDIR="$TEST_TMPDIR/gitrepo"
+mkdir -p "$GITDIR/docs"
+git -C "$GITDIR" init -q
+cat >"$GITDIR/docs/tracked.md" <<EOF
+A tracked em dash ${EM} here.
+EOF
+cat >"$GITDIR/docs/untracked.md" <<EOF
+An untracked em dash ${EM} here.
+EOF
+git -C "$GITDIR" add docs/tracked.md
+cat >"$GITDIR/sibling.md" <<EOF
+A sibling em dash ${EM} here.
+EOF
+git -C "$GITDIR" add sibling.md
+out="$(bash "$DETECT" "$GITDIR/docs" 2>&1)"
+assert_contains "dir target in git repo: tracked file scanned via ls-files" "$out" "file=$GITDIR/docs/tracked.md"
+assert_contains "dir target in git repo: only the tracked file counts" "$out" "1 files scanned"
+assert_not_contains "dir target in git repo: sibling outside the subtree is not scanned" "$out" "sibling.md"
+
+# Path agreement. One directory has several SPELLINGS on Git Bash: git answers
+# the Windows form of the same checkout a shell reaches as "/tmp/...". An
+# expansion that derives its prefix from one source and its filter from another
+# drops every candidate wherever the two disagree, and the walk that backs it up
+# returns untracked markdown in place of the tracked listing. The
+# assertion is that the SPELLING of the target cannot change the answer. On a
+# host where the two forms already agree these two cases restate the one above,
+# which is the point: the invariant holds everywhere, and it is only observable
+# here.
+GITSPELL="$(git -C "$GITDIR/docs" rev-parse --show-toplevel)/docs"
+PWDSPELL="$(cd "$GITDIR/docs" && pwd)"
+
+out="$(bash "$DETECT" "$GITSPELL" 2>&1)"
+assert_contains "dir target, git spelling: the emitted path keeps that spelling" "$out" "file=$GITSPELL/tracked.md"
+assert_contains "dir target, git spelling: only the tracked file counts" "$out" "1 files scanned"
+
+out="$(bash "$DETECT" "$PWDSPELL" 2>&1)"
+assert_contains "dir target, shell spelling: the emitted path keeps that spelling" "$out" "file=$PWDSPELL/tracked.md"
+assert_contains "dir target, shell spelling: only the tracked file counts" "$out" "1 files scanned"
+
+# A trailing slash is the same directory and must expand identically; the
+# expansion builds paths by concatenation, so an unnormalized target would emit
+# a doubled separator and scan nothing.
+out="$(bash "$DETECT" "$GITDIR/docs/" 2>&1)"
+assert_contains "dir target with a trailing slash: the emitted path is not doubled" "$out" "file=$GITDIR/docs/tracked.md"
+assert_not_contains "dir target with a trailing slash: no doubled separator" "$out" "file=$GITDIR/docs//tracked.md"
+assert_contains "dir target with a trailing slash: only the tracked file counts" "$out" "1 files scanned"
+
+# --- Bare invocation (no paths) ---------------------------------------------------
+
+# Listing rules (quotePath, prefix, git failures) are asserted in
+# resolve-targets.test.sh; these two cases pin only that a bare invocation
+# reaches the report and the summary through detect.sh.
+BAREREPO="$TEST_TMPDIR/barerepo"
+mkdir -p "$BAREREPO/unicode"
+git -C "$BAREREPO" init -q
+printf 'A tracked em dash %s here.\n' "$EM" >"$BAREREPO/unicode/notes${EM}name.md"
+printf 'A tracked em dash %s here too.\n' "$EM" >"$BAREREPO/ascii.md"
+git -C "$BAREREPO" add "unicode/notes${EM}name.md" ascii.md
+
+out="$(cd "$BAREREPO" && CLAUDE_PROJECT_DIR="$BAREREPO" bash "$DETECT" 2>&1)"
+assert_contains "bare invocation: the non-ASCII tracked file is in the report" "$out" "file=unicode/notes${EM}name.md"
+assert_contains "bare invocation: both tracked files count" "$out" "2 files scanned"
+
+# A listing failure reaches the summary as an empty audit.
+BADLS_BIN="$TEST_TMPDIR/bin-badls"
+mkdir -p "$BADLS_BIN"
+REAL_GIT="$(command -v git)"
+cat >"$BADLS_BIN/git" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do
+  if [[ "\$a" == "ls-files" ]]; then
+    echo "fatal: stubbed ls-files failure" >&2
+    exit 128
+  fi
+done
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$BADLS_BIN/git"
+out="$(cd "$BAREREPO" && PATH="$BADLS_BIN:$PATH" CLAUDE_PROJECT_DIR="$BAREREPO" bash "$DETECT" 2>&1)"
+assert_contains "bare invocation, listing fails: the summary reports 0 files scanned" "$out" "0 files scanned"
+
+# --- Excerpt truncation at the byte boundary --------------------------------------
+
+# 79 ASCII bytes then an em dash: a byte cut at 80 would keep only the first
+# byte of the three-byte sequence, emitting invalid UTF-8 into the finding.
+LONGLINE="$(printf 'x%.0s' $(seq 1 75)) em${EM}dash tail"
+BOUNDARY="$TEST_TMPDIR/boundary.md"
+printf '%s\n' "$LONGLINE" >"$BOUNDARY"
+out="$(bash "$DETECT" "$BOUNDARY" 2>&1)"
+if printf '%s' "$out" | LC_ALL=C grep -q $'\xe2\x80\x94'; then
+  pass "excerpt truncation: em dash at boundary survives whole"
+elif printf '%s' "$out" | LC_ALL=C grep -q $'\xe2'; then
+  fail "excerpt truncation: no partial multi-byte sequence" "whole em dash or none" "lone lead byte present"
+else
+  pass "excerpt truncation: partial sequence dropped cleanly"
+fi
+
+# --- emit-findings.sh ------------------------------------------------------------
+
+EMIT="$SCRIPT_DIR/emit-findings.sh"
+EMITSRC="$TEST_TMPDIR/emitsrc.md"
+cat >"$EMITSRC" <<EOF
+# Mixed-tier sample
+
+A pipe | and an em dash ${EM} on one line.
+
+As of my knowledge cutoff, this was true.
+EOF
+
+DETOUT="$TEST_TMPDIR/detect-out.txt"
+bash "$DETECT" "$EMITSRC" >"$DETOUT" 2>&1 || true
+FOUT="$TEST_TMPDIR/findings/ai-slop.md"
+
+out="$(bash "$EMIT" --from "$DETOUT" --out "$FOUT" --branch test-branch 2>&1)"
+assert_contains "emit: reports destination" "$out" "wrote $FOUT"
+fcontent="$(cat "$FOUT")"
+assert_contains "emit: frontmatter type" "$fcontent" "type: review-findings"
+assert_contains "emit: frontmatter branch" "$fcontent" "branch: test-branch"
+# The `date:` frontmatter field is PARSED by the consumer: fix-pass-mode.md
+# "Step 1" reads a value only if it is a full ISO-8601 date-time with an explicit
+# UTC designator, so the time portion needs COLONS. The colon-free rule
+# belongs to the FILE NAME (Windows-safe), not to this field.
+if LC_ALL=C grep -qE '^date: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$FOUT"; then
+  pass "emit: ISO-8601 extended UTC date"
+else
+  fail "emit: ISO-8601 extended UTC date" "YYYY-MM-DDThh:mm:ssZ" "$(grep '^date:' "$FOUT")"
+fi
+assert_contains "emit: finding cell leads with qualified rule id" "$fcontent" "ai-slop/audit/rule-em-dash"
+# detect.sh sanitizes prose pipes to / at excerpt production; the cell must
+# never carry a raw table-breaking pipe from prose.
+assert_contains "emit: prose pipe arrives sanitized" "$fcontent" "pipe / and"
+
+# The emitter's own escaping still guards pipes reaching it through other
+# fields: feed a synthetic detect-output row carrying one.
+SYNTH="$TEST_TMPDIR/synth-out.txt"
+cat >"$SYNTH" <<'EOF'
+Finding: rule=ai-slop/audit/rule-em-dash file=doc.md line=1 fired=zero|tolerance excerpt=text
+Summary rule=ai-slop/audit/rule-em-dash findings=1 declined=0 disabled=0
+EOF
+bash "$EMIT" --from "$SYNTH" --out "$TEST_TMPDIR/findings/synth.md" --branch test-branch >/dev/null 2>&1
+assert_contains "emit: pipe escaped in cell" "$(cat "$TEST_TMPDIR/findings/synth.md")" 'zero\|tolerance'
+
+# A naive gsub double-escapes a pipe the SOURCE already escaped (`a \| b` ->
+# `a \\| b`), which GFM reads as a literal backslash plus a LIVE delimiter.
+# This repo writes literal `\|` in its own tables, so the case is real.
+ALREADY="$TEST_TMPDIR/already-esc.txt"
+cat >"$ALREADY" <<'EOF'
+Finding: rule=ai-slop/audit/rule-em-dash file=doc.md line=1 fired=a\|b excerpt=text
+Summary rule=ai-slop/audit/rule-em-dash findings=1 declined=0 disabled=0
+EOF
+ALREADY_OUT="$TEST_TMPDIR/findings/already-esc.md"
+bash "$EMIT" --from "$ALREADY" --out "$ALREADY_OUT" --branch test-branch >/dev/null 2>&1
+already_row="$(LC_ALL=C grep -m1 '^| 1 ' "$ALREADY_OUT")"
+assert_not_contains "emit: an already-escaped pipe is not double-escaped" "$already_row" '\\\|'
+assert_contains "emit: and survives as a single-escaped literal" "$already_row" 'a\|b'
+already_delims="$(printf '%s' "$already_row" | sed 's/\\|//g' | awk -F'|' '{print NF - 1}')"
+assert_contains "emit: so the row still parses as exactly 7 cells" "delims=$already_delims" "delims=8"
+
+# Repo-root spelling mismatch: git's toplevel and the caller's pwd can name
+# the same directory differently (Git Bash). This producer fails OPEN, so an
+# unmatched spelling leaves Location absolute and says nothing. A symlink makes
+# pwd and --show-toplevel disagree on Linux too.
+SPELL_REAL="$TEST_TMPDIR/spell-real"
+SPELL_LINK="$TEST_TMPDIR/spell-link"
+mkdir -p "$SPELL_REAL"
+(
+  cd "$SPELL_REAL" || exit 1
+  git init -q .
+  git config user.email t@example.com
+  git config user.name Test
+)
+ln -s "$SPELL_REAL" "$SPELL_LINK"
+printf 'Finding: rule=ai-slop/audit/rule-em-dash file=%s/doc.md line=1 fired=zero excerpt=text\n' "$SPELL_LINK" >"$TEST_TMPDIR/spell.txt"
+printf 'Summary rule=ai-slop/audit/rule-em-dash findings=1 declined=0 disabled=0\n' >>"$TEST_TMPDIR/spell.txt"
+SPELL_OUT="$TEST_TMPDIR/findings/spell.md"
+(cd "$SPELL_LINK" && bash "$EMIT" --from "$TEST_TMPDIR/spell.txt" --out "$SPELL_OUT" --branch test-branch) >/dev/null 2>&1
+spell_body="$(cat "$SPELL_OUT")"
+assert_contains "emit: a pwd-spelled absolute path is relativized" "$spell_body" "| doc.md:1 |"
+assert_not_contains "emit: Location carries no absolute prefix" "$spell_body" "$SPELL_LINK/doc.md"
+assert_not_contains "emit: Location carries no git-toplevel prefix either" "$spell_body" "$SPELL_REAL/doc.md"
+
+# An excerpt that itself contains file=/line= tokens (a doc describing this
+# format) must not spoof the Location cell — first-occurrence parsing.
+SPOOF="$TEST_TMPDIR/spoof.md"
+cat >"$SPOOF" <<EOF
+The docs file=README.md line=12 ${EM} see reference.
+EOF
+SPOOFOUT="$TEST_TMPDIR/spoof-out.txt"
+bash "$DETECT" "$SPOOF" >"$SPOOFOUT" 2>&1 || true
+bash "$EMIT" --from "$SPOOFOUT" --out "$TEST_TMPDIR/findings/spoof.md" --branch test-branch >/dev/null 2>&1
+assert_contains "emit: excerpt field tokens cannot spoof Location" \
+  "$(cat "$TEST_TMPDIR/findings/spoof.md")" "spoof.md:1 |"
+first_row="$(LC_ALL=C grep -m1 '^| 1 |' "$FOUT")"
+assert_contains "emit: IMPORTANT ranks first" "$first_row" "IMPORTANT"
+assert_contains "emit: surfaces zero-result rules listed" "$fcontent" "rule-utm-params"
+
+out="$(bash "$EMIT" --from "$DETOUT" --out "$FOUT" --branch test-branch 2>&1)"
+assert_contains "emit: non-overwrite suffix on existing file" "$out" "ai-slop-2.md"
+
+CLEANOUT="$TEST_TMPDIR/clean-out.txt"
+bash "$DETECT" "$CLEAN" >"$CLEANOUT" 2>&1 || true
+bash "$EMIT" --from "$CLEANOUT" --out "$TEST_TMPDIR/findings/none.md" --branch test-branch >/dev/null 2>&1
+if [[ -f "$TEST_TMPDIR/findings/none.md" ]] && LC_ALL=C grep -q '^## Findings' "$TEST_TMPDIR/findings/none.md"; then
+  pass "emit: zero findings still writes (coverage is the payload)"
+else
+  fail "emit: zero findings still writes (coverage is the payload)" "file with empty Findings" "missing"
+fi
+
+if bash "$EMIT" --from "$EMITSRC" --out "$TEST_TMPDIR/findings/garbage.md" --branch test-branch >/dev/null 2>&1; then
+  fail "emit: refuses non-detector input" "exit 3" "exit 0"
+else
+  rc=$?
+  if [[ "$rc" -eq 3 && ! -e "$TEST_TMPDIR/findings/garbage.md" ]]; then
+    pass "emit: refuses non-detector input"
+  else
+    fail "emit: refuses non-detector input" "exit 3, no file" "exit $rc"
+  fi
+fi
+
+# --- emit: branch names that are YAML indicators ---------------------------------
+#
+# git accepts branch names beginning with a YAML indicator: `git check-ref-format
+# --branch` calls "@foo", "!foo", "#foo" and "&foo" all valid. Emitted as a bare
+# plain scalar, "#foo" and "&foo" parse to null and "@foo"/"!foo"/"*foo" are
+# parse errors. The consumer (review/fanout fix-pass-mode.md "Step 1") admits a
+# findings file only when its `branch:` value equals the current branch EXACTLY,
+# so a misparse silently drops every finding for that branch — no error, and
+# nothing distinguishing it from "no findings".
+#
+# Both directions are asserted. Quoting is CONDITIONAL, so an ordinary branch
+# name must stay a byte-identical plain scalar: a helper that quoted
+# unconditionally would pass a quoted-only assertion while moving the wire
+# format for every ordinary branch. `*foo` is not a legal git branch name, but
+# --branch takes an arbitrary string, so the predicate is still asserted on it.
+emit_branch_line() {
+  # emit_branch_line <branch> -> the emitted `branch:` frontmatter line
+  local b="$1" out="$TEST_TMPDIR/findings/ybranch.md"
+  # Non-overwrite naming would divert a leftover sibling to ybranch-2.md.
+  rm -f "$TEST_TMPDIR/findings/ybranch"*.md
+  # Stdin closed: a missing-file grep that fell through to stdin would hang
+  # the suite (the Windows Git Bash failure mode that blocked the first
+  # widening of this loop). The emitter itself does not read stdin.
+  bash "$EMIT" --from "$DETOUT" --out "$out" --branch "$b" </dev/null >/dev/null 2>&1 || true
+  [[ -f "$out" ]] || {
+    printf 'MISSING\n'
+    return 0
+  }
+  LC_ALL=C grep -m1 '^branch:' "$out" </dev/null || true
+}
+assert_branch_line() {
+  # assert_branch_line <branch> <expected `branch:` line> <case name>
+  local got
+  got="$(emit_branch_line "$1")"
+  if [[ "$got" == "$2" ]]; then pass "$3"; else fail "$3" "$2" "$got"; fi
+}
+
+# EVERY character in the predicate's indicator class is asserted, not a sample.
+# A five-name sample stayed green after `|`, `>`, `%`, backtick, `"` and `'`
+# were dropped from a sibling — the drift acceptance criterion 3 forbids.
+# `-foo` is omitted: git rejects it, and --branch treats a leading `-` as a
+# missing option value (exit 2), so no caller can reach the predicate with it.
+for b in '?foo' ':foo' ',foo' '[foo' ']foo' '{foo' '}foo' '#foo' \
+  '&foo' '*foo' '!foo' '|foo' '>foo' '%foo' '@foo' '`foo' "'foo"; do
+  assert_branch_line "$b" "branch: \"$b\"" \
+    "emit: indicator branch '$b' is emitted as a quoted scalar"
+done
+
+# The double-quote indicator, whose expected form carries an escape.
+assert_branch_line '"foo' 'branch: "\"foo"' \
+  'emit: indicator branch (leading double quote) is quoted and escaped'
+
+# Non-leading `: ` and ` #` also force quoting: both end a plain scalar early.
+for b in 'has: colon' 'has #hash'; do
+  assert_branch_line "$b" "branch: \"$b\"" \
+    "emit: branch '$b' is quoted (plain scalar would end early)"
+done
+
+for b in 'main' 'feat/3179-slug' 'release-1.2_x'; do
+  assert_branch_line "$b" "branch: $b" \
+    "emit: ordinary branch '$b' stays an unquoted plain scalar"
+done
+
+# YAML implicit types: git accepts these as branch names, but a bare scalar
+# becomes a boolean, null, or number and the consumer's exact-match drops
+# every finding.
+for b in true null 123 yes FALSE '~'; do
+  assert_branch_line "$b" "branch: \"$b\"" "emit: implicit-type branch '$b' is quoted"
+done
+
+# The quoting must survive a branch name carrying the quote character itself —
+# otherwise the emitted scalar is quoted but unparsable, trading a silent drop
+# for a hard consumer failure. A BACKSLASH is deliberately not asserted: git
+# rejects it in a branch name (`git check-ref-format --branch 'a\b'` fails), and
+# awk consumes it as an escape at the -v assignment boundary before the helper
+# ever runs, so an assertion here would pin an awk -v artifact on an input that
+# cannot occur rather than this producer's quoting.
+assert_branch_line '@with"quote' 'branch: "@with\"quote"' \
+  "emit: a quote character inside an indicator branch is escaped"
+
+# --- Roster agreement: every rule's tier is asserted -----------------------------
+#
+# emit-findings.sh's rule_tier() declares itself a MIRROR of the severity
+# crosswalk, and a mirror nothing compares drifts silently. Asserting two rules
+# (as this suite did) left thirteen unguarded, so a rule added to detect.sh
+# without a crosswalk row would emit SUGGESTION by fall-through and look
+# deliberate. Two properties are checked here:
+#   1. every slug detect.sh reports carries its expected tier through the emitter
+#   2. the roster ITSELF has not changed — a new rule fails until it is tabled
+# The expected set is written out rather than derived, so the test disagrees with
+# the code instead of restating it.
+
+EXPECTED_IMPORTANT="rule-knowledge-cutoff-disclaimer rule-llm-citation-artifacts rule-chatbot-artifacts"
+EXPECTED_SUGGESTION="rule-em-dash rule-emoji-formatting rule-curly-artifacts rule-significance-inflation rule-negative-parallelism rule-challenges-conclusion rule-utm-params rule-filler-phrases rule-stacked-hedging rule-model-era-phrases rule-ai-vocabulary rule-copulative-avoidance"
+
+# The roster detect.sh actually ships, taken from its Summary rows on any run.
+ROSTER="$(bash "$DETECT" "$CLEAN" 2>&1 | LC_ALL=C sed -n 's|^Summary rule=ai-slop/audit/\([a-z-]*\) .*|\1|p' | sort)"
+EXPECTED_ROSTER="$(printf '%s %s' "$EXPECTED_IMPORTANT" "$EXPECTED_SUGGESTION" | tr ' ' '\n' | sort)"
+if [[ "$ROSTER" == "$EXPECTED_ROSTER" ]]; then
+  pass "roster agreement: detect.sh ships exactly the 15 tabled rules"
+else
+  fail "roster agreement: detect.sh ships exactly the 15 tabled rules" \
+    "the tabled set" "$(diff <(echo "$EXPECTED_ROSTER") <(echo "$ROSTER") | tr '\n' ' ')"
+fi
+
+# Synthetic detector output naming every slug: a fixture that fired the whole
+# roster organically would be a slop corpus this plugin then has to exempt from
+# itself.
+TIERSRC="$TEST_TMPDIR/tier-src.txt"
+: >"$TIERSRC"
+for slug in $EXPECTED_IMPORTANT $EXPECTED_SUGGESTION; do
+  printf 'Finding: rule=ai-slop/audit/%s file=doc.md line=1 fired=synthetic excerpt=sample\n' "$slug" >>"$TIERSRC"
+  printf 'Summary rule=ai-slop/audit/%s findings=1 declined=0 disabled=0\n' "$slug" >>"$TIERSRC"
+done
+
+TIEROUT="$TEST_TMPDIR/findings/tiers.md"
+bash "$EMIT" --from "$TIERSRC" --out "$TIEROUT" --branch test-branch >/dev/null 2>&1
+tier_content="$(cat "$TIEROUT")"
+
+assert_tier() {
+  # assert_tier <slug> <tier>: the emitted row for <slug> carries <tier>
+  local row
+  row="$(LC_ALL=C grep -m1 "ai-slop/audit/$1 " "$TIEROUT")"
+  case "$row" in
+  *"| $2 |"*) pass "tier mirror: $1 is $2" ;;
+  *) fail "tier mirror: $1 is $2" "$2" "$row" ;;
+  esac
+}
+for slug in $EXPECTED_IMPORTANT; do assert_tier "$slug" IMPORTANT; done
+for slug in $EXPECTED_SUGGESTION; do assert_tier "$slug" SUGGESTION; done
+
+# Both owner docs say this producer omits `tier:`.
+assert_not_contains "frontmatter: no uncomputed tier: field" "$tier_content" "tier:"
+assert_contains "action: filler-phrases carries its substitution, not the generic judgment string" \
+  "$(LC_ALL=C grep -m1 'rule-filler-phrases' "$TIEROUT")" 'in order to'
+assert_contains "action: stacked-hedging names the one-hedge repair" \
+  "$(LC_ALL=C grep -m1 'rule-stacked-hedging' "$TIEROUT")" "states the real uncertainty"
+
+# --- Quotation exemption across a soft line break -------------------------------
+# A double-quoted span whose closing quote sits on the next line: without the
+# carried open-span state, the pairing on the continuation line is off by one,
+# the quoted phrases survive and the prose between them is stripped, so a
+# changelog DOCUMENTING "challenges remained" fired the rule it described.
+# A stray unmatched quote inside one bullet must not blank the next bullet.
+
+WRAPQ="$TEST_TMPDIR/wrapq.md"
+cat >"$WRAPQ" <<'EOF'
+# Wrapped quotes
+
+The pattern fires on "challenges remained", "challenges
+remainder", "challenges remaining", "challenges persisted"; it does not
+fire on "challenges-adjacent".
+
+Plain prose written in order to trip the wording rule.
+
+- A bullet with an unmatched quote "here
+- The next bullet is written in order to stay scanned
+
+A 6" bolt is written in order to stay scanned, and so is
+the line after the inch mark, written in order to stay scanned.
+EOF
+out="$(bash "$DETECT" "$WRAPQ" 2>&1)"
+assert_contains "wrapped quote: documented phrases across a line break stay exempt" "$out" "rule=ai-slop/audit/rule-challenges-conclusion findings=0"
+assert_contains "wrapped quote: exempt candidates counted under the quote cause" "$out" "rule=ai-slop/audit/rule-challenges-conclusion findings=0 declined=2 declined_marker=0 declined_quote=2 declined_config=0"
+assert_contains "wrapped quote: an unmatched quote resets at the next list item; an inch mark opens nothing" "$out" "rule=ai-slop/audit/rule-filler-phrases findings=4"
+
+# --- Vocabulary: the noun "underscore" is not a tell ------------------------------
+# Six nouns in a naming-convention doc must not reach the density rule.
+
+UNDERSCORE="$TEST_TMPDIR/underscore.md"
+cat >"$UNDERSCORE" <<'EOF'
+# Naming
+
+Private fields take a leading underscore. The underscore is the convention;
+one underscore per field, never two. A field with no underscore fails review,
+and a field whose underscore is trailing fails too. Count the underscore once.
+EOF
+out="$(bash "$DETECT" "$UNDERSCORE" 2>&1)"
+assert_contains "vocab: the noun underscore does not fire the density rule" "$out" "rule=ai-slop/audit/rule-ai-vocabulary findings=0"
+
+# --- Declined counts split by cause ------------------------------------------------
+# One total per rule said nothing about what was exempted. The split names the
+# marker, quote, and config shares; the total is unchanged.
+
+SPLITMARK="$TEST_TMPDIR/splitmark.md"
+cat >"$SPLITMARK" <<EOF
+# Split
+
+An em dash ${EM} with a marker. <!-- ai-slop-ignore: quoted example -->
+EOF
+out="$(bash "$DETECT" "$SPLITMARK" 2>&1)"
+assert_contains "split declined: a line marker counts under marker" "$out" "rule=ai-slop/audit/rule-em-dash findings=0 declined=1 declined_marker=1 declined_quote=0 declined_config=0"
+out="$(bash "$DETECT" "$QUOTED" 2>&1)"
+assert_contains "split declined: quote-exempt hits count under quote" "$out" "rule=ai-slop/audit/rule-filler-phrases findings=1 declined=2 declined_marker=0 declined_quote=2 declined_config=0"
+out="$(CLAUDE_PROJECT_DIR="$RAP" bash "$DETECT" "$RAP/quirks/doc.md" 2>&1)"
+assert_contains "split declined: a rule_allowed_paths exemption counts under config" "$out" "rule=ai-slop/audit/rule-filler-phrases findings=0 declined=1 declined_marker=0 declined_quote=0 declined_config=1"
+
+# --- Marker declines are charged per rule ------------------------------------------
+# A rule whose expression cannot match the exempted text must not report a
+# decline it never had a candidate for. A rule is charged only what its own expression
+# matches: a pattern rule counts exempted LINES, the unit it emits findings in,
+# and a density rule counts OCCURRENCES, the unit its quote accounting already
+# uses.
+
+ATTRIB="$TEST_TMPDIR/attrib.md"
+cat >"$ATTRIB" <<EOF
+# Marker attribution
+
+An em dash ${EM} on a marked line. <!-- ai-slop-ignore: attribution case -->
+EOF
+out="$(bash "$DETECT" "$ATTRIB" 2>&1)"
+assert_contains "per-rule marker: the rule the exempted line matches is charged" "$out" "rule=ai-slop/audit/rule-em-dash findings=0 declined=1 declined_marker=1 declined_quote=0 declined_config=0"
+assert_contains "per-rule marker: a rule the exempted line cannot match is charged nothing" "$out" "rule=ai-slop/audit/rule-utm-params findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0"
+
+# A wording rule never scans quoted material, so an exempted BLOCKQUOTE line is
+# not a candidate it lost and is not charged to it. The line below is exempt
+# twice over (blockquote and marker); the typography rule on the same line still
+# counts, because typography rules scan quoted material.
+QUOTEDMARK="$TEST_TMPDIR/quotedmark.md"
+cat >"$QUOTEDMARK" <<EOF
+# Quoted marker
+
+> A quote written in order to ship ${EM} here. <!-- ai-slop-ignore: quoted -->
+EOF
+out="$(bash "$DETECT" "$QUOTEDMARK" 2>&1)"
+assert_contains "per-rule marker: a typography rule is charged the exempted blockquote line" "$out" "rule=ai-slop/audit/rule-em-dash findings=0 declined=1 declined_marker=1 declined_quote=0 declined_config=0"
+assert_contains "per-rule marker: a wording rule is not charged quoted exempted material" "$out" "rule=ai-slop/audit/rule-filler-phrases findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0"
+
+# The marker and its reason are control syntax, not prose the author wrote, so
+# a word appearing only inside the reason is not a candidate any rule lost.
+# Counting it charged a decline for text the exempted prose never held.
+MARKREASON="$TEST_TMPDIR/markreason.md"
+cat >"$MARKREASON" <<'EOF'
+# Marker reason
+
+Plain prose with no candidate in it. <!-- ai-slop-ignore: delve tapestry pivotal -->
+EOF
+out="$(bash "$DETECT" "$MARKREASON" 2>&1)"
+assert_contains "per-rule marker: words inside the marker reason are not counted" "$out" "rule=ai-slop/audit/rule-ai-vocabulary findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0"
+
+# A file whose every prose line sits inside an ignore block has no scannable
+# words at all, so the density loop never runs. Marker accounting must not sit
+# behind that guard, or the rule reports zero for material the markers
+# demonstrably suppressed. Two exempted lines, eleven vocabulary occurrences:
+# the counts differ, so the occurrence unit is what the assertion pins.
+ALLBLOCK="$TEST_TMPDIR/allblock.md"
+cat >"$ALLBLOCK" <<'EOF'
+<!-- ai-slop-ignore-start: vocabulary sample -->
+Delve tapestry pivotal crucial meticulous vibrant.
+Intricate renowned enduring interplay groundbreaking.
+<!-- ai-slop-ignore-end: end of sample -->
+EOF
+out="$(bash "$DETECT" "$ALLBLOCK" 2>&1)"
+assert_contains "per-rule marker: a density rule counts exempted occurrences with no scannable words left" "$out" "rule=ai-slop/audit/rule-ai-vocabulary findings=0 declined=11 declined_marker=11 declined_quote=0 declined_config=0"
+assert_contains "per-rule marker: a pattern rule the block cannot match stays at zero" "$out" "rule=ai-slop/audit/rule-utm-params findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0"
+
+# The whole-file marker is unchanged: its unit is the FILE, not a line, so every
+# rule is charged exactly one decline whether or not the prose would match it.
+out="$(bash "$DETECT" "$FILEMARK" 2>&1)"
+assert_contains "whole-file marker: a rule the prose matches is charged one file decline" "$out" "rule=ai-slop/audit/rule-em-dash findings=0 declined=1 declined_marker=1 declined_quote=0 declined_config=0"
+assert_contains "whole-file marker: a rule the prose does not match is charged one file decline too" "$out" "rule=ai-slop/audit/rule-utm-params findings=0 declined=1 declined_marker=1 declined_quote=0 declined_config=0"
+
+# --- emit: chunked detector output is summed ---------------------------------------
+# A repo-scale run emits one Summary block per chunk. The old emitter kept the
+# LAST chunk's declined count and called a rule "no result" when any single
+# chunk reported zero for it; the sum is what the consumer needs.
+
+CHUNK_A="$TEST_TMPDIR/chunk-a.txt"
+CHUNK_B="$TEST_TMPDIR/chunk-b.txt"
+cat >"$CHUNK_A" <<'EOF'
+Finding: rule=ai-slop/audit/rule-em-dash file=a.md line=3 fired=zero-tolerance excerpt=one
+Summary rule=ai-slop/audit/rule-em-dash findings=1 declined=1 declined_marker=1 declined_quote=0 declined_config=0 disabled=0
+Summary rule=ai-slop/audit/rule-filler-phrases findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0 disabled=1
+Summary rule=ai-slop/audit/rule-utm-params findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0 disabled=0
+Summary total: 1 findings across 3 files scanned (0 files declined)
+EOF
+cat >"$CHUNK_B" <<'EOF'
+Declined: file=vendor/x.md cause=excluded-glob
+Summary rule=ai-slop/audit/rule-em-dash findings=0 declined=2 declined_marker=0 declined_quote=2 declined_config=0 disabled=0
+Summary rule=ai-slop/audit/rule-filler-phrases findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0 disabled=1
+Summary rule=ai-slop/audit/rule-utm-params findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0 disabled=0
+Summary total: 0 findings across 2 files scanned (1 files declined)
+EOF
+CHUNKOUT="$TEST_TMPDIR/findings/chunked.md"
+bash "$EMIT" --from "$CHUNK_A" --from "$CHUNK_B" --out "$CHUNKOUT" --branch test-branch >/dev/null 2>&1
+ccontent="$(cat "$CHUNKOUT")"
+assert_contains "emit chunked: files scanned and chunk count are summed" "$ccontent" "Scanned: 5 files in 2 chunk(s); 1 whole file(s) declined."
+assert_contains "emit chunked: declined counts sum across chunks with their split" "$ccontent" "Declined candidates: ai-slop/audit/rule-em-dash count=3 (marker=1, quote=2, config=0)"
+assert_contains "emit chunked: a config-disabled rule is named" "$ccontent" "Disabled by config: [ai-slop/audit/rule-filler-phrases]"
+assert_contains "emit chunked: a rule with zero findings in every chunk returns no result" "$ccontent" "Returned no result: [ai-slop/audit/rule-utm-params]"
+assert_not_contains "emit chunked: a rule that fired in one chunk is not called no-result" "$ccontent" "Returned no result: [ai-slop/audit/rule-em-dash"
+assert_contains "emit chunked: the declined-file row survives" "$ccontent" "Declined: file=vendor/x.md cause=excluded-glob"
+assert_contains "emit chunked: the finding row from the first chunk is present" "$ccontent" "a.md:3"
+
+# --- Result ---------------------------------------------------------------------
+
+# The tally is this suite's only witness, so it is reconciled against the
+# declared total before it may report green: the liveness-assertion convention's
+# "Gate / classifier" row, docs/conventions/liveness-assertion/README.md
+# ("never green when findings were miscounted"). Both conditions are evaluated
+# and both reports printed, so a failing run that also lost cases says so twice.
+echo
+TOTAL=$((CASE_NUM + SKIPPED))
+RC=0
+if [[ "$TOTAL" -ne "$EXPECTED_CASES" ]]; then
+  RC=1
+  printf 'CASE COUNT MISMATCH: ran %d cases (%d pass/fail + %d host skip), expected %d.\n' \
+    "$TOTAL" "$CASE_NUM" "$SKIPPED" "$EXPECTED_CASES" >&2
+  printf 'Either a case did not run, so this tally cannot be trusted, or a case was added or removed and EXPECTED_CASES needs updating.\n' >&2
+fi
+if [[ "$FAILED" -ne 0 ]]; then
+  RC=1
+  echo "$FAILED of $CASE_NUM cases FAILED, $SKIPPED host skip(s)"
+elif [[ "$RC" -eq 0 ]]; then
+  echo "All $CASE_NUM cases passed, $SKIPPED host skip(s)"
+fi
+exit "$RC"

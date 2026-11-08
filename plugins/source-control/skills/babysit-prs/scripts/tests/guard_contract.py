@@ -43,10 +43,17 @@ LEDGER_CLI = "skills/babysit-prs/scripts/manage_feedback_ledger.py"
 PRUNE_CLI = "skills/babysit-prs/scripts/prune_babysit_worktrees.py"
 REFRESH_CLI = "skills/babysit-prs/scripts/refresh_pr_branch.py"
 POSTMERGE_CLI = "skills/babysit-prs/scripts/babysit_postmerge.py"
+LIFT_CLI = "skills/babysit-prs/scripts/babysit_lift.py"
 REVIEW_CLI = "skills/babysit-prs/scripts/request_review.py"
 SNAPSHOT_CLI = "skills/babysit-prs/scripts/pr_queue_snapshot.py"
 FINDINGS_CLI = "skills/babysit-prs/scripts/babysit_findings.py"
+PREFILTER_CLI = "skills/babysit-prs/scripts/babysit_merge_prefilter.py"
+SKIP_CLI = "skills/babysit-prs/scripts/babysit_merge_skip.py"
+VERIFY_EVIDENCE_CLI = "skills/babysit-prs/scripts/babysit_verify_evidence.py"
+WHOLE_REVIEW_CLI = "skills/babysit-prs/scripts/babysit_whole_review.py"
+EVIDENCE_COMMENT_CLI = "skills/babysit-prs/scripts/babysit_evidence_comment.py"
 THREADS_CLI = "skills/babysit-prs/scripts/pr_review_threads.py"
+REPO_CONFIG_CLI = "skills/babysit-prs/scripts/babysit_repo_config.py"
 READINESS_GATE = "scripts/babysit-readiness-gate.sh"
 MERGE_WRAPPER = "scripts/source-control-babysit-merge"
 RESOLVE_WRAPPER = "scripts/source-control-babysit-resolve-thread"
@@ -636,6 +643,26 @@ REFUSALS: tuple[Refusal, ...] = (
         enforced_at="babysit_resolve_thread.py::main",
     ),
     Refusal(
+        id="resolve.own-pr-lane-logins-requires-autonomous",
+        claim=(
+            "--own-pr-lane-logins is the worker tier's own-PR exception and nothing "
+            "else: outside --autonomous it is refused at exit 2, so it can never widen "
+            "the explicit or independent-resolver modes."
+        ),
+        entry_point=RESOLVE_CLI,
+        argv=(
+            "owner/repo#1",
+            "--allowed-owners",
+            "owner",
+            "--own-pr-lane-logins",
+            "lane",
+        ),
+        exit_code=2,
+        error_contains=("--autonomous",),
+        refused_by=PYTHON_CLI,
+        enforced_at="babysit_resolve_thread.py::main",
+    ),
+    Refusal(
         id="resolve.wrapper-reaches-failclosed-cli",
         claim=(
             "The resolve wrapper is a pure passthrough: no --allowed-owners refuses at "
@@ -885,6 +912,7 @@ def _thread(
     severity_flagged: bool | None = None,
     finding_count: object = _OMITTED,
     human_deferred: bool = False,
+    lane_answered: bool | None = None,
 ) -> dict[str, object]:
     thread: dict[str, object] = {
         "isResolved": resolved,
@@ -902,6 +930,10 @@ def _thread(
         # MEANINGFUL value here (the projection reports it for a truncated
         # comment page), which is why omission needs its own sentinel.
         thread["findingCount"] = finding_count
+    if lane_answered is not None:
+        # Omitted by default, so the own-PR rows keep exercising the guard's
+        # fail-closed `.get(..., False)` default.
+        thread["laneAnswered"] = lane_answered
     return thread
 
 
@@ -1141,6 +1173,70 @@ PREDICATES: tuple[Predicate, ...] = (
         expected="eligible",
     ),
     Predicate(
+        id="classify.own-pr-requires-a-lane-answer",
+        claim=(
+            "On a PR whose author is a self login, an outdated clean bot thread is "
+            "still refused unless a lane login answered it: the resolver is the PR's "
+            "author, so the 'handled' claim must come from another actor. An absent "
+            "signal fails closed."
+        ),
+        enforced_at=CLASSIFY_ANCHOR,
+        thread=_thread(
+            resolved=False, bot_only=True, outdated=True, severity_flagged=False
+        ),
+        flags={
+            "autonomous": True,
+            "only_outdated": False,
+            "include_human": False,
+            "own_pr": True,
+        },
+        expected="skipped-own-pr-not-lane-answered",
+    ),
+    Predicate(
+        id="classify.own-pr-keeps-the-severity-line",
+        claim=(
+            "A lane answer never buys past the severity line: a CRITICAL or security "
+            "thread on an own PR stays with a person."
+        ),
+        enforced_at=CLASSIFY_ANCHOR,
+        thread=_thread(
+            resolved=False,
+            bot_only=True,
+            outdated=True,
+            severity_flagged=True,
+            lane_answered=True,
+        ),
+        flags={
+            "autonomous": True,
+            "only_outdated": False,
+            "include_human": False,
+            "own_pr": True,
+        },
+        expected="skipped-severity-marked",
+    ),
+    Predicate(
+        id="classify.own-pr-lane-answered-is-eligible",
+        claim=(
+            "The own-PR exception admits exactly an outdated, bot-opened, unflagged "
+            "thread a lane already answered."
+        ),
+        enforced_at=CLASSIFY_ANCHOR,
+        thread=_thread(
+            resolved=False,
+            bot_only=True,
+            outdated=True,
+            severity_flagged=False,
+            lane_answered=True,
+        ),
+        flags={
+            "autonomous": True,
+            "only_outdated": False,
+            "include_human": False,
+            "own_pr": True,
+        },
+        expected="eligible",
+    ),
+    Predicate(
         id="classify.already-resolved-precedes-every-guard",
         claim=(
             "An already-resolved thread is skipped before any other guard is consulted, "
@@ -1240,6 +1336,33 @@ MECHANISMS: tuple[Mechanism, ...] = (
         must_not_contain=('"push"', "'push'"),
     ),
     Mechanism(
+        id="whole-review.marks-ready",
+        claim=(
+            "babysit_whole_review.py recover performs a GitHub write: it marks a "
+            "draft pull request ready for review through GraphQL."
+        ),
+        entry_point=WHOLE_REVIEW_CLI,
+        must_contain=("markPullRequestReadyForReview",),
+    ),
+    Mechanism(
+        id="whole-review.toggles-draft",
+        claim=(
+            "babysit_whole_review.py toggle performs GitHub writes: it converts a "
+            "pull request to a draft and marks it ready again through GraphQL."
+        ),
+        entry_point=WHOLE_REVIEW_CLI,
+        must_contain=("convertPullRequestToDraft", "markPullRequestReadyForReview"),
+    ),
+    Mechanism(
+        id="evidence-comment.upserts-a-comment",
+        claim=(
+            "babysit_evidence_comment.py post performs a GitHub write: it posts or "
+            "rewrites the lane identity's one evidence-verification comment."
+        ),
+        entry_point=EVIDENCE_COMMENT_CLI,
+        must_contain=("upsert_marker_comment", "<!-- evidence-verification -->"),
+    ),
+    Mechanism(
         id="review.posts-a-comment",
         claim=(
             "request_review.py --apply performs a GitHub write: it POSTs an issue comment "
@@ -1319,13 +1442,25 @@ MECHANISMS: tuple[Mechanism, ...] = (
         id="postmerge.remediate-gates-every-write",
         claim=(
             "babysit_postmerge.py calls its writers (the attribution re-run, the "
-            "full-run dispatch, the dequeue and the demotion issue) only inside one "
+            "full-run dispatch, the disarm, the dequeue and the demotion issue) only "
+            "inside one "
             "branch of main() that needs --remediate, a readable verdict and a known "
             "branch. Without the flag it reads GitHub and prints the verdict, whatever "
             "the verdict says."
         ),
         entry_point=POSTMERGE_CLI,
         must_contain=("elif args.remediate and verdict.readable and branch:",),
+    ),
+    Mechanism(
+        id="postmerge.file-quarantine-gates-its-writes",
+        claim=(
+            "babysit_postmerge.py --judge-run files or comments on a quarantine "
+            "issue only inside one branch of its --judge-run path that needs "
+            "--file-quarantine; without it --judge-run reads GitHub and prints its "
+            "judgment."
+        ),
+        entry_point=POSTMERGE_CLI,
+        must_contain=("if args.file_quarantine and quarantines:",),
     ),
     Mechanism(
         id="postmerge.parser-refuses-abbreviation",
@@ -1335,6 +1470,36 @@ MECHANISMS: tuple[Mechanism, ...] = (
         ),
         entry_point=POSTMERGE_CLI,
         must_contain=("allow_abbrev=False",),
+    ),
+    Mechanism(
+        id="lift.close-is-the-only-github-write",
+        claim=(
+            "babysit_lift.py writes to GitHub only in its `close` subcommand, which "
+            "comments on, removes the human-gated label from and closes each canary, "
+            "revert or read-back demotion record that has lifted by the merge gate's "
+            "rule (babysit_merge_policy.py `_lift`). `canary-block` and `revert-block` "
+            "read git and run the silent-revert canary in the named checkout, and "
+            "print a lift block; they make no GitHub call."
+        ),
+        entry_point=LIFT_CLI,
+        must_contain=(
+            'if args.action == "close":',
+            '"state=closed",',
+        ),
+    ),
+    Mechanism(
+        id="lift.parsers-refuse-abbreviation",
+        claim=(
+            "babysit_lift.py sets allow_abbrev=False on its top-level parser and on "
+            "each subcommand parser, so a rule written against an exact flag "
+            "spelling also covers every prefix of it."
+        ),
+        entry_point=LIFT_CLI,
+        must_contain=(
+            'argparse.ArgumentParser(prog="babysit_lift.py", allow_abbrev=False)',
+            "sub.add_parser(action, allow_abbrev=False)",
+            'sub.add_parser("close", allow_abbrev=False)',
+        ),
     ),
 )
 
@@ -1363,7 +1528,9 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         gate="--merge (absent: readiness check only, exit 0 ready / 10 not ready)",
         claim=(
             "Without --merge this is a readiness reporter on GitHub; with --state-dir it "
-            "may still clear a finished pending-merge record locally. With --merge, the TOCTOU guard "
+            "may still clear a finished pending-merge record locally, except under "
+            "`merge.report-only`, which reads the record and leaves it as it was. "
+            "With --merge, the TOCTOU guard "
             "requires --expected-head unless --allow-unpinned-head is passed -- and the "
             "scripts/ wrapper refuses that override outright."
         ),
@@ -1452,14 +1619,35 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         mutation=CONDITIONAL,
         mutates_what=(
             "re-runs failed jobs of a red full run; dispatches a full run when none "
-            "covers an unverified auto-merge; dequeues the agent identity's "
-            "merge-queue entries; files, reopens, or comments on the demotion issue"
+            "covers an unverified auto-merge; turns off native auto-merge the agent "
+            "identity armed on its own pull requests; dequeues the agent identity's "
+            "merge-queue entries; files, reopens, or comments on the demotion issue; "
+            "files or comments on a quarantine issue"
         ),
-        gate="--remediate",
-        claim="Read-only without --remediate.",
+        gate="--remediate, --file-quarantine",
+        claim="Read-only without --remediate or --file-quarantine.",
         backed_by=(
             "postmerge.remediate-gates-every-write",
+            "postmerge.file-quarantine-gates-its-writes",
             "postmerge.parser-refuses-abbreviation",
+        ),
+    ),
+    EntryPoint(
+        path=LIFT_CLI,
+        wrapper=None,
+        mutation=CONDITIONAL,
+        mutates_what=(
+            "comments on, removes the human-gated label from, and closes each open "
+            "canary, revert or read-back demotion record that has lifted"
+        ),
+        gate="the `close` subcommand (`canary-block` and `revert-block` write nothing)",
+        claim=(
+            "No GitHub write outside `close`; the block subcommands read the local "
+            "checkout and print one line."
+        ),
+        backed_by=(
+            "lift.close-is-the-only-github-write",
+            "lift.parsers-refuse-abbreviation",
         ),
     ),
     EntryPoint(
@@ -1468,7 +1656,8 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         mutation=CONDITIONAL,
         mutates_what=(
             "disables an armed auto-merge, then asks GitHub to update the PR branch "
-            "server-side; writes queue state"
+            "server-side, or for a Dependabot head posts one @dependabot rebase or "
+            "recreate comment per base tip; writes queue state"
         ),
         gate="--apply",
         claim=(
@@ -1508,6 +1697,86 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         backed_by=(),
     ),
     EntryPoint(
+        path=PREFILTER_CLI,
+        wrapper=None,
+        mutation=READ_ONLY,
+        mutates_what="nothing",
+        gate="n/a",
+        claim=(
+            "Pure classification of the candidate list on stdin into kept and "
+            "held, printed on stdout; no write of any kind and no GitHub call."
+        ),
+        backed_by=(),
+    ),
+    EntryPoint(
+        path=EVIDENCE_COMMENT_CLI,
+        wrapper=None,
+        mutation=MUTATING,
+        mutates_what="a pull request's evidence-verification comment",
+        gate=(
+            "enable-auto-merge.mjs runs `post` with the lane token before it "
+            "arms a pull request, live mode only"
+        ),
+        claim=(
+            "`post` reads the head's pr-capture artifact and its run under "
+            "BABYSIT_VERIFY_GH_TOKEN and, when a pr-verify-capture run on main "
+            "uploaded it, posts or rewrites the lane identity's one "
+            "evidence-verification comment linking it."
+        ),
+        backed_by=("evidence-comment.upserts-a-comment",),
+    ),
+    EntryPoint(
+        path=WHOLE_REVIEW_CLI,
+        wrapper=None,
+        mutation=MUTATING,
+        mutates_what="a pull request's draft state",
+        gate=(
+            "pr-merge.yml's merge job runs `recover`, and enable-auto-merge.mjs "
+            "runs `recover`, `request` and `toggle`, with the lane token, live "
+            "mode only"
+        ),
+        claim=(
+            "`recover` reads each listed draft's comments and newest "
+            "conversion to draft, and marks ready a draft whose newest "
+            "reasons comment (`<!-- babysit-merge-risk -->`) by the lane "
+            "identity records a whole-review request, when the lane identity "
+            "also made that conversion within ten minutes after a record. "
+            "`request` writes nothing; `toggle` converts the pull request to "
+            "a draft and marks it ready again."
+        ),
+        backed_by=("whole-review.marks-ready", "whole-review.toggles-draft"),
+    ),
+    EntryPoint(
+        path=SKIP_CLI,
+        wrapper=None,
+        mutation=READ_ONLY,
+        mutates_what="nothing on GitHub",
+        gate="n/a",
+        claim=(
+            "Reads GitHub (one GraphQL query per 20 candidates, the artifact "
+            "listing) and writes only the local files its arguments name: the "
+            "kept candidates, the skipped rows, the keys and the refusal store, "
+            "plus the artifact listing `BABYSIT_VERIFY_LISTING` names. "
+            "No GitHub write on any path."
+        ),
+        backed_by=(),
+    ),
+    EntryPoint(
+        path=VERIFY_EVIDENCE_CLI,
+        wrapper=None,
+        mutation=READ_ONLY,
+        mutates_what="nothing on GitHub",
+        gate="n/a",
+        claim=(
+            "`evidence` reads the pull request, its commits, the artifact "
+            "listing, run records, compares and verdict files, and prints the "
+            "gate's verifier evidence as one JSON line; it writes only the "
+            "local listing, head-ref and run-cache files the BABYSIT_* "
+            "variables name. No GitHub write on any path."
+        ),
+        backed_by=(),
+    ),
+    EntryPoint(
         path=THREADS_CLI,
         wrapper=THREADS_WRAPPER,
         mutation=READ_ONLY,
@@ -1517,6 +1786,20 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
             "The pull-request skill's readiness thread gate. It reads unresolved review "
             "threads and reports THREADS_OK / THREADS_BLOCKED / THREADS_UNPROVEN; "
             "it writes no file and performs no GitHub write."
+        ),
+        backed_by=(),
+    ),
+    EntryPoint(
+        path=REPO_CONFIG_CLI,
+        wrapper=None,
+        mutation=READ_ONLY,
+        mutates_what="nothing",
+        gate="n/a",
+        claim=(
+            "`loop-keys <owner/repo>` reads docs/conventions/source-control.yaml "
+            "from the target's default branch through the "
+            "contents API and prints the four babysit_loop_* values as JSON; it performs "
+            "no GitHub write and writes only a temporary file for the shared YAML reader."
         ),
         backed_by=(),
     ),

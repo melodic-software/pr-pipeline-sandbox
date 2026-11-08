@@ -1,0 +1,2910 @@
+# Changelog
+
+All notable changes to the `knowledge` plugin are recorded here. The `version` in
+`.claude-plugin/plugin.json` is the delivery vehicle. A consumer receives a change
+only after that version increases.
+
+## [0.27.3] - 2026-10-23
+
+### Changed
+
+- `docpage-digest` dual verification gives correction rounds a convergence rule and a cap. A correction for Summary or Implications prose that dropped part of a conditional rule removes the paraphrase and points at the claim labels carrying the rule, instead of adding scope words. After 3 correction rounds on a digest unit, its open findings move to the interview handoff with their round history and no fourth round runs; an open `high` finding still goes to the operator as a stop.
+
+## [0.27.2] - 2026-10-23
+
+### Fixed
+
+- `docpage-digest` names the checklist's `- Canonical URL:` value line wherever it reads or fills the Canonical URL (the run-start collision check, both fill sites, and the link-resolution and coverage reads), so a first-match read no longer lands on the template's prose and refuses a valid resume.
+
+## [0.27.1] - 2026-10-22
+
+### Fixed
+
+- `video-digest`'s repository clone no longer survives a SIGINT or SIGTERM that reaches the harvester between starting the clone and tracking it: the parent's handlers are installed before the clone is spawned.
+
+- The docs-page queue pointer for check run output targets the `code-review-pull-requests` page, and the eval prompts' fictional course, video and repository URLs are listed in `.lycheeignore`.
+
+## [0.27.0] - 2026-10-20
+
+### Added
+
+- `docpage-digest` has a `check-prose-terms.py` standing gate that fails a digest whose prose (outside fences) names pipeline vocabulary, `unit NN` or `SOURCES.md`, reporting file, section and term.
+
+### Changed
+
+- `docpage-digest`'s mechanism-only rule now covers every prose section, "Open questions for interview" included, and names skills, plugins and conventions visible in the digest agent's own session as consuming-org context.
+
+## [0.26.1] - 2026-10-20
+
+### Fixed
+
+- `video-digest` `run-watch.js` now removes its temp video, frame and sheet directories when SIGHUP, SIGINT or SIGTERM interrupts a watch before `watch.json` records them, then exits `129`, `130` or `143`. On POSIX the interrupt kills each child's whole process group, so a yt-dlp ffmpeg grandchild ends too; on Windows only direct children are killed. Cleanup runs once, and the handlers are removed when the run ends.
+
+## [0.26.0] - 2026-10-20
+
+### Added
+
+- `video-digest` has an `asr_python` option naming the Python interpreter that imports `faster_whisper`. ASR detection and the readiness check probe it before `python`, `python3` and `py`, so a venv works on a machine whose default Python refuses `pip install --user`. Unset, detection is unchanged. Nothing is installed.
+- `video-digest` Prerequisites carry a copyable `uv` venv recipe for faster-whisper, with the `av<19` pin, a pointer to the upstream fix, and a recheck trigger for the faster-whisper release that ships it. Every source's `run.mjs` invocation passes `--asr-python` when the option is set.
+
+### Fixed
+
+- The ASR runner script adds each existing `site-packages/nvidia/*/bin` directory as a DLL directory on Windows, so CUDA libraries installed as `nvidia-*` wheels load without PATH edits. It is a no-op elsewhere.
+
+## [0.25.1] - 2026-10-20
+
+### Fixed
+
+- video-digest's watch spine, Phase 9 and checklist template now run the corpus relayout before `close`, which removes the media the relayout copies, and the recommendations README template's Shards line names `research/findings/` so the relayout link check resolves it ([#7177](https://github.com/melodic-software/claude-code-plugins/issues/7177)).
+
+- `video-digest` `fetch-deck-attachments` now fetches only `https:` links whose host resolves to public addresses, follows redirects manually (up to 5 hops) and re-checks each hop, so loopback, private, link-local and unique-local targets from harvested links are skipped.
+
+## [0.25.0] - 2026-10-20
+
+### Added
+
+- `docpage-digest` has a standing gate, `check-sources-parity.py`, that lists every heading of the source (`#` lines and `<h1>`-`<h6>` tags with an `id`, outside code fences) and fails when the SOURCES.md heading table, the digest-map line ranges, the digest files and the status rows disagree with it.
+
+- `video-digest` watch records the primary entry's video, info JSON and caption file names in `watch.json` (`phases.acquire.metrics.primaryMedia`), and `relayout-slice.js` uses them, so a multi-video X post can be re-laid out with media. A session with more than one video and no recorded entry (an older `watch.json`) is still refused. (#7034)
+
+- `video-digest watch` records a metadata versus probed duration mismatch. When the source metadata duration and the probed media duration differ by more than the larger of 5 s and 1% of the longer one, `watch.json` carries `durationMismatch` with both values and the slice `README.md` gets a `Duration mismatch` section. Agreement within that threshold records nothing, and the pipeline still uses the probed duration.
+
+- `/knowledge:check`, a model-invocable read-only skill that reports, through the shared prerequisites checker, whether each tool `prerequisites.json` declares resolves. Its check installs nothing; after the report it offers each missing row's fix and runs it only on the user's yes. `prerequisites.json` entries now name it as their re-check skill, and `video-digest`'s Prerequisites failure line names it beside the preflight.
+
+### Changed
+
+- **build: Bump playwright from 1.61.1 to 1.64.1 in /plugins/knowledge/skills/course-digest/extraction in the npm-minor-patch group** (#8352).
+  - `playwright` 1.61.1→1.64.1
+
+- **build: Bump mdast-util-from-markdown from 2.0.3 to 2.1.0 in /plugins/knowledge/skills/video-digest/extraction in the npm-minor-patch group across 1 directory** (#8353).
+  - `mdast-util-from-markdown` 2.0.3→2.1.0
+
+- **build: Bump vitest from 4.1.11 to 5.0.5 in /plugins/knowledge/skills/course-digest/extraction** (#8354).
+
+- **build: Bump vitest from 4.1.11 to 5.0.5 in /plugins/knowledge/skills/video-digest/extraction** (#8355).
+
+- **build: Bump @types/node from 24.13.3 to 26.6.5 in /plugins/knowledge/skills/video-digest/extraction** (#8358).
+
+- **build: Bump @types/node from 24.13.3 to 26.6.5 in /plugins/knowledge/skills/course-digest/extraction** (#8359).
+
+- **build: Bump typescript from 6.0.3 to 7.0.2 in `course-digest/extraction`** (#8357). The JSDoc types for the platform config, the parsed course.json and the validators' regression summary are now real types, which TypeScript 7 requires where `object` stood in.
+
+- **build: Bump typescript from 6.0.3 to 7.0.2 in `video-digest/extraction`** (#8361). The watch slice, the key-frame quality audit, the promotion decisions and the nullable locals TypeScript 7 no longer widens from `null` now carry real JSDoc types.
+
+### Fixed
+
+- `/knowledge:course-digest` no longer says the Bash tool has a hard 10-minute timeout or that a `nohup` background run has no limit. The long-extraction advice now points at the tools reference's timeout section with an as-of date and recheck trigger, and tells the user to rerun the same command to resume a stopped extraction.
+
+- `list-promotion-candidates.js` run as a CLI now prints a malformed or missing claim inventory error (with the session format hint) as one line on stderr and exits 1, instead of an uncaught exception with a Node stack trace. The `listPromotionCandidates` function still throws for programmatic callers.
+
+- `video-digest` no longer lists the dead `/extracting cookies/i` cookie-profile retry hint: yt-dlp prints that line on stdout, which the stderr-only failure detail never holds. A missing browser profile still advances to the next one through `/could not find .* cookies/i`.
+
+- `docpage-digest` no longer tells authors to put an ellipsis or a join marker inside a key-claim fence, which the exact-substring fence gate rejects. A fence payload is an exact contiguous substring of the source, and a truncation or a join of source lines is recorded outside the fence.
+
+- `docpage-digest` counts an HTML-tag H2 as a digest-unit boundary in the Phase 2 inventory and the checklist, and the Anthropic-docs profile lists HTML-tag headings among the `code.claude.com` raw-md artifacts, so such a section no longer merges silently into the previous unit.
+
+- video-digest `watch` no longer exits 1 after downloading a YouTube video that has no captions in any language: in full mode with the video downloaded, an exhausted caption ladder returns the entry with `caption: null`, and the transcript strategy selects `asr` when it is detected or completes with a recorded `transcriptDegradation`. `transcript` mode, which downloads no media, still stops on an exhausted ladder.
+
+- `video-digest`'s watch outcome gate now lets a `key-frames/visual-gaps.md` row `| talking-head-only | <session name> | <note> |` satisfy `session-visual-coverage` and `session-synthesis-depth` for that session, so a webcam-only session no longer needs a promoted frame the synthesis contract rejects. A session with neither a frame nor such a row still fails both. `quality-gates.md` and `synthesis-contract.md` state the rule.
+
+- `/knowledge:video-digest` no longer leaves a harvested-repo clone running when its parent process dies. The parent tracks each live clone process group and kills it on exit, SIGINT, SIGTERM and SIGHUP, then re-raises the signal so it still dies the conventional way. SIGKILL of the parent cannot be caught, and Windows behavior is unchanged.
+
+- `video-digest` `init-watch-checklist.js --force` now drops a tick, with its evidence lines, when the row's criteria text changed since it was ticked, and prints the dropped row ids on stdout. Each checklist row carries a criteria hash for this; a tick saved before the hash existed is kept and gets the current hash stamped.
+
+- `video-digest` ASR transcripts now get the same proper-noun repair captions do: the repair lexicon is built from the title, description and harvested links for every transcript strategy, and the repair pass runs over ASR cues, so `repairedTermCount` counts their repairs.
+
+- `docpage-digest` digests put `**FN.**` figure rows under their own `## Figure claims` heading after Key claims, so the fence gate no longer fails them as unlabeled fences. The Anthropic profile lists the figure parts to extract (figcaption title, subtitle and id, alt and aria-label, SVG text, control labels) and checks the extracted file against them.
+- A verifier arm whose effective effort is never confirmed (a Codex verifier B) is recorded as `requested <level>, unconfirmed`, and the checklist has effort lines for both arms.
+- Recorded and replayed search commands call GNU grep explicitly, or check `grep --version` first, so a plain `grep` that resolves to ugrep no longer changes recorded counts.
+
+- The `library_dir` description and README no longer say a project artifacts convention wins: they state that video-digest relocates its work root and supports the `relayout-slice.js` layout. Phase 9 and the gotchas point at `relayout-slice.js` before `close` to keep media. (#6817)
+
+- video-digest watch: a run whose transcript came from the optional ASR rung now feeds the ASR cues to frame densification, instead of an empty cue list that recorded `densificationWindows: 0`. `writeEnvelopeTranscriptArtifacts` returns the cues each transcript was built from (caption or ASR) per entry, and `run-watch.js` passes the primary entry's cues to watching. A captioned run passes the same cues as before.
+
+- Shared `prerequisites.mjs` synced: a `node-pkg` or `python-pkg` entry reads `CLAUDE_PLUGIN_DATA` only when its last path segment is this plugin's name or starts with `<plugin>-`, and treats a literal `${...}` value as unset, so another plugin's data directory reports `unverified` instead of `missing`.
+
+## [0.24.0] - 2026-10-18
+
+### Added
+
+- `video-digest` documents a late Phase 0b for companion sources found during research or after `close`: it writes `source/companion-digest/`, merges links into `harvested-links.json`, and folds the digest back into research, with a matching gotcha.
+
+### Changed
+
+- `docpage-digest` dual verification now defines the verdict set (PASS / PASS-WITH-FINDINGS / FAIL / BLOCKED), the rule that sets it (any open high finding is FAIL and needs a corrections round), and that medium or low findings deferred to the interview handoff do not block Phase 4 completion.
+
+- `video-digest` watch pipeline now names a smaller `--max-frame-gap-sec` re-run as the supported fix for a sampler gap, and states its limits: it re-samples the whole video, cannot add one chosen timestamp, and re-downloads after `close`. A frame extracted by hand outside the sampler renders `untimed`.
+
+- The Node floor in the prerequisite check is now 22. Node 21.0 and 21.1 lack `import.meta.dirname` and the old 20.11 floor passed them; Node 20 and 21 are past end of life.
+
+### Fixed
+
+- `video-digest` `queue-claim.js stale-check` now resets a stale claim's `QUEUE.md` row from `in_progress` to `pending` when it deletes the stub, and lists `in_progress` rows that have no stub as `orphaned`. The watch-queue spoke now says the CLI owns the reset.
+- `queue-claim.js claim` now exits `1` for a row number that is not in `QUEUE.md` instead of recording a phantom claim, and accepts `--claimed-by <name>` to record the session holding the claim.
+
+- `video-digest` now runs its readiness check as one plain command, `extraction/preflight.mjs`, pre-approved in `allowed-tools`, so worktree-isolated auto-mode sessions no longer refuse the compound preflight block. It probes the node dependencies, yt-dlp, ffmpeg, ImageMagick and faster-whisper, prints where the dependencies install and how to relocate them with `--data-dir`, and always exits 0. Prerequisites tells the model to run it by hand when the pre-computed context did not run.
+- `video-digest` renders each `userConfig` option once in a SKILL.md "Configured options" table, and the output-contract and source spokes refer to it, so a configured `library_dir`, cookies file, JS runtime or concurrency cap reaches the pipeline instead of arriving as an unsubstituted token.
+- `video-digest`'s Bootstrap gate now stops when the node dependencies are missing or `setup-deps.mjs` fails, and states that a hand-run of yt-dlp, ffmpeg or ImageMagick is not the skill's output.
+
+- `docpage-digest` treats a "Concurrent subagent limit reached" refusal as a wait, not a subagent death, and keeps one copy of the death ladder in `context/pipeline-hardening.md`; the inline rung is skipped for a unit the profile maps to another model.
+- The gate scripts and test suites no longer write `__pycache__` into the installed `scripts/` directory.
+- Helper and scratch files go under `<work-root>/scratch/`, Phase 3 notes the shared subagent limit, the handoff leads with a decisions section, the live-doc checks are listed and assigned to Verifier A when Verifier B has no network, and the profile dispositions the raw-markdown banner and adds a response-field pair.
+
+- `video-digest` X preflight now rejects a removed or nonexistent status as `unavailable` (no uploader, description or counts), and takes a link post's delegation refusal as `ok` with an empty-media note instead of `transient`. Acquisition fails a removed post permanently (`X post unavailable`) rather than as rate-limited retry-later, and the queue spoke caps degraded retries at 3 per id.
+- `video-digest` transcript runs write the slice README after the transcripts, listing only those written; a 0-entry post says no video entries were found.
+
+- The generated plugin options section of the README no longer claims which setup route most people prefer.
+
+## [0.23.2] - 2026-10-16
+
+### Changed
+
+- Skill text no longer cites the guardrails `block-hook-bypass` guard, which guardrails retired:
+  a shell write still skips the Write and Edit content guards, so the Write tool stays the route.
+
+## [0.23.1] - 2026-10-16
+
+### Changed
+
+- Shared `prerequisites.mjs` synced: the SessionStart probe now also reports a drifted git-hook entry for a plugin that ships `git-hooks/entries.json`. This plugin ships none, so its behavior is unchanged.
+
+## [0.23.0] - 2026-10-14
+
+### Added
+
+- Eight outcome eval cases under `evals/` (two each for `book-distill`, `course-digest` and `video-digest`, one each for `docpage-digest` and `map-corpus`), and frozen trigger-probe sets for the five model-invoked skills under `probes/`.
+
+### Changed
+
+- `book-distill`, `course-digest`, `docpage-digest`, `map-corpus` and `video-digest` have shorter descriptions, one trigger per use, measured against the old text by held-out trigger probes. `book-distill`, `docpage-digest`, `map-corpus` and `video-digest` also have tighter text in the body sections the new outcome cases reach, measured by those cases. `setup` has a one-line description; its body is unchanged.
+
+## [0.22.0] - 2026-10-14
+
+### Added
+
+- `docpage-digest` lists the outbound links a page's digests rely on in `SOURCES.md`, read from the snapshot with no fetch, and its interview handoff gives each one a disposition: covered (a verified sibling slice's path), queued (a same-publisher page, with proposed recorded-pages entry text for its own one-page run), or skipped with a reason.
+
+## [0.21.2] - 2026-10-13
+
+### Changed
+
+- **Shared `prerequisites.mjs` synced: its per-probe timeout is now 20 seconds, up from 5.** A version or `system-lib` probe that resolves a secret or calls a network API, such as `firecrawl --status` behind a key-injecting wrapper, no longer false-fails on a slow run. A fast probe is unaffected; a hung one now costs at most 20 seconds per entry. No change to this plugin's own entries.
+
+- Replace restated Claude Code behavior (plugin data lifetime, Read page limit, variable substitution, option storage scopes, worktree project directory) with live section pointers, name the probes behind the raw-channel observations, and keep one effort pointer record in dual-verification.md.
+
+### Fixed
+
+- **`scripts/fetch-docs.sh` runs its address check and interpreter probe with `python -I`**, so a module planted in the working directory (an `ipaddress.py`, say) is never imported by the `--public-only` check.
+
+- docpage-digest: stop claiming a rendered WebFetch of a long page gives no truncation signal; point at the live WebFetch section instead.
+- map-corpus: resolve a relative `library_dir` against the session working tree, as docpage-digest does, instead of `CLAUDE_PROJECT_DIR`.
+
+- Shared library comments that restated Claude Code hook, plugin and managed-settings behavior now point at the live docs sections, and the prerequisites probe no longer gives a wrong reason for always exiting 0.
+
+- **video-digest watch recovery picks the same caption as acquisition.** `resolveWorkArtifacts` in `recover-watch-bootstrap.js` chose the first `.vtt` without `-orig` in its name, so a work dir holding `<id>.en.vtt` and `<id>.en-orig.vtt` with no manual English track in info.json rebuilt the transcript from the possibly machine-translated bare track. It now resolves the caption through `selectCaptionFile` with the `manualLanguages` signal from the work dir info.json and the source adapter caption class, so recovery and acquisition agree. Candidate captions and info.json are scoped to the recovered video's `<id>.` prefix, so a multi-video X work dir never takes another entry's caption; when the recovered entry's own caption or info.json is missing, recovery fails with an error instead of using a sibling's (#6837).
+
+- video-digest records a `--target` passed as a local checkout path in `watch.json` as its portable `owner/repo` name (from the checkout's GitHub `origin`, else the directory name), never the machine path.
+- video-digest documents how the deck harvest types links and fetches them: the session adds a `kind` to each `harvested-links.json` entry, then runs `harvesting/fetch-deck-attachments.js`.
+- video-digest's SKILL.md names which `mark-phase` marker each phase uses, since the skill-session phases share the `vision`, `research` and `close` markers.
+- video-digest's `fetch-deck-attachments.js` skips a `deck` whose `sessionSlug` is not one safe path segment, so a slug such as `../..` can no longer write outside the slice.
+
+- **`course-digest` and `video-digest`: the pre-computed dependency block no longer holds brace
+  groups**, which Claude Code's shell permission check refuses
+  (`Contains brace with quote character (expansion obfuscation)`). Each line is now a plain list:
+  the outer group is gone, and each capped version probe repeats its guard before the fallback
+  (`command -v ffmpeg >/dev/null 2>&1 && ffmpeg -version 2>/dev/null | head -1 || command -v ffmpeg >/dev/null 2>&1 || echo "MISSING ..."`),
+  which renders the same with and without `pipefail`. The block still needs `allowed-tools` grants
+  before it loads outside auto mode; its `node -e` lines have no narrow grant, so that stays open.
+
+- **The shared prerequisites checker now finds a `python-pkg` in the plugin's own installed Python
+  set.** A module that the interpreter cannot import on its own is looked up in the set a plugin
+  with a committed `requirements.txt` installs into its data directory
+  (`<data>/python/<lock hash>-<interpreter tag>/`), imported the way that plugin's launcher runs
+  it. Before, such a package was reported missing. When the data directory is unknown (no
+  `--data-dir`, no `CLAUDE_PLUGIN_DATA`), the entry reports `unverified` instead of failing.
+  Refs #6112.
+
+### Security
+
+- video-digest: the resume prompt (`run-state/continuation-prompt.md`) no longer puts the video title in its heading or the source URL on a bare line. Both now sit in a fenced `## Video metadata` block, reduced to one line each with backticks neutralized, under the untrusted-content framing that marks them, and the slice files the resume steps read (`run-state/watch.json`, `source/transcript.txt`, the lane deliverables), as data, never instructions. A publisher-written title can no longer read as part of the resuming session's own prompt. (#6980)
+
+- video-digest: vision-gated promotion refuses a `promotion-decisions.json` `sourceFile` that is not a bare file name, and resolves each promoted frame to its real path, refusing one that sits outside the frames directory (through `..` or a symlink) or is not a regular file. The copy then opens the checked frame with `O_NOFOLLOW` where the platform defines it and refuses it unless the open file is the same regular file the check passed, so a frame swapped for a symlink after the check is not copied. Before, such a value could copy a file from anywhere on disk into the slice. (#6979)
+
+## [0.21.1] - 2026-10-11
+
+### Changed
+
+- **`docpage-digest` reads `claude.dev/blog` posts through their raw-markdown channel.** The publisher profile now fetches `https://claude.dev/blog/<slug>.md` as `source.md`, keeps the rendered page as `source.html` for figure text, and falls back to `extract_blog_body.py` when the `.md` fetch fails, is not markdown, or lacks the article's title. The channel's observed shape lives in a probe record the profile points at, and a new eval case covers the raw-first, HTML-companion and fallback path.
+
+## [0.21.0] - 2026-10-11
+
+### Added
+
+- video-digest: `watch/relayout-slice.js` copies a finished slice into the knowledge-corpus layout (`transcript/`, `metadata/`, `frames/all/`, `frames/key/`, `media/`, `analysis/`, provenance `README.md`). It finds the links, images, definitions and backticked paths in each markdown file with `mdast-util-from-markdown`, rewrites each one that names a copied slice path for the file's new location (a slice file the layout does not keep becomes plain text saying so), and exits 1 listing every slice-internal path that still does not resolve. It runs on a closed slice, or before `close` on one whose outcome checks pass; run it before `close` to keep the media, because `close` removes the temp session and a closed slice then needs `--no-media`. It builds the layout in a staging directory and moves it into place only when the link check passes; an existing target needs `--replace`, and a `.relayout-backup` left by an interrupted replace blocks the run until restored or removed. `context/output-contract.md` points at it in place of re-laying out by hand and lists what it cannot rewrite ([#6902](https://github.com/melodic-software/claude-code-plugins/issues/6902)).
+
+### Fixed
+
+- video-digest: an auto-caption transcript paragraph no longer repeats the previous paragraph's closing words that a rolling caption carried over: 2 to 12 words compared case- and punctuation-insensitively, dropped only when the opening cue carries them from the cue before it (the cues overlap in time, or the cue starts with the previous cue's words verbatim), so a phrase the speaker genuinely repeats stays ([#6992](https://github.com/melodic-software/claude-code-plugins/issues/6992)).
+
+## [0.20.13] - 2026-10-11
+
+### Changed
+
+- docpage-digest: verifier A dispatched through the Agent tool now passes its resolved level as the spawn `effort` on a generic spawn and omits it on a pinned named agent, instead of running at the session level.
+- map-corpus: the effort gotcha now points at the "Where per-task effort is set" record, which covers both the Agent tool's per-spawn `effort` and Workflow.
+
+- Skill bodies that routed to the retired `/discovery:research-deep` now name `/discovery:research` and its `deep` tier.
+
+### Fixed
+
+- video-digest decodes HTML entities in transcripts built from auto captions, so a `&gt;&gt;` speaker marker reads `>>` as it already did for manual captions ([#6824](https://github.com/melodic-software/claude-code-plugins/issues/6824)).
+
+- video-digest keeps an English caption file already written when another caption track's download fails (for example a translated track rate-limited with HTTP 429), records the failed track in `transcriptDegradation`, no longer requests YouTube's translations of manual tracks unless no English track landed, and prefers the original `en-orig` track over the bare auto `en` track ([#6812](https://github.com/melodic-software/claude-code-plugins/issues/6812), [#6740](https://github.com/melodic-software/claude-code-plugins/issues/6740)).
+
+- video-digest's `session-visual-coverage` and `session-synthesis-depth` outcome checks, and `list-promotion-candidates.js`, now fail with the required session format when `research/claim-inventory.md` parses to no session, instead of passing over zero sessions. Boundary stamps may be `[h:mm:ss]` as well as `[m:ss]`, and Phase 2 documents the `## <n>. <name>` plus `**Boundary:**` shape with an example.
+
+- video-digest's `watch-state.js close` (and `check-watch-outcomes.js`) now fails a slice whose research gate fails, through a new blocking `research-complete` outcome check that is skipped only when the watch ran with `--skip-research`. The research gate's docs now name `research/findings/*.md`, the path the gate counts, and no longer allow findings inline in `RESEARCH.md` ([#6814](https://github.com/melodic-software/claude-code-plugins/issues/6814)).
+- video-digest's `close` now also sets the slice `README.md` frontmatter `status:` to `complete`, so it matches `watch.json` ([#6823](https://github.com/melodic-software/claude-code-plugins/issues/6823)).
+
+- video-digest's `init-watch-checklist.js --force` keeps every ticked row (matched by row id) and the Resume notes when it regenerates the floors and per-sheet rows, instead of resetting the checklist to the template ([#6815](https://github.com/melodic-software/claude-code-plugins/issues/6815)).
+
+- video-digest: on Windows the automatic browser-cookie fallback now moves past Chrome when yt-dlp reports `Could not copy Chrome cookie database`, so it reaches Firefox instead of stopping at the Chrome failure ([#6816](https://github.com/melodic-software/claude-code-plugins/issues/6816)).
+
+- video-digest: a watch that fails before its slice records the temp session (an acquisition error, a 429, an unsupported URL) now removes the three temp directories it made, including the downloaded video, instead of leaving them in the OS temp dir. Once `watch.json` records them they stay for `--recover`.
+
+- video-digest documents the JSON it has subagents write (per-sheet triage, promotion decisions, post-promotion audit) in `templates/vision-json-shapes.md`, with a worked example each that passes the validators, and each brief carries its file's section ([#6818](https://github.com/melodic-software/claude-code-plugins/issues/6818)).
+- video-digest frames ingested transcripts, descriptions, comments, decks, companion pages and cloned repositories as untrusted data in the skill and in every subagent brief ([#6820](https://github.com/melodic-software/claude-code-plugins/issues/6820)).
+- video-digest names Git Bash on Windows and Node 20.11 as prerequisites, and the knowledge plugin's prerequisites check now reports a node older than 20.11 ([#6828](https://github.com/melodic-software/claude-code-plugins/issues/6828)).
+
+- video-digest names its successor in a `## Next` section, numbers its phases in `SKILL.md` and `watch-pipeline.md` the way the watch checklist and quality gates do, and documents the `--acquire-phase-gap` throttle flag in `reference/sources/youtube.md` and `gotchas.md` ([#6827](https://github.com/melodic-software/claude-code-plugins/issues/6827)).
+
+### Security
+
+- video-digest's shallow clones of repositories harvested from video descriptions now fail fast instead of prompting: the credential helper is cleared, terminal prompts and Git LFS downloads are disabled, and a clone still running after two minutes is killed and skipped ([#6829](https://github.com/melodic-software/claude-code-plugins/issues/6829)).
+
+## [0.20.12] - 2026-10-11
+
+### Fixed
+
+- video-digest `resume` reports a closed slice as having nothing to resume and leaves its continuation prompt untouched, writes only slice-relative paths into `continuation-prompt.md`, stops before vision with a re-run instruction when the temp session dirs are gone, and rejects a slug that is not a single slice-name segment ([#6822](https://github.com/melodic-software/claude-code-plugins/issues/6822)).
+
+## [0.20.11] - 2026-10-10
+
+### Fixed
+
+- **docpage-digest's Agent-tool fallback now sets the verifier's effort.** Where the Workflow tool is unavailable, Phase 4 dispatches verifier A through the Agent tool and now passes `effort` on that call on the same terms as the Workflow call, instead of accepting whatever the agent's pin or the session level happened to be. The skill no longer says the Agent tool takes no per-call effort, which stopped being true in Claude Code 2.1.292, and both places now point at the subagents docs section on effort for the live precedence.
+
+## [0.20.10] - 2026-10-10
+
+### Fixed
+
+- video-digest reports a caption download that is still rate-limited (HTTP 429) after its retries as a rate limit with a wait-and-retry fix path, instead of "No English captions found" ([#6739](https://github.com/melodic-software/claude-code-plugins/issues/6739)).
+
+- video-digest: when a YouTube video has no manual English subtitles, the caption ladder now picks the original `.en-orig.vtt` speech recognition over the bare `.en.vtt`, which can be YouTube's machine translation and produced garbled transcripts.
+
+## [0.20.9] - 2026-10-10
+
+### Fixed
+
+- The shared docs cache detects GNU `mv` from a here-string instead of `mv --version | grep -q GNU`. Under `pipefail` an early `grep -q` exit can break the pipe and fail the check, so a GNU `mv` was taken for a non-GNU one and directory renames took the check-and-undo fallback.
+
+## [0.20.8] - 2026-10-08
+
+### Changed
+
+- **Upstream records ([#6498](https://github.com/melodic-software/claude-code-plugins/issues/6498)).** Verification records carry recheck triggers specific to each claim, and citations of retired code.claude.com pages or drifted claims point at the live sections.
+
+- **Dependency bump.** Bump source-map-js from 1.2.1 to 1.2.2 in the course-digest extraction package (#6513).
+
+- **Dependency bump.** Bump source-map-js from 1.2.1 to 1.2.2 in the video-digest extraction package (#6468).
+
+### Fixed
+
+- **`scripts/fetch-docs.sh` keeps a map lookup's value in the caller's own variable
+  ([#6540](https://github.com/melodic-software/claude-code-plugins/issues/6540)).** Under
+  `--public-only`, the address check during an origin's `llms.txt` fetch no longer overwrites the
+  "no bundle" result, so an origin without `llms.txt` is never given a bundle channel.
+
+- **`scripts/docs-cache.sh slice` prints each line once, in page order
+  ([#6501](https://github.com/melodic-software/claude-code-plugins/issues/6501)).** A slice that
+  named a parent section and its child printed the child twice, because the parent's range already
+  holds it; one measured request for 59193 unique bytes printed 75892. Overlapping and repeated ids
+  now print their lines once, in the order they appear on the page.
+
+## [0.20.7] - 2026-10-07
+
+### Changed
+
+- **The docs lookup procedure no longer asks for a coverage check before answering
+  ([#6501](https://github.com/melodic-software/claude-code-plugins/issues/6501)).** The step that
+  sliced extra sections for each uncovered part of the question is removed from
+  `reference/docs-lookup-procedure.md`: its re-measure in
+  [#6538](https://github.com/melodic-software/claude-code-plugins/pull/6538) used more bytes than
+  its pre-registered cost limit allowed.
+
+## [0.20.6] - 2026-10-07
+
+### Fixed
+
+- **The shared docs lookup scripts run on Bash 3.2
+  ([#6496](https://github.com/melodic-software/claude-code-plugins/issues/6496)).** `scripts/fetch-docs.sh`
+  and `scripts/docs-cache.sh` no longer use `${x,,}`, `${x^^}`, `declare -A` or `printf '%(...)T'`,
+  which stock macOS Bash 3.2 rejects, so a docs lookup there no longer exits with `bad substitution`.
+
+## [0.20.5] - 2026-10-07
+
+### Changed
+
+- **Test suite only; nothing shipped changes.** The docpage-digest gate harness, `test_check_html_rows`, and the map-corpus discovery and inventory tests register temp-dir cleanup right after creating the dir.
+
+## [0.20.4] - 2026-10-07
+
+### Security
+
+- `scripts/fetch-docs.sh` runs curl with `-q`, so a `~/.curlrc` option such as `insecure` or
+  `proxy` no longer reaches its requests, and takes `--public-only`, which refuses a host that
+  resolves to a non-global address and pins the request to the checked one
+  ([#6488](https://github.com/melodic-software/claude-code-plugins/issues/6488),
+  [#6486](https://github.com/melodic-software/claude-code-plugins/issues/6486)).
+
+## [0.20.3] - 2026-10-07
+
+### Changed
+
+- **The docs lookup procedure checks every part of the question against the sections it read
+  before answering ([#6487](https://github.com/melodic-software/claude-code-plugins/issues/6487)).**
+  Step 3 of `reference/docs-lookup-procedure.md`, synced from the shared copy, now has the reader
+  slice the sections for any part of the question none of its slices covers, and the section of
+  every item when the question asks the same thing for each of many events, options or keys.
+
+## [0.20.2] - 2026-10-07
+
+### Changed
+
+- **Docs links ([#6498](https://github.com/melodic-software/claude-code-plugins/issues/6498)).** Citations of the retired `plugins-reference` and `discover-plugins` pages now point at the live pages that took over each section (`plugins/manifest-reference`, `plugins/components`, `plugins/cli-reference`, `plugins/loading`, `plugins/install`, and `settings-reference#pluginconfigs`). Quotes that moved with them are updated, and each re-verified pointer carries an as-of date of 2026-10-07.
+
+## [0.20.1] - 2026-10-07
+
+### Changed
+
+- **Test suites only; nothing shipped changes.** The course-digest `cli-entry` and `cli-browser-artifacts` tests remove their temp dirs after each test; `cli-entry` drops its junction into the source `extraction/` dir first.
+
+## [0.20.0] - 2026-10-07
+
+### Changed
+
+- **`docpage-digest` fetches absence-establishing pages through the shared docs lookup ([#6484](https://github.com/melodic-software/claude-code-plugins/issues/6484)).** The Anthropic profile's complete-fetch rule now runs `scripts/fetch-docs.sh --cache --max-age 0` instead of `curl`: fresh bytes are required, the page's `bytes` come from the manifest, and an `unread` or `stale` record is unread for the claim, never evidence of absence.
+- **`map-corpus` link-map format points page reads at the fetch-route rungs.** WebFetch stays the discovery channel for `llms.txt` and sitemaps; the page itself is read by the upstream-drift convention's rungs.
+- **`prerequisites.json` declares `curl` and `jq`** as required for `docpage-digest`'s docs fetch.
+
+## [0.19.9] - 2026-10-06
+
+### Changed
+
+- **`video-digest` prerequisites say what to try when the usual install falls short, and to run the newest safe release.** The Prerequisites section points at the project's own release builds and conda-forge when a distro package sits below the ffmpeg or ImageMagick floor, and at the `default` and `curl-cffi` extras when yt-dlp comes from pip. The floors are minimums: a run upgrades a tool to its latest stable release when it comes from an official channel and no security advisory is open against it. `prerequisites.json` carries the yt-dlp 2026.6 floor as a version check, so `/harness-ops:prerequisites` reports an outdated yt-dlp, and adds the pip and conda install hints.
+- **`video-digest` states that a watch with no video stops.** When the media download fails, `run-watch.js` already exits non-zero before writing a slice. The skill now says to stop there and report, never to continue without frames or switch to the `transcript` action unasked, and `context/gotchas.md` gains the HTTP 403 media-stream case with its fix paths.
+
+## [0.19.8] - 2026-10-04
+
+### Changed
+
+- **Shared `prerequisites` checker copies synced ([#6225](https://github.com/melodic-software/claude-code-plugins/issues/6225)); no change to this plugin's behavior.**
+
+## [0.19.7] - 2026-10-04
+
+### Changed
+
+- **Upstream plugin doc links repointed to the split `plugins/` pages ([#5962](https://github.com/melodic-software/claude-code-plugins/issues/5962)).** The README options block now links `plugins/cli-reference#plugin-install` for the `--config` flag, since the old `plugins-reference` page no longer carries that section, and `plugins/manifest-reference#user-configuration` for the `userConfig` schema.
+
+## [0.19.6] - 2026-10-04
+
+### Fixed
+
+- `book-distill` spoke files (`context/templates.md`, `templates/checklist.md`) write `<plugin-data>` where they wrote a literal `${CLAUDE_PLUGIN_DATA}`. Those files are read as bytes, so the token reached the Bash tool unsubstituted. The skill body tells the agent to put the `${CLAUDE_PLUGIN_DATA}` path it shows in place of `<plugin-data>` before using a path from those files, and records the plugins-reference section that basis comes from with an as-of date and recheck trigger ([#6072](https://github.com/melodic-software/claude-code-plugins/issues/6072)).
+
+## [0.19.5] - 2026-10-04
+
+### Fixed
+
+- **`video-digest` watch-pipeline papercuts** ([#6048](https://github.com/melodic-software/claude-code-plugins/issues/6048)).
+  `rebuild-visual-frames.js` treats a missing `key-frames/frames` directory as an empty synthesis
+  tier. The watch checklist's sheet-triage floor (item 4.9) renders from the same floors as the
+  floors line, and reads "the deferred floor" until `vision-plan.md` exists. YouTube failure
+  patterns name an HTTP 403 on media fragments as a cue to update yt-dlp. `run-watch.js` writes a stderr progress line at
+  the start and end of acquire, transcript (with the strategy), and watching. `mark-phase vision`
+  records contact sheets triaged, cells triaged, and the promotion-map count so
+  `vision-metrics-honesty` runs. A bare URL in the action router, the argument hint, and the
+  Arguments line means `watch <url>`. A successful `close` writes `status: complete`, then removes
+  the resolved directories recorded in that slice's `tempSession`, after checking each one is
+  inside the OS temp dir. A directory it cannot remove (on Windows, EBUSY or EPERM from a file held
+  open) gets a stderr warning naming it and does not fail the close. `watch-pipeline.md` and
+  `gotchas.md` describe the cleanup.
+
+## [0.19.4] - 2026-10-03
+
+### Changed
+
+- **Shared `prerequisites.mjs` synced ([#6084](https://github.com/melodic-software/claude-code-plugins/issues/6084)); no change to this plugin's lib.**
+  The prerequisite check now counts a Windows App Execution Alias (a Store or winget install on PATH) as found,
+  except App Installer's Python install stub. A `cli` or `runtime` entry can set `reject_store_alias` to skip aliases instead; no entry in this plugin does.
+
+## [0.19.3] - 2026-10-03
+
+### Changed
+
+- `skills/docpage-digest/scripts/check-html-rows.test.sh` and `skills/docpage-digest/scripts/extract_blog_body.test.sh` declare the files they read without naming them in `# test-scope:` headers, so CI's test selection runs them when one of those files changes. Nothing the plugin runs changed.
+
+## [0.19.2] - 2026-10-03
+
+### Changed
+
+- Shared `prerequisites.sh`, `prerequisites.ps1` synced ([#5843](https://github.com/melodic-software/claude-code-plugins/issues/5843)); no change to this plugin's own behavior.
+
+## [0.19.1] - 2026-10-03
+
+### Fixed
+
+- **`video-digest` and `course-digest` install into and load from the knowledge plugin's own data
+  directory, whatever `CLAUDE_PLUGIN_DATA` the Bash tool's shell holds.** Another plugin's
+  SessionStart hook can export its own data directory under that name for every Bash call, and
+  `setup-deps.mjs` installed the extraction dependencies there. `run.mjs` and `setup-deps.mjs`
+  now take a leading `--data-dir`, which every documented command passes as
+  `"${CLAUDE_PLUGIN_DATA}"` (or `"<plugin-data>"` in the spoke files). Without the flag they
+  accept an inherited value only when it names this plugin, and `setup-deps.mjs` stops before
+  writing anything when no directory resolves. The pre-computed dependency checks read the
+  substituted path, and the bootstrap recovery command names the launcher by absolute path with
+  the resolved `--data-dir`.
+
+## [0.19.0] - 2026-10-02
+
+### Added
+
+- `prerequisites.json`, declaring the external tools this plugin runs and what stops working
+  without each, and the generated `lib/prerequisites.mjs` checker with its `.sh` and `.ps1`
+  stubs that read it ([#5841](https://github.com/melodic-software/claude-code-plugins/issues/5841)).
+
+## [0.18.0] - 2026-10-03
+
+### Changed
+
+- **`map-corpus`'s effort gotcha points at the marketplace's Effort tiers record.** It no longer
+  says no dispatched subagent takes a per-call effort override; which dispatch surfaces take one is
+  read from that record's Workflow probe paragraph.
+
+## [0.17.1] - 2026-10-02
+
+### Fixed
+
+- `plugin.json` no longer sets `$schema`. claude.ai's marketplace sync stripped it with a warning, and Claude Code ignores it at load time.
+- The plugin description is 500 characters or fewer, the limit claude.ai's marketplace sync enforces.
+- The `docpage-digest` skill description no longer contains angle brackets: placeholders such as `<X>` are now uppercase words. The Agent Skills spec forbids XML tags in a description, and claude.ai strips them.
+
+## [0.17.0] - 2026-10-02
+
+### Added
+
+- **The Anthropic docs profile tags a blog post's outcome counts for claude.ai as
+  `tag-exempt (consumer-surface)` with the `vendor-claimed` marker,** on both blog hosts. A team
+  that wants them handled otherwise says so in its own CLAUDE.md or AGENTS.md.
+
+### Changed
+
+- **The Anthropic docs queue's notes on the loops, Code Review, and test-impact analysis posts
+  record their fetched topics** and give each pointer in the when-fetch-live form with an as-of
+  date and a recheck trigger.
+
+## [0.16.0] - 2026-10-02
+
+### Added
+
+- **`docpage-digest` gains `check-html-rows.py`, the HTML quote gate.** It checks F-labeled rows
+  quoted from a page's HTML against `source.html` and grades each `EXACT`, `JOIN` (with declared
+  truncations) or `FAIL`; usage and read errors exit 2. It ships with a synthetic negative-control
+  test suite beside `check-fences-exact.py`.
+- **`check-html-rows.py` is a standing gate when digests carry `**FN.**` rows quoted from
+  `source.html`**, named in the pipeline invocation, dual verification and the Phase 4 checklist;
+  a fence that is empty, blank or only truncation marks fails.
+
+## [0.15.4] - 2026-10-02
+
+### Security
+
+- The `video-digest` recommendations-menu HTML view is built by a checked-in builder
+  (`skills/video-digest/scripts/build-menu-view.mjs`) that escapes every field derived from fetched
+  transcripts, titles, and URLs through the rendered-views escape helper, now carried at
+  `lib/html-escape.mjs`, and stamps the generator marker. The page has no script and the URL
+  renders as text. `build-menu-view.mjs --check <file>` flags a page that bypassed the builder.
+
+## [0.15.3] - 2026-10-02
+
+### Changed
+
+- `course-digest` writes `continuation-prompt.md` and the `course.json` phase markers after every
+  module, and at a module boundary routes the next step with `/session-flow:workflow`, naming the
+  course slug, the next module and the `course.json` path for a compaction focus. A new session
+  resumes with `continue <slug>`. Without session-flow it links the docs section on when context
+  fills up.
+
+### Fixed
+
+- `video-digest` no longer labels auto captions as manual. A bare `<id>.en.vtt` counts as manual
+  only when info.json lists English manual subtitles; otherwise the transcript uses the
+  auto-caption cleaner and records why in `transcriptDegradation`.
+- Transcript paragraphs no longer open with the words the previous cue ended on.
+- `status: complete` is written only by the new `watch-state.js close <slice-dir>`, which runs the
+  outcome checks and the blocking checklist first and leaves status unchanged when they fail.
+  `mark-phase <slice-dir> synthesis` delegates to it.
+- `video-digest` key frames carry the time ffmpeg measured instead of one spread evenly over the
+  video. Each frame records where its time came from in `timestampSource`; an interval frame
+  ffmpeg gave no time for is marked `estimated` with an error bound, and a frame with no basis
+  stays untimed and renders as `untimed` rather than 0:00. Scene detection writes the times to
+  `frame-times.json` in the temp frames directory, which recovery reloads instead of recomputing
+  them, and `selection.json` now carries each frame's time source.
+- `visual-gaps.md` logs a densification window as a gap only when no promoted frame's exact time
+  falls inside it; whole-minute labels are used only for slices with no promoted frames on disk.
+  Each row keeps its `~Nm` region and adds the window's exact bounds, and the outcome check no
+  longer credits a `~15m` row to region 5.
+- `video-digest` now extracts an extra frame inside any stretch between timed frames longer than
+  `maxFrameGapSec` (60 s by default, `run-watch.js --max-frame-gap-sec` per run), including the
+  start and end of the video. Gaps are measured over every timed frame examined, before dedup,
+  so an unchanged slide whose frames dedup dropped is not refilled. `watch.json` and `coverage-plan.json` record the value, so
+  `run-watch.js --recover` plans with the run's own gap (an older slice without it gets the
+  default); `SKILL.md` and `watch-pipeline.md` list the flag. The coverage-plan rationale names
+  stratified sampling only when that pass runs.
+
+## [0.15.2] - 2026-10-02
+
+### Changed
+
+- **The Anthropic docs queue records two more claude.dev posts as correlate-only digest targets:**
+  "Using Claude Code: Spending your effort" and "Lessons from building Claude Code: Prompt caching
+  is everything", each with the docs page that serves as its pointer.
+
+## [0.15.1] - 2026-10-02
+
+### Changed
+
+- Option titles and descriptions follow the plugin option naming convention
+  (`docs/conventions/plugin-option-naming/`): titles drop the plugin name and the "(video-digest)"
+  suffix and no longer open with lowercase "yt-dlp", and every description is 300 characters or
+  fewer, with the cut `library_dir` detail moved to the README's "Option details". No key, type,
+  or default changes.
+
+## [0.15.0] - 2026-10-02
+
+### Changed
+
+- **The `docpage-digest` Anthropic docs profile is stated as our decisions plus pointers.** The
+  docs hosts `platform.claude.com` and `code.claude.com` are pointer hosts; `claude.com/blog`,
+  `claude.dev/blog` and `anthropic.com/engineering` are correlate-only hosts that the upstream-drift
+  convention never accepts as a pointer, and the blog hosts share every blog rule. Rules that
+  quoted or paraphrased a page now say what we do and where the page is read. The pinned-versus-alias
+  model ID rule stores no generation rule and carries a pointer record.
+- **The Anthropic docs queue lists blog posts as digest targets, never pointers.** Each post entry
+  names the docs page that serves as its pointer and keeps the post as a correlate, and the
+  queue's custody notes state our finding rather than the page's wording.
+- **`docpage-digest` gains a claude.dev blog extractor and a pin-manifest script**, each with a
+  fixture-driven test suite. The extractor emits table separator rows, drops code-widget and
+  video-control labels, and never opens a code fence with a blank line; a paragraph inside a
+  list item keeps its bullet, one inside a table cell stays in the cell, and a table inside a list
+item stays indented under it. The pin manifest's
+  `--check` reports a deleted file as `BLOCKED: missing`, even when its whole category is gone.
+- **`docpage-digest` pipeline fixes.** The work root resolves against the session's worktree (the
+  `library_dir` description says so); the platform docs corpus is searched before a claim is
+  certified vendor-claimed or blog-only; one standard absence corpus; a split-applicability quote
+  rule; a tag-exempt blog-apparatus category; per-unit corrections files; an exact-byte write route
+  that the guardrails hook allows; no edits to the slice, the orchestrating session included, while
+  a verifier arm runs; the model-alias spawning gap and the Codex verifier's no-network limit are
+  recorded; the effort gotcha names where an agent's effort comes from; the hedge rule is
+  links-only.
+- **The `docpage-digest` Anthropic profile tags blog rows by what they assert, and correction
+  rounds search twice.** A blog row-class table gives benchmark method, results and the author's
+  own test runs a vocabulary tag plus `unverified-inference` or `vendor-claimed` as their content
+  warrants, and leaves pure widget text tag-exempt. Figure data decoded from a framework payload is
+  a derived file read for stated values only, never numbers from drawn geometry. Each correction
+  round pairs its occurrence sweep per fixed class with a differently worded second search.
+- docpage-digest's queue drops the two what's-new entries whose URLs now serve model overview
+  pages, names the model-config section "Work with Fable" with its link, and gives its no-docs-
+  page note a recheck trigger. The project-root rule and the Codex sandbox note state the
+  mechanism without a past-run anecdote.
+- docpage-digest's effort gotcha points at the marketplace's record on where per-task effort is
+  set: Workflow's per-call option, or an agent's pin for an Agent tool dispatch.
+- docpage-digest's verifier A runs as a Workflow `agent()` call at effort `high` by default,
+  overridable per run; a named agent keeps its own pin, and the verdict header records the
+  effective effort and its source. Without the Workflow tool it falls back to an Agent tool
+  dispatch, where effort is the agent's pin or the session level; below `medium`, Phase 4 stops
+  and reports the level instead of verifying.
+
+## [0.14.17] - 2026-10-02
+
+### Changed
+
+- **The README drops the "Migrating from the standalone `book-distill` plugin" note.** The
+  marketplace no longer carries a `renames` map; an install naming `book-distill` must enable
+  `knowledge` instead.
+
+## [0.14.16] - 2026-10-02
+
+### Fixed
+
+- The `course-digest` `argument-hint` uses Claude Code's official bracket notation: it lists the
+  actions the skill accepts.
+- The `setup` `argument-hint` uses Claude Code's official bracket notation: it leads with its check
+  action and keeps alternatives inside brackets with an unspaced `|`.
+- The `video-digest` `argument-hint` uses Claude Code's official bracket notation: it keeps
+  alternatives inside brackets with an unspaced `|`. The action router gains an empty-argument row:
+  with no argument the skill names its actions and asks which to run.
+
+## [0.14.15] - 2026-10-01
+
+### Changed
+
+- Dropped citations of the removed topic-docs convention and the `docs/specs` tree.
+
+## [0.14.14] - 2026-10-01
+
+### Changed
+
+- The `docpage-digest` Anthropic docs queue lists the Sonnet 5.5 prompting guide.
+
+## [0.14.13] - 2026-09-30
+
+### Changed
+
+- Test-only: the suites remove their temporary directories on exit. No behavior change.
+
+## [0.14.12] - 2026-09-30
+
+### Fixed
+
+- **Digest skill spokes resolve without the plugin-root token.** The `course-digest`, `docpage-digest` and `video-digest` spoke files referred to bundled scripts through `${CLAUDE_PLUGIN_ROOT}`, which does not expand in files the model reads as plain bytes. Each `SKILL.md` now says `<skill-dir>` is `${CLAUDE_SKILL_DIR}`, and the spokes write paths as `<skill-dir>/...`.
+
+## [0.14.11] - 2026-09-29
+
+### Fixed
+
+- **Digest scripts document their CLI surface.** `course-digest` and `video-digest` `run-tests.sh` accept `-h` and `--help` (usage to stdout, exit 0) and name the rejected argument on an unknown subcommand (still exit 2). The `docpage-digest` gates `check-fences-exact.py` and `check-snippets.py` list exit codes 0/1/2/3 in `--help` and echo at most 50 failures to stderr, then one `... K more failure(s) not shown` line. The `FAILED -- N failure(s)` line, the failure count and the exit codes are unchanged.
+
+## [0.14.10] - 2026-09-29
+
+### Fixed
+
+- **`video-digest` CLIs run under a symlinked plugin root.** The entrypoint check compared unresolved paths, so a CLI started through a symlink or junction printed nothing and exited 0. `video-digest` and `course-digest` now share one realpath-based `isMainModule` from `@melodic/video-digestion/shared/main-module`, and the two skill-local guards are gone.
+- **Vendor package docs and scripts match the code.** The `repo-analysis` README says `node:test` instead of vitest, the `video-digestion` README describes the package as plain ESM JavaScript, and both packages run `node --test` discovery instead of hardcoded test file names. Both READMEs say why: the vendor packages declare no test-framework dependency so they use `node:test`, and `course-digest` extraction keeps vitest.
+
+### Changed
+
+- **`course-digest` CLI tests assert emitted artifacts.** `build-course-json`, `extract-course`, and `discover-resources` are driven through argv with a stubbed `playwright` and their output files are checked. The `build-course-json` test no longer reads or writes real saved auth state, and the `validate-extraction` exit-code assertion is no longer vacuous.
+
+## [0.14.9] - 2026-09-28
+
+### Changed
+
+- **Argument hints** on `course-digest`, `docpage-digest`, `map-corpus`, `video-digest` stay inside the 100-character house style
+  ([#3542](https://github.com/melodic-software/claude-code-plugins/issues/3542)).
+  Examples, defaults, and flag catalogs that exceeded the budget now live in the skill body.
+
+## [0.14.8] - 2026-09-28
+
+### Changed
+
+- **Course-digest CLIs run only as the process entrypoint.** Importing
+  `analyze-code-repo.js`, `build-course-json.js`, `discover-resources.js`,
+  `download-resources.js`, `extract-course.js`, or `validate-extraction.js`
+  does not parse argv or start the program. Each still exits 1 when
+  `--course-dir` or `course.json` is missing. `build-course-json.js` prints
+  its usage line in that case. `validate-extraction.js` writes
+  `validation-report.json`, `analyze-code-repo.js --skip-clone` writes
+  `analysis.json`, and `download-resources.js` writes `article-links.json`.
+  The entrypoint check compares real paths, so a CLI started through a
+  symlinked plugin root still runs.
+
+## [0.14.7] - 2026-09-28
+
+### Changed
+
+- Vendor tests for `repo-analysis` and `video-digestion` run under `node:test` instead of vitest, and each package.json exposes an `npm test` script so the outside-node suite runner can execute them.
+
+## [0.14.6] - 2026-09-28
+
+### Changed
+
+- **Skill descriptions trimmed to 500 characters or fewer (#4661).** All five listed skills ran
+  over 500. Each now leads with its use case, keeps its quoted trigger phrases, and names its
+  nearest sibling. What the bodies already carry is cut: pipeline-phase lists, action
+  enumerations, and restated output shape. `setup` is `disable-model-invocation: true`, is never
+  listed, and is unchanged. `check-listing-budget.sh plugins/knowledge/skills` goes from 4,200
+  to 2,155 characters. No skill is renamed or merged.
+
+## [0.14.5] - 2026-09-27
+
+### Changed
+
+- `book-distill`'s one-chapter-at-a-time rule, `course-digest`'s gather-before-Phase-3 rule and storage rules, and the Dometrain adapter's instructor rule drop their all-caps and "Critical rule" markers. The rules themselves are unchanged (#4120).
+
+## [0.14.4] - 2026-09-27
+
+### Changed
+
+- **`video-digest` and `course-digest` gather their four dependency probes in one fenced
+  pre-compute block each.** The rows and their labels are unchanged. Each `node -e` probe gains
+  the fallback it lacked, so a host without `node` renders `MISSING - node not found` instead of
+  failing the skill load.
+
+## [0.14.3] - 2026-09-27
+
+### Fixed
+
+- **setup:** the reconfigure scope caveat now gives the measured reason to pass the scope
+  `claude plugin list` reports: a rerun at another scope adds a second install record there and
+  enables the plugin at that scope, while the value itself always lands in user settings. It no
+  longer says the write lands at a scope that does not load. The advice is unchanged.
+  It also says a rejected `--config` value prints a warning yet exits 0, so read the output.
+
+## [0.14.2] - 2026-09-25
+
+### Changed
+
+- Comment-only pass with /code-tidying:dissolve-comments: restating comments, history narration and ticket back-references removed from scripts and tests, over-budget rationale shortened. Every edit is certified comment-only by a token-level proof, so behavior is unchanged; the removed text is recorded in the commit bodies.
+
+## [0.14.1] - 2026-09-23
+
+### Changed
+
+- The Anthropic docs profile records a third blog-channel extraction artifact: chart and diagram
+  text (inline SVG `<text>`, image alt text, video captions) is dropped by text extraction, so the
+  raw HTML is kept as `source.html` beside `source.md` and that text is read from it;
+  `docpage-digest` Phase 1 and the checklist template count `source.html` in the rendered
+  channel's file set where the profile requires it. A resumed work root holding only
+  `source.md` keeps it unchanged and fetches `source.html` beside it, noted in the checklist. The title
+  recovery reads `source.html` first. Claude Tag product mechanics are `tag-exempt
+  (consumer-surface)`.
+- The Anthropic docs queue records three blog posts: getting started with loops, code review, and
+  test-impact analysis for agentic CI.
+
+## [0.14.0] - 2026-09-23
+
+### Changed
+
+- `docpage-digest` keeps going between phases that need no input and pauses only when a phase
+  needs the human or the session is ending.
+- The Anthropic docs queue records the Opus 5.5 release notes, prompting guide, and usage guide
+  blog post; the publisher profile now matches `claude.dev/blog` under the same blog rules as
+  `claude.com/blog`.
+- `course-digest`'s per-module agent briefs state when each agent is done and when it returns
+  early, and synthesis checks each claim against the file the agent names for it.
+
+## [0.13.77] - 2026-09-21
+
+### Changed
+
+- American spellings throughout this plugin's prose, ahead of the `en-us` locale the
+  shared typos config adopts. Wording only: no behavior, option, default, or identifier
+  changes. Released sections were corrected in place on the same terms.
+
+## [0.13.76]
+
+### Removed
+
+- **The video-digest source-liveness harness** (`skills/video-digest/extraction/liveness/`) and its `liveness:offline` and `liveness:live` package scripts, with the repository's scheduled liveness workflow whose runs nobody read. No skill body, pipeline script, or runtime code used the harness.
+
+## [0.13.75]
+
+### Changed
+
+- The repair and vision-gated promotion scripts share one synthesis destination-name normalizer in lib, and the two slice validators report through one shared wrapper. Messages, exit codes and written artifacts are unchanged.
+
+## [0.13.74]
+
+### Changed
+
+- The harvest, transcript, watch and bootstrap-recovery entry points call the adapter's harvestLinks directly instead of through a one-line wrapper, and the harvest-links suite exercises the same behavior through the adapter. Output is unchanged.
+
+## [0.13.73]
+
+### Changed
+
+- The two docpage-digest gate test wrappers run through one sourced library and the two Python gate suites share one harness module. Collected case counts, messages and exit codes are unchanged.
+
+## [0.13.72]
+
+### Changed
+
+- The mux, hotmart, dometrain and teachable adapters resolve their video player selector and probe for the player element through one shared helper instead of four inline copies. Dometrain keeps its non-optional config access, now pinned by a test.
+
+## [0.13.71]
+
+### Changed
+
+- The course-digest browser helper no longer creates and removes a temporary profile directory that nothing read; launch and close keep their call order and every caller passes two arguments. A duration match in build-course-json uses optional chaining for the same result.
+
+## [0.13.70]
+
+### Changed
+
+- The watching pipeline and the watch bootstrap recovery normalize VTT cues through one helper, and the coverage-plan and frame-selection sequences are exposed as named functions instead of being repeated at each call site. Plans, selections, and manifests are unchanged.
+
+## [0.13.69]
+
+### Changed
+
+- The video-digest watch scripts read argv only under their main-module guard and share the selected-frame index and lane JSON reads through one library helper, with identical output and exit codes.
+
+## [0.13.68]
+
+### Changed
+
+- Round seconds through one helper, merge overlapping windows in a single pass and iterate contact-sheet batches by entries in video-digest watching (behavior unchanged).
+
+## [0.13.67]
+
+### Changed
+
+- Merge the proper-noun repair branches behind one guard, hoist the ASR runnable check, return the auto-caption flag directly and share the io stub in the video-digest transcript suite (behavior unchanged).
+
+## [0.13.66]
+
+### Changed
+
+- Index sheet frames by the frame object, drop the single-group dedupe fast path, inline the session end lookup, name the frames-per-sheet constant and return the claim parse directly in the video-digest watch scripts (behavior unchanged).
+
+## [0.13.65]
+
+### Changed
+
+- Share the optional text read, count regex matches through one helper, derive the session frame counts once and collapse the golden part matcher in the video-digest evals (behavior unchanged).
+
+## [0.13.64]
+
+### Changed
+
+- Hoist the transcript degradation metric and the phase order, nest the anchor-name scoring guard, merge the triage-log pushes and share the talk fixture and temp-dir cleanup in the video-digest watch scripts (behavior unchanged).
+
+## [0.13.63]
+
+### Changed
+
+- Inline the single-use file reads, drop the redundant object check on the parsed info and share the fetch stub in video-digest harvesting (behavior unchanged).
+
+## [0.13.62]
+
+### Changed
+
+- Fold the duplicated auth-fallback spawn into one call, share the captions-only pass, staged-failure and metadata entry parsers and hoist the title fallback in video-digest acquisition (behavior unchanged).
+
+## [0.13.61]
+
+### Changed
+
+- Parse http urls through one helper, pass the acquire function directly, hoist the stderr default in the liveness classifier and share the spawn-result stub across the video-digest x adapter and liveness suites (behavior unchanged).
+
+## [0.13.60]
+
+### Changed
+
+- Derive the video-digest run and setup-deps entry-point directory from import.meta.dirname and drop the unused url import (behavior unchanged).
+
+## [0.13.59]
+
+### Changed
+
+- Share the integer check across the map-corpus gates, fold the three link scans into one loop, hoist the fence match and read manifest keys directly after the missing-key gate (behavior unchanged).
+
+## [0.13.58]
+
+### Changed
+
+- Share the gate argument parser and runner between the docpage-digest fence and snippet checks and route their suites through one invoke helper (behavior unchanged).
+
+## [0.13.57]
+
+### Changed
+
+- Resolve the video-player selector and subtitle language through one helper each, inline the date patterns and fold the preflight and resource probes into returned object literals in the course-digest adapters (behavior unchanged).
+
+## [0.13.56]
+
+### Changed
+
+- Share the validation check logger, the href dedup helper and the lesson-failure record, narrow the frame-extraction result to its two read fields and inline the lesson position in course-digest extraction (behavior unchanged).
+
+## [0.13.55]
+
+### Changed
+
+- video-digest extraction: watch-vision-validation.js reads the triage manifest's sheets array through one helper and finds records by key through another, dropping an unused typedef; temp-session-paths.js names its separator normalizer once and drops the unused resolveFramePath export. No behavior change.
+
+## [0.13.54]
+
+### Changed
+
+- course-digest extraction: validators.js counts schema keys with one Map instead of a two-pass scan, meta-tags.js skips a missing property attribute once instead of guarding every test, hotmart.js drops a redundant optional chain, and hotmart.test.js shares its page builders. No behavior change.
+
+## [0.13.53]
+
+### Changed
+
+- **Bump `vitest` and `@vitest/mocker` 4.1.2→4.1.11 in the video-digest extraction package** (#4031): a devDependency range move plus its lockfile, the same pin the course-digest package took in 0.13.52. No runtime code, pipeline script, or shipped skill body changes. `run-tests.sh install`, `build`, and `test` all pass on the new pin.
+
+## [0.13.52]
+
+### Changed
+
+- **Bump `vitest` 4.1.2→4.1.11 in the course-digest extraction package** (#4061): a devDependency range move plus its lockfile. No runtime code, pipeline script, or shipped skill body changes. `run-tests.sh install`, `build`, and `test` all pass on the new pin.
+
+## [0.13.51]
+
+### Changed
+
+- Cite the marketplace `docs/` doctrine files by their lower-kebab names (`docs/plugin-philosophy.md`, `docs/migration-playbook.md`, and siblings); the files were renamed and the old uppercase paths no longer resolve.
+
+## [0.13.50]
+
+### Changed
+
+- **Options reference drops its em dashes.** The generated How-to-set-these block is rewritten by `scripts/sync-plugin-options-docs.py`, which is the fix site: its output is regenerated, never hand-edited. The block no longer needs the ignore marker that exempted it from the repository's em-dash gate, so that marker is gone as well.
+
+- **Every markdown surface in the plugin passes `/ai-slop:audit`.** Em dashes in the plugin's own
+  prose (the README, this changelog, every skill body, and the context, reference, template,
+  extraction, discovery, and verification files under each skill, plus the vendor READMEs) are
+  rewritten as a comma, a period, a colon where a definition or list follows, or a restructured
+  sentence. Headings that carried one take the colon form, and every Contents entry and in-file
+  link pointing at a renamed heading follows. Reflexive `load-bearing` and `seam` become the
+  concrete word each stood for; the corpus seam the topic-docs contract defines keeps its name.
+  Em dashes inside backticked literals stay, including the three `MISSING` prerequisite strings
+  the skills emit verbatim. No pipeline, phase, gate, contract, or output shape changed.
+- **The manifest description and two `yt_dlp` option descriptions drop their em dashes.** Wording
+  only. The plugin description renders into `docs/CATALOG.md`, which the repository's em-dash
+  gate reads.
+- **A stale cross-reference is repointed.** The `upstream-drift` convention's fetch-route heading
+  lost its doubled anchor separator when its em dash went, so this changelog and the
+  `docpage-digest` Anthropic-docs profile now link `#reading-the-basis-the-fetch-route`.
+- **Changelog, in-place wording corrections to released entries:** the same rewrite was applied
+  inside
+  `[0.13.27]`, `[0.13.19]`, `[0.13.7]`, `[0.13.6]`, `[0.13.5]`, `[0.13.4]`, `[0.13.3]`,
+  `[0.13.0]`, `[0.12.5]`, `[0.12.4]`, `[0.12.2]`, `[0.12.1]`, `[0.12.0]`, `[0.11.1]`,
+  `[0.11.0]`, `[0.10.24]`, `[0.10.23]`, `[0.10.22]`, `[0.10.21]`, `[0.10.20]`, `[0.10.19]`,
+  `[0.10.18]`, `[0.10.17]`, `[0.10.16]`, `[0.10.15]`, `[0.10.14]`, `[0.10.13]`, `[0.10.12]`,
+  `[0.10.11]`, `[0.10.10]`, `[0.10.9]`, `[0.10.8]`, `[0.10.7]`, `[0.10.6]`, `[0.10.5]`,
+  `[0.10.4]`, `[0.10.3]`, `[0.10.2]`, `[0.10.0]`, `[0.9.6]`, `[0.9.5]`, `[0.9.4]`, `[0.9.3]`,
+  `[0.9.2]`, `[0.9.1]`, `[0.9.0]`, `[0.8.4]`, `[0.8.3]`, `[0.8.1]`, `[0.8.0]`, `[0.7.1]`,
+  `[0.7.0]`, `[0.6.0]`, `[0.5.3]`, `[0.5.2]`, `[0.5.1]`, `[0.5.0]`, `[0.4.0]`, `[0.3.0]`, and
+  `[0.2.0]`. Wording only; every entry's facts are unchanged. The `0.10.22` entry's quotation of
+  a `docpage-digest` table cell was updated byte for byte to match that cell's new wording.
+
+## [0.13.49]
+
+### Added
+
+- **`docpage-digest`**: a `## Next` section naming the skill that normally runs after this one, in
+  the mention-only shape the skill-body rule describes.
+
+## [0.13.48]
+
+### Changed
+
+- Fix the docpage-digest fence and snippet gates crashing with a UnicodeEncodeError when the console encoding is not UTF-8, which reported a clean digest as a gate bug (prompt-audit follow-up F10)
+
+## [0.13.47]
+
+### Fixed
+
+- **course-digest:** an adapter's `videoPlayerSelector` override now reaches every place that
+  queries for the player. `.hotmart_video_player` was hardcoded inside the `page.evaluate` calls in
+  `detectResources` and `preflight` (Teachable adapter) and in `hasHotmartPlayer` (Hotmart player
+  module), so an override validated and was then ignored, and detection failed as though no player
+  were present. The selector is passed as an evaluate argument, not closed over, because the
+  callback is serialized into the browser context.
+- **course-digest:** the Hotmart interceptor guard is keyed to the Page instead of the module. A
+  second Page in the same process was short-circuited by a module-level flag and captured no HLS
+  master URL or subtitle manifest. Repeat installs on one Page remain a no-op. The test helper
+  `isInterceptorsInstalled` now takes the Page to check and throws when called without one.
+- **course-digest:** Hotmart captured HLS and subtitle data is keyed to the Page instead of
+  `page.url()`. Two Pages on the same lesson URL each keep their own master URL and subtitle
+  manifest; previously the second Page overwrote (and `preparePage` deleted) the first Page's
+  entry. `getHlsUrl`, `getTranscript`, and `preparePage` look up by Page. The test helper
+  `clearCapturedData` takes the Page to clear.
+
+## [0.13.46]
+
+### Changed
+
+- `run-args.test.js` names its Windows corpus directory `D:\repos\<corpus>`. The assertion is that
+  backslashes survive substitution untouched, which holds on any spelling of the last segment, and
+  the org machine-specific-path detector reads a literal checkout path as a leaked machine path
+  even inside a test.
+
+## [0.13.45]
+
+### Changed
+
+- **book-distill:** replaced the unsourced routing-precision figures with the reason a
+  per-discipline skill routes better than a catch-all.
+- **course-digest:** resolved the conflicting Mux JWT lifetimes into one rule that reads the
+  remaining time from the token; replaced the unsourced OCR, slide-OCR, and ASR benchmark figures
+  with their mechanisms; generalized one past course's frame counts, instructor, and lesson titles;
+  scoped the Dometrain player selector and referer to the adapter; removed the session and task
+  references and the credential-storage justification; gave the Pluralsight and Udemy rows a
+  behavior instead of "(future)"; and made the analysis template stack-neutral.
+- **docpage-digest:** removed the past-run incident narration from the Anthropic profile and the
+  dual-verification and pipeline-hardening spokes; moved the recorded doc queue into a new
+  `context/anthropic-docs-queue.md` spoke with a pointer from the profile and the skill;
+  dropped the campaign-owned amendment labels and the per-slice retag work items; and replaced the
+  version-gated `INDEX.md` rule with an unconditional one.
+- **map-corpus:** removed the past-gate clause from the inventory gate's exit-code note.
+- **setup:** renamed the YouTube pipeline and the yt-dlp probe label to video digest.
+- **video-digest:** removed the tracker, ADR, and plan-phase references from the liveness lane doc;
+  dropped the routing to the unbuilt `/knowledge:apply` skill and the roadmap phrasing in the output
+  contract; retitled six source-agnostic spokes off "YouTube"; replaced the retired-file gotcha with
+  the current rule; replaced the undefined "A+" grade with the concrete requirement; and moved the
+  queue evolution breadcrumbs to `reference/ingest-deferred-decisions.md` section 6.
+
+Applied from the 2026-09 prompt-audit against Claude Fable 5.1 (docs/specs/prompt-audit-skills-2026-09.md).
+
+## [0.13.44]
+
+### Changed
+
+- **Fifteen commits across the course-digest and video-digest extraction trees**, from the
+  repo-wide simplification sweep: duplicated locals folded, dead stores removed, suites deduped,
+  and the hotmart packaged-master URL capture, which the request and response interceptors spelled
+  out identically, consolidated into `captureMasterUrl`. `resolveResourceSelectors` in
+  `teachable.js` and the offline/live branch in `run-source-liveness.js` get the same treatment.
+  Float-sensitive frame and timestamp math was compared with `Object.is` semantics so `-0` and
+  `NaN` divergences could not hide; on-disk manifests were byte-compared rather than reasoned
+  about.
+- **`processLesson`'s fail-loud ordering was RESTORED after a hoist proved not
+  behavior-preserving.** Moving the skip guard above the two path joins looks free, but
+  `lessonDirName` throws on a non-string title and `join` throws on a non-string `module.slug`, so
+  the hoist converted a crash on a corrupt `course.json` into a silently skipped lesson and an
+  exit 0. `course.json` is hand-editable, so a typo reaches that path. 416 of 3,000 adversarial
+  cases diverged. The revert is now recorded as a comment at the site, so the next reader does not
+  re-derive the same false saving.
+- **`generate-manifests.js` was left untouched after its edits proved unverifiable.** Three
+  cosmetic changes were made and then reverted: a `!!`-coerced local inlined into the truthiness
+  test that consumed it, a `nextFrame`/`isLastInRun` pair collapsed into one optional-chained
+  expression, and an intermediate `screenshotsDir` folded into a three-argument `join`. Net four
+  lines. The file is a standalone ESM script exposed only as the `manifests` npm script: it exports
+  nothing, no module imports it, and no suite names it, so `scripts/affected-tests.sh` reports it
+  UNMAPPED and AGENTS.md treats that as an error rather than "nothing to run". Recording it in
+  `scripts/affected-tests-no-suite.txt` was rejected because that file's header defines an entry as
+  a claim that a named non-shell lane covers the class, and no lane covers this one. Changing
+  frame-classification logic that nothing exercises, for four lines, is the wrong side of that
+  trade.
+- **A key-order coupling introduced by this sweep is documented where it is created.** Deriving
+  `REQUIRED_METHODS` from `REQUIRED_METHOD_ARITY`'s keys closes the gap where a method could be
+  declared in one table and unchecked in the other, but it makes the arity table's key order
+  load-bearing: reordering it reorders `validateAdapter`'s violations array, which any caller
+  asserting on the whole array rather than on membership will see.
+
+### Notes for maintainers
+
+- Coverage here is thinner than the test counts suggest. `hotmart.test.js`'s mock never invokes
+  the `page.on` handler it registers; `acquire-staged.test.js` returns a constant listing so it
+  cannot see a changed relist; two `transcript/` branches survive constant changes; and mutations
+  planted in every region one course-digest commit touched left all 91 tests green.
+- **`acquisition/acquire.test.js` recursively walks the machine's shared `/tmp`** while asserting
+  only that the result is an array. It is boundary-flaky by construction and gets slower the
+  longer a machine lives; pointing it at a `mkdtemp` directory it owns would fix it.
+
+## [0.13.43]
+
+### Changed
+
+- **`digest_fences.py`: a captured group and a field nothing read are gone, and
+  two tick counters use one string operation.** `CLAIM_LABEL` no longer captures
+  the trailing `(.*)`, and `Claim.rest`, which only ever carried it, is dropped;
+  no caller read either. `parse_claims` now keeps each label's match object from
+  the first scan instead of re-matching every label line and asserting the result
+  is not `None`. The two hand-rolled leading-backtick loops become
+  `len(s) - len(s.lstrip("`"))`. An 18,142-probe differential against the prior
+  implementation found one input where the regexes differ, and it is unreachable
+  by construction: the pattern is only ever fed newline-free lines, and the
+  divergence needs an embedded newline.
+- **`check_linkmap.py`: `ground` is now `rungs_by_url`.** The old name needed a
+  comment to say what it held; the new one says it. Mechanical rename, five call
+  sites, no behavior change.
+- **`check_inventory.py`: `rows_clean` was write-only.** It was incremented and
+  never read, so it is removed. The rest of the file's diff is `ruff format`
+  output, not hand edits: the pinned formatter reflowed 147 of 148 lines when the
+  hook ran on the edit. Reproduced byte-for-byte by running the pinned formatter
+  over the unmodified copy from `HEAD`, which differs from the committed result
+  by exactly the two `rows_clean` lines. Roughly 45 further repository `.py` files
+  are formatter-dirty at `HEAD` with no CI gate enforcing the formatter, so this
+  reflow will recur on the next file a hook touches.
+
+  Recorded, not fixed: `verification/lib/gate_common.py` reports zero coverage
+  from the suite selector, but tracing execution shows 190 of its 392 entries run
+  across two suites. That is a mapping gap in the selector, not a coverage gap in
+  the code.
+
+## [0.13.42]
+
+### Changed
+
+- **`dedupe-synthesis-dir.js` stops exporting an internal-only hash helper.** Two
+  references exist repo-wide, both inside the file; the module has no barrel, no
+  namespace importer, no dynamic import and no string-key access, and its package
+  is private with neither a `main` nor an `exports` field. Confirmed by loading
+  the module both ways, and by a 17-scenario differential over the deletion path
+  that carries near-miss keeps as well as removals: zero divergences, with four
+  seeded defects caught and two equivalence controls correctly spared.
+- **`merge-triage-json.js` binds its cell-count fallback to the registry** rather
+  than to a literal. This is tighter than the number it replaces, because the
+  validator it feeds slices that registry by the value, so the fallback now means
+  "the whole registry". No existing test reaches that path, so it was driven
+  deliberately with a purpose-built probe: ten cases, five of them on the
+  fallback, identical output and identical thrown messages on both sides.
+
+### Fixed
+
+- **Eight doubled newlines across four watch scripts.** The shared emit helpers
+  append a newline unconditionally, so each explicit one produced a blank line;
+  two files were internally inconsistent, with the sibling call in the same block
+  already omitting it. Measured per command: exactly one byte less per emission,
+  exit codes unchanged, artifacts byte-identical through the production
+  orchestrator, and no consumer parses these streams.
+
+  Removing them left four calls wrapping a single expression in a template that
+  no longer did anything, so those were reduced to a bare argument. That is not
+  cosmetic: the emit helper formats an `Error` as its stack and an object as
+  JSON, so bare and wrapped differ for anything but a string. All four
+  expressions are strings, proven by execution with every throw source
+  enumerated.
+
+### Known issues
+
+- **Which duplicate frame gets deleted can depend on directory iteration order.**
+  `synthesisNameQualityScore` is not a total order, so names that tie are
+  resolved by the order `readdirSync` returns them; forcing both orders deletes
+  opposite files. Left unfixed because choosing a tiebreak changes which file
+  survives, which is a product decision rather than a tidy.
+- **Two files disagree by one cell on a sheet's midpoint.**
+  `render-triage-log.js` hardcodes it while `export-sheet-frame-index.js`
+  computes it from the registry length, so they label the same sheet with
+  different timestamps.
+
+## [0.13.41]
+
+### Added
+
+- **`expand-visual-gaps.js` now has a test suite.** The script mapped to zero
+  suites, which `scripts/affected-tests.sh` reports as an error rather than an
+  empty selection, and the no-suite allowlist is for prose and manifests
+  explicitly not for code. The suite covers gap detection, both window
+  boundaries, window order, the minute-rounded region label and the
+  empty-window case. Mutation-tested against four seeded defects: inverting the
+  gap filter kills four of the five cases, rounding to a floor kills one, and
+  making either boundary exclusive kills three and one respectively.
+
+### Changed
+
+- **Video-digest watch frames and vision tidyings from the repo-wide sweep.**
+  `export-sheet-frame-index.js` drops its local 16-element cell array for the
+  `CELL_IDS` registry already imported elsewhere in the tree and names the bare
+  `inputFiles[8]` literal; the two lists were compared index by index and the
+  produced `sheet-frame-index.json` is byte-identical across cell counts of 2,
+  9, 16 and 20. `expand-visual-gaps.js` rewrites an accumulate-into-array loop
+  as `filter`/`map`, verified over 38 curated cases and 20,000 fuzz iterations
+  with zero mismatches. `repair-synthesis-promotions.js` extracts a
+  `promotedDecisions` helper, sheds two unused parameters from
+  `applyFileRenames` and hoists the decisions write to the caller, where it
+  remains the first statement of the `!dryRun` branch and so still precedes
+  every rename; an instrumented op-trace over six `sliceDir` spellings and
+  crash injection at eight boundaries leave the resulting trees identical.
+  `rebuild-visual-frames.js` drops a row field nothing reads and
+  `list-promotion-candidates.js` names the per-session candidate floor.
+
+### Fixed
+
+- **Eighteen doubled newlines across nine watch scripts.** `writeStdout` and
+  `writeStderr` append a newline unconditionally, so every explicit `\n` passed
+  to them emitted a stray blank line. Measured per CLI, each delta is exactly
+  one byte per emission executed; exit codes are unchanged and the text is
+  identical once blank lines collapse. No consumer parses these streams.
+
+## [0.13.40]
+
+### Fixed
+
+- **`fetch-deck-attachments.js` no longer emits doubled newlines.** Three calls
+  passed an explicit `\n` to the shared stderr/stdout helpers, which already
+  append one, so the usage message, the result JSON and the error line each ended
+  with a stray blank line. Exactly one trailing byte is removed per emission;
+  the JSON payload is byte-identical and output still ends in a single newline.
+  All three sites are terminal (each is immediately followed by process exit or
+  the end of the promise chain), so nothing runs together, and no consumer of
+  either CLI exists in the repo.
+
+### Changed
+
+- **Video-digest acquisition, adapter, transcript and watch tidyings from the
+  repo-wide sweep.** `acquisition/acquire.js` drops write-only `files` state (a
+  return field its only caller never read, and an outer `let` whose every write
+  was dead or read on the next line); its two suites collapse duplicated spawn
+  stubs into a `spawnOk` helper and reuse the existing `makeStale` helper.
+  `watch/run-watch.js` unwraps a try/finally that held only a comment, moving
+  the temp-dir retention note to the mkdtemp calls it describes, and drops a
+  redundant `harvestedLinks` field from an internal closure's return.
+  `transcript/write-transcript.js` names its duplicated paragraph-count
+  expression `countParagraphs()`; `transcript/run-transcript.test.js` renames a
+  `const URL` that shadowed the global constructor. Comment passes across the
+  adapter, liveness and transcript layers rewrite history narration as
+  present-tense rationale and remove design-plan tokens that no document in the
+  repository defines. Vitest 12/100 acquisition, 8/131 adapters and liveness,
+  6/54 transcript, 21/106 watch, and the full package 71/509 green before and
+  after; `tsc --noEmit` clean.
+
+## [0.13.39]
+
+### Changed
+
+- **Course-digest pipeline and adapter tidyings (third wave).**
+  `extract-course-run.js` collapses a double-negative boolean pair via De Morgan;
+  `utils.js` drops a dead export; `extract-course.js` documents the existing
+  `--show-browser` flag; six non-interpolated template literals become plain strings;
+  `adapters/dometrain.js` chains its landing-URL replacements and both adapters merge
+  double-JSDoc blocks. Full extraction package 91/91 and tsc clean before and after.
+- **Course-digest extraction lib tidyings (second wave).** `players/hotmart.js` drops
+  two provably dead guards in `getTranscript` (the vendor manifest parser returns only
+  dense arrays of non-empty strings), a redundant boolean annotation, and hoists a
+  batch-size constant; `browser.js` and `auth-store.js` headers rewritten from history
+  narration to present-tense rationale. Vitest 41/41 and full package 91/91 before and
+  after.
+- **Video-digest extraction lib tidyings from the repo-wide sweep.**
+  `synthesis-filename.js` removes a provably dead stub-token set in
+  `isStubQualityAuditNote` (every token sat under the function's 20-character
+  early-return floor); `work-root.js` rewrites a history-narration JSDoc line to
+  present tense; `watch-slice-sessions.js` reduces a block-bodied map callback to a
+  concise arrow; one restating comment dropped from `run-args.test.js`. Vitest lib
+  suites 50/50 and the whole extraction package 501/501 before and after.
+
+## [0.13.38]
+
+### Changed
+
+- **Options reference cites the plugin-reconfiguration convention.** The generated
+  How-to-set-these block no longer restates the 2.1.240 verified-version record.
+
+## [0.13.37]
+
+### Fixed
+
+- **`acquire-throttle` stale-slot reclaim is exclusive.** Two reclaimers could
+  both pass `isStaleSlot` and `rm` the same path. The first delete freed the
+  directory, a peer `mkdir` became a live holder, and the second `rm` evicted
+  that holder so a third acquire exceeded `maxSlots`. Reclaim now takes
+  `slot-N.reclaim` (mkdir, EEXIST skips), re-stats, and only then removes the
+  slot. A leftover reclaim lock older than the slot TTL is stolen by renaming
+  it to a unique tombstone so only one racer can win. Rename-then-rm of the
+  live slot is not used: the original holder still releases `slot-N` in
+  `finally` and would delete a relocated occupant.
+
+## [0.13.36]
+
+### Changed
+
+- **setup:** cite the plugin-reconfiguration convention for the native
+  `/plugin configure` / headless `--config` path instead of restating the
+  verified-version record inline.
+
+## [0.13.35]
+
+### Fixed
+
+- **Shared yt-dlp driver threads `captionClass` into `selectCaptionFile`.**
+  `adapterSourceDeclarations` dropped the adapter's declared class, and both
+  driver call sites omitted the second argument, so every shared-driver acquire
+  walked the `manual-and-auto` ladder. A `platform-asr` source would have
+  classified a bare `.en.vtt` as `manual-en`. The declaration now carries
+  `captionClass`, and both selection sites pass it.
+
+## [0.13.34]
+
+### Fixed
+
+- **`build-yt-dlp-args` tests pass an empty `env` so host cookie settings cannot inject argv.** Six
+  cases omitted `env`, so `resolveYtDlpAuthArgs` fell through to `process.env`. A runner with
+  `VIDEO_DIGEST_YT_DLP_COOKIES_FILE` (or the legacy `YOUTUBE_` spelling) exported then failed the
+  positional and `not.toContain` assertions. They now match the adapter-argv conformance suite.
+
+## [0.13.33]
+
+### Fixed
+
+- **`analyze-harvested-repos.js` lets stdout drain before exit.** The CLI called
+  `process.exit(code)` immediately after an async `writeStdout`, which can truncate a
+  piped report (especially on Windows). It now sets `process.exitCode` and returns, matching
+  the other video-digest CLIs.
+
+## [0.13.32]
+
+### Fixed
+
+- **map-corpus: `check_inventory` FAILED banner spacing matches `check_linkmap`.** The checker
+  printed `FAILED --{n}` while the sibling prints `FAILED -- {n}` (space after the dashes). Both
+  `FAILED` print statements now carry the same space.
+
+## [0.13.31]
+
+### Changed
+
+- **map-corpus: corpus placement wording aligned to topic-docs contract v3.0.0.** The work-root
+  section now hard-binds every corpus write to the `library_dir` seam (never the consuming repo's
+  `memory_dir`; topic slices hold pointers to corpus content, per the contract's corpus-seam rule),
+  notes that inside the seam the tree is shape-unified to the contract's slice and `INDEX.md`
+  rules, and owns the two-level `<epic>/<slug>/` depth cap as this skill's own contract now that
+  the contract's slice tree recurses freely. Behavior unchanged; the sanction's ownership moved.
+- **docpage-digest: SOURCES.md opens with an `abstract:` frontmatter line.** The Phase 2
+  prescription now requires a YAML frontmatter block carrying at least `abstract:` (one unwrapped
+  line), the topic-docs v3 indexable-artifact hook: a parent slice index regenerated by the shared
+  lib script mirrors that line verbatim, and without it a corpus parent declaring a docpage slice
+  fails the regen shape check.
+
+## [0.13.30]
+
+### Changed
+
+- **docpage-digest: the slice-root inventory is now `SOURCES.md`.** The Phase 2 artifact
+  is renamed from `INDEX.md`, with the resume pointer, digest-agent brief context,
+  digest-unit parity invariant, pin-manifest path list, and eval expectations updated to
+  match. Semantics are unchanged; the rename frees the `INDEX.md` name, which the work-folder
+  slice contract reserves for a per-slice index with different semantics.
+
+## [0.13.29]
+
+### Changed
+
+- **video-digest watch: orphaned module removed.** `watch/promotion-name-map.js`
+  is deleted. 0.13.28 removed its last importer (`synthesis-naming.js`'s dead
+  `synthesisDestNameForSlice` export) and confirmed the module carries no
+  load-time side effects; a fresh repo-wide sweep re-proved zero importers of
+  the file or of `loadPromotionNameMap` (only historical changelog text and one
+  now-corrected doc parenthetical in `context/quality-gates.md` named it). It
+  had no test file of its own. Watch suites and `tsc` clean after removal.
+
+## [0.13.28]
+
+### Changed
+
+- **video-digest watch: dead export removed.** `watch/synthesis-naming.js`
+  drops `synthesisDestNameForSlice` (no importer anywhere since its
+  introduction) together with its now-orphaned `loadPromotionNameMap` import,
+  and unexports the internal-only `sourceStem`. A fresh-context sweep confirmed
+  zero consumers across code, markdown, and fixtures, and that
+  `promotion-name-map.js` has no load-time side effects. Watch suites 58/58,
+  `tsc` clean.
+
+## [0.13.27]
+
+### Changed
+
+- **video-digest acquisition: dead fallback removed.** `acquire.js` drops a
+  `?? "staged acquire failed"` default that could never fire. Both `ok: false`
+  return sites in `acquireFullStaged` construct non-empty string errors, and
+  the old `??` only replaced null/undefined. Verified by site enumeration and
+  `tsc`; acquisition + adapters suites 205/205. (A second candidate, merging
+  the duplicated initial spawn in `spawn-yt-dlp-with-auth-fallback.js`, was
+  refuted by differential testing. The cookie-config probe it would skip
+  emits a once-per-process deprecation warning, so it was reverted rather than
+  shipped.)
+
+## [0.13.26]
+
+### Changed
+
+- **video-digest extraction test suite deduplicated across modules.** The
+  `forbiddenSynthesisFileNameReason` describe block in
+  `watch-vision-validation.test.js` re-tested `synthesis-filename.js` behavior
+  that module's own suite already covers; its two unique cases (the
+  `densification-code-0.png` reject and `benchmark-curve-slide-metrics.png`
+  accept) moved into `synthesis-filename.test.js` and the block and its import
+  were removed. Assertion-level coverage is unchanged (verified pair by pair);
+  the full extraction suite passes 71 files / 501 tests. Test-only change; no
+  runtime code touched.
+
+## [0.13.25]
+
+### Changed
+
+- **Behavior-preserving simplification sweep (batch-simplify).** `docpage-digest`'s
+  digest_fences.py removes dead `unclosed` bookkeeping from parse_claims: the flag was assigned on
+  both arms of the try and the trailing `if unclosed: fence = None` could never change the already
+  computed value. Refutation-verified (per-block flag scoping ruled out cross-iteration leakage;
+  18/18 parse comparisons and 10/10 end-to-end gate runs byte-identical; both suites, 30 tests, OK).
+- **video-digest extraction, same sweep.** setup-deps.mjs drops a redundant per-directory
+  localeCompare sort inside computeStamp's walk (the final code-unit path sort alone determines
+  hash-input order; stamps verified byte-identical on the real vendor tree and an adversarial
+  fixture, including under forced readdir scrambling). acquisition/build-yt-dlp-args.js removes
+  the born-dead export `YT_DLP_CAPTION_ONLY_SLEEP_SUBTITLES_SEC` (zero references at any commit;
+  the consumed constant lives in acquire-retry-policy.js). acquisition/acquire.js drops a
+  double-defaulting spread at the acquireFullStaged call site (the spread's withThrottle value was
+  by construction mergedDeps' own value or the same default the callee re-derives; full
+  case-matrix refutation including the null/undefined split found no divergent reachable shape).
+
+## [0.13.24]
+
+### Fixed
+
+- **`video-digest` and `course-digest`: the prerequisites gate would refuse to run on a machine that
+  HAS the toolchain.** 0.13.23 fixed a gate that failed open and left one that fails closed for the
+  wrong reason. The five tool probes were
+  `command -v ffmpeg >/dev/null 2>&1 && ffmpeg -version 2>/dev/null | head -1 || echo "MISSING …"`.
+  Under `set -o pipefail` the `&&` list takes the pipeline's exit status, and `head -1` closes the
+  pipe while a multi-line version banner is still being written, so `ffmpeg` dies of SIGPIPE (exit
+  141) and pipefail promotes that to the list's status. The `||` then fires on a working tool. The
+  rendered context shows the real version line and `MISSING — install ffmpeg` directly beneath it.
+
+  That is not cosmetic. Both skills instruct the agent to STOP when the pre-computed context shows
+  `MISSING` for yt-dlp, ffmpeg, or ImageMagick. On a correctly provisioned machine the context now
+  shows `MISSING`, so the skill refuses to run against a toolchain that is installed and working.
+  0.13.23 turned a gate that failed open into one that spuriously fails closed. The direction is
+  safer, the behavior is still wrong.
+
+  The five probes are not equally exposed, and the difference matters for diagnosis. Whether the
+  token fires is a race between the tool still writing its banner and `head -1` closing the pipe,
+  so it scales with how much the tool prints. Measured over 30 runs per size against a synthetic
+  tool on `PATH`, under `pipefail`, with the tool installed and working:
+
+  | Tool output | 0.13.23 shape fires `MISSING` | This shape |
+  |---|---|---|
+  | 1 line (`yt-dlp --version`) | 0/30 | 0/30 |
+  | 5 lines (`magick -version`) | 19/30 | 0/30 |
+  | 41 lines (`ffmpeg -version`) | 29/30 | 0/30 |
+
+  So `yt-dlp` is safe by output size alone, `ffmpeg` fails on nearly every run, and `magick` is a
+  genuine race that fails on roughly two runs in three. The intermittent one is the worst to live
+  with: a gate that stops the skill on most invocations and lets it through on the rest reads as
+  flakiness in the skill rather than as a defect in the probe. All five are fixed together, because
+  the shape is wrong regardless of how often it trips.
+
+  Proven by execution in three states, each with and without `pipefail`. Tool absent: both shapes
+  render `MISSING …` under both settings. Tool present, single-line output: both shapes render the
+  version, no token, under both settings. Tool present, banner long enough to close the pipe:
+  without `pipefail` both render one version line and no token; with `pipefail` the 0.13.23 shape
+  renders the version line **and** `MISSING — install ffmpeg (watch action only)`, and this one
+  renders the version line alone.
+
+  The version pipeline now sits in a brace group closed by `:`, a command that cannot fail, so the
+  `||` is reachable only when `command -v` short-circuits. This is the shape `docs-hygiene` 0.21.23
+  and `code-tidying` 0.14.13 established. No `$` expansion is introduced, so the composed
+  pre-compute block stays verifiable to the worktree-isolation guard. Neither skill declares
+  `allowed-tools`, so no grant changed.
+
+## [0.13.23]
+
+### Fixed
+
+- **`video-digest`: the prerequisites gate could not fire, so a skill documented as failing closed
+  failed open.** The skill's own "Prerequisites gate" step says to STOP if the pre-computed context
+  shows `MISSING` for yt-dlp, ffmpeg, or ImageMagick, and cloud agents without the media toolchain
+  are supposed to stop there. The three probes were written
+  `yt-dlp --version 2>/dev/null | head -1 || echo "MISSING ..."`. `||` binds to the whole pipeline,
+  a pipeline's exit status is its last command's, and `head` exits 0 whether the probe printed a
+  version or nothing at all, so with the tool absent the line rendered as an empty string and the
+  word `MISSING` never appeared. Verified by execution on a host with none of the three installed:
+  the old shape rendered `yt-dlp: []`, the new one renders
+  `yt-dlp: [MISSING — install yt-dlp (see Prerequisites)]`. Each probe now leads with
+  `command -v <tool> >/dev/null 2>&1 &&`, so the `||` fires on probe failure; with the tool present
+  the real version still renders. This is the shape `firecrawl:firecrawl` already ships and the rule
+  `plugins/playbooks/skills/skill-authoring/reference/precompute-context.md` codifies under "Bind
+  the fallback to the probe, not to the pipeline".
+- **`course-digest`: the same two probes, the same repair.** Its ffmpeg and ImageMagick probes
+  carried the identical pipeline-bound fallback. This skill has no STOP step reading them, so the
+  consequence was a silently blank prerequisites line rather than a dead gate, but the defect is the
+  same one.
+
+Neither skill declares `allowed-tools`, so no grant changed.
+
+## [0.13.22]
+
+### Changed
+
+- **`setup`: repaired a broken numbered-list item and a comma splice in the headless-reconfigure
+  recipe.** One continuation line had lost its indentation, which ended the list item early and
+  detached the 2.1.240 verification stamp from the claim it qualifies; the same block also carried
+  the fused-sentence splice the fleet's other setup skills had. Whole-repo extract-ssot sweep.
+
+## [0.13.21]
+
+### Changed
+
+- **Grammar repaired where the em-dash purge left a sentence broken.** `skills/docpage-digest/SKILL.md`. The #2891 substitution replaced a dash without restructuring the sentence, leaving a verbless fragment or a comma splice. Wording only; no rule changed.
+- **Authoring-doctrine pass over `README.md`, `skills/video-digest/context/companion-primary-sources.md`, `skills/video-digest/templates/readme-journey.md`, `skills/video-digest/templates/recommendations/menu.md`.** Fixed pointers and cross-references that did not resolve; counts and inventories that had drifted from the tree. Every edit was verified against the file by an agent that did not propose it. Prose only; no behavior, contract, or trigger phrase changed.
+
+## [0.13.20]
+
+### Changed
+
+- **Comment-residue cleanup (`/code-tidying:audit-comment-residue`).** History narration, plan/session references, and stale back-references in code comments rewritten as present-tense rationale or removed. Comment-only, no behavior change.
+
+## [0.13.19]
+
+### Changed
+
+- **Behavior-preserving simplification sweep, wave 6 (batch-simplify).** `video-digest`
+  extraction: the `isMainModule()` helper (lib/cli-entrypoint.js) rollout is completed
+  package-wide. All 30 remaining hand-rolled ESM main-module checks across watch/, watching/,
+  transcript/, evals/, and acquisition/ now use the helper, and the imports they orphaned
+  (`node:url`, sometimes `node:path`) are dropped; the only main-module check left in the
+  package is the helper itself. Two watch test files also consolidate: four hand-rolled
+  Map-backed fs fakes into one `memoryStore(seed)` helper (assertion-for-assertion identical)
+  and a byte-identical fixture setup hoisted into `beforeEach`. Every batch adversarially
+  refutation-verified (expression-identity tables, URL-normalization probes, HEAD-baseline
+  spot-runs); full package suite 71 files / 494 tests green; `tsc --noEmit` clean.
+
+## [0.13.18]
+
+### Changed
+
+- **Behavior-preserving simplification sweep, wave 5 (batch-simplify).** `video-digest`
+  extraction cleanups, each adversarially refutation-verified with emitted bytes unchanged:
+  adapters/x.js folds the twice-built degraded-acquisition failure message into one
+  `failDegraded()` helper and drops a per-iteration `Set` + spread inside a filter for a plain
+  array; adapters/adapter-contract.js collapses the two near-identical
+  `extractorArgs`/`allowedExtractors` validation branches into one loop (violation strings and
+  order byte-identical); adapters/youtube.js replaces a single-use `/^\//` regex with
+  `.slice(1)` and hoists a per-call `Set` literal to module scope;
+  transcript/transcript-strategy.js folds two byte-identical no-transcript degradation returns
+  into a `noTranscriptPlan()` helper; acquisition/build-yt-dlp-args.js collapses a redundant
+  `&& length > 0` conjunct to `||`. Package suites green (adapters 112, transcript 58,
+  acquisition 93, watch consumers spot-checked); `tsc --noEmit` clean.
+
+## [0.13.17]
+
+### Changed
+
+- **Behavior-preserving simplification sweep (batch-simplify).** `course-digest`'s
+  extract-course-run.js drops a dead `return { modulesDir }` from `runLessonExtraction`
+  (repo-wide call-site census shows the sole caller awaits without reading the value) and the
+  destructure that fed only that return. No emitted output, JSON shape, or exit-code change;
+  package suite 91/91 green; adversarially refutation-verified.
+
+## [0.13.16]
+
+### Changed
+
+- **Comment triage pass (`/code-tidying:dissolve-comments`).** Removed four zero-information
+  comments in the course-digest extraction scripts (`download-resources.js`,
+  `generate-manifests.js`); no behavior change.
+
+## [0.13.15]
+
+### Fixed
+
+- **`recover-watch-bootstrap` crashed instead of printing its usage line (#3365).** The CLI ran
+  `path.resolve(argv[2])` through `path.resolve(argv[5])` BEFORE the presence check, so a
+  missing argument threw `TypeError: The "paths[0]" argument must be of type string` first and
+  the usage branch (and its `return 1`) was unreachable. Callers got a stack trace. Arguments
+  are now validated before resolution, so a short invocation prints the usage line and returns
+  1.
+- **The downsample WARN reported the same count on both sides (#3365).** `selection` was
+  reassigned with the downsampled array before the log interpolated
+  `selection.selected.length`, so a 50-frame selection cut to 16 logged
+  `downsampled 16 → 16 frames` and hid every dropped frame. The stratified downsample moved to
+  an exported `downsampleSelectedFrames` helper that captures the pre-downsample count, and the
+  WARN now names the true before count, the after count, and how many frames were dropped.
+
+## [0.13.14]
+
+### Changed
+
+- **Long reference files carry a `## Contents` index.** 3 reference files in this plugin gained one.
+
+  The predicate is `audit-progressive-disclosure`'s own: a reference file over 300 lines with no
+  table of contents, which both official sources agree on by that length. Scope came from the
+  detector's tier classification rather than a line count, so `SKILL.md` files are excluded by
+  construction: they are invocation tier, not the on-demand reference tier the rule names. Files
+  with fewer than five H2s were held out, because a three-row index on a long file earns nothing and
+  the doctrine offers a grep recipe instead. Purely additive, with anchors generated from each
+  file's own headings and verified to resolve. Docs-hygiene sweep, L2-progressive-disclosure.
+
+## [0.13.13]
+
+### Changed
+
+- **`course-digest` links `reference/screenshot-strategy.md` directly from the hub.** It was
+  reachable only through `context/workflow.md`, two levels from `SKILL.md`. A
+  `Reference index. Load on demand` section now carries it with a read condition; the
+  `context/workflow.md` citation is unchanged. Docs-hygiene sweep, L2-progressive-disclosure.
+
+## [0.13.12]
+
+### Changed
+
+- **`docpage-digest`'s Phase 4 moves to `context/dual-verification.md`.** The phase was 90 lines,
+  the single largest block in the body, and it runs after the digest exists. The hub keeps the
+  phase heading and the reason the phase is not optional, and points at the spoke for both passes.
+  Docs-hygiene sweep, L2-progressive-disclosure.
+
+## [0.13.11]
+
+### Changed
+
+- **Options-reference regeneration.** `scripts/sync-plugin-options-docs.py` dropped the
+  phrase `in order to` from its shared options template, per the repo's own
+  write-for-humans style rule that the phrase is just `to`. The generated options
+  block in `README.md` regenerated with the shorter wording; no other change.
+
+## [0.13.10]
+
+### Changed
+
+- **Behavior-preserving simplification pass (repo-wide batch-simplify).** course-digest:
+  stale classifyLesson comment corrected in `generate-manifests.js`; auth test helper's
+  `first()` delegates to the full mock locator (recorded actions byte-identical);
+  `validate-extraction.js` reuses the PASS/WARN/FAIL constants from `lib/validators.js`;
+  `setup-deps.mjs` drops a per-directory sort provably dead with respect to the vendor
+  stamp. docpage-digest: shared `preview_payload()` extracted across the two gates
+  (escape-then-truncate order proven identical); dead `extra_args` harness parameter
+  removed. video-digest: dead `EN_ORIG_LOCALIZED_PATTERN` subset regex removed from
+  `select-caption.js` with its adjacent auto-en blocks merged (165k+ differential
+  comparisons, zero mismatches). Also across video-digest: dead export
+  `outcomeFloorsForSlice` and an unused destructured option removed from
+  `check-watch-outcomes.js`; `run-harvest.js` and `run-source-liveness.js` adopt the shared
+  `isMainModule` guard; a shadowed duplicate branch removed from `temp-session-paths.js`; a
+  redundant guard dropped in `watch-vision-validation.js`; `proper-noun-repair.js` delegates
+  to `repairCues` (6k differential cases); a never-injected deps parameter removed from
+  `write-watching-manifest.js`; watch-tree cleanups (duplicate JSDoc lines, argv reads moved
+  into main guards, fixture dedups, a duplicate prompt build folded into
+  `writeContinuationPrompt`, shared `writeStderr` usage lines). map-corpus: a provably-dead
+  fallback removed from `check_linkmap.py` and a fixture context-manager reuse in
+  `test_extract_nodes.py`. All suites green (36 + 55 + 39 vitest targeted, 494 full
+  video-digest, 19 + 11 + 30 + 28 + 29 unittest); every change independently
+  refutation-verified.
+
+## [0.13.9]
+
+### Changed
+
+- **setup:** remaining instruction-surface punctuation after the 0.13.8
+  plugin-wide rewrite. The OS-level media-tools probe now comma-separates
+  frame extraction from watch/course actions.
+
+## [0.13.8]
+
+### Fixed
+
+- **De-slop review repair.** Restored empty table cells that the em-dash purge
+  had turned into stray `,` / `.` punctuation in the course-digest adapter
+  roster.
+
+### Changed
+
+- **Instruction-surface de-slop (#2891, shard 9).** Rewrote this plugin's `README.md` and every
+  `SKILL.md` to drop em dashes under the repo's zero-tolerance house policy, using
+  `/ai-slop:audit fix` semantics: periods or commas, or a restructured sentence, never
+  parentheses, en dashes, or a spaced hyphen as a stand-in. Meaning stays; only the mark
+  and the sentence break change. The generated options block is ignore-fenced because
+  `scripts/sync-plugin-options-docs.py` still emits em dashes from its shared template.
+  Fenced report and protocol templates keep their original punctuation.
+
+## [0.13.7]
+
+### Changed
+
+- **setup:** normalized restated setup-contract prose (preamble, probe-ladder
+  opening, never-writes boundary, and/or headless-reconfigure recipe as present) to the
+  canonical fleet wording, keeping the operable text inline with a provenance-only citation
+  (whole-repo extract-ssot batch, #2698).
+- Normalized fleet-wide framing this plugin restates (cross-vendor advisor
+  fallback, untrusted-content posture, attribution/idiom prose, as touched) to the canonical
+  SSOT wording, operable text kept inline with provenance-only citations (#2698).
+
+## [0.13.6]
+
+### Fixed
+
+- **`setup` skill:** the headless reconfiguration route no longer prescribes `claude plugin
+  uninstall` + reinstall. That instruction rested on an unversioned claim that `claude plugin
+  install --config` is ignored once a plugin is installed, and following it dropped the plugin's
+  whole stored `pluginConfigs` entry, resetting every declared option to its manifest default.
+  On Claude Code 2.1.240 a plain `claude plugin install … --config` against an already-installed
+  plugin prints `already installed` and still writes the value, so that is now the documented
+  route, stamped with the CLI version it was verified against
+  ([#3111](https://github.com/melodic-software/claude-code-plugins/issues/3111)). `apply` also
+  now separates the write from its effect: the stored value changes immediately, but the running
+  session's hooks keep the `CLAUDE_PLUGIN_OPTION_*` they were handed at session start, so
+  verification means rerunning `check` in a FRESH session. A same-session rerun reports the old
+  value, which is not a failed write. It never asserts an unobserved change.
+- **Docs:** the generated options block's headless route no longer implies `--config` applies
+  only at install time, and now carries the CLI version its claim was verified against
+  ([#3111](https://github.com/melodic-software/claude-code-plugins/issues/3111)). The block also
+  now separates the write from its effect: the value is stored immediately, but hooks are handed
+  their `CLAUDE_PLUGIN_OPTION_*` at session start, so a check run in the same session still
+  reports the old value and that is not a failed write. Two upstream links that pointed at empty
+  backward-compatibility anchors on the settings page were repointed at the headings that hold
+  the content.
+
+## [0.13.5]
+
+### Changed
+
+- **`docpage-digest` pipeline hardening from the 9-slice cloud-fleet corpus run
+  (#3015).** Fence mandate: every verbatim quote is a column-0 fenced container
+  under a bold `**CN.**` label. Blockquotes and inline code spans are forbidden
+  quote carriers (the PostToolUse hook rewrites list markers inside blockquotes
+  and strips a trailing space from a bare code span). Ships
+  `scripts/check-fences-exact.py` and `scripts/check-snippets.py` as standing
+  gates alongside the quote gate; both fail loud on zero-parse and compare
+  payloads without `.strip()`, with negative-control suites that must fail
+  known-bad fixtures before a PASS is believed. Pin the tree on agent-REPORTED
+  completion, never file presence; a hash manifest freezes the tree for the
+  verification window and each arm restates the hashes it audited; a verdict
+  file on disk is an intermediate write, never a report. Subagent-death /
+  usage-limit ladder (retry window → inline-with-disclosure → degraded marker +
+  re-run trigger) sits beside the existing degraded-verifier rule, which covers
+  a missing cross-vendor arm, not a session that cannot spawn. `SKILL.md`
+  enumerates each gate's blind spots. Format and pin-manifest shape live in
+  `context/pipeline-hardening.md`.
+
+## [0.13.4]
+
+### Changed
+
+- **Anthropic publisher profile: interview-ratified amendment bundle from the 9-slice
+  cloud-fleet corpus run (#3014).** Ten contract rules land in
+  `context/anthropic-docs-profile.md`. The `cc-applicable`/`mixed` boundary is now the pure
+  four-surface letter rule (a row is `mixed` only when its own quoted text names an API request
+  parameter, endpoint, SDK call, or model ID) with worked examples: a settings-page "parameter"
+  such as `dangerouslyDisableSandbox` never triggers; a hostname is a name not an endpoint
+  (`prUrlTemplate` / `skipWebFetchPreflight`); header names stay out (`apiKeyHelper`). The
+  vocabulary's evidence burden binds digest prose, not only claim rows. The `code.claude.com`
+  raw-md channel gains a known-artifact register (Documentation-Index banner, `theme={null}`
+  fences, hard-tab expansion, `\&`-escaped URLs). Digest layer reproduce-never-repair;
+  reader-facing layer repair-and-disclose. Hedge preservation gains the wrong-footer trap
+  (server-managed-settings' own "not a security boundary" sentence travels instead of the
+  hallucination footer). Row-local basis accepts subsection-level inheritance when
+  anchor-correct and mechanically recoverable. A settings-style claim is the whole table row
+  including its Example cell. `tag-exempt (consumer-surface)` is a documented-subject test, not
+  a hosting test. Bare "See X" is `navigation-pointer`; a directive pointer is guidance. Digest
+  sections state mechanism, never consuming-org instance. Ranked doc queue recorded, not
+  dispatched: `/docs/en/permissions` first, `/docs/en/self-hosted-environments` second; corpus
+  expansion otherwise STOPPED (operator decision 2026-08-19). The two settings-slice Example-cell
+  retags and the `skipWebFetchPreflight` retag execute only inside a graduation-time verification
+  cycle, never as bare edits to verified slices.
+
+## [0.13.3]
+
+### Changed
+
+- **The pipeline hand-offs name the Skill tool (#3002).** These were the two offenders the sweep
+  issue named. `map-corpus`: the resource-seeds-only route, the queue hand-off to N
+  `/knowledge:docpage-digest` runs, and the `mapper-handoff.md` hand-off to `/planning:interview`.
+  `docpage-digest`: the Phase 5 interview hand-off. `course-digest`: the two freshness-verification
+  steps (`/discovery:explore`, `/discovery:research`). `video-digest`: the optional agent-lane
+  `/x:read` reply-chain harvest, in `SKILL.md` and `reference/sources/x.md`. `video-digest`'s
+  "offer `/planning:interview`" phase line and the `templates/recommendations/` files are
+  deliberately unchanged. They *offer* to the operator rather than invoking, which the pipeline's
+  no-auto-implement rule requires. Wording only; queue contracts and phase order unchanged.
+
+## [0.13.2]
+
+### Added
+
+- **`book-distill`: first eval suite (#2968).** Six cases pinning the Phase 1 setup shape, the
+  read-one-write-one interleave, the untrusted-source-text posture, filename slugification against
+  path traversal, the EPUB package-document/spine path, and the copyright caution that leaves the
+  rights decision with the user. Required because the skill gate demands evals for any skill whose
+  SKILL.md changes.
+
+### Changed
+
+- **Explicit `disable-model-invocation` on `book-distill` (#2968).** The skill now states the
+  invocation mode the harness already applied for an absent key (`false`), so the choice is
+  auditable and gated by `skill-quality:check` check 24. No behavior change. Rubric:
+  `docs/conventions/invocation-mode/README.md`.
+
+## [0.13.1]
+
+### Changed
+
+- Behavior-preserving simplifications from the repository-wide batch-simplify pass:
+  duplicated helpers folded, dead code and redundant constructs removed, no functional
+  change. Every group was verified by a fresh-context verifier agent against the
+  plugin's own test suite.
+
+## [0.13.0]
+
+### Changed (breaking)
+
+- **Skill renamed: `youtube-digest` → `video-digest`.** The skill now digests X (Twitter)
+  video posts at full watch parity with YouTube, so the name stops claiming YouTube-only
+  scope. The skill directory, the `/knowledge:video-digest` invocation, every
+  `${CLAUDE_PLUGIN_ROOT}/skills/video-digest/extraction/run.mjs` launcher path, and the
+  extraction npm package (`@melodic/youtube-extraction` → `@melodic/video-extraction`)
+  all rename together. **Five consumer surfaces reference the old name and four of them
+  fail silently. Audit each:**
+  1. **Cloud routines** that invoke `/knowledge:youtube-digest`. The unknown command no
+     longer matches a skill; the routine runs without the skill's procedure. Update the
+     routine prompt to `/knowledge:video-digest`.
+  2. **Scheduled tasks and `/loop` prompts** carrying the old invocation. Same silent
+     no-match. Update the stored prompt text.
+  3. **Permission rules** `Skill(knowledge:youtube-digest)`. Rules are exact-match, so an
+     allow rule silently stops matching and **a deny rule fails open**: the renamed skill
+     is no longer denied. Rewrite rules to `Skill(knowledge:video-digest)`; treat deny
+     rules as the priority.
+  4. **Agent SDK `skills:` allowlists** naming `youtube-digest`. This is the one loud
+     failure: the allowlisted skill no longer exists, so the skill is simply absent from
+     the agent's set. Rename the allowlist entry.
+  5. **Bare-`/youtube-digest` references in docs and prompts**. The freed name is a
+     squatting surface: a later plugin can claim it and receive traffic meant for this
+     skill. Sweep docs and prompts to `/knowledge:video-digest`. The skill description
+     keeps `'/youtube-digest'` as a trigger phrase so conversational routing still finds
+     the renamed skill.
+
+  The 0.12.6 resume-argument rename carries forward unchanged under the new name: the
+  resume action is `/knowledge:video-digest resume <slice-slug>`.
+
+### Deprecated
+
+- The extraction lane's `YOUTUBE_*`-prefixed environment variables are renamed to
+  `VIDEO_DIGEST_*`: `YOUTUBE_WORK_ROOT` → `VIDEO_DIGEST_WORK_ROOT`,
+  `YOUTUBE_YT_DLP_JS_RUNTIMES` → `VIDEO_DIGEST_YT_DLP_JS_RUNTIMES`,
+  `YOUTUBE_YT_DLP_COOKIES_FILE` → `VIDEO_DIGEST_YT_DLP_COOKIES_FILE`,
+  `YOUTUBE_YT_DLP_COOKIES_FROM_BROWSER` → `VIDEO_DIGEST_YT_DLP_COOKIES_FROM_BROWSER`,
+  `YOUTUBE_MAX_CONCURRENT_ACQUIRES` → `VIDEO_DIGEST_MAX_CONCURRENT_ACQUIRES`,
+  `YOUTUBE_ACQUIRE_PHASE_GAP_SEC` → `VIDEO_DIGEST_ACQUIRE_PHASE_GAP_SEC`. Legacy
+  spellings keep working via a compatibility read that warns once per process; the new
+  name wins when both are set. The `run.mjs` launcher now forwards only the new names.
+
+### Added
+
+- `run.mjs` `--acquire-phase-gap <sec>` leading flag.
+
+## [0.12.6]
+
+### Changed
+
+- **BREAKING: `/knowledge:youtube-digest resume` takes `<slice-slug>` instead of `<video-slug>`
+  (#2818).** The argument names the work-slice directory under `.work/<watch-epic>/`, which may
+  identify an X status post with no video as well as a YouTube video. Same slug value and same
+  on-disk layout; only the user-facing argument name in `argument-hint`, the action router, resume
+  CLI usage, and handoff messaging changed. Stored prompts that still say `resume <video-slug>`
+  should be rewritten to `resume <slice-slug>`.
+
+## [0.12.5]
+
+### Added
+
+- **Scheduled source-adapter liveness lane for the video-digest pipeline (#2797).**
+  Offline hermetic harness under `skills/youtube-digest/extraction/liveness/`
+  (`run-source-liveness.js`, `probes.json`, fixtures) plus advisory workflow
+  `.github/workflows/video-digest-source-liveness.yml` (schedule / dispatch live
+  probes; PR path runs `--offline` only). Never wired into `ci.yml` / `ci-status`;
+  a red live run annotates the job, writes a step summary, and uploads the probe
+  report artifact. It never opens or updates GitHub issues. Auth-required X rows
+  skip without cookies. Owner doc:
+  `skills/youtube-digest/extraction/liveness/LIVENESS.md`.
+
+## [0.12.4]
+
+### Added
+
+- **Owner doc for ingest deferred-with-trigger decisions**
+  (`reference/ingest-deferred-decisions.md`): the five records that outlived the
+  `docpage-digest` Brief: the rung-3/`firecrawl` integration point (user-reserved), repo-tree
+  enumeration, `docpage-digest` rename cost, shared ingest-slice retrofit of sibling skills, and
+  cross-type routing, each with its named trigger. `map-corpus` keeps today's stop/non-goal behavior and
+  points at the owner doc for the durable records. Closes #2707. No behavior, schema, gate, exit
+  code, or argument changes.
+
+## [0.12.3]
+
+### Added
+
+- **`youtube-digest` and `course-digest` gain public test entry surfaces (#2701).** Each skill's
+  new `scripts/run-tests.sh` facade (`install`/`build`/`test`/`all`) delegates into the private
+  `extraction/` npm package; CI and repo docs now invoke the facades instead of running npm
+  directly inside the private subdirectory. The extraction packages themselves are unchanged.
+
+## [0.12.2]
+
+### Changed
+
+- **`map-corpus` states its own deferred decisions instead of pointing outside itself.** The skill
+  cited an authoring-time planning document by label, which no consumer ever receives. That is an
+  unresolvable reference on a shipped surface. Each site is now self-contained: the deferred rung-3
+  decision states its own fork (a presence-gated `/firecrawl:firecrawl map` call versus a recorded
+  reimplementation), its user-reserved arbiter, and its trigger; the deferred repo-tree enumeration
+  rung states its trigger; the opaque `Q19` label is dropped from `SKILL.md`,
+  `discovery/link-map-format.md`, `discovery/check_linkmap.py`, and the eval set; and the
+  whole-snapshot hash in `extraction/node-manifest-format.md` now points at
+  `reference/citation-shape.md`, its actual owner. No behavior, schema, gate, exit code, or
+  argument changes.
+
+## [0.12.1]
+
+### Added
+
+- **Owner doc for the tracked citation shape** (`reference/citation-shape.md`): URL + retrieval
+  date (ISO 8601, UTC) + `sha256:<hex64>` over raw snapshot bytes, with inline and structured
+  forms, an optional node-id sub-resource anchor, and a drift rule (new fetch = new citation;
+  never edit a hash in place). Pays down the debt `map-corpus` recorded ("that citation shape still
+  needs an owner doc before a second skill emits it"). The skill's cite-never-copy gotcha now
+  points at the owner doc instead of naming the debt.
+
+## [0.12.0]
+
+### Added
+
+- **New skill `map-corpus`** (`/knowledge:map-corpus`): map a multi-resource documentation corpus
+  into a verified slice before any digesting: bounded discovery (llms.txt + sitemap, rungs 1–2
+  only; in-page extraction deferred), a user-approved link map classifying every discovered URL
+  with rung provenance, deterministic per-resource node manifests emitted by a script over
+  immutable snapshots, and a per-node relevance inventory whose evidence tokens a script gate
+  byte-verifies. Hands an approved queue to N runs of the unrenamed `docpage-digest` and its
+  handoff to `/planning:interview`. Coverage denominators (URL set, node set) are
+  script-produced, never agent-produced; all three bundled gates fail loudly on unparsable
+  input and report exactly what they exercised. Requires `python3` (3.9+), declared at point of
+  use.
+
+## [0.11.2]
+
+### Changed
+
+- **Docs:** actionable `/plugin configure` guidance now uses the marketplace-qualified form
+  (`<plugin>@<marketplace>`; generated option blocks use `@<marketplace>`) per
+  [`docs/extensibility-contract-smoke-tests.md`](../../docs/extensibility-contract-smoke-tests.md)
+  Test E (#1360). Targetless references to the flow stay unqualified.
+
+## [0.11.1]
+
+### Fixed
+
+- **`docpage-digest`: the Anthropic profile cited a live docs page by line number, and the line had
+  moved.** The `api-only` near-miss sub-shape (3) recorded its sole attested instance as
+  `env-vars.md:394`. On a full verbatim read of that page on 2026-08-10 it runs 458 lines with 315
+  variable rows, line 394 is `DISABLE_UPGRADE_COMMAND`, and the retry/fallback row the instance
+  actually describes is `FALLBACK_FOR_ALL_PRIMARY_MODELS`, the only row on the page that both
+  describes Claude Code's own retry behavior and names a model subject, the sibling
+  `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` naming none. The attestation is intact; its address
+  was not, so the citation now names the variable. A standing rule goes with it: cite a live docs
+  page by anchor, heading, or row key, never by line number, which the `.md` channel renumbers
+  whenever the page gains a row. Line numbers into an archived snapshot stay citable, because that
+  file is immutable.
+- **`docpage-digest`: the profile's absence-fetch rule is now identified as the fleet rung it always
+  was.** The rule itself is unchanged and was already right: `curl` the raw `.md` channel, record
+  the retrieved length, because "a truncated fetch cannot fabricate a PRESENCE, only an ABSENCE".
+  That asymmetry is this pipeline's own and stays here. What is added is one sentence naming it as
+  rung 1 of the
+  [fetch route](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/upstream-drift/README.md#reading-the-basis-the-fetch-route),
+  which the `upstream-drift` convention now owns fleet-wide. This profile's practice was one of two
+  surfaces that route was generalized from, so the pointer records provenance rather than importing
+  anything. Nothing is duplicated into or out of the profile. Its recorded "451-line, 316-row page"
+  is qualified in place: the count has no stated counting rule and this page admits two differing by
+  three, so it supports nothing by subtraction. The rule rests on the unambiguous 277-of-451
+  position and the first-fifth cutoff. Qualified, not deleted, per the profile's own rule that a
+  source artifact is noted at the row and never silently repaired.
+
+## [0.11.0]
+
+### Removed
+
+- **The bare `/<skill>` alias for this plugin's skills.** Their `SKILL.md` files no longer
+  declare a frontmatter `name`. The field is optional and defaults to the directory name, so
+  declaring it only restated the path while registering a second, unnamespaced command, which
+  the slash-command picker then echoed back as `/plugin:skill (skill)`. Invoke a skill by its
+  namespaced command; the command itself is unchanged.
+
+## [0.10.24]
+
+### Changed
+
+- **`course-digest` no longer mandates a progress report every fixed number of lessons.** The
+  fixed-interval status cadence appeared in both the SKILL.md pacing list and the `context/workflow.md`
+  Phase 2 pacing list the phase table routes execution at. Per-lesson crash-safe saving, the
+  per-module save, and the context-pressure checkpoint are unchanged, so extraction durability and
+  the resume path are untouched. Only the forced interim status is gone.
+- **`course-digest` keys session handoff to observable signals instead of a self-estimated context
+  percentage.** The handoff protocol and the pacing checkpoint carried inconsistent `>40%` and
+  `>50%` thresholds, and a model cannot measure its own context occupancy. Both now trigger on a
+  long or quality-degraded session, a compaction, or a session ending mid-pipeline. The
+  continuation-prompt contents, the phase markers, and both resume paths are unchanged.
+
+## [0.10.23]
+
+### Added
+
+- **Anthropic profile's applicability filter gains the `tag-exempt (<sub-shape>)` class.** The
+  vocabulary (`cc-applicable` / `mixed` / `api-only`) adjudicates API-vs-harness guidance, but some
+  rows carry no guidance for any surface it adjudicates: consumer-surface material, an archive's
+  own apparatus, metadata, or a navigation pointer. The closest negative tag misdescribes what
+  such material is. The new class is one disposition with those four documented sub-shapes, the
+  sub-shape named at the row. It describes the material's genre and asserts nothing about harness
+  applicability. It is not a positive tag and not a negative claim, so it owes no live-doc citation and no
+  absence basis, and the near-miss disclosure burden never attaches; `api-only` remains reserved
+  for rows that DO assert a harness absence for their own specific assertion. Consistent with the
+  co-decided positive-tag rule (a positive tag asserts harness applicability and requires a
+  live-doc citation): the class carries neither assertion, so neither evidence obligation.
+
+## [0.10.22]
+
+### Changed
+
+- **Anthropic profile's model-matching table catches up with the dateless model-ID scheme.** The
+  table's model-pin cell warned "never a bare family alias, which resolves to the current family
+  model" and demanded "a full model ID". That is vocabulary from the dated-snapshot era. The live
+  model-IDs-and-versioning page now states that since the 4.6 generation the canonical model ID is
+  dateless (`claude-{name}-{major}[-{minor}]`) and "is not an alias. It is the snapshot", so the
+  old wording would misclassify exactly the correct pin for a current-generation model guide as a
+  forbidden alias and fall through to the session default. The cell now pins "its pinned model ID,
+  never an alias that can move to a newer snapshot", and a sentence under the table routes the
+  generation-dependent pinned-vs-alias resolution to the live page at spawn time
+  (pointer-not-copy; verified against the live page 2026-08-04, raw `.md` channel, 3836 bytes).
+
+## [0.10.21]
+
+### Changed
+
+- **`whats-new-opus-5` moves from deferred to the Anthropic profile's Models queue, on grounds its
+  own trigger never supplied.** The deferral read "release notes for a model the models `overview`
+  page already covers canonically; enqueue when Opus 5 enters or materially changes a fleet lane",
+  and that trigger has not fired. What moved the entry is custody: the `playbooks` Opus 5
+  model-adaptation chapter already cites this page as **sole authority** for three shipped claims:
+  thinking on by default, the 400 the API returns when thinking is disabled above effort `high`, and
+  the live effort-level enumeration that establishes the upstream Opus 5 prompting guide's own ladder
+  statement as truncated (all three re-verified live 2026-08-03), and the `overview` page carries
+  none of them. The deferral's premise is therefore
+  false for exactly the facts already in use: doctrine ships on a page with no digest slice and no
+  custody record. Scope is this one page, not a reopened release-notes lane. `whats-new-sonnet-5`
+  carries no such citations and keeps its identical trigger.
+
+## [0.10.20]
+
+### Added
+
+- **Anthropic profile gains archive-reading conventions.** Some pages this publisher maintains are
+  archives: dated entries accumulated over time rather than a current statement, the [published
+  system prompts](https://platform.claude.com/docs/en/release-notes/system-prompts) being the
+  standing case. Three of their properties are invisible from inside any single entry, so a
+  digest that does not know them reads the archive wrong in a way its own verification cannot catch.
+  Each was found independently by multiple digest units before it became a convention. **(1) A dated
+  entry is not a content-change signal:** two entries five days apart are byte-identical, differing
+  on zero lines across 100-line bodies, with no annotation explaining why the second exists, so a
+  new dated heading licenses no inference of revision, intent, or policy movement. The rule is
+  stated in the narrower **content-change** form, which is what the finding supports: it bars
+  inferring change from sameness, and leaves a reader free to read an actual textual narrowing
+  between two entries as the change it is. **(2)
+  Absence of bold does not prove absence of change:** the page states that updates between versions
+  are bolded and the convention does not hold. One span carries zero bold markup across three dated
+  entries differing in three sentences plus a twelve-paragraph addition, another marks one
+  transition of three, and silent unbolded typo fixes and a silent removal were found the same way,
+  so deltas come from diffing entries and never from reading the markup. **(3) Note a source
+  artifact at the row; never silently repair it:** typos, escaped markup and malformed auto-links
+  are reproduced byte-exact so a verifier can tell faithful reproduction from digest transcription
+  error, with the blog channel's two known extraction artifacts named as the standing instance
+  rather than restated. Its one exception runs the other way. A downstream artifact reproducing a
+  known-corrupt entry *for a reader* rather than for verification repairs the corruption and says
+  that it did. The property all three refine, that everything inside a dated entry is scoped to that
+  entry's date, opens the section as its premise rather than as a fourth rule.
+
+- **Anthropic profile gains hedge preservation and the residual-risk footer.** A source's own hedge
+  now travels with the content it qualifies: an artifact graduated from this publisher preserves the
+  hedge as the source states it, neither dropped as throat-clearing nor widened past what the source
+  claims. Two instances graduate under the one convention rather than each inventing its own: the
+  residual-risk footer below, and the harness best-practices material's "starting points, not set in
+  stone" relativization. The **footer** is quoted rather than paraphrased from [Reduce
+  hallucinations](https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/reduce-hallucinations)
+  (re-fetched 2026-08-03, HTTP 200; the sentence is byte-identical to the snapshot the corpus
+  froze): *"Remember, while these techniques significantly reduce hallucinations, they don't
+  eliminate them entirely. Always validate critical information, especially for high-stakes
+  decisions."* **Its scope is the source's own and is deliberately not broadened.** It is about
+  hallucinations, not errors or guardrail failures in general, and it names **no validator**, since
+  who or what validates critical information is unstated in the source. That exact scoping is the
+  part most likely to be lost in transit: it survived two correction rounds during the slice's
+  verification, both of which caught a widening. It attaches **at the profile rather than per
+  artifact**, because the profile is the one file every guardrail slice of this publisher flows through,
+  so a graduated chapter or template cites the footer and never restates it.
+
+## [0.10.19]
+
+### Changed
+
+- **Anthropic profile: the doc queue is repopulated from the Sitting-5 doc-queue dispositions.**
+  The queue had been emptied as its slices completed, so twelve adopted rows had nowhere to land and
+  the pipeline had no stated next page. Counted at the bytes, one bullet per page: **14 pages
+  queued** across seven groups, and **5 pages deferred with triggers**. The deferred section now
+  holds six bullets, the sixth being `task-budgets`, which predates this batch. Each entry carries
+  the reason it is where it is rather than a bare URL.
+- **`thinking-troubleshooting` is queued first, on a corrected rationale.** DQ-2's original ground,
+  that the page backs the thinking doc set's *weakest* absence check, is not what the corpus says.
+  The check is **falsified, not weak**: the harness carries a parallel troubleshooting surface
+  (`errors.md`, `prompt-caching.md`), which is why the page's transfer is demonstrated rather than
+  conjectured and why digesting it lets the corpus state the mapping instead of guessing at it.
+  Carrying the old wording forward would have re-inherited a premise the evidence disproves. Rider
+  R1, the `api-only` → `mixed` retag the falsification compels on the affected claim, was
+  discharged separately on 2026-08-03 and does not close silently with this enqueue.
+- **Companion-doc order amended: `memory` moves to second.** DQ-9's source ranked
+  `how-claude-code-works` ahead of it and held `memory` entirely. Two things have moved since:
+  `memory.md` carries four to five times the corpus citation load of either page ranked ahead of it
+  (47 line-anchored citations across 22 distinct sites in 18 files, against 11/6/9 and 9/5/6), and
+  `claude-memory:audit` became a live adopted routing destination for memory-layer findings.
+  `features-overview` keeps first place on its own reasoning; `common-workflows` stays held as
+  recipe-level content whose citations are concentrated rather than distributed.
+- **The Agent SDK entry queues one page, not the SDK doc set.** All thirty snapshotted `agent-sdk_*`
+  pages sit inside the harness boundary, so a loosely phrased entry would take a scope decision
+  nobody has made. The heading states the boundary instead of leaving it to inference.
+- **Two pages fold into existing entries rather than gaining their own (DQ-15).**
+  `whats-new-sonnet-5` is already a subject of the models deferral with a trigger, and a second
+  differently-triggered standalone entry is how one page acquires two custody records that drift
+  apart; `prompting-best-practices` is API-side content this corpus points at rather than digests.
+  The source's premise that best-practices was "already in the profile doc queue" is false at the
+  bytes. It never has been. The disposition is unaffected, because folding resolves to no
+  standalone entry either way.
+- **Retention and ZDR are queued as one slice, and the slice remains owner-vetoable.** A corpus that
+  will be pointed at repositories we do not control is precisely the one that should not be silent
+  on retention: it is the one queued topic carrying compliance weight, and both properties are
+  already in scope. The slice drains as three page runs per the engine's one-page-per-run rule;
+  the API lane is the only page not already held in the harness snapshot. The org-policy posture
+  is the argument for it rather than against, but the posture is real
+  and cuts against the standing self-alignment-before-packaging ordering, so the enqueue is recorded
+  as still open to an owner veto. A queue entry is trivially reversible if that veto fires.
+- **The engineering-post entry's contingency is discharged.** Its enqueue was sequenced behind the
+  engineering-property profile edit, which landed in 0.10.18, the same merge that closed that
+  property decision's veto window, so the entry ships unconditionally; the deferred-with-trigger
+  fallback written for a fired veto never engaged.
+
+## [0.10.18]
+
+### Changed
+
+- **Anthropic profile: `anthropic.com/engineering` is now an in-scope property.** The profile
+  scoped this publisher to `platform.claude.com`, `code.claude.com`, and `claude.com/blog`, which
+  put Anthropic's own engineering posts outside the pipeline even though they are first-party and
+  are the stated best-practices channel for several topics the corpus already wants. Engineering
+  pages are in scope by default now, rather than admitted one at a time by exception. That is the
+  same coverage either way, with an honest boundary instead of a growing list of one-off exemptions.
+  Two standing costs come with it and are not yet written into any rule: the vendor-blog
+  attestation bullet below still names `claude.com/blog` literally and does not reach the new
+  property, and unlike the two docs properties, `anthropic.com/engineering` publishes no
+  machine-readable page index, so page selection and absence checks against it have no instrument.
+- **Anthropic profile gains a fourth artifact target: cross-slice synthesis.** The taxonomy named three
+  targets, all of which describe a shape a cross-model synthesis artifact is not: it is not
+  per-model, not an audit rule row, and not graduation of one slice. Content deferred to such a pass
+  therefore had nowhere to route: the digest fan-out is barred from reaching across units by design,
+  and no later pipeline stage exists to pick it up. Four units in one slice deferred content into
+  that gap. The target is named without a host. Which repository or surface it lands in is a
+  separate decision no run has taken, so the taxonomy stops silently converting cross-unit findings
+  into out-of-scope ones.
+
+## [0.10.17]
+
+### Changed
+
+- **Anthropic profile: "harness surface" now has a written definition, and three shapes that come
+  close without falsifying `api-only`.** J-12 was one of the five items 0.10.16 deliberately held
+  for the dispositions interview; it is answered here. A harness surface is a surface a user can
+  reach. Two of the three non-falsifying shapes, a **counterpart artifact** and a
+  **same-workload mention**, carry an identical adjudication from two independent verification
+  arms. The third, **harness-internal recognition or support** (a harness doc naming the subject in
+  describing the harness's own behavior toward it, with no user-reachable path), is new: it rests on
+  one attested instance, and the amendment is labeled as the campaign's own choice rather than an
+  inherited adjudication, because nothing in the corpus ever defined the term. Every such hit is
+  still disclosed as a near-miss under 0.10.16's rule, which this appends to rather than replaces.
+  Without the definition, an `api-only` tag turned on whether the reader read "harness surface" as
+  user-reachable selection or as any harness mention at all, and the two readings disagree on real
+  rows.
+- **Anthropic profile: bare names are not API surfaces.** The `cc-applicable`/`mixed` boundary now
+  says what an API surface is not: a product name, display name, or docs-path slug never by itself
+  triggers `mixed`, and the enumeration gains the fourth surface it had been missing (model ID)
+  alongside parameter, endpoint, and SDK call. This ratifies a standard 15+ rows in the
+  models-explained slice already stood on and a cross-vendor retag already applied in-slice. It is
+  written down, not invented. It also gives the tier-name line `changelog.md:961` a destination: the
+  harness-surface definition above excludes it from sub-shape (3), and this rule is what it routes
+  to instead: a bare-name near-miss, disclosed under 0.10.16's rule, neither an API surface nor a
+  harness surface.
+
+## [0.10.16]
+
+### Changed
+
+- **`docpage-digest`: a second batch of the campaign's evidence-forced amendments.** Same standard
+  as 0.10.15: each rule below was forced by a defect the pipeline's own runs produced, and each
+  states its evidence inline. Not the last batch. The two classes held below say why.
+- **Anthropic profile: what falsifies `api-only`, written down once.** Only the corpus documenting
+  the claim's *own specific assertion* falsifies the tag; topical overlap never does. Below that
+  line sits the **near-miss**, a harness page covering the row's subject without stating its
+  specific rule. The tag survives, and the row must name the near-miss by page and line, so an
+  affirmative "no surface" or "undisclosed" phrasing in such a row is simply false. Undisclosed
+  near-misses were the largest MINOR class in the slice that measured them, with one unit disclosing
+  24 on its own, and the rule had been re-derived per unit rather than written down.
+- **Anthropic profile: the two reproducible `claude.com/blog` extraction artifacts are recorded**
+  (H1 word-spacing collapse; reading-time value and unit split across lines) with reconstruction
+  from the canonical URL slug, labeled reconstructed because a slug recovers word boundaries only.
+  Both reproduced exactly across two blog runs, which is what the earlier deferral was waiting for.
+
+Two classes of item are deliberately **not** applied here, for two different reasons.
+
+Three change instruments live in the campaign's untracked work root, not in the shipped plugin:
+making the quote checker a required artifact (whose own precondition, unrecognized-row detection
+erroring loudly, cannot be demonstrated as shipped), the command-replay gate reading only the first
+number of a `→ N lines, M files` pair, and the absence-measurement script skipping positive rows.
+Whether any of those graduates into the skill is a scope decision, not a forced one.
+
+Five more are held for the dispositions interview, having been reclassified out of this batch. The
+campaign's triage marks each `evidence-forced`, but the judgment-amendments file writes all five up
+as judgment calls with two named readings apiece: vendor-voice attestation for blog material
+embedded in a non-blog page (J-6), splitting the two questions a positive tag's row collapses (J-7),
+naming the publisher's `llms.txt` index as the page-selection instrument (J-8), the scope of
+"harness surface" for counterpart artifacts and same-workload mentions (J-12), and the standing
+convention for site-injected matter in a snapshot (J-14). That file's own reasoning governs: J-14
+says outright it is held "only because no defect was demonstrated, so the bar for the applied subset
+is not met", and J-7 says it should be decided *after* the Decision-A ordering question already
+escalated to the maintainer. All five now carry recommendations in the interview's decision block.
+The contested tag-vocabulary questions therefore remain where 0.10.15 left them, and these five join
+them: with the dispositions interview.
+
+## [0.10.15]
+
+### Changed
+
+- **`docpage-digest` now carries the evidence-forced rules the eleven-run digest campaign proved on
+  itself.** Every rule below was demonstrated as a defect by the pipeline's own runs, not proposed
+  abstractly, and each states its evidence inline so a later maintainer can see why it exists.
+- **Anthropic profile: absence and citation evidence.** An `api-only` basis now records the exact
+  command and its raw result count rather than a prose summary of what was checked; every non-zero
+  result names its match site(s), with a sampled hit set stating that scope at the row; and a cited
+  `file.md:NN` counts as disclosed only when a command recorded in that same row produces it.
+  Absence-establishing fetches must use the raw `.md` channel with `curl` and record the retrieved
+  length. A rendered fetch of a long page returns a silent prefix, and truncation can fabricate an
+  absence but never a presence.
+- **`SKILL.md` Phase 4: verification-record discipline.** No tree moves until every dispatched arm
+  has reported; every correction round leaves a dated applied record whose "New findings" section is
+  a required input to the next round's brief; verdicts land in `verification/` or they did not
+  happen; a mechanical gate errors loudly on input it cannot parse and is fixed *before* it is made
+  required; commands are replayable in every pipeline artifact, not just digest rows, and each is
+  replayed where it is authored, the Phase 5 handoff included, which no Phase 4 pass can reach; and
+  the digest set is reconciled against itself before Phase 5, since every other check is scoped
+  within a row.
+
+Contested amendments the campaign also surfaced are deliberately **not** applied here. The tag
+vocabulary questions (metadata and consumer-surface classes, pointer/navigation claims, archive-page
+representation, the form `api-only` corroboration should take) have two defensible readings each and
+belong to the dispositions interview, alongside the already-escalated Decision-A ordering question.
+
+## [0.10.14]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: system-prompts release-notes entry removed, and the doc
+  queue is now empty.** The `platform.claude.com/docs/en/release-notes/system-prompts` slice
+  completed with 18 digests over a 2,548-line source, 659 claim rows, 561 `api-only`. It is the
+  largest slice the pipeline has run and the last entry in the queue; only the deferred
+  task-budgets trigger entry remains, which was never queued.
+- **The "Supplementary references" heading is removed with it**, since the entry was the last one
+  under it.
+
+Verification reached `VERDICT: PASS` on both arms across the run's rounds, on SHA-256-pinned bytes,
+with a final confirming round after the last corrections. Residual MINOR findings are disclosed in
+the slice's `interview-handoff.md` as Open questions for the batched dispositions interview, per the
+run's stopping rule; one contested tag-ordering question is escalated there as a candidate profile
+amendment rather than decided in-run.
+
+## [0.10.13]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: verification-loops blog entry removed, and the "Blog posts"
+  heading with it.** The `claude.com/blog/building-verification-loops-in-claude-code-with-skills`
+  slice completed, raw-md fetch through interview handoff, with dual verification reached on
+  identical SHA-256-pinned bytes (both arms PASS, no MAJOR findings), so its entry leaves the doc
+  queue per the queue's remove-on-completion rule, and the heading is removed because it emptied.
+  The slice exercised the vendor-blog attestation rule (profile 0.10.9) at scale: all 44
+  `vendor-claimed` rows carry a targeted row-local `platform.claude.com` check, because the rule's
+  predicate, "no harness **or platform** doc states the same assertion", names both properties and
+  a harness-only search never establishes it.
+
+## [0.10.12]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: resources-overview queue entry removed.** The
+  `platform.claude.com/docs/en/resources/overview` slice completed, raw-md fetch through interview
+  handoff, with dual verification reached on identical SHA-256-pinned bytes (both arms PASS, no
+  MAJOR findings), so its entry leaves the doc queue per the queue's remove-on-completion rule. The
+  "Supplementary references" heading remains: the system-prompts release-notes page is a separate
+  concurrent run under the same heading, and its own queue PR removes the heading when it empties.
+
+## [0.10.11]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: thinking-steering-and-cost queue entry removed, emptying
+  the "Thinking" category.** The thinking-steering-and-cost platform doc slice completed, raw-md
+  fetch through interview handoff, dual verification (three correction rounds, re-verified PASS by
+  both arms on identical frozen bytes, no degraded fallback), so its entry leaves the doc queue
+  per the queue's remove-on-completion rule, and the now-empty "Thinking" category heading goes
+  with it, as its paired run-9 entry's PR anticipated. Both overlapping thinking docs are now
+  digested, one page per run under the category's contract.
+
+## [0.10.10]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: thinking queue entry removed.** The extended-thinking
+  platform doc slice completed, raw-md fetch through interview handoff, dual verification (one
+  correction round of ten items, re-verified PASS by both verifiers, no degraded fallback), so
+  its entry leaves the doc queue per the queue's remove-on-completion rule. The paired
+  thinking-steering-and-cost entry and the "Thinking" category heading remain: that page is a
+  separate concurrent run under the category's one-page-per-run contract, and its own queue PR
+  removes both.
+
+## [0.10.9]
+
+### Fixed
+
+- **Vendored `video-digestion` frame counting no longer stops at 500 frames.**
+  `countFrameFiles` carried a `max = 500` default bound, so a video with 500 or more
+  contiguous extracted frames silently lost everything past frame 500, about 4h10m at the
+  interval fallback's 1 frame / 30 s, truncating long conference recordings with no warning.
+  Counting is now unbounded and ends only at the first gap in the sequence, for both scene
+  and interval frames. Mirrored from the medley SSOT
+  (`melodic-software/medley#1687`), where the authored fix and its regression test live.
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: models-explained blog queue entry removed.** The
+  claude-models-explained blog slice completed, rendered-channel fetch (raw-md confirmed
+  absent, matching the profile's blog-post channel note) with firecrawl extraction, through
+  interview handoff, dual verification (two correction rounds, re-verified REVERIFY2: PASS by
+  both verifiers, no degraded fallback), so its entry leaves the doc queue per the queue's
+  remove-on-completion rule, taking its inlined seven-item pairing cross-link contract with it
+  (the contract was executed by the slice; its results live in the slice's handoff).
+- **`docpage-digest` Anthropic profile: vendor-blog attestation rule.** Blog-only assertions
+  (behavioral, performance, figure/percentage, comparative, positioning, an illustrative, not
+  exhaustive, list) carry an assertion-specific `vendor-claimed (blog, <fetch date> fetch)`
+  marker beside their vocabulary tag, never satisfied by related-property citations, never
+  co-occurring with a same-assertion live-doc citation, never deferred to the interview. Closes
+  the rule gap the context-engineering blog slice's handoff flagged (its OQ-3), with the shape
+  enforced end-to-end by both verifiers on this slice.
+
+## [0.10.8]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: choosing-a-model queue entry removed.** The
+  choosing-a-model digest slice completed, raw-md fetch through interview handoff, dual
+  verification (two correction rounds, re-verified REVERIFY2: PASS by both verifiers, no
+  degraded fallback), closing the entry's second half; its routing-vet half was already
+  executed 2026-07-29 (#1697). The emptied "Model selection" special-handling category goes
+  with it. The paired models-explained blog entry now points at the completed slice's handoff
+  for its pairing observations.
+
+## [0.10.7]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: increase-consistency queue entry removed.** The
+  increase-consistency guardrail slice completed, raw-md fetch through interview handoff,
+  dual verification (one correction round, re-verified REVERIFY: PASS by both verifiers, no
+  degraded fallback), so its entry leaves the doc queue per the queue's remove-on-completion
+  rule. It was the last remaining guardrail guide, so the emptied category heading goes with it.
+
+## [0.10.6]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: reduce-hallucinations queue entry removed.** The
+  reduce-hallucinations guardrail slice completed, raw-md fetch through interview handoff,
+  dual verification (two correction rounds, re-verified REVERIFY2: PASS by both verifiers, no
+  degraded fallback), so its entry leaves the doc queue per the queue's remove-on-completion
+  rule. The increase-consistency guardrail entry remains queued.
+
+## [0.10.5]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: best-practices queue entry removed.** The
+  code.claude.com best-practices slice completed, raw-md fetch through interview handoff,
+  dual verification (one correction round, re-verified REVERIFY: PASS by both verifiers, no
+  degraded fallback), so its entry leaves the doc queue per the queue's remove-on-completion
+  rule. It was the sole "Applies across all of the above" entry, so the emptied category
+  heading goes with it.
+- **`docpage-digest` Anthropic profile: applicability-filter clarification from that slice's
+  verification.** A digested page that is itself a live code.claude.com harness doc serves as
+  its own row-local basis for intrinsic harness-guidance claims; the boundary rule still routes
+  API-surface-naming claims to `mixed`, with third-party APIs counting as API surfaces.
+
+## [0.10.4]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: sonnet-5 prompting-guide queue entry removed.** The
+  prompting-claude-sonnet-5 slice completed, raw-md fetch through interview handoff, dual
+  verification with corrections applied and cross-vendor re-verified, so its entry leaves the
+  doc queue per the queue's remove-on-completion rule. It was the last remaining per-model
+  guide, so the emptied category heading goes with it.
+- **`docpage-digest` Anthropic profile: applicability-filter clarifications from that slice's
+  verification.** Evidence is row-local ("same basis as claim N" never satisfies the contract),
+  and `unverified-inference` is an additional uncertainty marker, never a substitute for the
+  `cc-applicable`/`api-only`/`mixed` tag itself.
+
+## [0.10.3]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: context-engineering blog queue entry removed.** The
+  new-rules-of-context-engineering blog slice completed, rendered-channel fetch (raw-md
+  confirmed absent for this page, matching the profile's blog-post channel note) through
+  interview handoff, dual verification (both verifiers returned corrections; all applied and
+  cross-vendor re-verified), so its entry leaves the doc queue per the queue's
+  remove-on-completion rule.
+
+## [0.10.2]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: fable-5 prompting-guide queue entry removed.** The
+  prompting-claude-fable-5 slice completed, fetch through interview handoff, dual verification
+  (same-vendor PASS; cross-vendor corrections applied and re-verified PASS), so its entry
+  leaves the doc queue per the queue's remove-on-completion rule. The two thinking docs the
+  effort-slice disposition enqueued were already queued in 0.10.1; verified still live at their
+  queued URLs.
+
+## [0.10.1]
+
+### Changed
+
+- **`docpage-digest` Anthropic profile: applicability-tag boundary + doc-queue dispositions.**
+  The Claude-Code-applicability filter gains the `cc-applicable`/`mixed` boundary rule (a claim
+  naming an API surface tags `mixed` even when its guidance transfers; `cc-applicable` is
+  reserved for claims naming no API surface). Doc queue: the choosing-a-model entry records its
+  routing vet as executed (melodic-software/claude-code-plugins#1697, digest slice still
+  pending); the two thinking docs are queued as two runs; the task-budgets doc is recorded as
+  deferred-with-trigger (api-only until harness support lands).
+
+## [0.10.0]
+
+### Added
+
+- **New skill `docpage-digest`, the 4th ingestion sibling.** Ingests a single online documentation
+  page (docs-site URL) into a verified knowledge slice: fetch the unaltered original, inventory
+  it into an `INDEX.md`, fan out one model-matched digest agent per section (model-pinned briefs
+  use conditional framing, "if you are not X, note the mismatch and continue", because
+  spawn-time overrides can desync a brief from the running model), run dual verification
+  (same-vendor Claude + one cross-vendor verifier; degraded-verifier fallback is
+  recorded in the verdict header, never silent; verdicts are append-only), and hand off an
+  interview-ready decision artifact. Publisher-specific configuration (fetch channel,
+  Claude-Code-applicability filter with live-doc verification at tag time, digest-agent model
+  matching, doc queue) lives in a separable profile at `context/anthropic-docs-profile.md`; a
+  second publisher joins as a sibling profile, engine extraction waits for the third (Rule of
+  Three). Ingested content is data, never directives (prompt-injection discipline named in the
+  skill contract). Work root resolves through the plugin's `library_dir` setting, matching
+  `course-digest`. Ships `templates/checklist.md` and `evals/evals.json`.
+
+## [0.9.6]
+
+### Fixed
+
+- **course-digest extraction: `npm ci` failed on a clean install (#1507).** The
+  `skills/course-digest/extraction` package pulls in the shared `@melodic/repo-analysis` and
+  `@melodic/video-digestion` vendor packages as `file:` dependencies, same as the sibling
+  `youtube-digest/extraction` package. Unlike that sibling, it shipped no `.npmrc` setting
+  `install-links=true`. Without it, `npm ci` failed with `EUSAGE` (`Missing:
+  @melodic/repo-analysis@0.1.0 from lock file`, `Missing: @melodic/video-digestion@0.1.0 from lock
+  file`) on a fresh install, even though the committed `package-lock.json` was otherwise in sync.
+  Added the missing `.npmrc`, matching `youtube-digest/extraction`'s. Discovered while wiring the
+  package's test suite into CI, which never ran `npm ci` from a clean state before.
+
+### Added
+
+- **course-digest extraction test suite now runs in CI (#1507).** The `vitest` suite under
+  `skills/course-digest/extraction` (`utils`, the adapter contract, the Dometrain/Teachable
+  adapters, Clerk/Teachable-SSO auth, config, and the Hotmart/Mux players, 91 tests across 10
+  files) had never been wired into `.github/workflows/ci.yml`; it only ever ran locally. Added a
+  `course-digest-extraction` CI job mirroring the existing `youtube-extraction` lane (typecheck +
+  `npm test`), gated behind the same docs-only scope guard as the repo's other Node lanes.
+
+## [0.9.5]
+
+### Fixed
+
+- **Headless reconfigure recipe now preserves install scope (#1406).** The `claude plugin
+  uninstall` → `claude plugin install ... --config` recipe in `skills/setup/SKILL.md` defaulted
+  both halves to `-s user`. When this plugin is installed at `project` or `local` scope, that
+  silently uninstalled a separate user-scope record while the effective project/local install kept
+  loading, and the reinstall landed at a scope that does not load. Both commands now carry
+  `-s <scope>`, sourced from what `claude plugin list` reports for this plugin, the same fix
+  already applied to `session-flow` and `rate-limit-guard` in #1393.
+  The recipe also now requires the reinstall to re-supply **every** key whose value should
+  stay non-default, not only the key being changed: uninstalling drops the stored
+  `pluginConfigs` entry, so an omitted key silently falls back to its manifest default.
+  Record the current values before uninstalling.
+
+## [0.9.4]
+
+### Fixed
+
+- **youtube-digest: resume recovers an explicit `--target`** (#1356): `watch --target <repo>`
+  resolved a synthesis target, but nothing in the extraction runtime persisted it.
+  `WatchState` had no target field, and `buildContinuationPrompt()` never told a resumed
+  session where to find it, so an interrupted cross-repo watch lost the resolved target and
+  `resume` had to re-infer or re-ask. `run-watch.js` now accepts `--target <repo>`, threads it
+  into `createWatchState()`, and `watch.json` records the portable name (never a machine-local
+  absolute path). `buildContinuationPrompt()` and `run-resume.js`'s JSON output now surface the
+  recorded target so a resumed session reuses it instead of re-asking.
+
+## [0.9.3]
+
+### Fixed
+
+- **youtube-digest: contact-sheet retention wording + `--target` resolution gap**
+  (#1015): the intro paragraph called the `key-frames/contact-sheets/` snapshot
+  "temp-only handling," contradicting the Output contract's "local DR snapshot,
+  gitignored" characterization of the same directory; reworded to "never-committed
+  handling" so the snapshot reads as a durable-on-disk-but-gitignored instance, not
+  temp state. `--target <repo>` resolution now requires a **local working tree on
+  disk** (not just a name) because `templates/synthesis-item.md`'s grep-backed
+  **Target touchpoints** need a tree to grep; an explicit `--target` with no local
+  checkout now halts and asks for its path instead of falling through to
+  `CLAUDE_PROJECT_DIR`/CWD or inventing paths. `README.md`'s `**Target:**` line
+  records the target's portable name only, never the machine-local checkout path,
+  since that README is a staged artifact. It is a record for readers and downstream
+  consumers of a finished slice, not resume state.
+
+## [0.9.2]
+
+### Fixed
+
+- **youtube-digest extraction: deterministic dev installs** (#905): `npm ci` in
+  `skills/youtube-digest/extraction` failed from a clean checkout. The committed
+  lockfile pins the shared `vendor/` packages as packed installs (the mode
+  `setup-deps.mjs` uses via `--install-links`), while a plain `npm install`
+  resolved them as symlinks, skipped their dependencies (`imghash`), and rewrote
+  the lockfile into the mismatched link shape. A committed `.npmrc`
+  (`install-links=true`) pins the packed mode for every install command, so dev
+  installs match the runtime path and the lockfile stays stable. CI gains a
+  `youtube-extraction` lane (clean `npm ci` + typecheck + vitest) so this drift
+  class can no longer go latent.
+
+## [0.9.1]
+
+### Changed
+
+- **youtube-digest: synthesis is now framed against a resolved target, not an
+  implicit "the repo I'm in".** `templates/recommendations/menu.md`,
+  `templates/synthesis-item.md`, and `templates/readme-journey.md` referenced
+  the invoking repo by assumption; a session running from a separate corpus
+  checkout had no way to say which repo the menu was actually for. `SKILL.md`
+  now documents a "Synthesis target resolution" ladder: explicit `--target
+  <repo>` argument (any `watch` form) → the invoking project when run
+  standalone → ask. The templates substitute `{target}` instead of
+  assuming the CWD. `recommendations/**` is documented as this skill's own
+  ephemeral, target-bound deliverable, expected to be superseded by the
+  designed-but-unbuilt `/knowledge:apply` report→diff→PR flow
+  (`docs/knowledge-integration-design.md`) once that skill ships.
+- **youtube-digest: two known agnosticism gaps are now named explicitly in
+  `SKILL.md` instead of left silent.** The `library_dir` setting relocates the
+  `.work/<watch-epic>/<video-slug>/` work *root* but not that sub-path's
+  *shape*. A corpus consumer whose own convention differs (e.g.
+  `sources/<type>/<slug>/`) does not get that shape today. Separately, raw
+  video, bulk frames, and working contact sheets stay OS-temp-only by design
+  (contact sheets do get a gitignored, slice-local disaster-recovery snapshot
+  at `key-frames/contact-sheets/`, but that is not committed durable
+  retention); a consumer that wants these retained as a committed,
+  re-runnable substrate does not get that today either. Both are called out as tracked follow-ups rather
+  than an unstated limitation a consumer discovers by hand. Doc-only; no
+  pipeline behavior changes.
+
+## [0.9.0]
+
+### Added
+
+- **`library_dir` portable value forms** (#798): the setting now accepts a leading `~`
+  (home-relative) and environment-variable references `${NAME}` / `%NAME%` (e.g.
+  `${KNOWLEDGE_CORPUS_DIR}`) alongside the existing relative and absolute literals, so a
+  machine-varying corpus root (a non-home drive, a per-machine checkout) never requires a
+  literal machine-specific path in stored configuration, the form guardrail hardcoded-path
+  checks block. The youtube-digest launcher (`run.mjs`) expands both forms in `--work-root`
+  (`expandPathValue` in `lib/run-args.js`), failing loud on an unset variable or a
+  non-absolute expansion; literal values pass through unchanged (back-compat). The
+  youtube-digest artifact-landing contract, README option table, plugin manifest option
+  description, and setup mismatch guidance document the forms. Env-var indirection was
+  chosen over a ghq-derived scheme, which would couple the setting to ghq presence; a ghq user
+  points the variable at the ghq-derived path instead.
+
+## [0.8.4]
+
+### Changed
+
+- Skills with `!` dynamic-context injections now declare `shell: bash` explicitly, per
+  the pinned precompute convention. Bash-only pipelines must not fall through to a
+  PowerShell host.
+
+## [0.8.3]
+
+### Fixed
+
+- **youtube-digest: resolved a self-contradiction in `SKILL.md` about `.work/`
+  commit behavior.** The video-slug carve-out prose claimed the `.work/` root
+  "self-ignores (a `.gitignore` containing `*`) and is never committed", an
+  unimplemented statement (no code writes a root `*` ignore) that directly
+  contradicted the Output contract, where ~35 slice artifacts are marked
+  `Staged: yes`. The prose now states the committed reality: slice artifacts are
+  the durable substrate, staged and committed per the Output contract *when the
+  resolved work root is not itself gitignored*, with the contact-sheet JPGs held
+  out of git in every case by the per-directory `.gitignore` (`*.jpg`) that
+  `snapshot-bootstrap.js` writes. It also surfaces the precondition the old text
+  elided: a co-resident topic-docs convention self-ignores the shared repo-root
+  `.work/` (default `memory_dir`), leaving slices local until the work root is
+  relocated (e.g. a non-default `library_dir`). Doc-only; no pipeline behavior
+  changes.
+
+## [0.8.2]
+
+### Changed
+
+- Documentation-only: the License section now states the plugin's own MIT
+  license inline and no longer points at a `LICENSE` file at the repository
+  root, which an installed consumer running from the isolated plugin cache
+  cannot reach. No behavior change.
+
+## [0.8.1]
+
+### Changed
+
+- **youtube-digest: the `variation-matrix-backlog.json` manual smoke-test log is
+  demoted out of `evals/fixtures/`.** It is a tracking backlog of candidate videos
+  across footage variations (status notes, blocked-caption records), not an
+  input→expected-output graded fixture. No eval `files[]` entry or test consumed
+  it. Moved to the skill's `reference/`; `SKILL.md` and vendor `TUNING.md` prose now
+  point at the new path, and its grandfather line is removed from
+  `scripts/orphaned-fixtures-baseline.txt`.
+
+## [0.8.0]
+
+### Changed
+
+- **Setup adopts the uniform `check` / `apply` contract and covers the extraction
+  prerequisites.** The read-only `check` (default) verifies `library_dir` against the
+  repository's artifact convention and probes the shared node dependencies, Playwright
+  Chromium, and the OS-level media tools (`yt-dlp`, `ffmpeg`, ImageMagick 7) as
+  PASS/FAIL/INFO. `apply` routes `library_dir` changes through Claude Code's plugin
+  configuration prompt (never hand-editing `pluginConfigs`); `apply install-deps` runs the
+  youtube-digest and course-digest `setup-deps.mjs` provisioners, the same idempotent
+  scripts the ingest skills already run, pulling the prerequisite/provisioning surface onto
+  the setup contract. The personal env-channel scalars are unchanged.
+
+## [0.7.1]
+
+### Changed
+
+- README declares the shell mechanics with their Windows path (Git Bash
+  bundles the `sha256sum` that `book-distill` runs on every distillation) and
+  the EPUB branch's `unzip` requirement (not bundled with Git Bash), part of the
+  cross-platform declaration wave. PDF-only use needs neither extra install.
+
+## [0.7.0]
+
+### Changed
+
+- **`youtube-digest` yt-dlp / throttle scalars migrated to personal `userConfig`.** Four
+  options, `yt_dlp_js_runtimes` (string, default `node`; `off` omits `--js-runtimes`),
+  `yt_dlp_cookies_file` (string, path to a Netscape cookies.txt), `yt_dlp_cookies_from_browser`
+  (string, e.g. `chrome`/`firefox`/`edge`), and `max_concurrent_acquires` (number, default 1,
+  1–3), are now configured through Claude Code's plugin-configuration prompt and wired into the
+  extraction pipeline as leading `run.mjs` flags (`--js-runtimes`, `--cookies-file`,
+  `--cookies-from-browser`, `--max-concurrent-acquires`), exactly as `library_dir` wires
+  `--work-root`. The launcher translates each flag into the environment variable the extraction
+  child already reads.
+- **BREAKING: the `YOUTUBE_YT_DLP_JS_RUNTIMES`, `YOUTUBE_YT_DLP_COOKIES_FILE`,
+  `YOUTUBE_YT_DLP_COOKIES_FROM_BROWSER`, and `YOUTUBE_MAX_CONCURRENT_ACQUIRES` shell env vars are
+  no longer a documented consumer channel.** Configure the four options above instead. The env
+  vars remain only as the internal launcher-to-child interface `run.mjs` sets from those options;
+  setting them by hand in your shell is no longer supported. Zero-config behavior is unchanged.
+  Unset options contribute no flag and the pipeline keeps its built-in defaults.
+
+### Notes
+
+- **Course-platform credentials deliberately remain shell env vars.** `COURSE_*` / `TEACHABLE_*`
+  are excluded from this migration: a `sensitive: true` userConfig option still persists as
+  plaintext in `~/.claude/.credentials.json` on Windows, so those secrets stay in shell env until
+  keychain-backed sensitive storage lands there (documented at the course-digest auth-env site).
+
+## [0.6.1]
+
+### Changed
+
+- References to the renamed `/planning:plan` skill (was `/planning:architect`, planning 0.13.0 breaking rename) retargeted. Version bumped so existing installs receive the rewritten prompts.
+
+## [0.6.0]
+
+### Changed
+
+- **BREAKING: `youtube` skill renamed to `youtube-digest`.** Invoke as
+  `/knowledge:youtube-digest` (previously `/knowledge:youtube`). Sibling skills follow a
+  source+operation grammar (`book-distill`, `course-digest`); the platform noun alone named
+  the source but not the operation. Triggers are unchanged: "youtube", "watch this YouTube
+  video", and youtube.com/youtu.be URLs still route to the skill. In-flight watch slices are
+  unaffected (`.work/<watch-epic>/...` layout is unchanged); resume with
+  `/knowledge:youtube-digest resume <video-slug>`.
+
+## [0.5.6]
+
+### Added
+
+- Revisit condition in the README recording when the bundled `youtube` skill would
+  graduate into a standalone plugin (once its vendored `video-digestion` package is
+  independently distributable).
+
+## [0.5.5]
+
+### Fixed
+
+- **Lossless WebVTT transcript extraction.** Cue cleanup still strips complete WebVTT tags in one
+  linear pass, but now preserves an unmatched literal less-than tail instead of truncating the rest
+  of programming, mathematics, or other tolerant transcript text.
+
+## [0.5.4]
+
+### Fixed
+
+- **Current Claude Code configuration contract.** Setup now treats `library_dir` as a personal
+  `userConfig` option, validates it against the consuming repository's artifact convention, and
+  routes changes through Claude Code's configuration prompt instead of editing unsupported
+  project/local `pluginConfigs` entries.
+- **Repository and transcript input hardening.** GitHub repository URLs now require an exact,
+  credential-free GitHub HTTPS or SSH shape before canonical clone arguments are constructed;
+  clone option parsing is terminated explicitly; and WebVTT/entity cleanup uses bounded,
+  single-pass transformations that cannot turn nested malformed input into active markup.
+
+## [0.5.3]
+
+### Changed
+
+- **Aligned with the marketplace topic-docs convention** (`docs/conventions/topic-docs/`).
+  Setup's convention inference now points at the `.claude/topic-docs.yaml` concern file and
+  the `.work/` memory tier (the retired `.claude/notes/` location is no signal, since the contract
+  is a clean break), and the youtube/course-digest skills carry the contract's **formal carve-out**
+  note (the work root resolves through this plugin's `library_dir` setting, not the concern file's
+  `memory_dir`; slug conformance is form-only; nested `<epic>/<slug>/` sub-slices are
+  sanctioned), linking the convention by its canonical URL. The youtube slice-lane rationale
+  now records that the `verification/` lane name matches the convention's canon. Docs-only.
+  No paths or behavior change; the `library_dir` setting is untouched.
+
+## [0.5.2]
+
+### Fixed
+
+- **YouTube extraction: crash/incorrect-output paths on normal use.** Recovery
+  (`--recover`/`resume`) now accepts an auto-caption-only `*-orig.vtt` instead of
+  throwing `Missing mp4/vtt/info.json`; `watch.json` + tempSession are persisted
+  before the long extraction phase so an interrupt there stays recoverable;
+  exact cue/densification anchor timestamps survive the second dedup pass instead
+  of being replaced by fabricated ordinals; harvested GitHub deep links are cloned
+  from the canonical `https://github.com/<owner>/<repo>` URL rather than the
+  un-cloneable deep link; the documented `companion` Phase 0b marker is accepted;
+  recovery is no longer advertised when the acquisition `workDir` is gone;
+  `--skip-research` is persisted so resume doesn't re-route into research;
+  marking the terminal `synthesis` phase sets `watch.status` to `complete` so the
+  blocking checklist is enforced; `resume` advertises the on-disk continuation-prompt
+  path; the research gate requires a `research-agenda.md`; and contact-sheet snapshots
+  write a local `.gitignore` so the JPG binaries can't be committed.
+- **YouTube extraction: hardening.** Deck/attachment fetches stream to disk under a
+  500 MB cap (byte-counted, not just `content-length`) instead of buffering the whole
+  attacker-controlled response; the acquire throttle gained an optional overall
+  `timeoutMs` and heartbeats a held slot's mtime so a long download isn't misclassified
+  as stale and reclaimed; clone paths sanitize Windows-reserved characters; acquisition
+  forces `--no-playlist`; and a passing key-frame quality-audit row now requires a
+  substantive evidence note (an omitted note no longer bypasses the gate).
+
+## [0.5.1]
+
+### Changed
+
+- **Vendored shared libraries deduplicated to one plugin-wide copy.** `@melodic/repo-analysis`
+  and `@melodic/video-digestion` were vendored separately under both
+  `skills/youtube/extraction/vendor/` and `skills/course-digest/extraction/vendor/`. They now
+  live once at the plugin root (`vendor/`); each skill's `extraction/package.json` links it via
+  `file:../../../vendor/*` and each `setup-deps.mjs` fingerprints the shared tree. Runtime install
+  into `${CLAUDE_PLUGIN_DATA}` is unchanged. Internal restructure, no consumer-facing behavior
+  change; the version bump delivers the moved source (and the new install fingerprint) to consumers.
+
+## [0.5.0]
+
+### Added
+
+- **`course-digest` skill** (`/knowledge:course-digest`): extract and synthesize
+  online video courses (Dometrain, Teachable) into repo-applicable recommendations:
+  browser-automation transcript + frame extraction, code-companion analysis, and
+  multi-modal synthesis. Actions: full pipeline, `extract`, `analyze`, `status`,
+  `resume`, `continue`.
+- Bundled `extraction/` node pipeline for the course-digest skill, with the two
+  shared libraries (`@melodic/repo-analysis`, `@melodic/video-digestion`) vendored
+  under `extraction/vendor/`. Dependencies install into `${CLAUDE_PLUGIN_DATA}` via
+  `skills/course-digest/extraction/setup-deps.mjs`, which also provisions Playwright's
+  Chromium into `${CLAUDE_PLUGIN_DATA}/ms-playwright` (idempotent; re-run after a
+  plugin update). ffmpeg and ImageMagick remain OS-level installs the skill's
+  Prerequisites section documents.
+
+### Changed
+
+- **Credential model.** Course-platform login uses the user's own shell env vars
+  (`COURSE_*`/`TEACHABLE_*`, prefix driven by `platformConfig.authEnvPrefix`) with an
+  interactive manual-login fallback. Session cookies persist under
+  `${CLAUDE_PLUGIN_DATA}/auth/<platform>.auth-state.json` (out of the consumer repo),
+  keyed per platform.
+
+### Notes
+
+- The course-digest pipeline is ESM and shares the youtube skill's launcher shape
+  (`run.mjs` ESM resolve hook so bundled deps resolve from `${CLAUDE_PLUGIN_DATA}`);
+  `run.mjs` additionally pins `PLAYWRIGHT_BROWSERS_PATH` to the data directory so the
+  browser binary resolves regardless of cwd.
+- Manual login (`node:readline` + headed browser) may not function under headless
+  plugin execution; env-var + cookie-reuse carry the skill regardless.
+- `repo-analysis` and `video-digestion` are now vendored by both the youtube and
+  course-digest skills. Deduplication of the two copies is tracked separately.
+
+## [0.4.0]
+
+### Changed
+
+- **`youtube` skill now honors the `library_dir` setting.** The invoking skill wires a
+  non-default `library_dir` into the extraction pipeline by passing
+  `run.mjs --work-root <dir>`, which the launcher translates into the
+  `YOUTUBE_WORK_ROOT` environment variable the scripts already read, so watch,
+  transcript, and queue artifacts land under the configured directory instead of
+  always at the consuming repo root. Agent-written slice artifacts (the queue table,
+  its claim stubs, and every Output-contract deliverable) anchor to the same resolved
+  root, so a non-default `library_dir` never splits a slice across two directories. The default (`.`) path is unchanged: no flag,
+  `resolveWorkRoot()` keeps its `CLAUDE_PROJECT_DIR` → `process.cwd()` fallback. A
+  double-quoted CLI arg was chosen over an inline `YOUTUBE_WORK_ROOT=… node` prefix
+  because the latter is bash-only and fails under PowerShell.
+- **`setup` Output** now states that `library_dir` governs where youtube artifacts
+  land, restoring the stronger wording softened while the setting was unwired
+  (`book-distill` remains the documented exception).
+
+## [0.3.0]
+
+### Changed
+
+- **`setup` skill.** Retrofit `library_dir` precedence resolution and portability
+  hardening so synthesized artifacts land at the configured library directory in the
+  consuming repo.
+
+## [0.2.0]
+
+### Added
+
+- **`youtube` skill** (`/knowledge:youtube`): watch a single public YouTube video
+  (transcript + visual frames), harvest reference links, drive external research,
+  and synthesize a prioritized repo-applicability menu. Actions: `watch`, `queue`,
+  `transcript`, `resume`.
+- Bundled `extraction/` node pipeline for the youtube skill. Its dependencies are
+  installed into `${CLAUDE_PLUGIN_DATA}` on first use via
+  `skills/youtube/extraction/setup-deps.mjs` (idempotent; re-run after a plugin
+  update). Media binaries (`yt-dlp`, `ffmpeg`, ImageMagick) remain OS-level installs
+  the skill's Prerequisites section documents.
+
+### Notes
+
+- The youtube pipeline is ESM. Its entry points run through
+  `skills/youtube/extraction/run.mjs`, which injects an ESM resolve hook so bundled
+  dependencies resolve from `${CLAUDE_PLUGIN_DATA}` (NODE_PATH is CommonJS-only and
+  does not apply).
+
+## [0.1.1]
+
+- Prior baseline: `book-distill` and `setup` skills.

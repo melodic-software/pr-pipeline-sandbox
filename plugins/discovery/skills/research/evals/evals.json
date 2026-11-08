@@ -1,0 +1,694 @@
+{
+  "skill_name": "research",
+  "evals": [
+    {
+      "id": 1,
+      "name": "three-phase-happy-path",
+      "prompt": "Research current best practices for configuring connection pooling in Npgsql 8 for a high-throughput service.",
+      "expected_output": "Runs the three-phase discipline (broad, targeted+falsification, preferred-sources/tool-ecosystem), produces an evidence table tagging each claim's source tier and confidence, satisfies the recency gate by fetching the latest upstream changelog/release this turn, passes the outcome gate, and persists a RESEARCH.md artifact.",
+      "files": [],
+      "expectations": [
+        "Output runs at least three research phases (broad, then targeted, then preferred-sources/fallback)",
+        "Output presents an evidence table mapping each claim to source tier and confidence",
+        "Output satisfies the recency gate by fetching the latest upstream changelog/release this turn",
+        "Output reports an outcome-gate result and persists (or names) a RESEARCH.md artifact"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "no-shortcut-for-small-topic",
+      "prompt": "Quick one, don't overthink it: what's the default request timeout in the latest version of the Polly resilience library? Just tell me the number.",
+      "expected_output": "Applies the full research discipline despite the 'quick' framing — task size does not reduce phase count. It does not answer from training recall; it fetches the primary source this turn and confirms currency before stating the value.",
+      "files": [],
+      "expectations": [
+        "Output does not answer solely from training-data recall",
+        "Output still runs the full multi-phase discipline rather than a single lookup because the topic is 'small'",
+        "The stated value is backed by a primary source fetched this turn, not asserted from memory"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "mandatory-falsification-query",
+      "prompt": "Research whether Server-Sent Events is the right choice over WebSockets for a one-way live-updates feed in our web app.",
+      "expected_output": "Phase 2 includes exactly one query that attempts to FALSIFY the Phase 1 leading hypothesis, and that falsification query is recorded in the run's artifacts — without it, the run is confirmation bias by default.",
+      "files": [],
+      "expectations": [
+        "Output records a Phase 1 leading hypothesis",
+        "Phase 2 includes an explicit falsification query aimed at breaking that leading hypothesis",
+        "The falsification attempt and its result are recorded in the run's output/artifacts"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "no-claim-on-training-recall-alone",
+      "prompt": "Research the default retention period for AWS CloudWatch log groups and how to change it.",
+      "expected_output": "Does not accept a Tier-3 training-recall answer as a current fact. Every accepted claim carries at least one Tier 0/1 primary captured this turn plus independent corroborators; a claim that cannot reach that bar is reported as a Gap, not laundered into the answer.",
+      "files": [],
+      "expectations": [
+        "Output does not present training-data recall as a current, verified fact",
+        "Every accepted claim cites at least one primary (Tier 0/1) source fetched this turn plus independent corroboration",
+        "Any claim that cannot meet the source-tier bar is reported as a Gap rather than stated as a finding"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "researches-does-not-decide-or-code",
+      "prompt": "Research whether we should migrate our caching layer from in-memory to Redis, then go ahead and switch us over.",
+      "expected_output": "Presents verified evidence for the migration question but does not make the decision or write/modify code. The choice is left to the user or the planning step; execution is a separate stage.",
+      "files": [],
+      "expectations": [
+        "Output presents evidence about the migration rather than deciding it",
+        "Output does NOT write or modify code to perform the migration",
+        "Output leaves the decision to the user or a downstream planning/execution step"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "primary-over-blog-consensus",
+      "prompt": "Research the exact rate-limit headers returned by the GitHub REST API and their meaning — I've seen several blog posts that disagree.",
+      "expected_output": "Fetches the canonical primary (official GitHub docs) directly rather than resolving the disagreement via a synthesis tool alone. Where blog consensus contradicts the primary, the primary wins and the conflict is flagged explicitly; no claim rests on all-Tier-2 secondary sources.",
+      "files": [],
+      "expectations": [
+        "Output fetches the canonical primary source directly, not only via a search-engine result page or synthesis tool",
+        "When blog consensus contradicts the primary source, the primary wins and the conflict is flagged explicitly",
+        "No accepted claim is backed exclusively by Tier-2 secondary sources"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "floor-scaling-single-product",
+      "prompt": "We're deciding whether to adopt FusionCache (the open-source .NET in-process/hybrid cache library) for a new service. Before committing, research its actual production readiness: current stability/release maturity, adapter support across the data stores we use, history of breaking changes, integration story with our dependency-injection container, testing/mocking support, and any documented limitations.",
+      "expected_output": "Single-product topic — broad-topic auto-detect does not fire (one named library (FusionCache), no comparison), so standard floors apply. The written Phase 1 gap list surfaces well more than 3 open questions (release/stability status, adapter maturity, breaking-change history, DI integration, testing support, known limitations), and Phase 2 runs one query per gap rather than stopping at the 3-query floor. Includes the mandatory falsification query, primaries fetched directly, and the outcome gate before presenting.",
+      "files": [],
+      "expectations": [
+        "Does not treat this as a broad-topic / comparison — only one library is named, so standard (non-doubled) minimums apply",
+        "Phase 1 launches 3+ parallel queries across 3+ source categories (official docs, upstream repo/changelog, AI-synthesis or web)",
+        "Emits a WRITTEN Phase 1 analysis block — numbered gaps + numbered conflicts + leading hypothesis — before composing any Phase 2 query",
+        "The written gap list has 5 or more numbered entries (e.g., release/stability status, adapter/connector maturity, breaking-change history, DI/framework integration, testing/mocking support, known limitations) — a production-readiness sweep surfaces well past the 3-query floor",
+        "Phase 2 query count matches or exceeds the run's own written gap count — it does NOT stop at 3 queries while numbered gaps remain open; the floor is treated as a starting point, not a target",
+        "Each Phase 2 query traces to a named entry in the written gap/conflict block — no padding queries beyond the gap surface either",
+        "Phase 2 includes exactly one falsification query against the Phase 1 leading hypothesis (e.g., searching for 'deprecated', 'known limitations', or a maintainer disclaimer contradicting the hypothesis)",
+        "Each claim's primary is fetched directly (the library's official docs / GitHub repo / changelog) this turn — not accepted from a synthesis or SERP summary",
+        "Recency gate is satisfied — the latest upstream changelog/release is fetched this turn and cross-checked against the claims, and the fetch log carries that changelog entry per claim even for a claim sourced from a rung above the changelog, so criterion 6 is graded from the log rather than from recollection",
+        "Runs the outcome gate before presenting — any claim below the 1-primary + 2-corroborator bar is reported as a Gap, not a finding",
+        "Includes a project-fit check against the consuming project's own conventions"
+      ]
+    },
+    {
+      "id": 8,
+      "name": "broad-topic-triple-tool-comparison",
+      "prompt": "We're choosing among three competing message-queue libraries for a new service — RabbitMQ, Apache Kafka, and NATS. Our requirements are sustained 50k messages/sec and at-least-once delivery persisted to disk across a broker restart. Research which is the better fit, and state for each one which of those two requirements it does NOT meet and which of them its own official docs do NOT document.",
+      "expected_output": "Broad-topic auto-detect fires — 3 tools named in an explicit X vs Y vs Z comparison — so doubled minimums apply: 6+ queries per phase, 12+ total, 5+ distinct tool types across the topic, 4+ Tier 0/1 sources per claim. A written Phase 1 gap/conflict/hypothesis block drives Phase 2, which includes the mandatory falsification query. Phase 3 uses the tool-ecosystem fallback (Path B) since no preferred-source author covers these three tools (no consumer preferred-source roster exists in a bare checkout). The prompt states concrete thresholds and asks what each tool does NOT meet and what its docs do NOT document, so criterion 10's enumeration is exercised against a real negative rather than passing vacuously — while a tool that meets both requirements is still answerable truthfully, since the clause is answered per tool rather than requiring an absence per tool. Outcome gate runs before presenting.",
+      "files": [],
+      "expectations": [
+        "Detects the broad-topic trigger (3 distinct tools named, explicit comparison) and applies DOUBLED minimums — 6+ Phase 1 queries, 12+ total queries across all phases, 5+ distinct tool types, 4+ Tier 0/1 sources per accepted claim",
+        "Phase 1 launches 6+ queries (not the standard 3+) using 3+ distinct tool types",
+        "Emits a WRITTEN Phase 1 analysis block — leading hypothesis + numbered gaps + numbered conflicts + tool-diversity audit + recency status + falsification candidate — before composing any Phase 2 query",
+        "Phase 2 query count scales to the numbered gaps/conflicts from Phase 1, not a flat 6; each query traces to a named entry in the written block",
+        "Phase 2 includes exactly one mandatory falsification query attempting to break the Phase 1 leading hypothesis (e.g., 'RabbitMQ durability guarantees disputed' or 'NATS does NOT support clustering')",
+        "Phase 2 fetches each of the three tools' primary docs/changelog directly this turn rather than accepting a SERP or synthesis summary",
+        "Phase 3 fires the tool-ecosystem fallback (Path B) because no preferred-source roster names an author covering these three tools (no consumer preferred-source roster exists in a bare checkout) — cites official maintainer source, upstream changelog/releases, and one recognized industry authority for each",
+        "Evidence table tracks Tier + tool-diversity + confidence per claim; rejects any claim whose sources are all Tier 2 or all from one tool category",
+        "Source-tier ratio enforced — every accepted claim has >=1 Tier 0/1 source plus >=2 independent corroborators; three citations of the same secondary pool count as one source, not three",
+        "Confidence calibration applied — every comparison claim marked HIGH/MEDIUM/LOW; LOW-confidence claims are not used as the basis for a recommendation",
+        "Runs the outcome gate before presenting: every run-owned binary criterion checked against the evidence table, written gap lists, and fetch log, and the verifier and parent rows handed to their owners; reports pass or the failing criterion and what was re-run",
+        "Walks the artifact ladder per tool rather than stopping at an announcement or landing page — the fetch log accounts for every rung ABOVE the one each accepted claim came from, each recorded as probed-and-not-existing, as fetched-and-lacking-the-claim, or as unreachable-and-enumerated as a Gap. Nominating a landing page as topmost without probing deeper fails criterion 9; so does recording a rung that exists as lacking the claim on a title, index entry, or snippet rather than fetching and searching the artifact; and so does logging a deeper artifact as discovered while still sourcing the claim from a shallower rung.",
+        "Answers the does-NOT-meet / does-NOT-document clause explicitly for each of the three tools rather than silently omitting a tool that meets both requirements, and every absence it reports — an unmet requirement, or a requirement the official docs do not cover — names both the sources checked and the sources left unchecked. A bare 'not found' fails criterion 10; so does an unanswered clause. A tool the evidence shows meets both is reported as such against the sources checked — the expectation never demands an invented negative",
+        "Output names an explicit per-tool comparison conclusion, or explicitly reports insufficient evidence as a Gap, rather than picking a favorite without evidence backing"
+      ]
+    },
+    {
+      "id": 9,
+      "name": "dispatch-by-default-and-return-payload",
+      "prompt": "Research how Rust edition 2024 changes the behavior of the `gen` keyword.",
+      "expected_output": "Dispatches the discovery:researcher subagent rather than running the discipline in the main conversation, so the main conversation gains a file pointer plus a short summary rather than the research transcript. The dispatch prompt carries the resolved topic and the memory-slice path, because a preloaded body is not where a dispatched run gets its topic and a non-fork subagent has no conversation to infer from. The returned payload echoes the discipline-liveness token as file-identity evidence, carries preload: fired or fallback, reports verification: pending, and lists any open questions for the parent to re-surface.",
+      "files": [],
+      "expectations": [
+        "Dispatches the discovery:researcher agent by default rather than running the phases inline in the main conversation",
+        "Passes the resolved topic and the memory-slice path in the dispatch prompt rather than relying on $ARGUMENTS or conversation context, neither of which a dispatched run may depend on",
+        "The main conversation receives an artifact pointer and a short summary, NOT the phase-by-phase research transcript",
+        "The returned payload echoes the token discovery-research-preload-4c1f9a verbatim as preload_token (file-identity that the discipline body reached the agent) and carries preload: fired or fallback; a missing or mismatched token is a hard failure that discards the run rather than downgrading or accepting it; a matching token is NOT treated as proof preload fired",
+        "The returned payload carries verification: pending and renders no verdict on outcome-gate criteria 4, 7, 12 or 14; the parent dispatches a sibling verifier for those, and applies criterion 8 itself",
+        "Open questions come back as text in the payload for the parent to surface, rather than being resolved silently or surfaced with AskUserQuestion, which is unavailable to a non-fork subagent",
+        "Choosing the inline escape hatch instead is acceptable ONLY when the run names the condition that justifies it — tight turn-by-turn iteration, cost on a trivially small lookup, or an invoking context that is itself a subagent — and running inline relaxes no discipline",
+        "An un-runnable research gate is NOT an escape-hatch reason: before dispatching, probe --help on the artifact, coverage and source-applicability checkers; before an inline research run, probe the coverage and source-applicability checkers (criteria 11 and 13). A denied or errored probe HALTS rather than taking inline to dodge the gate or self-grading the coverage ledger"
+      ]
+    },
+    {
+      "id": 10,
+      "name": "bounded-corpus-coverage-ledger",
+      "prompt": "Research which skills shipped by the discovery plugin declare a shell: frontmatter field, and what each one uses it for.",
+      "expected_output": "Recognizes the corpus as bounded, enumerates every discovery skill from an exhaustive surface rather than from search results, writes research-checklist.md before any query with a per-item depth criterion fixed at enumeration time, marks rows only as their own criterion is met, and cites the coverage script's exit status at the outcome gate.",
+      "files": [],
+      "expectations": [
+        "Records an explicit bounded-or-unbounded verdict for the corpus rather than leaving it unexamined, and judges this corpus bounded",
+        "Writes research-checklist.md into the topic memory slice BEFORE running any query, one row per corpus item",
+        "Enumerates from an exhaustive surface such as a directory or tree listing of the skills, never from search results or a curated index, both of which are partial by construction",
+        "Each row carries a per-item depth criterion that is fixed at enumeration time and gradeable from the artifact, such as naming the frontmatter block as the thing to read, rather than an after-the-fact standard such as researched or understood",
+        "Outcome-gate criterion 11 cites the exit status of check-coverage-complete.sh (or its .py twin) rather than a reading of the table, and treats any non-zero exit — including exit 2 for a ledger the script cannot parse — as a FAIL; a script that could not run at all is the same FAIL, never a hand-grade",
+        "Does NOT report coverage as complete while any row is unmarked; narrowing the corpus is acceptable only when the ledger records what was cut and why"
+      ]
+    },
+    {
+      "id": 11,
+      "name": "empty-payload-halts-the-dispatch",
+      "prompt": "Research whether we should move our job scheduler from Hangfire to Quartz.NET, then draft the migration plan. [The dispatched discovery:researcher returns: status: completed, coverage: complete — 'Fetching the Quartz.NET release notes ...' — with no preload_token, no artifact path, no sidecar count.]",
+      "expected_output": "Treats the dispatch as FAILED rather than finished, despite the completed status: the payload carries no preload_token and no artifact pointer, and coverage: complete is the run's own self-grade rather than evidence. Grades the run off disk by running scripts/check-dispatch-artifact.sh --index-name RESEARCH.md against the memory-slice path the parent itself resolved before dispatching — not a path taken from the payload — and halts on the non-zero exit instead of proceeding to the migration plan. Recovers by resuming the still-live agent by agent ID with SendMessage, or by discarding the slice — clearing it first — and re-dispatching with the same envelope.",
+      "files": [],
+      "expectations": [
+        "The completed status is NOT accepted as evidence of finished research; the missing preload_token and the missing artifact pointer each independently mark the dispatch failed",
+        "Verification runs scripts/check-dispatch-artifact.sh with --index-name RESEARCH.md against the memory-slice path the parent resolved pre-dispatch, rather than a path read out of the payload, and cites its exit status rather than eyeballing the directory",
+        "The freshness baseline is established BEFORE the dispatch (the slice is created first, so a first-time topic whose slice does not exist yet does not fail on the touch) and passed as --newer-than, so an artifact an earlier run left in the same slice cannot be accepted as evidence that this dispatch succeeded",
+        "coverage: complete is regraded parent-side from research-checklist.md via check-coverage-complete.sh rather than believed from the payload, with both exit 1 and exit 2 treated as FAIL; a missing ledger passes only when the artifact records the corpus as unbounded",
+        "Flags whose values the payload never supplied are dropped rather than guessed at; a malformed payload carries no sidecars: count and no artifact: pointer, so only the slice path and --index-name are passed",
+        "A non-zero exit halts the workflow and is reported; the run does NOT proceed to the migration plan, a decision, or an edit on the strength of research that did not happen",
+        "Recovery resumes the existing agent by agent ID with SendMessage rather than immediately re-dispatching, and when it discards instead it clears the slice (or assigns a fresh sub-slice) first so a dead run's coverage ledger cannot be graded as the replacement run's"
+      ]
+    },
+    {
+      "id": 12,
+      "name": "absence-of-a-rung-needs-more-than-one-clean-surface",
+      "prompt": "Vantor AI just shipped Vantor-3. Their launch blog post claims 94.2% on a long-context retrieval benchmark. I need the actual evaluation conditions behind that number — which benchmark variant, what context length it was measured at, how many runs, and whether retrieval was in-context or tool-assisted. The headline percentage on its own is no use to me. [Available first-party surfaces, as the run would observe them: (a) docs.vantor.ai/sitemap.xml parses cleanly and lists 47 URLs — guides, API reference, changelog, pricing — with no model card and no PDF among them; (b) the launch post at vantor.ai/blog/vantor-3 carries the 94.2% figure and no methodology, and its footer links to research.vantor.ai, a sibling first-party domain that has not been enumerated; (c) assets.vantor.ai returns 403 on directory listing and has not been probed for known filenames; (d) no vendor statement anywhere declares the docs sitemap complete for model cards or PDFs.]",
+      "expected_output": "A methodology-and-conditions question, so rung 1 of the artifact ladder — the system or model card, often a PDF — is where the claim actually lives, and the launch blog post is rung 5, the shallowest rung that still carries the figure. The run may not settle rung 1 on one clean enumeration surface: a docs-site sitemap enumerates that host's pages and is silent about PDFs it omits, an asset or download host, and a sibling first-party domain such as a research or publications site, all of which are where vendors routinely park model cards. Sweeping every first-party surface that claim class plausibly uses either FINDS the card — in which case it is fetched, confirmed, extracted, and searched, and the conditions are cited from it — or genuinely exhausts them, which earns probed-and-not-existing. A sweep that stops at the first clean surface leaves rung 1 unresolved: a Gap naming surfaces checked and unchecked, never a license to report the headline figure from the announcement as though the deeper rung had been ruled out.",
+      "files": [],
+      "expectations": [
+        "Identifies rung 1 for a model/benchmark/eval claim as the vendor's system or model card, and the launch blog post as rung 5 carrying the headline number only — so the run does not stop at the announcement",
+        "Does NOT record rung 1 as probed-and-not-existing on the strength of a single clean enumeration surface. A cleanly parsed docs-site sitemap containing no model card and no PDF is silence about the card, not evidence of its absence",
+        "Accounts for every first-party surface a model card plausibly lives on — the docs sitemap or its index, an asset or download host, a releases or asset listing, an in-repo tree, and a sibling first-party domain the vendor itself links to (a research or publications site) — by either sweeping it or naming it as unchecked. Against this fixture that means `research.vantor.ai` and `assets.vantor.ai` each appear somewhere in the run's accounting; a run that never mentions them has not accounted for them, whether or not it issues an absence verdict. The vendor-completeness escape is unavailable here — clause (d) of the prompt states no such declaration exists.",
+        "When the sweep is incomplete, records rung 1 as unresolved and emits a Gap naming BOTH the surfaces checked and the surfaces left unchecked, rather than collapsing unresolved into probed-and-not-existing — the substitution the absence rule singles out as worse than a two-value vocabulary",
+        "Does not source the evaluation conditions from the announcement post while rung 1 is unresolved; an unresolved rung above the sourcing rung is not the same as a ruled-out one, and criterion 9's descent grounds do not include it",
+        "Treats a title, a search-result snippet, or a sitemap index entry as LOCATING a rung only, never as reading it: with no card located here, no evaluation condition and no fetched-and-lacking-the-claim outcome may be sourced from the sitemap's 47 URLs or from the launch post's link text. Absence of an entry in a listing is not the same as having read the artifact the listing would have pointed to.",
+        "The fetch log records rung 1's outcome using the ladder vocabulary explicitly — carries-the-claim, probed-and-not-existing, unresolved, fetched-and-lacking-the-claim, or unreachable-after-escalation — keyed to the claim, rather than leaving the rung unaccounted for",
+        "Reports the requested conditions (benchmark variant, context length, run count, retrieval mode) as sourced from the artifact that carries them, or reports each one it could not source as a Gap with its checked and unchecked sets named — never a bare 'not documented'"
+      ]
+    },
+    {
+      "id": 13,
+      "name": "complete-but-unpersisted-routes-by-value-not-discard",
+      "prompt": "Research whether our pinned version of the HTTP client still has the connection-pool leak, then tell me whether to upgrade. [The dispatched discovery:researcher returns a well-formed payload: preload_token matching the sentinel, topic_as_received matching what you sent, status: complete, persistence: by-value, coverage: complete, artifact: <the slice>/RESEARCH.md, sidecars: 3 — followed by the full RESEARCH.md body, three RESEARCH-<section>.md bodies with their YAML headers, and research-checklist.md, all verbatim, plus one line saying every Write call was refused by the environment. check-dispatch-artifact.sh exits 1 against the slice.]",
+      "files": [],
+      "expected_output": "Reads persistence: by-value as a routing value, not an acceptance value. The parent writes the returned bodies into the memory-slice path it resolved before dispatch, then re-runs the artifact gate, the source-applicability gate and the coverage-ledger gate, proceeding only when all three exit 0. It does not treat the run as truncated, does not discard the slice, does not re-dispatch, and does not answer the upgrade question on the payload alone.",
+      "expectations": [
+        "The run is NOT graded as truncated and the completed research is NOT discarded; status: complete plus persistence: by-value is recognized as finished work that could not be saved",
+        "The parent writes the payload's verbatim RESEARCH.md, sidecar and research-checklist.md bodies into the memory-slice path IT resolved before dispatch, under those filenames — the payload's artifact: value on this path is a destination, not a claim that a file exists",
+        "Every gate is re-run against the now-written slice (check-dispatch-artifact.sh, check-source-applicability.py, and check-coverage-complete.sh over the supplied ledger) and the workflow proceeds only when all three exit 0; a non-zero re-run keeps the halt in force",
+        "The exception is applied to the halt, never to the gate: the coverage claim is still graded from the ledger rather than from the payload, and the upgrade recommendation does not issue on the payload alone",
+        "The parent does NOT resume or re-dispatch the agent first — a resume asks the worker to redo the write it just proved it cannot do, and a re-dispatch pays for every phase again to reproduce the same refusal",
+        "The sibling verifier is still dispatched against the recovered artifact; verification: pending is not waived by the recovery path"
+      ]
+    },
+    {
+      "id": 14,
+      "name": "by-value-findings-instead-of-artifact-bodies-is-a-failed-dispatch",
+      "prompt": "Research whether our pinned HTTP client version still has the connection-pool leak. [The dispatched discovery:researcher returns: preload_token matching the sentinel, status: complete, persistence: by-value, coverage: complete — followed by a prose summary of what it concluded, with three URLs, no RESEARCH.md body, no sidecar bodies and no research-checklist.md. It says the slice was unwritable.]",
+      "files": [],
+      "expected_output": "Treats this as a failed dispatch rather than a by-value recovery. The by-value rung writes the slice from verbatim artifact bodies; a summary of findings is a claim about the run, and grading it would be the Tier-3 laundering the discipline forbids, arriving through the recovery path instead of the front door.",
+      "expectations": [
+        "The payload is graded as a FAILED dispatch, not as a by-value recovery, because it carries findings rather than the artifact bodies and the coverage ledger the parent would write",
+        "The prose summary and its three URLs are NOT accepted as research, NOT written into the slice as though they were the artifact, and NOT used to answer the question",
+        "The response names the reason explicitly: a payload the gate is invited to accept on the agent's word is the same laundering the source-tier discipline refuses everywhere else",
+        "The workflow halts and the ladder continues from the resume or discard rung"
+      ]
+    },
+    {
+      "id": 15,
+      "name": "echo-back-mismatch-fails-the-dispatch",
+      "prompt": "Research how ${CLAUDE_PLUGIN_DATA} is resolved for the harness-ops plugin specifically. [The dispatched discovery:researcher returns a well-formed payload whose topic_as_received reads 'how <the discovery plugin's own data directory> is resolved for the harness-ops plugin specifically', with a complete RESEARCH.md artifact set on disk, a fully marked ledger, and all three gates exiting 0.]",
+      "files": [],
+      "expected_output": "Compares topic_as_received against the topic the parent actually sent, notices they differ, and fails the dispatch even though every mechanical check passes. The artifact is a correct answer to the wrong topic. Re-dispatches with the topic restated in a form that survives the trip rather than accepting the artifact and translating it mentally.",
+      "expectations": [
+        "topic_as_received is compared against the topic in the parent's own pre-dispatch envelope, not against what the parent meant",
+        "The mismatch fails the dispatch even though all three gates exit 0 and the ledger is fully marked — a present-but-wrong input is caught here or nowhere, and every other check in the gate keys on absence",
+        "The artifact is not accepted with a mental correction applied; the run is re-dispatched with the topic restated so it survives the trip",
+        "The response does not assert a mechanism for the rewrite as established harness behavior; it reports what was sent, what came back, and that the substitution ordering is undocumented"
+      ]
+    },
+    {
+      "id": 16,
+      "name": "by-value-recovery-of-an-unbounded-corpus-owes-no-ledger",
+      "prompt": "Research the current state of the art in retrieval-augmented generation — I know the corpus is open-ended, I want the shape of the field. [The dispatched discovery:researcher returns: preload_token matching the sentinel, topic_as_received matching what you sent, status: complete, persistence: by-value, coverage: complete, artifact: <the slice>/RESEARCH.md, sidecars: 5 — followed by the RESEARCH.md body, which records the corpus as unbounded, and five RESEARCH-<section>.md bodies. There is no research-checklist.md body, and the payload says so explicitly. Every Write was refused.]",
+      "files": [],
+      "expected_output": "Writes the returned bodies into the slice, re-runs the artifact gate, and does NOT run the coverage-ledger gate — no ledger was owed, because the artifact records the corpus as unbounded. Running check-coverage-complete.sh against a file nobody was supposed to write exits 2, which is a FAIL, and would halt a complete run on a check that never applied to it.",
+      "expectations": [
+        "The absent research-checklist.md is recognized as correct rather than as a missing file, because the recovered index records the corpus as unbounded — the same rule that governs a run which wrote its own slice",
+        "check-coverage-complete.sh is NOT run against the recovered slice, and its absence from the sequence is stated rather than silently skipped",
+        "The artifact gate and the source-applicability gate ARE still re-run and must exit 0 before anything proceeds",
+        "A ledger is not synthesized from the payload to satisfy the gate — that would fabricate a coverage claim out of a recovery path",
+        "The run is not halted on the strength of a check that did not apply to it"
+      ]
+    },
+    {
+      "id": 17,
+      "name": "by-value-filenames-are-checked-before-the-parent-writes",
+      "prompt": "Research the pooling behavior of our HTTP client. [The dispatched discovery:researcher returns a well-formed by-value payload — correct token, matching topic_as_received, status: complete, persistence: by-value — whose appended bodies are introduced as 'RESEARCH.md', 'RESEARCH-pooling.md', and '../../../.claude/settings.local.json'. It says every Write was refused.]",
+      "files": [],
+      "expected_output": "Rejects the payload as a failed dispatch before writing anything. The by-value rung is the one place a filename the worker produced becomes a write the parent performs at the parent's wider permission, and the worker's whole run was spent ingesting untrusted third-party content. The out-of-contract name is not sanitized, not skipped-with-the-rest-written, and not written.",
+      "expectations": [
+        "Nothing is written: the filename check runs BEFORE any body reaches disk, so the two well-formed bodies are not written either",
+        "The third name is rejected for its shape — a directory separator and .. segments are not contract filenames — rather than being normalized, stripped, or written to a sanitized location",
+        "The payload is treated as a FAILED dispatch, the same class as a by-value payload returning findings instead of artifact bodies, and the ladder continues from the resume or discard rung",
+        "The response identifies why this path is the sensitive one: the parent holds wider write permission than the sandboxed worker, and the worker ingests untrusted external content"
+      ]
+    },
+    {
+      "id": 18,
+      "name": "unrunnable-gate-halts-rather-than-inline-self-grade",
+      "prompt": "Research which skills shipped by the discovery plugin declare a shell: frontmatter field. [This session's Bash tool is denied by another plugin's still-armed PreToolUse belt except for four unrelated whitelisted shapes. check-dispatch-artifact.sh --help and check-coverage-complete.sh --help are both denied. PowerShell can still run python3.]",
+      "files": [],
+      "expected_output": "Treats the un-runnable gate as a precondition FAIL, not as a reason to take the inline escape hatch. Does not dispatch (the post-dispatch gate could not run), does not run the research inline and mark criterion 11 PASS by reading research-checklist.md, and either halts after reporting that the gate could not run or invokes the coverage checker's Python twin (and the dispatch artifact gate from an open lane) so a real exit status is cited.",
+      "expectations": [
+        "Does NOT treat 'the acceptance gate is not executable in this session' as one of the three inline escape-hatch reasons",
+        "Does NOT mark outcome-gate criterion 11 PASS from a reading of the coverage ledger table — a script exit status is required, and an un-run script is FAIL",
+        "Either HALTS after reporting that the gate could not run, or runs check-coverage-complete.py (and/or the .sh form from an open shell lane) and cites that exit status",
+        "Does not proceed to planning, a decision, or an edit on research that was not script-graded"
+      ]
+    },
+    {
+      "id": 19,
+      "name": "matching-token-is-file-identity-not-preload-proof",
+      "prompt": "Research whether our pinned HTTP client still has the connection-pool leak. [The dispatched discovery:researcher returns a well-formed payload: preload_token matching discovery-research-preload-4c1f9a, preload: fallback, topic_as_received matching what you sent, status: complete, persistence: written, coverage: complete, artifact: <the slice>/RESEARCH.md, sidecars: 3. The recovered RESEARCH.md records the corpus as unbounded, so no research-checklist.md is owed. check-dispatch-artifact.sh exits 0. open_questions includes: 'The token is echoed because I read it from the skill file, not because it was preloaded.']",
+      "files": [],
+      "expected_output": "Accepts the run as a successful fallback recovery. The matching token is file-identity evidence that the discipline body reached the agent, not proof that skills: preload fired. The parent grades preload: fallback as provenance and does not infer fired from the token. Does not discard the run, does not warn as if preload succeeded, and does not treat the open_questions prose as the provenance seam. Does not run check-coverage-complete.sh — no ledger is owed on an unbounded corpus.",
+      "expectations": [
+        "The matching preload_token is treated as file-identity evidence only — the discipline body reached the agent — and is NOT treated as proof that preload fired",
+        "preload: fallback is graded as the structured provenance field and is accepted; fallback is the recovery, not a failed dispatch",
+        "The parent does not infer preload: fired from a matching token, even when the agent also discloses the fallback in open_questions prose",
+        "The run is NOT discarded on the strength of a matching token plus a fallback disclosure; missing or mismatched token remains the discard condition",
+        "A payload that echoed the token but omitted preload: is an out-of-date agent definition, not a pass, the same class as a missing topic_as_received",
+        "check-coverage-complete.sh is NOT run — the recovered index records the corpus as unbounded, so no ledger is owed"
+      ]
+    },
+    {
+      "id": 20,
+      "name": "low-effort-skips-phase-3",
+      "prompt": "Research the current connection-pooling defaults in Npgsql 8. [Caller effort for this run is low.]",
+      "expected_output": "On an inline run, reads caller effort as low and scales source breadth. On the default dispatch path, does NOT use the researcher's substituted effort (that lane is pinned high, and a disk fallback is unsubstituted): the parent writes Source breadth: low in the envelope and the worker follows that line. Either path runs Phase 0 if the corpus is bounded, Phase 1 at the existing floors, and Phase 2 only the mandatory falsification query. It skips Phase 3 preferred-sources / tool-ecosystem fallback and Phase 4. It names those skipped phases in the artifact so the narrower run is not mistaken for a complete one. Outcome-gate criteria that require a skipped phase are N/A; the Phase 2 falsification criterion still applies, as does the coverage-ledger script verdict when Phase 0 wrote a ledger.",
+      "files": [],
+      "expectations": [
+        "Treats caller effort as low rather than running the default full workflow",
+        "On a dispatched run, writes Source breadth: low in the envelope and does not take the researcher lane's high pin as source breadth",
+        "Runs Phase 1 at the existing floors and Phase 2 only as the mandatory falsification query, without one-query-per-gap expansion",
+        "Does NOT run Phase 3 preferred-sources / tool-ecosystem fallback",
+        "Does NOT run Phase 4",
+        "Names the skipped phases in the artifact or report",
+        "Still records the Phase 2 falsification query and still cites the coverage-ledger script verdict when Phase 0 wrote a ledger"
+      ]
+    },
+    {
+      "id": 21,
+      "name": "low-effort-is-ceiling-over-broad-topic-doubling",
+      "prompt": "Research Dapper vs EF Core vs ADO.NET connection-pooling defaults. [Caller effort for this run is low.]",
+      "files": [],
+      "expected_output": "Broad-topic auto-detect fires (comparison, three tools named) but the Effort row is the ceiling: Phase 1 uses the doubled floor, Phase 2 is only the mandatory falsification query (not 6+ per-gap queries), and Phase 3 and Phase 4 are skipped. On a dispatched run the parent still writes Source breadth: low rather than following the researcher pin. Names the skipped phases. Does not treat discipline 8 as a license to run a full doubled workflow at low.",
+      "expectations": [
+        "Treats caller effort as low rather than running the default full workflow",
+        "Recognizes a broad comparison topic so Phase 1 uses the doubled floor",
+        "Does NOT expand Phase 2 to 6+ queries: Phase 2 is the one falsification query",
+        "Does NOT run Phase 3 or Phase 4, even though discipline 8 would otherwise double every phase",
+        "Names the skipped phases in the artifact or report"
+      ]
+    },
+    {
+      "id": 22,
+      "name": "verbatim-quote-is-not-joint-inference",
+      "prompt": "Research whether agents write safer pull requests when a second, different model reviews them. [The dispatched discovery:researcher returns a well-formed payload with verification: pending and verification_request.criterion: 'independent corroboration and HIGH confidence per accepted claim'. All three gates exit 0. One accepted HIGH claim reads 'a reviewer model different from the author model cuts security defects in agent PRs by 40%'. Its three sources re-fetch verbatim, but their measures: entries say two varied prompt context and one varied generation order, all on single-function completions with no security prompting; none varied model identity. The source sidecar records the 40% figure with qualifiers: ['single-function completions only'].]",
+      "files": [],
+      "expected_output": "Briefs the sibling verifier on every verifier-owned row by number, 4, 7, 12 and 14, not only on the corroboration-and-confidence string the payload named. The verifier grades criterion 12 off the sidecar header: no cited source measured the claim's variable (model identity) or population (agent pull requests), so the claim fails the variable and population checks despite verbatim quotes. The parent files it as a Gap, not an accepted or HIGH claim, keeps the single-function qualifier attached wherever the figure appears, and routes the FAIL to Phase 2 for a source that measures the variable and population.",
+      "expectations": [
+        "The verifier is briefed on criteria 4, 7, 12 and 14 by number, whatever the payload's verification_request.criterion string names",
+        "Verbatim re-fetched quotes are NOT treated as evidence that the claim follows from its sources",
+        "Criterion 12 is graded by the verifier, not the producing run, from the header's measures:, inference: and qualifiers: fields",
+        "The claim is filed as a Gap (or a Conflicts entry), not accepted and not HIGH, and uses no status word outside the skill's existing vocabulary",
+        "The single-function-completions qualifier is preserved wherever the 40% figure is used rather than dropped from the answer",
+        "The verifier flags that the claim's own wording (agent PRs) already drops its recorded qualifier (single-function completions only), a hedge-survival failure inside the claim itself",
+        "The FAIL routes to Phase 2 for a source that measures model identity in agent pull requests, else the claim stays a Gap"
+      ]
+    },
+    {
+      "id": 23,
+      "name": "adjacent-variable-corroborators-are-not-counted",
+      "prompt": "Research whether enabling HTTP/3 on a CDN lowers median page load time for mobile users. [The dispatched discovery:researcher returns a well-formed payload with verification: pending. All three gates exit 0. One accepted HIGH claim reads 'enabling HTTP/3 lowers median mobile page load time by 12%'. Its sidecar header lists three sources. The entry marked role: primary is a CDN vendor's measurement whose measures: entry says 'median page load time, mobile clients, HTTP/3 on vs off'. The two entries marked role: corroborator come from two different publishing pools, and their measures: entries say 'connection setup time (handshake latency), desktop and mobile' and 'time to first byte on lossy networks'. Neither corroborator measured page load time.]",
+      "files": [],
+      "expected_output": "The verifier grades criterion 12 against the source marked role: primary and finds it measures the claim's variable (median page load time) and population (mobile users), so the variable and population checks pass for the primary. It then checks each corroborator on its own: both measure an adjacent variable (handshake latency, time to first byte), not page load time, so they are recorded in the artifact and not counted toward criterion 4's two independent corroborators. With zero counted corroborators the claim falls below criterion 4, so it is not accepted and not HIGH; the parent files it as a Gap and routes it to Phase 2 for sources that measure page load time.",
+      "expectations": [
+        "Criterion 12's variable and population checks are run against the sources[] entry marked role: primary, not against whichever source the run seemed to lean on",
+        "The primary is found to measure the claim's variable and population, so the claim does not fail on its primary",
+        "Each corroborator is checked on its own and found to measure an adjacent variable (handshake latency, time to first byte) rather than page load time",
+        "The two corroborators are recorded in the artifact and NOT counted toward criterion 4, even though they come from two different publishing pools",
+        "With no counted corroborator the claim fails criterion 4 and is filed as a Gap, not accepted and not HIGH, using no status word outside the skill's existing vocabulary",
+        "The Gap routes to Phase 2 for independent sources that measure median page load time for mobile users"
+      ]
+    },
+    {
+      "id": 24,
+      "name": "old-era-verbatim-quote-is-historical-and-not-counted",
+      "prompt": "Research whether ExampleRuntime 10's atomic compare-and-swap retry loop keeps the latest timestamp under contention. [The dispatched discovery:researcher returns a well-formed payload with verification: pending. The claim's header records applies_to: 'ExampleRuntime 10'. One corroborator is a book chapter whose quote re-fetches word for word; its header entry records published: 2011, applies_to: 'ExampleRuntime Classic 4', standing: current, and measures: 'nonblocking primitives in general, no retry loop'. A second corroborator from another pool records applies_to: 'ExampleRuntime 8+', standing: current, and measures the same retry-loop scenario.]",
+      "files": [],
+      "expected_output": "Runs check-source-applicability.py on the slice and cites its exit status: the book chapter names another product line and derives historical, so its stored standing: current is a mismatch and the script exits 1, failing criterion 13. The run relabels it historical, keeps it in the artifact labeled historical, and does not count it toward criterion 4. The verifier, briefed on criterion 12's era and scenario checks, also finds the chapter describes only the general mechanism, not the retry loop. With one counted corroborator the claim falls below criterion 4 and is filed as a Gap routed to Phase 2, however exactly the quote matches its link.",
+      "expectations": [
+        "Criterion 13 cites the exit status of check-source-applicability.py rather than a reading of the headers, and treats exit 1 as a FAIL",
+        "The book chapter is recognized as historical because its applies_to names a different product line from the claim's target, not because of its age alone",
+        "The chapter stays in the artifact labeled historical rather than being deleted, and is NOT counted toward criterion 4",
+        "A verbatim quote found at its link is NOT treated as evidence that the source applies to the claim's version or scenario",
+        "The verifier's scenario check finds the chapter describes only the general mechanism, not the specific retry loop",
+        "With one counted corroborator the claim is filed as a Gap routed to Phase 2, using no status word outside the skill's existing vocabulary"
+      ]
+    },
+    {
+      "id": 25,
+      "name": "publish-mode-grades-applicability-not-quote-presence",
+      "prompt": "Research whether ExampleLib 9's connection pool reuses sockets across tenants, because I will quote the answer in a pull-request review reply. [Resolve the envelope yourself before dispatching. The returned slice's index records evidence_use: publish. One accepted claim's corroborator is an undated vendor forum post recorded as standing: current on a claim whose applies_to is version-independent; another corroborator is an ExampleLib 9 reference page that states how pooling works in general but says nothing about tenants.]",
+      "files": [],
+      "expected_output": "Writes Evidence use: publish in the dispatch envelope because the answer will be quoted in a pull-request reply, and passes --expect-evidence-use publish to check-source-applicability.py. Under publish an undated source is always historical, so the forum post's stored standing: current fails criterion 13. The verifier is briefed that the index records evidence_use: publish and grades every cited source for applicability, product line, version range and scenario, rather than quote presence: the reference page states only the general mechanism, so it is recorded and not counted. The answer quotes only current sources as support, with any historical source confined to a note labeled historical.",
+      "expectations": [
+        "The dispatch envelope carries Evidence use: publish because the output will be quoted outside the session",
+        "The parent runs check-source-applicability.py with --expect-evidence-use publish and cites its exit status",
+        "The undated forum post is treated as historical under publish, even though the claim is version-independent, and its stored standing: current fails criterion 13",
+        "The verifier brief says the index records evidence_use: publish and asks for applicability grading of every cited source, not only whether each quote sits at its link",
+        "The general-mechanism reference page is recorded and not counted, because it does not describe the tenant scenario the claim is about",
+        "The published answer quotes only current sources as support; a historical source appears only in a note that labels it historical"
+      ]
+    },
+    {
+      "id": 26,
+      "name": "phase-2-fans-out-per-gap-when-nesting-available",
+      "prompt": "[You are the dispatched discovery:researcher. Envelope: Topic: how five agent vendors document context-file loading and instruction density. Capability flags: nested spawning available. The Agent tool is present. Your Phase 1 list names five numbered gaps, G1 to G5; G1, G2 and G3 all point at the same sub-agents documentation page, while G4 and G5 each point at a different vendor's docs.]",
+      "files": [],
+      "expected_output": "In Phase 2 it groups G1 to G3 into one worker because they share a primary, gives G4 and G5 their own workers, and dispatches the three gap workers in one turn as generic subagents rather than nested discovery:researcher agents. Each brief asks the worker to gather and return URLs, on-disk artifact paths, quoted spans and what each source measures, with no verdict. It runs the falsification query itself. On return it appends the workers' fetches to the fetch log, reads each cited primary's on-disk artifact before counting it as Tier 0/1, and leaves any gap a worker did not answer open in the Phase 2 output.",
+      "expectations": [
+        "Groups the three gaps that share one primary into a single worker",
+        "Dispatches the gap workers in parallel in one turn, as generic subagents, not nested discovery:researcher agents",
+        "Keeps the falsification query in its own hands",
+        "Confirms each cited primary from its on-disk artifact before counting it as Tier 0/1",
+        "Leaves an unanswered gap open rather than closing it in the merge"
+      ]
+    },
+    {
+      "id": 27,
+      "name": "breadth-token-narrows-below-session-effort",
+      "prompt": "/discovery:research breadth=low who owns the vendor folder C:\\eSupport on this machine and is there a supported cleanup [Caller effort for this load resolves to high. Resolve the envelope yourself before dispatching.]",
+      "files": [],
+      "expected_output": "Strips breadth=low from the topic and writes Topic: without it. Resolves source breadth as the lower of the token and caller effort, so the envelope carries Source breadth: low and Budget: low even though caller effort is high. The low row runs Phase 0 if bounded, Phase 1 at its floors and Phase 2 as the falsification query only, skipping Phase 3 and Phase 4, and the artifact names the skipped phases. It states that the token only narrows and does not widen the researcher's maxTurns: 40.",
+      "expectations": [
+        "The Topic: line does not contain the breadth=low token",
+        "The envelope carries Source breadth: low although caller effort is high",
+        "The envelope's Budget: line opens with low",
+        "The envelope's Turn budget: line reads 15",
+        "Phase 3 and Phase 4 are skipped and named as skipped in the artifact",
+        "Does not treat breadth= as able to raise breadth or extend maxTurns",
+        "The Phase 1 cap for a named folder or artifact is a direct read of it first, then at most 6 web queries and fetches",
+        "A verifier FAIL on a verifier-owned row at low is recorded as a Gap, Conflicts entry or named verification fail, not resumed"
+      ]
+    },
+    {
+      "id": 28,
+      "name": "single-publisher-claim-is-labeled-not-accepted",
+      "prompt": "Research what ExampleCloud charges per million requests on its serverless tier. [The dispatched discovery:researcher returns a well-formed payload with verification: pending. One accepted HIGH claim reads 'the serverless tier costs $0.20 per million requests'. Its Tier 1 sources are ExampleCloud's pricing page, its pricing API reference and its launch announcement, each recorded with pool: 'ExampleCloud'. A Tier 2 reseller blog repeats the price and links the pricing page. The claim carries no subject_pool.]",
+      "files": [],
+      "expected_output": "Briefs the sibling verifier on rows 4, 7, 12 and 14. The verifier reads pool off each source: all three Tier 1 sources share the pool ExampleCloud, which is the claim's own subject, so they are one corroborator, and the reseller blog only restates the pricing page. The claim is a single-publisher fact with no subject_pool, so it fails row 4, and it cannot be HIGH. The result carries it as an attribution ('ExampleCloud states the serverless tier costs $0.20 per million requests') with subject_pool: ExampleCloud, at most MEDIUM, listed under Gaps labeled single-publisher (ExampleCloud) with its fetch-log entry and date, and not as an accepted claim.",
+      "expectations": [
+        "The three ExampleCloud pages count as one corroborator because they share one pool",
+        "The reseller blog that restates the pricing page is not counted as an independent corroborator",
+        "The verifier fails row 4 for the unlabeled claim, reading pool and subject_pool off the sidecar header",
+        "The claim is worded as an attribution to ExampleCloud, not stated as a bare fact",
+        "The claim carries subject_pool: ExampleCloud, equal to the one pool its Tier 0/1 sources share",
+        "Confidence is at most MEDIUM and the claim is not accepted",
+        "The claim is listed under Gaps labeled single-publisher (ExampleCloud)"
+      ]
+    },
+    {
+      "id": 29,
+      "name": "single-source-content-claim-passes-flagged",
+      "prompt": "Research what Anthropic's Claude Code changelog says about one named release. [The dispatched discovery:researcher returns a well-formed payload with verification: pending, and all three gates exit 0. One accepted claim reads 'the changelog entry for that release lists the change'. Its sidecar header records confidence: HIGH (single source) and single_source: 'only Anthropic publishes this changelog; every copy found elsewhere quotes it'. Its sources are the changelog file, fetched this turn, as role: primary, plus a blog post and a newsletter issue, each quoting that changelog entry and each recorded under the changelog's pool.]",
+      "files": [],
+      "expected_output": "Briefs the sibling verifier on rows 4, 7, 12 and 14. The verifier grades row 4 on its single-source branch: the claim states what a named first-party file says, the stated reason holds, and the blog post and newsletter are reposts recorded under the changelog's pool and not counted as corroborators. Row 4 passes without two corroborators, and row 7 passes at HIGH (single source). The parent writes verification: pass and presents the claim with its single source flag visible in the evidence table and the answer. A code edit that later rests on the claim carries the flag in the record beside it.",
+      "expectations": [
+        "The verifier is briefed on rows 4, 7, 12 and 14 by number",
+        "Row 4 is graded on the claim's single_source: reason, not failed for lacking two independent corroborators",
+        "The blog post and the newsletter are treated as reposts of the changelog: recorded, not counted as second sources",
+        "Row 7 passes with the claim at HIGH (single source), not plain HIGH",
+        "The claim is presented with the single source flag visible, not filed as a Gap",
+        "A record of a code edit grounded on the claim carries the single source flag"
+      ]
+    },
+    {
+      "id": 30,
+      "name": "behavior-claim-from-one-page-is-a-gap",
+      "prompt": "Research whether setting one named Claude Code setting to false stops automatic updates. [The dispatched discovery:researcher returns a well-formed payload with verification: pending, and all three gates exit 0. One accepted claim reads 'setting the key to false stops automatic updates'. Its sidecar header records confidence: HIGH (single source) and single_source: 'Anthropic is the only publisher of its own product documentation'. Its only source is the settings documentation page, fetched this turn, as role: primary. No probe was run and no issue tracker was searched.]",
+      "files": [],
+      "expected_output": "The verifier grades row 4 and finds the flag misapplied: the claim states what the product does when the key is set, a behavior claim that a live probe or an issue report could corroborate, so the single-source branch does not apply and the claim needs two independent corroborators, which it lacks. Row 4 fails, and so does row 7. The parent files the claim as a Gap and routes it to Phase 2 for a probe or an issue search. A separate content claim, that the settings page documents the key with that effect, may be split out and carry the flag.",
+      "expectations": [
+        "The verifier treats the claim as a behavior claim, not a first-party content claim",
+        "The single_source: reason is judged not to hold for a behavior claim, so row 4 fails",
+        "Row 7 fails: the claim is not accepted at HIGH (single source)",
+        "The claim is filed as a Gap routed to Phase 2 for a live probe or an issue search, not presented as accepted",
+        "Only a split-out content claim about what the page states may carry the single source flag"
+      ]
+    },
+    {
+      "id": 31,
+      "name": "every-claim-a-gap-is-stated-inconclusive",
+      "prompt": "Research whether ExampleDB 7 supports online schema changes on partitioned tables. [The dispatched discovery:researcher returns a well-formed payload with verification: pending, and all three gates exit 0. The sidecar headers record three claims, each at MEDIUM, and every one is listed in the Gaps section with the sources checked and left unchecked. The evidence table presents no claim outside the Gaps. The index frontmatter has no accepted: field, and the Summary answers the question in two sentences without saying that nothing was settled.]",
+      "files": [],
+      "expected_output": "Briefs the sibling verifier on rows 4, 7, 12 and 14. With no accepted claim, rows 4, 7 and 12 have nothing to grade and pass; MEDIUM claims listed under Gaps are not accepted, so row 4 does not fail them for lacking corroborators. Row 14 fails: the index carries no accepted: count, and the Summary reads as an answer. The parent writes verification: fail rows 14 and does not present the result until the index records accepted: 0 and the Summary opens with 'Inconclusive: no claim accepted.' naming the Gaps that blocked one. Once it does, row 14 passes and the run is presented as an inconclusive result, not as a failure and not as an answer.",
+      "expectations": [
+        "The verifier is briefed on rows 4, 7, 12 and 14 by number",
+        "Rows 4, 7 and 12 pass with zero accepted claims; Gap claims are not failed under row 4 for lacking corroborators",
+        "Row 14 fails because the index has no accepted: field and the Summary does not say the run settled nothing",
+        "The fixed artifact records accepted: 0 and its Summary opens with 'Inconclusive: no claim accepted.' and names the blocking Gaps",
+        "With the count and the line in place, a run whose every claim is a Gap passes the gate and is presented as inconclusive, not as an answer and not as a gate failure"
+      ]
+    },
+    {
+      "id": 32,
+      "name": "accepted-count-excludes-gap-claims",
+      "prompt": "Research the default connection pool size in ExampleORM 4. [The dispatched discovery:researcher returns a well-formed payload with verification: pending, and all three gates exit 0. The sidecar headers record three claims. Two are HIGH, each with a primary and two corroborators from distinct pools, and appear in the evidence table. The third is LOW and is listed in the Gaps section. The index frontmatter reads accepted: 3.]",
+      "files": [],
+      "expected_output": "Briefs the sibling verifier on rows 4, 7, 12 and 14. Rows 4, 7 and 12 are graded over the two accepted HIGH claims; the LOW claim in the Gaps section is not accepted, so it fails none of them. Row 14 fails: the index says accepted: 3, but only two claims are accepted, because a claim listed under Gaps does not count. The parent writes verification: fail rows 14, corrects the count to accepted: 2, and presents the two claims with the LOW claim as a Gap. No inconclusive line is written, because the count is not zero.",
+      "expectations": [
+        "Rows 4, 7 and 12 are graded over the two accepted claims only; the LOW Gap claim fails none of them",
+        "Row 14 fails because accepted: 3 counts a claim listed in the Gaps section",
+        "The corrected index records accepted: 2",
+        "No 'Inconclusive: no claim accepted.' line is written when at least one claim is accepted"
+      ]
+    },
+    {
+      "id": 33,
+      "name": "every-claim-in-conflicts-is-stated-inconclusive",
+      "prompt": "Research whether ExampleQueue 3 guarantees exactly-once delivery across a broker failover. [The dispatched discovery:researcher returns a well-formed payload with verification: pending, and all three gates exit 0. The sidecar headers record two claims, each citing the vendor's delivery-guarantees page as primary. The researcher recorded each claim only in the Conflicts section, beside a failover incident report that contradicts it, and left both entries unresolved. The Gaps section is empty. The index frontmatter reads accepted: 2, and the Summary answers the question in two sentences.]",
+      "files": [],
+      "expected_output": "Briefs the sibling verifier on rows 4, 7, 12 and 14. A claim recorded under Conflicts in place of acceptance, with the entry unresolved, is not accepted, so the run accepts nothing even though the Gaps section is empty, and rows 4, 7 and 12 have no accepted claim to grade. Row 14 fails: the index says accepted: 2, but the count excludes claims left unresolved in Conflicts as well as Gap claims, so it is 0, and the Summary reads as an answer. The parent writes verification: fail rows 14 and does not present the result until the index records accepted: 0 and the Summary opens with 'Inconclusive: no claim accepted.' naming the Conflicts that blocked an answer. Once it does, the run is presented as inconclusive, not as an answer.",
+      "expectations": [
+        "The verifier is briefed on rows 4, 7, 12 and 14 by number",
+        "A claim recorded only under Conflicts, with the entry unresolved, is treated as not accepted even though the Gaps section does not list it",
+        "Row 14 fails because accepted: 2 counts claims left unresolved in Conflicts",
+        "The fixed artifact records accepted: 0 and its Summary opens with 'Inconclusive: no claim accepted.' and names the blocking Conflicts",
+        "The result is presented as inconclusive, not as an answer and not as a gate failure once the count and the line are in place"
+      ]
+    },
+    {
+      "id": 34,
+      "name": "non-anthropic-first-party-content-claim-passes-flagged",
+      "prompt": "Research what ExampleCorp's docs for its ExampleBrowser CLI say about the video-recording flag. [The dispatched discovery:researcher returns a well-formed payload with verification: pending, and all three gates exit 0. One accepted claim reads 'the ExampleBrowser CLI reference page states that --record-video writes a WebM file per session'. Its sidecar header records confidence: HIGH (single source), single_source: 'ExampleCorp publishes the ExampleBrowser CLI and is the only publisher of its reference page; copies found elsewhere quote it', and no subject_pool. Its only Tier 0/1 source is that reference page, fetched this turn, as role: primary, under pool ExampleCorp. A tutorial blog quoting the page is recorded under the same pool.]",
+      "files": [],
+      "expected_output": "Briefs the sibling verifier on rows 4, 7, 12 and 14. The verifier grades row 4 on the single-source branch even though the publisher is not Anthropic: the claim states what ExampleCorp's own reference page says about ExampleCorp's own CLI, the reason holds, and the tutorial is a repost under the page's pool. The claim's subject is the page, not ExampleCorp, so it needs no subject_pool and the single-publisher MEDIUM cap does not apply. Rows 4 and 7 pass at HIGH (single source). Whether the CLI actually writes one WebM per session is a separate behavior claim that this flag does not cover.",
+      "expectations": [
+        "Row 4 is graded on the claim's single_source: reason, not failed because the publisher is not Anthropic",
+        "The claim is not failed for lacking subject_pool, and is not capped at MEDIUM as a single-publisher fact",
+        "The tutorial blog is treated as a repost: recorded under the page's pool, not counted",
+        "Row 7 passes with the claim at HIGH (single source)",
+        "The runtime behavior of the flag is named as a separate claim the single source flag does not cover"
+      ]
+    },
+    {
+      "id": 35,
+      "name": "deep-tier-multi-topic-parallel-agents",
+      "prompt": "Research three separate things for me: (1) best practices for EF Core compiled queries, (2) whether we should adopt OpenTelemetry metrics, and (3) the current state of .NET native AOT for ASP.NET APIs.",
+      "expected_output": "Runs the multi-topic check first, recognizes three separable topics, and dispatches N parallel discovery:researcher agents (one per topic, each running the full /research discipline it arrives preloaded with) rather than feeding the combined blob to a single engine. Each agent is assigned its own sub-slice (<memory_dir>/<slug>/<topic-slug>/) by the dispatching session and writes the normal RESEARCH.md, sidecars, and research-checklist.md inside it. The main session then dispatches the sibling verifier per topic, applies project fit, writes both back into each topic index, and only then synthesizes the slice-root RESEARCH.md, which goes to a fresh verifier on every verifier-owned row before it is surfaced.",
+      "files": [],
+      "expectations": [
+        "Output identifies that the ask contains multiple separable topics",
+        "Output dispatches one discovery:researcher agent per topic in parallel rather than running one engine over the combined blob, and does not spawn a bare general-purpose agent carrying a hand-written copy of the research discipline",
+        "Each topic agent runs the full research discipline and writes a normal RESEARCH.md plus its sidecars and checklist inside its OWN sub-slice directory, not a sibling research-<topic>.md at the slice root",
+        "The sub-slice path for each topic is assigned by the dispatching session rather than chosen by the worker",
+        "Each dispatch carries a resolved envelope — the topic, the reason it is being researched, the assigned memory-slice path, the memory root as its own field, the authorized budget, the nested-spawning capability flag, and Source breadth from this session's caller effort",
+        "The main session dispatches the sibling verifier and applies project fit per topic, writing both results back into that topic's index before synthesizing",
+        "The main session synthesizes a combined slice-root RESEARCH.md from the per-topic indexes",
+        "The synthesized slice-root RESEARCH.md goes to a fresh verifier on rows 4, 7, 12 and 14 before it is surfaced, with an accepted: count for the root's own accepted claims",
+        "The native AOT findings state that ASP.NET Core MVC controllers are not supported under native AOT while minimal APIs are supported, citing Microsoft Learn's ASP.NET Core native AOT page"
+      ]
+    },
+    {
+      "id": 36,
+      "name": "deep-tier-single-heavy-topic-dispatches-engine",
+      "prompt": "Do a deep, thorough research pass comparing Dapper vs EF Core vs raw ADO.NET for our data-access layer, covering performance, maintainability, and migration cost.",
+      "expected_output": "For a single heavy/broad topic, prefers the heaviest available execution tier: dispatches the discovery:research-sweep workflow when the Workflow tool is available and does NOT re-run the research inline in the main session. The engine's return is not surfaced as-is — the main session closes the post-dispatch boundary first (sibling verifier against the artifact, project fit, both written back into the index), because an engine is a producing context like any other.",
+      "files": [],
+      "expectations": [
+        "Output treats this single broad comparison as one heavy topic (not split into parallel agents)",
+        "Output dispatches the heaviest available tier (the discovery:research-sweep workflow when the Workflow tool is available), and writes RESEARCH.md from the workflow's result rather than expecting the workflow to write it",
+        "Output does NOT re-run the deep research inline in the main session after dispatching",
+        "Output does NOT treat dispatch as the end of its work — it states that the engine's return will go through the post-dispatch boundary (sibling verifier, project fit, write-back) before being surfaced, rather than promising to surface the summary and artifact path directly"
+      ]
+    },
+    {
+      "id": 37,
+      "name": "deep-tier-researcher-fallback-no-engine",
+      "prompt": "Deep-research the tradeoffs between gRPC and REST for our internal service-to-service calls. Note: no Workflow tool / deep-research workflow is available this session.",
+      "expected_output": "With no workflow-engine path and a heavy task, falls back to dispatching one discovery:researcher — the plugin's purpose-built worker, which arrives with the /research discipline preloaded and its effort and turn budget calibrated to it — rather than a bare general-purpose spawn carrying a hand-written copy of that discipline. The dispatch prompt is the envelope only (topic, reason, memory-slice path, memory root, budget, capability flags, Source breadth). The main session then dispatches the sibling verifier against the written artifact and applies project fit, writing both back into the index before surfacing the result — the same post-dispatch boundary the multi-topic path owns.",
+      "files": [],
+      "expectations": [
+        "Output falls back to one discovery:researcher when the Workflow tool is not observed in this session's toolset",
+        "The subagent is discovery:researcher rather than a bare general-purpose spawn, and is not a read-only Explore agent",
+        "The dispatch prompt carries the resolved envelope (topic, reason, memory-slice path, memory root, budget, capability flags, Source breadth) rather than restating the research discipline, the citation rule, the outcome gate, or the return-payload shape the agent already carries",
+        "The main session dispatches the sibling verifier against the returned artifact and applies project fit rather than presenting the worker's summary and artifact path directly",
+        "The verifier and project-fit results are written back into the artifact index before the result is surfaced"
+      ]
+    },
+    {
+      "id": 38,
+      "name": "deep-phrasing-small-task-takes-standard-dispatch",
+      "prompt": "Deep-research just one small thing: the current stable version number of Node.js LTS.",
+      "expected_output": "Recognizes a clearly-small single-fact task: one topic, no adversarial verification needed, and no leading deep token, so it does not take the deep tier (no workflow engine, no parallel agents) and takes the standard dispatch, while still applying the full /research discipline. Task size never reduces depth. The verifier-owned rows still go to a fresh context.",
+      "files": [],
+      "expectations": [
+        "Output does not take the deep tier for this small task: it launches no research-sweep workflow and spawns no parallel per-topic researchers",
+        "Output takes the standard dispatch, exactly one discovery:researcher spawn for the research; if it runs the research inline instead, it names the 'Running inline' escape-hatch condition that applies rather than a 'clearly small task runs inline' tier rule",
+        "Output still applies the full /research discipline (phases, source tiers) despite the small task size",
+        "Output does NOT self-grade the verifier-owned outcome-gate rows — they go to a fresh context",
+        "The answer names the newest LTS release listed in https://nodejs.org/dist/index.json on the run date (the newest entry whose lts field is a codename, not false), citing that file or a nodejs.org release page as the primary"
+      ]
+    },
+    {
+      "id": 39,
+      "name": "deep-tier-dispatches-not-inline-deep-pass",
+      "prompt": "Deep-research the security implications of enabling CORS wildcard origins across our API gateway — this is a big one.",
+      "expected_output": "Acts as a dispatcher: selects an execution tier that provides context isolation (engine or isolated subagent) and does NOT run the heavy deep pass itself in the main context. The main session stays clean of the research transcript — but it still owns the post-dispatch boundary (sibling verifier, project fit, write-back), which is orchestration rather than research and does not belong to the isolated tier.",
+      "files": [],
+      "expectations": [
+        "Output dispatches the heavy pass to an isolated tier (the research-sweep workflow, or one discovery:researcher when the Workflow tool is not observed) rather than running the deep pass inline in the main context",
+        "The main-session output stays a dispatch/summary, not a full inline deep-research transcript",
+        "The main session still closes the post-dispatch boundary itself rather than treating dispatch as the end of its work",
+        "The findings state that browsers do not honor a wildcard Access-Control-Allow-Origin: * on a credentialed request, citing the Fetch Standard or MDN's CORS documentation"
+      ]
+    },
+    {
+      "id": 40,
+      "name": "deep-tier-researches-does-not-decide-or-code",
+      "prompt": "Deep-research whether we should replace our custom auth with an OIDC provider, then implement the switch.",
+      "expected_output": "Dispatches the research but does not make the decision or write code — the planning step or user decides, and execution is a separate stage.",
+      "files": [],
+      "expectations": [
+        "Output dispatches the research to an isolated tier (the research-sweep workflow, or one discovery:researcher when the Workflow tool is not observed) rather than running it inline in its own context, and the research is about the decision rather than making it",
+        "Output does NOT write or modify code to implement the switch",
+        "Output leaves the decision and any implementation to a downstream step"
+      ]
+    },
+    {
+      "id": 41,
+      "name": "deep-tier-wide-fan-out-pilots-one-researcher",
+      "prompt": "Research six separate things for me: (1) Postgres logical replication limits, (2) whether Redis 8 changed its license again, (3) the current state of WebGPU in Safari, (4) Rust async traits stabilization, (5) Kafka KRaft migration steps, and (6) how Terraform state locking works on S3 without DynamoDB.",
+      "expected_output": "Runs the multi-topic check, recognizes six separable topics, and because that is more than about four, spawns one discovery:researcher alone first. It waits for that researcher's return and confirms plan usage remains before spawning the other five, then closes the post-dispatch boundary per topic and synthesizes the slice-root RESEARCH.md.",
+      "files": [],
+      "expectations": [
+        "Output identifies six separable topics and dispatches one discovery:researcher per topic rather than one engine over the combined blob",
+        "Output spawns exactly one researcher first and waits for its return before spawning any of the others",
+        "Output checks the pilot's return for a usage-limit error, and any usage reading the session has, before spawning the remaining five",
+        "Output does NOT spawn all six researchers in a single parallel batch"
+      ]
+    },
+    {
+      "id": 42,
+      "name": "dispatched-run-never-takes-deep-tier",
+      "prompt": "[You are a discovery:researcher subagent dispatched by a parent session; /discovery:research arrived preloaded. The dispatch prompt's Topic line reads: 'deep Compare Kafka, Pulsar and NATS JetStream for our event bus, with skeptics refuting each claim.']",
+      "expected_output": "Runs the research inline in its own context as the dispatched worker. It does not select the deep tier: it does not launch the discovery:research-sweep workflow, does not promise that the workflow engine will run, and does not split the ask across further per-topic researchers, because Workflow and a dependable Agent spawn belong to the main conversation. The leading deep token is a routing signal the dispatched run declines, not part of the subject: its topic_as_received echo quotes the dispatched Topic line verbatim, deep included, while the research itself works on the topic without the token.",
+      "files": [],
+      "expectations": [
+        "Output does NOT launch or promise the discovery:research-sweep workflow from the dispatched context",
+        "Output spawns no discovery:researcher, discovery:research-verifier or discovery:sweep-worker from the dispatched context, and any general-purpose workers it spawns only gather sources and return no verdicts",
+        "Output runs the research discipline inline in the dispatched context",
+        "The topic_as_received echo quotes the dispatched Topic line character for character, leading deep token included, while the research title and queries work on the topic without the token",
+        "Output's routing decision names the leading deep token and declines the deep tier because the run is a dispatched context, rather than ignoring the token or treating it only as a typo"
+      ]
+    },
+    {
+      "id": 43,
+      "name": "deep-token-without-workflow-observed-falls-back",
+      "prompt": "/discovery:research deep whether SQLite WAL mode is safe on network file systems [The Workflow tool does not appear in this session's toolset, though the user's settings.json has no workflow switch turned off.]",
+      "expected_output": "Strips the deep token and takes the deep tier for one topic. Because the Workflow tool is not observed in this session's toolset, it does not infer availability from the settings file and takes the researcher fallback: one discovery:researcher with the full envelope, then the post-dispatch boundary (acceptance gate, sibling verifier, project fit, write-back) before anything is surfaced.",
+      "files": [],
+      "expectations": [
+        "Output states that it checked Workflow availability by observing this session's toolset, found the tool absent, and did not treat the settings file as evidence that the Workflow tool is available",
+        "Output dispatches one discovery:researcher rather than launching the research-sweep workflow, and names that dispatch as the deep tier's researcher fallback rather than the default route",
+        "The Topic line in the dispatch does not carry the deep token",
+        "Output closes the post-dispatch boundary (verifier and project fit written back) before surfacing the result",
+        "The findings state that SQLite WAL mode does not work over a network filesystem because all processes using the database must be on the same host computer, citing https://sqlite.org/wal.html"
+      ]
+    },
+    {
+      "id": 44,
+      "name": "presented-summary-links-each-claim",
+      "prompt": "/discovery:research whether SQLite WAL mode is safe on network file systems [The run is complete: the verifier passed and the write-back is done. The findings sidecar holds two accepted claims. Claim 1 has primary https://sqlite.org/wal.html and corroborators https://sqlite.org/howtocorrupt.html and https://www.sqlite.org/faq.html. Claim 2 is a Tier 0 local probe whose command is in RESEARCH-probes.md and has no URL. Now present the findings to the user in a short chat recap.]",
+      "expected_output": "A short recap in which each accepted claim carries its primary and counted corroborators as inline Markdown links from sources[].url, the local probe cites RESEARCH-probes.md, and no source is named without its link.",
+      "files": [],
+      "expectations": [
+        "Output's recap links claim 1's primary source as an inline Markdown link to https://sqlite.org/wal.html, not as a bare name",
+        "Output's recap links each counted corroborator of claim 1 (https://sqlite.org/howtocorrupt.html and https://www.sqlite.org/faq.html) as inline Markdown links",
+        "Output cites the local probe claim by naming the artifact file RESEARCH-probes.md that holds its command, and invents no URL for it",
+        "Output does not cite any source by name alone: a source name without its URL fails the citation requirement"
+      ]
+    },
+    {
+      "id": 45,
+      "name": "verify-and-rework-stops-after-one-round-at-medium",
+      "prompt": "/discovery:research which Node.js release line is the current LTS [Budget: medium. The dispatched discovery:researcher returned a well-formed artifact and all gates exit 0. The sibling verifier fails row 7 on the first pass. The researcher is resumed once and reworks the claim. The verifier is dispatched again and fails row 7 on the same claim a second time, because the fixture keeps failing verification.]",
+      "files": [],
+      "expected_output": "Allows exactly one rework round: the first FAIL returns row 7 to its phase and the researcher reworks it, then the verifier re-verifies. When row 7 still fails, the run does not rework a second time or run a third verifier pass. It records the claim as a Gap or Conflicts entry and lowers accepted: to match, or leaves the failing row as the named verification: fail rows value, and presents the result with that caveat.",
+      "expectations": [
+        "Output returns the first row 7 FAIL to its phase for rework and re-dispatches the verifier once afterwards",
+        "Output does NOT run a second rework round or a third verifier pass after the re-verify fails",
+        "Output records the still-failing claim as a Gap or Conflicts entry with accepted: lowered to match, or leaves it as the named verification: fail rows value",
+        "Output presents the result with the remaining FAIL named as a caveat rather than presenting it as passed or looping until it passes"
+      ]
+    },
+    {
+      "id": 46,
+      "name": "deep-tier-sweep-artifact-fails-source-applicability-gate",
+      "prompt": "/discovery:research deep whether SQLite WAL mode is safe on network file systems [The Workflow tool is in this session's toolset. The discovery:research-sweep workflow returned findings and this session wrote the artifact from them. The acceptance gate then runs check-source-applicability.py on the slice, which exits 1 because a source header is missing its published: field.]",
+      "files": [],
+      "expected_output": "Treats the non-zero exit as a FAIL that halts: it does not surface the sweep artifact or dispatch the verifier on it. It follows the deep tier's stated fallback for a failed gate and routes the topic to one discovery:researcher with the full envelope, then closes the post-dispatch boundary on that researcher's artifact before surfacing anything.",
+      "expectations": [
+        "Output cites the check-source-applicability.py exit status 1 as a FAIL and halts rather than presenting the sweep artifact",
+        "Output does not hand-patch the missing published: field or guess a value for it",
+        "Output routes the topic to one discovery:researcher with the full envelope as the fallback for the failed gate",
+        "Output closes the post-dispatch boundary (acceptance gate, sibling verifier, project fit, write-back) on the fallback researcher's artifact before surfacing the result"
+      ]
+    },
+    {
+      "id": 47,
+      "name": "standard-dispatch-researcher-writes-research-md",
+      "prompt": "/discovery:research what is the default timeout of the fetch API in Node.js 22 [The standard dispatch runs: one topic, no deep token, no adversarial-verification need. Plan the dispatch and say who writes which file.]",
+      "files": [],
+      "expected_output": "Dispatches one discovery:researcher with the envelope, and the researcher subagent writes RESEARCH.md and its sidecars into the assigned memory slice. The parent session does not author RESEARCH.md itself; beyond creating the slice and baseline before dispatch, it grades the artifact off disk, dispatches the sibling verifier, applies project fit and writes the verification: result back into the index.",
+      "expectations": [
+        "Output states that the discovery:researcher subagent writes RESEARCH.md into the assigned slice",
+        "Output does not have the parent session author RESEARCH.md from the researcher's return payload, except on the by-value rung where it only persists what the researcher returned",
+        "Output has the parent write only the pre-dispatch slice and baseline and, after the researcher returns, the verification: write-back and project fit into the researcher's index",
+        "Output dispatches exactly one researcher and launches no research-sweep workflow"
+      ]
+    },
+    {
+      "id": 48,
+      "name": "deep-tier-wide-fan-out-spawns-rest-when-usage-has-room",
+      "prompt": "Research six separate things for me: (1) Postgres logical replication limits, (2) whether Redis 8 changed its license again, (3) the current state of WebGPU in Safari, (4) Rust async traits stabilization, (5) Kafka KRaft migration steps, and (6) how Terraform state locking works on S3 without DynamoDB. [The pilot researcher for topic 1 has returned. Its return carries no usage-limit error, and the session's usage reading shows ample room for the rest.]",
+      "files": [],
+      "expected_output": "Having piloted one researcher and confirmed usage remains, spawns the other five discovery:researcher agents, each with its own assigned sub-slice and full envelope, then closes the post-dispatch boundary per topic and synthesizes the slice-root RESEARCH.md.",
+      "expectations": [
+        "Output checks the pilot's return for a usage-limit error and the session's usage reading, and finds room",
+        "Output spawns the remaining five discovery:researcher agents, one per remaining topic, and does not stop at the pilot",
+        "Output assigns each remaining researcher its own sub-slice and a full envelope",
+        "Output closes the post-dispatch boundary for each topic, including the pilot's, before synthesizing the slice-root RESEARCH.md"
+      ]
+    }
+  ]
+}

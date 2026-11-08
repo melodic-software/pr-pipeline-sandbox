@@ -8,8 +8,10 @@ Ports the discovery, author-scope, and review-thread coverage onto
 from __future__ import annotations
 
 import pathlib
+import subprocess
 import sys
 import unittest
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest import mock
 
@@ -17,6 +19,59 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import babysit_checks as checks
 import babysit_gh as gh
+import babysit_util as util
+
+
+class GhCaptureTests(unittest.TestCase):
+    """`gh_capture` returns a failed exit instead of raising, and layers
+    `env_overrides` onto the inherited environment for that call alone
+    (`babysit_util.run_command`); with none the child inherits it as is."""
+
+    def setUp(self) -> None:
+        # The limits are read before the subprocess seam is faked.
+        gh.warm_rate_guard()
+
+    def capture(self, **kwargs: Any) -> tuple[Any, Any]:
+        failed = subprocess.CompletedProcess(["gh"], 1, "", "gh: boom (HTTP 502)")
+        with (
+            mock.patch.object(util.shutil, "which", return_value="/bin/gh"),
+            mock.patch.object(util.subprocess, "run", return_value=failed) as run,
+            mock.patch.dict("os.environ", {"INHERITED": "1"}, clear=True),
+        ):
+            proc = gh.gh_capture(["api", "user"], **kwargs)
+        return proc, run.call_args.kwargs
+
+    def test_a_failed_exit_is_returned(self) -> None:
+        proc, _ = self.capture()
+        self.assertEqual(proc.returncode, 1)
+
+    def test_env_overrides_layer_onto_the_environment(self) -> None:
+        _, call = self.capture(env_overrides={"GH_TOKEN": "tok"})
+        self.assertEqual(call["env"], {"INHERITED": "1", "GH_TOKEN": "tok"})
+
+    def test_no_or_empty_overrides_inherit_the_environment(self) -> None:
+        for overrides in (None, {}):
+            with self.subTest(overrides):
+                _, call = self.capture(env_overrides=overrides)
+                self.assertIsNone(call["env"])
+
+    def test_binary_keeps_stdout_as_bytes_and_decodes_stderr(self) -> None:
+        # An artifact archive is not UTF-8; gh's message on stderr is.
+        archive = b"PK\x03\x04\xff\x00"
+        done = subprocess.CompletedProcess(["gh"], 0, archive, "réponse".encode())
+        with (
+            mock.patch.object(util.shutil, "which", return_value="/bin/gh"),
+            mock.patch.object(util.subprocess, "run", return_value=done) as run,
+        ):
+            proc = gh.gh_capture(
+                ["api", "repos/o/r/actions/artifacts/7/zip"], binary=True
+            )
+        self.assertEqual(proc.stdout, archive)
+        self.assertEqual(proc.stderr, "réponse")
+        self.assertFalse(run.call_args.kwargs["text"])
+        self.assertIsNone(run.call_args.kwargs["encoding"])
+        _, call = self.capture()
+        self.assertTrue(call["text"])
 
 
 class ParseRepoTests(unittest.TestCase):
@@ -1112,13 +1167,316 @@ class ThreadResolutionFailsClosedTests(unittest.TestCase):
         self.assertEqual(comments[0]["author"]["login"], "reviewer")
 
 
+def _zip(files: dict[str, str]) -> bytes:
+    import io
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, text in files.items():
+            archive.writestr(name, text)
+    return buffer.getvalue()
+
+
+class CollectMainReviewsTests(unittest.TestCase):
+    """The main-run review collector: every artifact under the exact name,
+    its run read fresh, a compare for whether main holds the run's head, and
+    verdict.json; an artifact from any other workflow, event or branch is
+    never downloaded."""
+
+    REPO = "owner/repo"
+    NAME = "pr-review-main-claude-review-5-" + "e" * 40
+    WORKFLOW = ".github/workflows/pr-review-main.yml"
+    HEAD = "c" * 40
+
+    def run_record(self, **fields: Any) -> dict[str, Any]:
+        return {
+            "id": 7,
+            "path": self.WORKFLOW,
+            "event": "workflow_run",
+            "head_branch": "main",
+            "head_sha": self.HEAD,
+            **fields,
+        }
+
+    def collect(self, artifacts, runs, compare="ahead", archive=None):
+        listing = f"repos/{self.REPO}/actions/artifacts?name={self.NAME}&per_page=100"
+        downloads: list[str] = []
+
+        def fake_json(args: list[str], env: Any = None) -> Any:
+            if args[1] == listing:
+                return [{"artifacts": artifacts}]
+            if args[1].startswith(f"repos/{self.REPO}/actions/runs/"):
+                return runs[int(args[1].rsplit("/", 1)[-1])]
+            if args[1] == f"repos/{self.REPO}/compare/{self.HEAD}...main":
+                return {"status": compare}
+            raise RuntimeError(f"gh: Not Found (HTTP 404) {args[1]}")
+
+        def fake_run(args: list[str], **kw: Any) -> Any:
+            downloads.append(args[1])
+            body = (
+                archive
+                if archive is not None
+                else _zip({"verdict.json": '{"findings": 0}'})
+            )
+            return subprocess.CompletedProcess(args, 0, body, b"")
+
+        with (
+            mock.patch.object(gh, "gh_json", side_effect=fake_json),
+            mock.patch.object(gh, "_run_gh", side_effect=fake_run),
+        ):
+            found = gh.collect_main_reviews(
+                self.REPO, {"claude-review": self.NAME}, self.WORKFLOW, "main"
+            )
+        return found, downloads
+
+    def artifact(self, artifact_id: int, run_id: int, **fields: Any) -> dict[str, Any]:
+        return {
+            "id": artifact_id,
+            "name": self.NAME,
+            "expired": False,
+            "workflow_run": {"id": run_id},
+            **fields,
+        }
+
+    def test_keeps_a_main_run_review_with_its_run_and_verdict(self) -> None:
+        found, downloads = self.collect([self.artifact(1, 7)], {7: self.run_record()})
+        self.assertEqual(downloads, [f"repos/{self.REPO}/actions/artifacts/1/zip"])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["lane"], "claude-review")
+        self.assertIs(found[0]["on_branch"], True)
+        self.assertEqual(found[0]["run"]["id"], 7)
+        self.assertEqual(found[0]["verdict"], {"findings": 0})
+
+    def test_never_downloads_an_artifact_of_another_run(self) -> None:
+        runs = {
+            8: self.run_record(id=8, event="pull_request"),
+            9: self.run_record(id=9, head_branch="feature"),
+            10: self.run_record(id=10, path=".github/workflows/forge.yml"),
+        }
+        artifacts = [self.artifact(n, n) for n in runs] + [
+            self.artifact(11, 7, expired=True),
+            self.artifact(12, 7, name=self.NAME + "-x"),
+        ]
+        found, downloads = self.collect(artifacts, {**runs, 7: self.run_record()})
+        self.assertEqual((found, downloads), ([], []))
+
+    def test_a_head_main_does_not_hold_is_marked_so(self) -> None:
+        found, _ = self.collect(
+            [self.artifact(1, 7)], {7: self.run_record()}, "diverged"
+        )
+        self.assertIs(found[0]["on_branch"], False)
+
+    def test_an_unreadable_archive_raises(self) -> None:
+        for archive in (
+            b"not a zip",
+            _zip({"other.json": "{}"}),
+            _zip({"verdict.json": "{"}),
+        ):
+            with self.subTest(archive=archive[:10]), self.assertRaises(RuntimeError):
+                self.collect(
+                    [self.artifact(1, 7)], {7: self.run_record()}, archive=archive
+                )
+
+
+class CollectMainReviewCriticalTests(unittest.TestCase):
+    """The counts pr-review-main's record job left as check runs on each head:
+    the most CRITICAL findings per lane, a title that does not read counting
+    one."""
+
+    NAMES = {
+        "claude-review": "pr-review-main: claude-review",
+        "claude-security-review": "pr-review-main: claude-security-review",
+    }
+
+    def collect(self, by_sha: dict[str, list[dict[str, Any]]]) -> dict[str, int]:
+        def fake(args: list[str], env: Any = None) -> Any:
+            sha = args[1].split("/commits/", 1)[1].split("/", 1)[0]
+            runs = by_sha.get(sha, [])
+            if "filter=all" not in args[1]:
+                # The API's default, `filter=latest`: the newest run per name.
+                runs = list({run["name"]: run for run in runs}.values())
+            return [{"check_runs": runs}]
+
+        with mock.patch.object(gh, "gh_json", side_effect=fake):
+            return gh.collect_main_review_critical(
+                "owner/repo", list(by_sha), self.NAMES
+            )
+
+    def check(
+        self, lane: str, title: str, app: str = "github-actions"
+    ) -> dict[str, Any]:
+        return {
+            "name": self.NAMES[lane],
+            "output": {"title": title},
+            "app": {"slug": app},
+        }
+
+    def test_another_apps_run_of_the_name_is_no_record(self) -> None:
+        counts = self.counts(
+            {
+                "a" * 40: [
+                    self.check(
+                        "claude-security-review", "findings=0 critical=0", "other-app"
+                    ),
+                    self.check("claude-security-review", "findings=1 critical=1"),
+                ]
+            }
+        )
+        self.assertEqual(counts["a" * 40]["claude-security-review"], [(1, 1)])
+
+    def counts(
+        self,
+        by_sha: dict[str, list[dict[str, Any]]],
+        shas: dict[str, list[str]] | None = None,
+        calls: list[str] | None = None,
+    ) -> Any:
+        def fake(args: list[str], env: Any = None) -> Any:
+            if calls is not None:
+                calls.append(args[1])
+            sha = args[1].split("/commits/", 1)[1].split("/", 1)[0]
+            name = args[1].split("check_name=", 1)[1].split("&", 1)[0]
+            return [
+                {
+                    "check_runs": [
+                        run
+                        for run in by_sha.get(sha, [])
+                        if gh.quote(run["name"], safe="") == name
+                    ]
+                }
+            ]
+
+        if shas is None:
+            shas = {lane: list(by_sha) for lane in self.NAMES}
+        with mock.patch.object(gh, "gh_json", side_effect=fake):
+            return gh.collect_main_review_counts("owner/repo", shas, self.NAMES)
+
+    def test_a_stop_title_reads_as_the_stop_and_its_reason(self) -> None:
+        counts = self.counts(
+            {
+                "a" * 40: [
+                    self.check(
+                        "claude-security-review", "verdict=none reason=too-large"
+                    ),
+                    self.check("claude-review", "verdict=none reason=other"),
+                ]
+            }
+        )
+        self.assertEqual(
+            counts["a" * 40],
+            {
+                "claude-security-review": [("stop", "too-large")],
+                "claude-review": [None],
+            },
+        )
+
+    def test_a_failed_chunk_reads_as_a_stop_that_counts_no_critical(self) -> None:
+        # A chunked main-run review whose chunk left no verdict records
+        # `verdict=none reason=chunk-failed`, a designed stop like the others.
+        title = "verdict=none reason=chunk-failed"
+        counts = self.counts({"a" * 40: [self.check("claude-review", title)]})
+        self.assertEqual(counts["a" * 40]["claude-review"], [("stop", "chunk-failed")])
+        found = self.collect({"a" * 40: [self.check("claude-review", title)]})
+        self.assertEqual(found["claude-review"], 0)
+
+    def test_a_stop_counts_no_critical_and_an_unknown_reason_counts_one(self) -> None:
+        found = self.collect(
+            {
+                "a" * 40: [
+                    self.check("claude-security-review", "verdict=none reason=binary"),
+                    self.check("claude-review", "verdict=none reason=other"),
+                ]
+            }
+        )
+        self.assertEqual(found, {"claude-review": 1, "claude-security-review": 0})
+
+    def test_a_stop_on_one_head_leaves_another_heads_critical(self) -> None:
+        found = self.collect(
+            {
+                "a" * 40: [
+                    self.check(
+                        "claude-security-review", "verdict=none reason=long-line"
+                    )
+                ],
+                "b" * 40: [
+                    self.check("claude-security-review", "findings=1 critical=1")
+                ],
+            }
+        )
+        self.assertEqual(found["claude-security-review"], 1)
+
+    def test_reads_each_lane_only_on_the_heads_listed_for_it(self) -> None:
+        calls: list[str] = []
+        head, old = "a" * 40, "b" * 40
+        counts = self.counts(
+            {
+                head: [self.check("claude-review", "findings=1 critical=0")],
+                old: [self.check("claude-security-review", "findings=2 critical=2")],
+            },
+            {"claude-review": [head], "claude-security-review": [head, old, head]},
+            calls,
+        )
+        # One read per (head, lane) listed: 1 + 2, the repeated head once.
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            counts,
+            {
+                head: {"claude-review": [(1, 0)], "claude-security-review": []},
+                old: {"claude-security-review": [(2, 2)]},
+            },
+        )
+
+    def test_takes_the_most_critical_findings_on_any_head(self) -> None:
+        found = self.collect(
+            {
+                "a" * 40: [
+                    self.check("claude-security-review", "findings=3 critical=2")
+                ],
+                "b" * 40: [
+                    self.check("claude-security-review", "findings=0 critical=0")
+                ],
+                "c" * 40: [
+                    self.check("claude-review", "findings=4 critical=1"),
+                    {
+                        "name": "other",
+                        "output": {"title": "findings=9 critical=9"},
+                        "app": {"slug": "github-actions"},
+                    },
+                ],
+            }
+        )
+        self.assertEqual(found, {"claude-review": 1, "claude-security-review": 2})
+
+    def test_a_newer_clean_run_of_the_same_name_hides_no_critical(self) -> None:
+        # A re-run, or a forged record, posts a clean run after the CRITICAL.
+        found = self.collect(
+            {
+                "a" * 40: [
+                    self.check("claude-security-review", "findings=2 critical=2"),
+                    self.check("claude-security-review", "findings=0 critical=0"),
+                ]
+            }
+        )
+        self.assertEqual(found["claude-security-review"], 2)
+
+    def test_a_title_that_does_not_read_counts_one(self) -> None:
+        found = self.collect(
+            {"a" * 40: [self.check("claude-security-review", "critical=0")]}
+        )
+        self.assertEqual(found["claude-security-review"], 1)
+
+    def test_a_head_that_is_not_a_sha_raises(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self.collect({"main": []})
+
+
 class CollectLaneRunsTests(unittest.TestCase):
     """The bind() input collector (the Phase 9 caller contract): runs listed
     by branch with no head_sha filter, kept by PR number, attempts counted
     from a fresh run read, annotations on the lane job only."""
 
     REPO = "owner/repo"
-    LANES = [(".github/workflows/pr-review-hosted.yml", "claude-review-status")]
+    LANES = [(".github/workflows/pr-review-hosted.yml", ("pr-review / claude-review-status",))]
 
     def answers(self, *, fresh_attempts: int = 2) -> dict[str, Any]:
         base = f"repos/{self.REPO}/actions/runs/7"
@@ -1132,7 +1490,8 @@ class CollectLaneRunsTests(unittest.TestCase):
             base: {"id": 7, "run_attempt": fresh_attempts},
         }
         for n in range(1, fresh_attempts + 1):
-            answers[f"{base}/attempts/{n}"] = {"id": 7, "run_attempt": n}
+            if n < fresh_attempts:  # the run read stands in for the latest
+                answers[f"{base}/attempts/{n}"] = {"id": 7, "run_attempt": n}
             answers[f"{base}/attempts/{n}/jobs?per_page=100"] = [
                 {
                     "jobs": [
@@ -1170,11 +1529,160 @@ class CollectLaneRunsTests(unittest.TestCase):
         )
         self.assertNotIn("annotations", jobs[1])
 
+    def test_the_lane_job_is_matched_by_its_whole_name(self) -> None:
+        names = ("pr-review / review-status", "pr-review / claude-review-status")
+        for name, read in (
+            ("pr-review / review-status", True),
+            ("pr-review / claude-review-status", True),
+            ("other / review-status", False),
+            ("review-status", False),
+        ):
+            with self.subTest(job=name):
+                answers = self.answers(fresh_attempts=1)
+                page = answers[f"repos/{self.REPO}/actions/runs/7/attempts/1/jobs?per_page=100"]
+                page[0]["jobs"][0]["name"] = name
+                with mock.patch.object(
+                    self, "LANES", [(self.LANES[0][0], names)]
+                ):
+                    jobs = self.collect(answers)[0]["attempts"][0]["jobs"]
+                self.assertEqual("annotations" in jobs[0], read)
+
+    def test_the_listing_is_bounded_to_runs_since_the_pull_request_opened(self) -> None:
+        answers = self.answers(fresh_attempts=1)
+        unbounded = f"repos/{self.REPO}/actions/workflows/pr-review-hosted.yml/runs?branch=feat%2Fx&event=pull_request&per_page=100"
+        bounded = unbounded.replace(
+            "&per_page", "&created=%3E%3D2026-10-22T01%3A02%3A03Z&per_page"
+        )
+        answers[bounded] = answers.pop(unbounded)
+
+        def fake(args: list[str]) -> Any:
+            if args[1] not in answers:
+                raise RuntimeError(f"gh: Not Found (HTTP 404) {args[1]}")
+            return answers[args[1]]
+
+        with mock.patch.object(gh, "gh_json", side_effect=fake):
+            runs = gh.collect_lane_runs(
+                self.REPO, 5, "feat/x", self.LANES, "2026-10-22T01:02:03Z"
+            )
+        self.assertEqual([r["id"] for r in runs], [7])
+
+    def test_a_creation_time_that_is_not_a_utc_timestamp_leaves_the_listing_unbounded(
+        self,
+    ) -> None:
+        answers = self.answers(fresh_attempts=1)
+
+        def fake(args: list[str]) -> Any:
+            if args[1] not in answers:
+                raise RuntimeError(f"gh: Not Found (HTTP 404) {args[1]}")
+            return answers[args[1]]
+
+        with mock.patch.object(gh, "gh_json", side_effect=fake):
+            runs = gh.collect_lane_runs(self.REPO, 5, "feat/x", self.LANES, "x&y")
+        self.assertEqual([r["id"] for r in runs], [7])
+
+    def listing_of(self, size: int, total: int) -> dict[str, Any]:
+        """Answers whose listing holds `size` runs: the pull request's run 7
+        and `size - 1` other pull requests' runs, under `total_count`."""
+        answers = self.answers(fresh_attempts=1)
+        key = f"repos/{self.REPO}/actions/workflows/pr-review-hosted.yml/runs?branch=feat%2Fx&event=pull_request&per_page=100"
+        mine = answers[key][0]["workflow_runs"][0]
+        others = [
+            {"id": 1000 + i, "run_attempt": 1, "pull_requests": [{"number": 6}]}
+            for i in range(size - 1)
+        ]
+        answers[key] = [
+            {"total_count": total, "workflow_runs": [mine] + others[:99]}
+        ] + [
+            {"total_count": total, "workflow_runs": others[i : i + 100]}
+            for i in range(99, size - 1, 100)
+        ]
+        return answers
+
+    def test_a_listing_one_under_the_search_cap_is_read(self) -> None:
+        runs = self.collect(self.listing_of(999, 999))
+        self.assertEqual([r["id"] for r in runs], [7])
+
+    def test_a_listing_at_the_search_cap_raises(self) -> None:
+        # GitHub returns at most 1,000 runs per filtered search, so a listing
+        # that reached 1,000 may be missing runs.
+        for size, total in ((1000, 1000), (1000, 1500), (100, 1000)):
+            with (
+                self.subTest(size=size, total=total),
+                self.assertRaisesRegex(RuntimeError, "search cap"),
+            ):
+                self.collect(self.listing_of(size, total))
+
     def test_a_deleted_or_expired_attempt_raises(self) -> None:
         answers = self.answers()
         del answers[f"repos/{self.REPO}/actions/runs/7/attempts/1"]
         with self.assertRaises(RuntimeError):
             self.collect(answers)
+
+    def reads_under(self, env: dict[str, str] | None) -> list[tuple[str, Any]]:
+        answers = self.answers()
+        reads: list[tuple[str, Any]] = []
+
+        def fake(args: list[str], env_overrides: Any = None) -> Any:
+            reads.append((args[1], env_overrides))
+            return answers[args[1]]
+
+        with mock.patch.object(gh, "gh_json", side_effect=fake):
+            gh.collect_lane_runs(self.REPO, 5, "feat/x", self.LANES, env_overrides=env)
+        # The listing, the run, attempt 1's record, and both attempts' jobs and
+        # annotations; the run read is attempt 2's record.
+        self.assertEqual(sorted(e for e, _ in reads), sorted(answers))
+        return reads
+
+    def test_every_read_runs_under_the_token_it_is_given(self) -> None:
+        reads = self.reads_under({"GH_TOKEN": "read"})
+        self.assertEqual([env for _, env in reads], [{"GH_TOKEN": "read"}] * 7)
+
+    def test_with_no_token_every_read_keeps_the_process_token(self) -> None:
+        reads = self.reads_under(None)
+        self.assertEqual([env for _, env in reads], [None] * 7)
+
+
+class FetchPullRequestAuthorTests(unittest.TestCase):
+    def test_reads_the_login_nested_under_author(self) -> None:
+        # `gh pr view --json author` nests the login one level down; reading it
+        # at the top level returned "" and the own-PR refusal never fired.
+        payload = {"author": {"login": "kyle-sexton", "is_bot": False}}
+        with mock.patch.object(gh, "gh_json", return_value=payload):
+            self.assertEqual(gh.fetch_pull_request_author("o/r", 1), "kyle-sexton")
+
+    def test_missing_login_fails_closed(self) -> None:
+        for payload in ({"author": {}}, {"login": "kyle-sexton"}, {"author": None}):
+            with (
+                self.subTest(payload=payload),
+                mock.patch.object(gh, "gh_json", return_value=payload),
+                self.assertRaises(RuntimeError),
+            ):
+                gh.fetch_pull_request_author("o/r", 1)
+
+
+class SplitCreatedWindowTests(unittest.TestCase):
+    """A capped `created` window halves at a whole second until it spans the
+    reader's minimum, where it cannot split and the reader refuses."""
+
+    START = datetime(2026, 10, 22, 0, 40, 38, tzinfo=UTC)
+    SECOND = timedelta(seconds=1)
+
+    def test_a_window_halves_at_a_whole_second(self) -> None:
+        end = self.START + timedelta(seconds=7)
+        middle = gh.split_created_window(self.START, end, self.SECOND)
+        self.assertEqual(middle, self.START + timedelta(seconds=3))
+
+    def test_a_window_at_or_under_the_minimum_does_not_split(self) -> None:
+        for span in (timedelta(0), self.SECOND, timedelta(milliseconds=1500)):
+            with self.subTest(span=span):
+                self.assertIsNone(
+                    gh.split_created_window(self.START, self.START + span, self.SECOND)
+                )
+
+    def test_two_seconds_split_into_one_each(self) -> None:
+        end = self.START + 2 * self.SECOND
+        middle = gh.split_created_window(self.START, end, self.SECOND)
+        self.assertEqual(middle, self.START + self.SECOND)
 
 
 if __name__ == "__main__":

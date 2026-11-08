@@ -1,0 +1,282 @@
+{
+  "requires": [
+    {
+      "id": "node",
+      "kind": "runtime",
+      "need": "required",
+      "for": [
+        "skill:course-digest",
+        "skill:setup",
+        "skill:video-digest"
+      ],
+      "detect": {
+        "any": [
+          "node"
+        ],
+        "version": {
+          "args": [
+            "--version"
+          ],
+          "pattern": "v([0-9.]+)",
+          "min": "22.0"
+        }
+      },
+      "degrade": "Without node 22 or newer, the digest skills cannot run their extraction scripts and stop; the video-digest runner and the setup-deps.mjs that /knowledge:setup runs read import.meta.dirname, which older node lacks.",
+      "install": {
+        "docs": "https://nodejs.org/en/download",
+        "brew": "node",
+        "winget": "OpenJS.NodeJS.LTS",
+        "apt": "nodejs"
+      },
+      "check": "/knowledge:check"
+    },
+    {
+      "id": "python",
+      "kind": "runtime",
+      "need": "required",
+      "for": [
+        "skill:docpage-digest",
+        "skill:map-corpus"
+      ],
+      "detect": {
+        "any": [
+          "python3",
+          "python"
+        ],
+        "version": {
+          "args": [
+            "--version"
+          ],
+          "pattern": "Python ([0-9.]+)",
+          "min": "3.9"
+        }
+      },
+      "degrade": "Without Python 3.9 or newer, the bundled gate scripts of /knowledge:map-corpus and /knowledge:docpage-digest cannot run, and both stop.",
+      "install": {
+        "docs": "https://www.python.org/downloads/",
+        "brew": "python",
+        "winget": "Python.Python.3.13",
+        "apt": "python3"
+      },
+      "check": "/knowledge:check"
+    },
+    {
+      "id": "curl",
+      "kind": "cli",
+      "need": "required",
+      "for": [
+        "skill:docpage-digest"
+      ],
+      "detect": {
+        "any": [
+          "curl"
+        ]
+      },
+      "degrade": "Without curl, /knowledge:docpage-digest cannot fetch a docs page for an absence claim and records it unread with reason curl-missing; a cached entry still within --max-age is served without a request.",
+      "install": {
+        "docs": "https://curl.se/download.html",
+        "brew": "curl",
+        "winget": "cURL.cURL",
+        "apt": "curl"
+      },
+      "check": "/knowledge:check"
+    },
+    {
+      "id": "jq",
+      "kind": "cli",
+      "need": "required",
+      "for": [
+        "skill:docpage-digest"
+      ],
+      "detect": {
+        "any": [
+          "jq"
+        ]
+      },
+      "degrade": "Without jq, fetch-docs.sh and docs-cache.sh exit before reading anything, so the docs fetch of /knowledge:docpage-digest stops.",
+      "install": {
+        "docs": "https://jqlang.org/download/",
+        "brew": "jq",
+        "winget": "jqlang.jq",
+        "apt": "jq"
+      },
+      "check": "/knowledge:check"
+    },
+    {
+      "id": "npm",
+      "kind": "cli",
+      "need": "optional",
+      "for": [
+        "skill:course-digest",
+        "skill:setup",
+        "skill:video-digest"
+      ],
+      "detect": {
+        "any": [
+          "npm"
+        ]
+      },
+      "degrade": "Without npm, setup-deps.mjs cannot install the extraction dependencies, so the digest pipelines are unavailable until they are installed.",
+      "install": {
+        "docs": "https://nodejs.org/en/download",
+        "brew": "node",
+        "winget": "OpenJS.NodeJS.LTS",
+        "apt": "npm"
+      },
+      "check": "/knowledge:check"
+    },
+    {
+      "id": "npx",
+      "kind": "cli",
+      "need": "optional",
+      "for": [
+        "skill:course-digest",
+        "skill:setup",
+        "skill:video-digest"
+      ],
+      "detect": {
+        "any": [
+          "npx"
+        ]
+      },
+      "degrade": "Without npx, setup-deps.mjs cannot provision the Playwright Chromium the extraction pipelines drive, so they are unavailable until it is installed.",
+      "install": {
+        "docs": "https://nodejs.org/en/download",
+        "brew": "node",
+        "winget": "OpenJS.NodeJS.LTS",
+        "apt": "npm"
+      },
+      "check": "/knowledge:check"
+    },
+    {
+      "id": "ffmpeg",
+      "kind": "cli",
+      "need": "optional",
+      "for": [
+        "skill:course-digest",
+        "skill:video-digest"
+      ],
+      "detect": {
+        "any": [
+          "ffmpeg"
+        ],
+        "version": {
+          "args": [
+            "-version"
+          ],
+          "pattern": "ffmpeg version n?([0-9]+\\.[0-9]+)",
+          "min": "7.1"
+        }
+      },
+      "degrade": "Without ffmpeg 7.1 or newer, the video-digest watch action and course-digest cannot extract frames reliably; the transcript-only digests still run.",
+      "install": {
+        "docs": "https://ffmpeg.org/download.html",
+        "brew": "ffmpeg",
+        "winget": "Gyan.FFmpeg",
+        "apt": "ffmpeg",
+        "conda": "conda-forge ffmpeg (when the distro package is below 7.1; prefer a release build, since a nightly reports no version)"
+      },
+      "check": "/knowledge:check"
+    },
+    {
+      "id": "ffprobe",
+      "kind": "cli",
+      "need": "optional",
+      "for": [
+        "skill:course-digest",
+        "skill:video-digest"
+      ],
+      "detect": {
+        "any": [
+          "ffprobe"
+        ]
+      },
+      "degrade": "Without ffprobe, the frame extraction cannot read a video's duration, so no frames are extracted.",
+      "install": {
+        "docs": "https://ffmpeg.org/download.html",
+        "brew": "ffmpeg",
+        "winget": "Gyan.FFmpeg",
+        "apt": "ffmpeg"
+      },
+      "check": "/knowledge:check"
+    },
+    {
+      "id": "magick",
+      "kind": "cli",
+      "need": "optional",
+      "for": [
+        "skill:course-digest",
+        "skill:video-digest"
+      ],
+      "detect": {
+        "any": [
+          "magick"
+        ],
+        "version": {
+          "args": [
+            "-version"
+          ],
+          "pattern": "ImageMagick ([0-9.]+)",
+          "min": "7.0"
+        }
+      },
+      "degrade": "Without ImageMagick 7, frame classification cannot build contact sheets and the frame-based digests stop; the transcript-only digests still run.",
+      "install": {
+        "docs": "https://imagemagick.org/script/download.php",
+        "brew": "imagemagick",
+        "winget": "ImageMagick.ImageMagick",
+        "conda": "conda-forge imagemagick (ImageMagick 7, for distros whose package is still ImageMagick 6)"
+      },
+      "check": "/knowledge:check"
+    },
+    {
+      "id": "yt-dlp",
+      "kind": "cli",
+      "need": "required",
+      "for": [
+        "skill:video-digest"
+      ],
+      "detect": {
+        "any": [
+          "yt-dlp"
+        ],
+        "version": {
+          "args": [
+            "--version"
+          ],
+          "pattern": "([0-9]+\\.[0-9]+)",
+          "min": "2026.6"
+        }
+      },
+      "degrade": "Without yt-dlp 2026.6 or newer, /knowledge:video-digest cannot download a YouTube video or its captions, and stops.",
+      "install": {
+        "docs": "https://github.com/yt-dlp/yt-dlp#installation",
+        "brew": "yt-dlp",
+        "winget": "yt-dlp.yt-dlp",
+        "pip": "yt-dlp[default,curl-cffi]"
+      },
+      "check": "/knowledge:check"
+    },
+    {
+      "id": "gh",
+      "kind": "cli",
+      "need": "optional",
+      "for": [
+        "skill:course-digest"
+      ],
+      "detect": {
+        "any": [
+          "gh"
+        ]
+      },
+      "degrade": "Without gh, /knowledge:course-digest cannot analyze a course's code repository; the rest of the digest is unchanged.",
+      "install": {
+        "docs": "https://cli.github.com/",
+        "brew": "gh",
+        "winget": "GitHub.cli",
+        "apt": "gh"
+      },
+      "check": "/knowledge:check"
+    }
+  ]
+}

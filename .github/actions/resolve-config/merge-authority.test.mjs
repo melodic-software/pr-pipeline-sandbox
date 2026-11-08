@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { parse, stringify } from "yaml";
 
 import { Rejection, resolve } from "./resolve.mjs";
+import { FORCED_DENIED_PATHS } from "../../scripts/pr-merge/merge-holds.mjs";
 
 const read = (relative) =>
   readFileSync(new URL(relative, import.meta.url), "utf8");
@@ -31,7 +32,6 @@ const run = (config) =>
         event: "synchronize",
         changedPaths: ["src/app.js"],
         labels: [],
-        workClasses: [],
       },
     },
   );
@@ -52,11 +52,13 @@ const rejectedFor = (config, pattern) =>
   );
 
 // The merge section valid.yaml resolves to: no merge section, so rung off,
-// manual landing, and only the forced denied paths.
+// manual landing, lane pull requests on native auto-merge, and only the
+// forced denied paths.
 const VALID_MERGE = {
   rung: "off",
-  "diff-check": { "denied-paths": [CONFIG_PATH, ".github/**", TRUSTED_ACTORS] },
+  "diff-check": { "denied-paths": [CONFIG_PATH, TRUSTED_ACTORS] },
   "stack-landing": "manual",
+  "lane-prs": "native",
 };
 
 test("authority local-babysit without agent-identity fails the schema on the missing identity", () => {
@@ -117,8 +119,65 @@ test("rung C2 with a valid diff-check and no authority still validates (absent a
   );
 });
 
-test("rung C2 without diff-check still fails the schema", () => {
-  rejectedFor(withMerge({ rung: "C2" }), /required property 'diff-check'/);
+// Merge-criterion plan, Design 3: the enabled pr-merge lane reads no class,
+// so the verifier verdict must be required.
+const LANE = {
+  rung: "C2",
+  "agent-identity": IDENTITY,
+  "diff-check": { "denied-paths": [".claude/**"], "max-changed-lines": 200 },
+};
+
+test("an enabled pr-merge lane above off without a required verdict fails the schema", () => {
+  for (const merge of [
+    LANE,
+    { ...LANE, authority: "pr-merge" },
+    { ...LANE, "require-verifier-verdict": false },
+    { ...LANE, rung: "C3", "require-verifier-verdict": false },
+  ]) {
+    rejectedFor(withMerge(merge), /require-verifier-verdict/);
+  }
+});
+
+test("an enabled pr-merge lane with a required verdict, or at rung off, validates", () => {
+  assert.doesNotThrow(() => run(withMerge({ ...LANE, "require-verifier-verdict": true })));
+  assert.doesNotThrow(() => run(withMerge({ ...LANE, rung: "off" })));
+  assert.doesNotThrow(() =>
+    run(withMerge({ ...LANE, authority: "local-babysit" })),
+  );
+});
+
+// Owner decision Q624: the pr-merge lane needs no denied path or size cap;
+// each check is a diff-check setting.
+test("a pr-merge rung C2 with no diff-check, or an empty one, validates", () => {
+  assert.doesNotThrow(() => run(withMerge({ rung: "C2" })));
+  assert.doesNotThrow(() =>
+    run(withMerge({ ...LANE, "require-verifier-verdict": true, "diff-check": { "denied-paths": [] } })),
+  );
+  assert.doesNotThrow(() =>
+    run(
+      withMerge({
+        ...LANE,
+        "require-verifier-verdict": true,
+        "diff-check": {
+          "denied-paths": [".github/**"],
+          "max-changed-lines": 400,
+          "max-changed-files": 8,
+          "high-path-floor": true,
+          "c2-contradictions": true,
+        },
+      }),
+    ),
+  );
+  rejectedFor(withMerge({ ...LANE, "diff-check": { "high-path-floor": "yes" } }), /high-path-floor/);
+});
+
+test("a local-babysit rung C2 still needs denied paths and a line cap", () => {
+  const local = { rung: "C2", authority: "local-babysit", "agent-identity": IDENTITY };
+  rejectedFor(withMerge({ ...local, "diff-check": { "denied-paths": [] } }), /max-changed-lines/);
+  rejectedFor(
+    withMerge({ ...local, "diff-check": { "denied-paths": [], "max-changed-lines": 200 } }),
+    /denied-paths/,
+  );
 });
 
 test("rung C2 with authority local-babysit and an identity but no diff-check fails the schema", () => {
@@ -156,10 +215,54 @@ test("resolveMerge output for valid.yaml is unchanged", () => {
   assert.deepEqual(run(read("./fixtures/valid.yaml")).merge, VALID_MERGE);
 });
 
+// ci-status adds this floor to the base config's denied paths itself.
+test("merge-holds.mjs's FORCED_DENIED_PATHS are the denied paths resolveMerge forces", () => {
+  assert.deepEqual(
+    [...run(read("./fixtures/valid.yaml")).merge["diff-check"]["denied-paths"]].sort(),
+    [...FORCED_DENIED_PATHS].sort(),
+  );
+});
+
 test("resolveMerge does not carry authority or agent-identity into the output", () => {
   assert.deepEqual(
     run(withMerge({ authority: "local-babysit", "agent-identity": IDENTITY }))
       .merge,
     VALID_MERGE,
   );
+});
+
+test("merge.dependabot.mode takes off, report or enforce", () => {
+  for (const mode of ["off", "report", "enforce"]) {
+    assert.doesNotThrow(() => run(withMerge({ dependabot: { mode } })), mode);
+  }
+});
+
+test("any other merge.dependabot.mode or key fails the schema", () => {
+  rejectedFor(
+    withMerge({ dependabot: { mode: "on" } }),
+    /must be equal to one of the allowed values/,
+  );
+  rejectedFor(
+    withMerge({ dependabot: { mode: "enforce", majors: true } }),
+    /must be equal to one of the allowed values/,
+  );
+  rejectedFor(
+    withMerge({ dependabot: { mode: "enforce", other: true } }),
+    /must NOT have additional properties/,
+  );
+});
+
+test("merge.lane-prs takes native or gate, and the schema's default is the resolver's", () => {
+  for (const mode of ["native", "gate"]) {
+    assert.equal(run(withMerge({ "lane-prs": mode })).merge["lane-prs"], mode);
+  }
+  rejectedFor(withMerge({ "lane-prs": "off" }), /must be equal to one of the allowed values/);
+  const schema = json("../../../docs/conventions/pr-pipeline/pr-pipeline.schema.json");
+  assert.equal(schema.$defs.merge.properties["lane-prs"].default, run(withMerge({})).merge["lane-prs"]);
+});
+
+test("merge.dependabot.majors takes hold or review", () => {
+  for (const majors of ["hold", "review"]) {
+    assert.doesNotThrow(() => run(withMerge({ dependabot: { mode: "enforce", majors } })), majors);
+  }
 });

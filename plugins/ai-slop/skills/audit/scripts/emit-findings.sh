@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# Compose a conforming review-findings file from detect.sh output.
+#
+#   emit-findings.sh --from <detect-output> [--from <detect-output> ...] --out <path> [--branch <b>]
+#
+# --from is repeatable: a chunked detector run (detect.sh --offset/--limit)
+# writes one Summary block per chunk, and this script SUMS the per-rule counts
+# across every --from file. A rule is reported as returning no result only
+# when every chunk reported zero findings for it; a rule is reported disabled
+# when any chunk said so (the config is the same for every chunk of one run).
+#
+# The FINDINGS HOME is never resolved here: the caller (the audit skill)
+# resolves it from the memory root per the detector-findings convention and its
+# fetch-and-refuse gate, then hands the resolved path in as --out. This script
+# owns only the deterministic composition: at repo scale a findings file runs
+# to thousands of rows, which is script work, not prose work.
+#
+# The per-rule Tier/Action cells MIRROR the severity crosswalk in
+# docs/conventions/detector-findings/README.md ("The severity crosswalk");
+# that table is the source of truth. A tier change lands there first and is
+# copied here, never the reverse.
+#
+# Exit: 0 on success, 2 on usage error, 3 when a --from file carries no
+# detect.sh Summary rows at all (not detector output; refusing beats composing
+# from garbage). Zero findings with Summary rows present still WRITES the file:
+# per the persist contract, coverage is the payload.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/opt-value.sh
+source "$SCRIPT_DIR/lib/opt-value.sh"
+
+# No `tier:` frontmatter is emitted. Both owner docs (context/persist-findings.md
+# and the detector-findings adopter row) say this producer omits it, and nothing
+# here computes a value: the retired --tier flag defaulted to a hardcoded
+# "medium" that described no property of the run.
+FROM_FILES=()
+OUT=""
+BRANCH=""
+
+usage() {
+  cat <<'EOF'
+emit-findings.sh: compose a review-findings file from detect.sh output.
+
+Usage:
+  emit-findings.sh --from <detect-output> [--from <detect-output> ...] --out <path> [--branch <b>]
+
+--from may repeat, one per detector chunk; per-rule counts are summed across
+chunks. --out is the CONVENTION-RESOLVED destination; if it exists, a -2/-3
+suffix is appended (non-overwrite naming). --branch defaults to the current
+git branch.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --from)
+    require_opt_value "emit-findings.sh" "$@"
+    FROM_FILES+=("$2")
+    shift 2
+    ;;
+  --out)
+    require_opt_value "emit-findings.sh" "$@"
+    OUT="$2"
+    shift 2
+    ;;
+  --branch)
+    require_opt_value "emit-findings.sh" "$@"
+    BRANCH="$2"
+    shift 2
+    ;;
+  --help | -h)
+    usage
+    exit 0
+    ;;
+  *)
+    echo "emit-findings.sh: unknown argument: $1" >&2
+    exit 2
+    ;;
+  esac
+done
+
+[[ "${#FROM_FILES[@]}" -gt 0 && -n "$OUT" ]] || {
+  usage >&2
+  exit 2
+}
+for from in "${FROM_FILES[@]}"; do
+  [[ -f "$from" ]] || {
+    echo "emit-findings.sh: --from file not found: $from" >&2
+    exit 2
+  }
+  if ! LC_ALL=C grep -q '^Summary rule=' "$from"; then
+    echo "emit-findings.sh: $from has no detect.sh Summary rows; not detector output" >&2
+    exit 3
+  fi
+done
+if [[ -z "$BRANCH" ]]; then
+  BRANCH="$(git branch --show-current 2>/dev/null || true)"
+  [[ -n "$BRANCH" ]] || {
+    echo "emit-findings.sh: no --branch and no current git branch" >&2
+    exit 2
+  }
+fi
+
+# Non-overwrite naming: never clobber an unconsumed findings file.
+if [[ -e "$OUT" ]]; then
+  n=2
+  while [[ -e "${OUT%.md}-$n.md" ]]; do n=$((n + 1)); done
+  OUT="${OUT%.md}-$n.md"
+fi
+mkdir -p "$(dirname "$OUT")"
+
+# ISO-8601 EXTENDED, colons in the time portion. The consumer parses this field:
+# fix-pass-mode.md "Step 1" reads a value only if it is "a full ISO-8601
+# date-time carrying an explicit UTC designator (Z) or a numeric offset", and
+# calls anything else UNREADABLE. The colon-free rule this convention states
+# elsewhere binds the FILE NAME (Windows-safe), never this frontmatter field.
+DATE_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Repo root, for relativizing Location when detect.sh handed us an absolute
+# path. One directory has several SPELLINGS on Git Bash, and matching the
+# wrong one leaves every Location absolute. An absolute path is still a
+# well-formed cell, so the fail-open producer never reports it. Measured:
+# `git rev-parse --show-toplevel` answers Git Bash's Windows spelling of the same temp repo
+# while the caller reached the same directory as `/tmp/t/repo`.
+#
+# The PRIMARY anchor is derived from the caller's own `pwd` by removing the
+# sub-path git reports for it. The git-reported forms stay as fallbacks.
+# (This producer FAILs OPEN: a path that matches no spelling is left as-is.
+# The harness-config sibling fails closed on the same mismatch.)
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+REPO_ROOT_ALT=""
+REPO_ROOT_PWD=""
+if [[ -n "$REPO_ROOT" ]]; then
+  REPO_ROOT_ALT="$(cd "$REPO_ROOT" 2>/dev/null && pwd)" || REPO_ROOT_ALT=""
+  [[ "$REPO_ROOT_ALT" == "$REPO_ROOT" ]] && REPO_ROOT_ALT=""
+  git_prefix="$(git rev-parse --show-prefix 2>/dev/null || true)"
+  git_prefix="${git_prefix%/}"
+  cwd_now="$(pwd)"
+  if [[ -z "$git_prefix" ]]; then
+    REPO_ROOT_PWD="$cwd_now"
+  elif [[ "$cwd_now" == */"$git_prefix" ]]; then
+    REPO_ROOT_PWD="${cwd_now%/"$git_prefix"}"
+  fi
+  [[ "$REPO_ROOT_PWD" == "$REPO_ROOT" || "$REPO_ROOT_PWD" == "$REPO_ROOT_ALT" ]] && REPO_ROOT_PWD=""
+fi
+
+cat "${FROM_FILES[@]}" | LC_ALL=C awk -v branch="$BRANCH" -v date_utc="$DATE_UTC" -v nchunks="${#FROM_FILES[@]}" \
+  -v repo_root="$REPO_ROOT" -v repo_root_alt="$REPO_ROOT_ALT" -v repo_root_pwd="$REPO_ROOT_PWD" '
+  # Quote a frontmatter value only when the plain form would misparse. git
+  # accepts branch names starting with a YAML indicator ("@foo", "!foo",
+  # "#foo"); emitted bare, "#foo" reads as a comment and the rest as
+  # indicators, so the value the consumer compares is not the branch name.
+  # The consumer (review/fanout fix-pass-mode.md "Step 1") admits a findings
+  # file only on an EXACT branch match, so a misparse silently drops every
+  # finding for that branch.
+  #
+  # Conditional, not unconditional: an ordinary name stays a byte-identical
+  # plain scalar, so the wire format for the common path does not move.
+  # Predicate deliberately IDENTICAL to the two sibling producers
+  # (harness-config/audit-instructions/scripts/emit-findings.sh and
+  # testing/audit/scripts/cant-fail-scan.sh): three producers answering one
+  # frontmatter contract must agree, or a consumer sees three shapes.
+  # A plain scalar YAML implicitly TYPES is also unsafe: git accepts branch
+  # names like `true`, `null`, `no`, `123` and `2026-08-23`, and a consumer
+  # reading those back gets a boolean, a null, a number or a date rather than
+  # the exact branch string the relay matches on. Quote them too.
+  function yaml_implicit_typed(s,   l) {
+    l = tolower(s)
+    if (l ~ /^(true|false|yes|no|on|off|null|~)$/) return 1
+    if (s ~ /^[+-]?[0-9]+$/) return 1
+    if (s ~ /^[+-]?[0-9]*\.[0-9]+([eE][+-]?[0-9]+)?$/) return 1
+    if (s ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}/) return 1
+    if (s ~ /^0[xXoObB][0-9a-fA-F_]+$/) return 1
+    return 0
+  }
+  function yaml_scalar(s) {
+    if (s ~ /^[-?:,\[\]{}#&*!|>%@`"\x27]/ || s ~ /: / || s ~ / #/ || s ~ /^$/ || s ~ /[ \t]$/ || yaml_implicit_typed(s)) {
+      gsub(/\\/, "\\\\", s)
+      gsub(/"/, "\\\"", s)
+      return "\"" s "\""
+    }
+    return s
+  }
+
+  # Tier/Action mirror of the severity crosswalk (see header comment).
+  function rule_tier(slug) {
+    if (slug == "rule-knowledge-cutoff-disclaimer" || slug == "rule-llm-citation-artifacts" ||
+        slug == "rule-chatbot-artifacts")
+      return "IMPORTANT"
+    return "SUGGESTION"
+  }
+  function rule_action(slug) {
+    if (slug == "rule-utm-params")
+      return "Strip the utm_* parameters from the URL (auto-applicable: resolution unchanged)"
+    if (slug == "rule-knowledge-cutoff-disclaimer")
+      return "Delete the assistant-frame sentence; check surrounding prose did not depend on it"
+    if (slug == "rule-llm-citation-artifacts")
+      return "Remove the generation artifact; decide whether the claim needs a real citation"
+    if (slug == "rule-chatbot-artifacts")
+      return "Delete the chat-turn sentence; keep any real content it carried in document register"
+    if (slug == "rule-filler-phrases")
+      return "Substitute per rewrite-guide.md: \"in order to\" -> \"to\", \"due to the fact that\" -> \"because\"; delete the note-phrases outright"
+    if (slug == "rule-stacked-hedging")
+      return "Keep the one hedge that states the real uncertainty; drop the other"
+    if (slug == "rule-model-era-phrases")
+      return "Rewrite per rewrite-guide.md model-era guidance: state the point without the stock construction"
+    return "Guarded rewrite via /ai-slop:audit fix (judgment; see crosswalk row)"
+  }
+  # Cell-escaping rule: literal | becomes \| inside Finding/Action cells.
+  #
+  # IDEMPOTENT. A naive gsub double-escapes a pipe the SOURCE already escaped:
+  # `a \| b` becomes `a \\| b`, which GFM reads as a literal backslash followed
+  # by a LIVE delimiter, so the cell splits and the fix action misreads the row.
+  # This repo writes literal `\|` in its own tables, so the case is real rather
+  # than theoretical. Escape by the parity of the complete backslash run before
+  # each pipe: an odd count already escapes the delimiter; an even count
+  # (including zero, and `\\|`) leaves it live in GFM and needs one more `\`.
+  function esc(s,    out, i, n, c, bs) {
+    out = ""
+    n = length(s)
+    i = 1
+    while (i <= n) {
+      c = substr(s, i, 1)
+      if (c == "\\") {
+        bs = 0
+        while (i <= n && substr(s, i, 1) == "\\") { bs++; i++ }
+        if (i <= n && substr(s, i, 1) == "|") {
+          if (bs % 2 == 0) bs++
+          while (bs--) out = out "\\"
+          out = out "|"
+          i++
+        } else {
+          while (bs--) out = out "\\"
+        }
+      } else if (c == "|") {
+        out = out "\\|"
+        i++
+      } else {
+        out = out c
+        i++
+      }
+    }
+    return out
+  }
+
+  # Prefer the caller pwd spelling, then git toplevel, then cd-then-pwd.
+  # Fail OPEN: a path matching no spelling is returned unchanged (absolute
+  # Location stays well-formed).
+  function relativize(p) {
+    if (repo_root_pwd != "" && index(p, repo_root_pwd "/") == 1)
+      return substr(p, length(repo_root_pwd) + 2)
+    if (repo_root != "" && index(p, repo_root "/") == 1)
+      return substr(p, length(repo_root) + 2)
+    if (repo_root_alt != "" && index(p, repo_root_alt "/") == 1)
+      return substr(p, length(repo_root_alt) + 2)
+    return p
+  }
+
+  # Read one `key=value` field out of a Summary row; 0 when the row lacks it,
+  # so older detector output without the split counts still composes.
+  function field(line, key,    v) {
+    if (index(line, " " key "=") == 0) return 0
+    v = line
+    sub(".* " key "=", "", v)
+    sub(/ .*/, "", v)
+    return v + 0
+  }
+
+  /^Finding: / {
+    # Split the excerpt off FIRST, on the first " excerpt=" occurrence, then
+    # parse the remaining header left-to-right with index() (first match).
+    # Greedy .* extraction would anchor on the LAST "file="/"line=" in the
+    # line, so an excerpt containing those tokens (docs describing this very
+    # format) would silently corrupt the Location cell.
+    line = $0
+    sub(/^Finding: rule=ai-slop\/audit\//, "", line)
+    ix = index(line, " excerpt=")
+    if (ix == 0) next
+    excerpt = substr(line, ix + 9)
+    head = substr(line, 1, ix - 1)
+    ix = index(head, " fired=")
+    fired = substr(head, ix + 7)
+    head = substr(head, 1, ix - 1)
+    ix = index(head, " line=")
+    lno = substr(head, ix + 6)
+    head = substr(head, 1, ix - 1)
+    ix = index(head, " file=")
+    file = relativize(substr(head, ix + 6))
+    slug = substr(head, 1, ix - 1)
+    t = rule_tier(slug)
+    row = "| " t " | high | " file ":" lno " | ai-slop:audit | " \
+      esc("ai-slop/audit/" slug " " fired " -- " excerpt) " | " esc(rule_action(slug)) " |"
+    if (t == "IMPORTANT") imp[++ni] = row
+    else sug[++ns] = row
+    next
+  }
+  /^Declined: / { declined_files[++ndecl] = $0; next }
+  /^Summary rule=/ {
+    line = $0
+    sub(/^Summary rule=/, "", line)
+    rid = line; sub(/ .*/, "", rid)
+    if (!(rid in seen)) { seen[rid] = 1; order[++nrules] = rid }
+    findings[rid] += field(line, "findings")
+    decl[rid] += field(line, "declined")
+    decl_marker[rid] += field(line, "declined_marker")
+    decl_quote[rid] += field(line, "declined_quote")
+    decl_config[rid] += field(line, "declined_config")
+    if (field(line, "disabled") == 1) disabled[rid] = 1
+    next
+  }
+  # "Summary total: N findings across M files scanned (K files declined)"
+  /^Summary total: / {
+    scanned += $6
+    k = $9; sub(/\(/, "", k); whole_declined += k
+    next
+  }
+  END {
+    printf "---\ntype: review-findings\ndate: %s\nbranch: %s\n---\n\n", date_utc, yaml_scalar(branch)
+    print "## Findings"
+    print ""
+    print "| Rank | Tier | Confidence | Location | Surface(s) | Finding | Action |"
+    print "|------|------|------------|----------|------------|---------|--------|"
+    rank = 0
+    for (i = 1; i <= ni; i++) printf "| %d %s\n", ++rank, imp[i]
+    for (i = 1; i <= ns; i++) printf "| %d %s\n", ++rank, sug[i]
+    print ""
+    print "## Surfaces"
+    print ""
+    ran = sprintf("Ran: [ai-slop:audit (detect.sh)]. Scanned: %d files in %d chunk(s); %d whole file(s) declined.", scanned, nchunks, whole_declined)
+    off = ""
+    zero = ""
+    for (i = 1; i <= nrules; i++) {
+      rid = order[i]
+      if (rid in disabled) off = off (off == "" ? "" : ", ") rid
+      else if (findings[rid] == 0) zero = zero (zero == "" ? "" : ", ") rid
+    }
+    if (off != "") ran = ran " Disabled by config: [" off "]."
+    if (zero != "") ran = ran " Returned no result: [" zero "]."
+    print ran
+    for (i = 1; i <= nrules; i++) {
+      rid = order[i]
+      if (decl[rid] > 0)
+        printf "Declined candidates: %s count=%d (marker=%d, quote=%d, config=%d)\n", rid, decl[rid], decl_marker[rid], decl_quote[rid], decl_config[rid]
+    }
+    for (i = 1; i <= ndecl; i++) print declined_files[i]
+  }
+' >"$OUT"
+
+echo "emit-findings.sh: wrote $OUT"

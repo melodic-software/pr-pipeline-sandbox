@@ -1,7 +1,8 @@
 name: pr-run-activity-read-probe
 
-# Test caller of pr-run-activity-read.yml. It passes no secret at all, so no
-# App key or OAuth token reaches the run. Runs only on PRs that touch
+# Test caller of pr-run-activity-read.yml. It passes only the scan-carrier
+# key, which the read runner requires and its scan job alone reads, so no App
+# key or OAuth token reaches the run. Runs only on PRs that touch
 # sandbox/read-split/**.
 #   read-token:     case 6, a read script activity; expected success.
 #   write-via-read: case 7a, a mutate-branch activity sent to the read
@@ -27,6 +28,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      issues: write
       id-token: write
     concurrency:
       group: ${{ github.workflow }}-read-token-${{ github.event.pull_request.number || inputs.pr-number }}
@@ -36,12 +38,15 @@ jobs:
       lane: pr-run-checks
       activity: check-read-token
       pr-number: ${{ inputs.pr-number }}
+    secrets:
+      scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
 
   write-via-read:
     permissions:
       contents: read
       pull-requests: read
       checks: write
+      issues: write
       id-token: write
     concurrency:
       group: ${{ github.workflow }}-write-via-read-${{ github.event.pull_request.number || inputs.pr-number }}
@@ -51,3 +56,5 @@ jobs:
       lane: pr-refine
       activity: check-write-effect
       pr-number: ${{ inputs.pr-number }}
+    secrets:
+      scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}

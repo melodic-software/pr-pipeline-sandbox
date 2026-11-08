@@ -1,0 +1,169 @@
+"""`collect_lane_runs` uses the fresh run read as the run's latest attempt.
+
+The fixture is a recorded live pair: `GET actions/runs/{id}` and
+`GET actions/runs/{id}/attempts/{run_attempt}` for one completed
+pr-review-hosted run, with the actor, commit and repository objects (equal in
+both) left out. Those two responses differ only in `jobs_url` and `logs_url`.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import sys
+import unittest
+from typing import Any
+from unittest import mock
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+import babysit_gh as gh
+
+FIXTURE = (
+    pathlib.Path(__file__).resolve().parent
+    / "fixtures"
+    / "lane_runs"
+    / "run_and_latest_attempt.json"
+)
+# Every attempt field babysit_review_evidence.bind() reads.
+BIND_FIELDS = gh.LANE_ATTEMPT_FIELDS
+
+
+class LaneAttemptReuseTests(unittest.TestCase):
+    REPO = "melodic-software/claude-code-plugins"
+    LANES = [(".github/workflows/pr-review-hosted.yml", ("pr-review / claude-review-status",))]
+
+    def setUp(self) -> None:
+        recorded = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        self.run_record = recorded["run"]
+        self.attempt = recorded["latest_attempt"]
+
+    def test_the_recorded_pair_differs_only_in_unread_urls(self) -> None:
+        differing = {
+            key
+            for key in self.run_record.keys() | self.attempt.keys()
+            if self.run_record.get(key) != self.attempt.get(key)
+        }
+        self.assertEqual(differing, {"jobs_url", "logs_url"})
+
+    def collect(
+        self,
+        run: dict[str, Any],
+        earlier: dict[int, Any],
+        jobs: dict[int, list[dict[str, Any]]] | None = None,
+        annotations: dict[int, list[dict[str, Any]]] | None = None,
+    ) -> Any:
+        run_id = run["id"]
+        base = f"repos/{self.REPO}/actions/runs/{run_id}"
+        listing = (
+            f"repos/{self.REPO}/actions/workflows/pr-review-hosted.yml/runs"
+            f"?branch={run['head_branch'].replace('/', '%2F')}"
+            "&event=pull_request&per_page=100"
+        )
+        number = run["pull_requests"][0]["number"]
+        answers: dict[str, Any] = {listing: [{"workflow_runs": [run]}], base: run}
+        for n in range(1, run["run_attempt"] + 1):
+            answers[f"{base}/attempts/{n}/jobs?per_page=100"] = [
+                {"jobs": (jobs or {}).get(n, [])}
+            ]
+        for n, attempt in earlier.items():
+            answers[f"{base}/attempts/{n}"] = attempt
+        for job_id, notes in (annotations or {}).items():
+            answers[
+                f"repos/{self.REPO}/check-runs/{job_id}/annotations?per_page=100"
+            ] = [notes]
+        self.reads: list[str] = []
+
+        def fake(args: list[str]) -> Any:
+            self.reads.append(args[1])
+            if args[1] not in answers:
+                raise RuntimeError(f"gh: Not Found (HTTP 404) {args[1]}")
+            return answers[args[1]]
+
+        with mock.patch.object(gh, "gh_json", side_effect=fake):
+            return gh.collect_lane_runs(
+                self.REPO, number, run["head_branch"], self.LANES
+            )
+
+    def test_the_latest_attempt_is_the_run_read_and_is_not_requested(self) -> None:
+        runs = self.collect(self.run_record, {})
+        latest = runs[0]["attempts"][-1]
+        self.assertEqual(
+            {field: latest[field] for field in BIND_FIELDS},
+            {field: self.attempt[field] for field in BIND_FIELDS},
+        )
+        self.assertNotIn(
+            f"repos/{self.REPO}/actions/runs/{self.run_record['id']}/attempts/1",
+            self.reads,
+        )
+
+    def test_earlier_attempts_are_still_read(self) -> None:
+        rerun = {**self.run_record, "run_attempt": 2}
+        first = {**self.attempt, "conclusion": "failure"}
+        runs = self.collect(rerun, {1: first})
+        attempts = runs[0]["attempts"]
+        self.assertEqual(
+            [(a["run_attempt"], a["conclusion"]) for a in attempts],
+            [(1, "failure"), (2, "success")],
+        )
+        base = f"repos/{self.REPO}/actions/runs/{self.run_record['id']}"
+        self.assertIn(f"{base}/attempts/1", self.reads)
+        self.assertNotIn(f"{base}/attempts/2", self.reads)
+
+    def test_an_earlier_attempts_kill_switch_notice_is_read(self) -> None:
+        # #10092's attempt 1: the kill-switch job wrote its notice and the
+        # reusable's caller job was skipped. The kill-switch job of an attempt
+        # that has a lane job, and one that neither succeeded nor failed, cost
+        # no read.
+        rerun = {**self.run_record, "run_attempt": 2}
+        notice = {
+            "annotation_level": "notice",
+            "message": "a kill switch stops this review (lanes: kill-switch)",
+        }
+        jobs = {
+            1: [
+                {"id": 11, "name": "kill-switch", "conclusion": "success"},
+                {"id": 12, "name": "pr-review", "conclusion": "skipped"},
+            ],
+            2: [
+                {"id": 21, "name": "kill-switch", "conclusion": "success"},
+                {"id": 22, "name": "pr-review / claude-review-status"},
+            ],
+        }
+        runs = self.collect(rerun, {1: self.attempt}, jobs, {11: [notice], 22: []})
+        first, second = (a["jobs"] for a in runs[0]["attempts"])
+        self.assertEqual(first[0]["annotations"], [notice])
+        self.assertNotIn("annotations", first[1])
+        self.assertNotIn("annotations", second[0])
+        self.assertEqual(second[1]["annotations"], [])
+        cancelled = {1: [{"id": 13, "name": "kill-switch", "conclusion": "cancelled"}]}
+        self.collect(rerun, {1: self.attempt}, cancelled)
+        self.assertFalse(any("check-runs" in path for path in self.reads))
+
+    def test_an_earlier_attempts_upstream_stop_is_read(self) -> None:
+        # The upstream-status gate failed attempt 1's kill-switch job with its
+        # error, and the reusable's caller job was skipped
+        # (babysit_review_evidence `_upstream_stopped`).
+        rerun = {**self.run_record, "run_attempt": 2}
+        error = {
+            "annotation_level": "failure",
+            "message": "an upstream outage stops this review (Actions major_outage)",
+        }
+        jobs = {
+            1: [
+                {"id": 11, "name": "kill-switch", "conclusion": "failure"},
+                {"id": 12, "name": "pr-review", "conclusion": "skipped"},
+            ],
+            2: [
+                {"id": 21, "name": "kill-switch", "conclusion": "success"},
+                {"id": 22, "name": "pr-review / claude-review-status"},
+            ],
+        }
+        first_attempt = {**self.attempt, "conclusion": "failure"}
+        runs = self.collect(rerun, {1: first_attempt}, jobs, {11: [error], 22: []})
+        first = runs[0]["attempts"][0]["jobs"]
+        self.assertEqual(first[0]["annotations"], [error])
+
+
+if __name__ == "__main__":
+    unittest.main()

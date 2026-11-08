@@ -1,0 +1,321 @@
+"""Shared parsing and CLI scaffolding for the docpage-digest standing gates.
+
+Stdlib only. Python 3.9+. Both gates stay standalone-runnable: they insert
+this directory on sys.path and import from here. Parsing is exact — no
+``.strip()`` on fence payloads — because a per-line strip is how indented-fence
+corruption and a load-bearing trailing space earned a clean quote-gate result.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from typing import Callable, Iterator, List, NamedTuple, NoReturn, Optional, Tuple
+
+MIN_PYTHON = (3, 9)
+
+CLAIM_LABEL = re.compile(r"^\*\*C(\d+)\.\*\*")
+ATX_H2 = re.compile(r"^##[ \t]+(.+?)\s*$")
+NONE_MARKERS = frozenset(
+    {
+        "none",
+        "n/a",
+        "(none)",
+        "no prompt snippets",
+        "no snippets",
+        "none.",
+    }
+)
+
+
+ECHO_LIMIT = 50
+
+
+class Failures:
+    """Named check failures, echoed to stderr as they land under ``prog``.
+
+    Only the first ``ECHO_LIMIT`` are echoed; ``report_suppressed`` then names
+    how many were not. ``items`` keeps every failure, so the count and the exit
+    code are unaffected.
+    """
+
+    def __init__(self, prog: str):
+        self.prog = prog
+        self.items: List[str] = []
+
+    def add(self, message: str) -> None:
+        self.items.append(message)
+        if len(self.items) <= ECHO_LIMIT:
+            sys.stderr.write(f"{self.prog}: FAIL: {message}\n")
+
+    def report_suppressed(self) -> None:
+        hidden = len(self.items) - ECHO_LIMIT
+        if hidden > 0:
+            sys.stderr.write(f"{self.prog}: ... {hidden} more failure(s) not shown\n")
+
+
+class Fence(NamedTuple):
+    start_line: int  # 1-based, opener
+    indented: bool
+    payload: str  # exact body; no strip; no closer-line newline
+
+
+class Claim(NamedTuple):
+    number: int
+    label_line: int
+    fence: Optional[Fence]
+    unfenced_blockquote: bool
+    unfenced_inline_code: bool
+
+
+def use_utf8_streams() -> None:
+    """Re-encode stdout and stderr as UTF-8 before a gate writes anything.
+
+    Both gates echo source bytes back through ``preview_payload`` and both
+    print a non-ASCII character in their own summary line, so a console whose
+    default encoding is not UTF-8 (cp1252 on a stock Windows terminal) raises
+    ``UnicodeEncodeError`` and the run reports itself as a gate bug even when
+    the digest is clean. ``backslashreplace`` keeps one unrenderable byte from
+    aborting a run. A stream with no ``reconfigure`` is left alone.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            pass
+
+
+def fail(prog: str, code: int, message: str) -> NoReturn:
+    sys.stderr.write(f"{prog}: ERROR: {message}\n")
+    raise SystemExit(code)
+
+
+def parse_gate_args(
+    prog: str, description: str, argv: Optional[List[str]]
+) -> argparse.Namespace:
+    """Both gates take one ``--source`` and repeatable ``--digest`` paths."""
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description=description,
+        epilog=(
+            "exit codes: 0 all checks passed; 1 one or more named check "
+            "failures; 2 unusable input; 3 internal gate bug"
+        ),
+    )
+    parser.add_argument(
+        "--source", required=True, help="Immutable source.md / source.txt"
+    )
+    parser.add_argument(
+        "--digest",
+        action="append",
+        default=[],
+        dest="digests",
+        help="Digest file (repeatable; at least one required)",
+    )
+    args = parser.parse_args(argv)
+    if not args.digests:
+        fail(prog, 2, "no --digest given; nothing to parse is not a PASS.")
+    return args
+
+
+def run_gate(prog: str, main: Callable[[], int]) -> NoReturn:
+    """Version floor, UTF-8 streams, then ``main`` under the exit-3 bug net."""
+    if sys.version_info < MIN_PYTHON:
+        sys.stderr.write(
+            f"{prog}: ERROR: Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required.\n"
+        )
+        sys.exit(2)
+    use_utf8_streams()
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        sys.stderr.write(
+            f"{prog}: ERROR: internal failure {type(exc).__name__}: {exc}. "
+            f"This is a gate bug; the run is NOT clean.\n"
+        )
+        sys.exit(3)
+
+
+def read_text(path: str, prog: str, what: str) -> str:
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        fail(prog, 2, f"cannot read {what} {path!r}: {exc}")
+    if not raw:
+        fail(prog, 2, f"{what} {path!r} is empty (0 bytes).")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(prog, 2, f"{what} {path!r} is not UTF-8: {exc}")
+
+
+def split_lines(text: str) -> List[str]:
+    if text.endswith("\n"):
+        return text[:-1].split("\n")
+    return text.split("\n")
+
+
+def iter_h2_sections(text: str) -> Iterator[Tuple[str, str, int]]:
+    """Yield (heading-rest, section-body, heading-line-number) for each ``## ``.
+
+    H2-looking lines inside a fence are payload, not section boundaries —
+    a verbatim quote of a docs heading must not truncate Key claims.
+    """
+    lines = split_lines(text)
+    starts: List[Tuple[int, str]] = []
+    in_fence = False
+    open_ticks = 0
+    for idx, line in enumerate(lines):
+        if in_fence:
+            if _is_fence_closer(line, open_ticks):
+                in_fence = False
+            continue
+        is_open, _indented, ticks = _is_fence_opener(line)
+        if is_open:
+            in_fence = True
+            open_ticks = ticks
+            continue
+        match = ATX_H2.match(line)
+        if match:
+            starts.append((idx, match.group(1)))
+    for i, (idx, title) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(lines)
+        body = "\n".join(lines[idx + 1 : end])
+        yield title, body, idx + 1
+
+
+def find_section(text: str, prefix: str) -> Optional[Tuple[str, str, int]]:
+    """First H2 whose title starts with ``prefix`` (case-insensitive)."""
+    wanted = prefix.lower()
+    for title, body, line in iter_h2_sections(text):
+        if title.lower().startswith(wanted):
+            return title, body, line
+    return None
+
+
+def _is_fence_opener(line: str) -> Tuple[bool, bool, int]:
+    """Return (is_opener, indented, backtick-run-length)."""
+    stripped = line.lstrip(" \t")
+    if not stripped.startswith("```"):
+        return False, False, 0
+    ticks = len(stripped) - len(stripped.lstrip("`"))
+    return True, (len(line) != len(stripped)), ticks
+
+
+def _is_fence_closer(line: str, min_ticks: int) -> bool:
+    """CommonMark: a closer is backticks-only, length >= the opener."""
+    stripped = line.lstrip(" \t")
+    if not stripped.startswith("`"):
+        return False
+    ticks = len(stripped) - len(stripped.lstrip("`"))
+    rest = stripped[ticks:].strip(" \t")
+    return rest == "" and ticks >= min_ticks
+
+
+def extract_fences(text: str, *, start_line: int = 1) -> List[Fence]:
+    """Column-aware fence walk. An indented opener is recorded, not repaired."""
+    lines = split_lines(text)
+    fences: List[Fence] = []
+    i = 0
+    while i < len(lines):
+        is_open, indented, ticks = _is_fence_opener(lines[i])
+        if not is_open:
+            i += 1
+            continue
+        opener_line = start_line + i
+        i += 1
+        body_lines: List[str] = []
+        closed = False
+        while i < len(lines):
+            if _is_fence_closer(lines[i], ticks):
+                closed = True
+                break
+            body_lines.append(lines[i])
+            i += 1
+        if not closed:
+            raise ValueError(f"unclosed fence opening at line {opener_line}")
+        fences.append(Fence(opener_line, indented, "\n".join(body_lines)))
+        i += 1
+    return fences
+
+
+def parse_claims(section_body: str, *, start_line: int = 1) -> List[Claim]:
+    """Parse ``**CN.**`` labels and the fence that must follow each one."""
+    lines = split_lines(section_body)
+    labels: List[Tuple[int, "re.Match[str]"]] = []
+    for i, line in enumerate(lines):
+        match = CLAIM_LABEL.match(line)
+        if match:
+            labels.append((i, match))
+    claims: List[Claim] = []
+    for n, (idx, match) in enumerate(labels):
+        end = labels[n + 1][0] if n + 1 < len(labels) else len(lines)
+        block = "\n".join(lines[idx + 1 : end])
+        block_start = start_line + idx + 1
+        try:
+            fences = extract_fences(block, start_line=block_start)
+        except ValueError:
+            fences = []
+        fence = fences[0] if fences else None
+        prose = block.split("```", 1)[0] if fences else block
+        # Forbidden carriers are defects even when a later fence is valid —
+        # a leftover blockquote/inline quote is still hook-corruptible.
+        has_bq = bool(re.search(r"(?m)^>", prose))
+        has_inline = bool(re.search(r"(?<!`)`[^`\n]+`(?!`)", prose))
+        claims.append(
+            Claim(
+                number=int(match.group(1)),
+                label_line=start_line + idx,
+                fence=fence,
+                unfenced_blockquote=has_bq,
+                unfenced_inline_code=has_inline,
+            )
+        )
+    return claims
+
+
+def preview_payload(payload: str) -> str:
+    """First 80 chars of a payload with newlines escaped, for failure text."""
+    shown = payload.replace("\n", "\\n")
+    if len(shown) > 80:
+        shown = shown[:80] + "…"
+    return shown
+
+
+def is_none_section(body: str) -> bool:
+    """True only for an explicit none-marker. Blank is not an assertion."""
+    return body.strip().lower() in NONE_MARKERS
+
+
+def payload_in_source(payload: str, source: str) -> bool:
+    """Exact contiguous match. No strip, no whitespace forgiveness.
+
+    A payload that is a prefix of a source line and leaves only trailing
+    spaces/tabs on that line is a *lost trailing space*, not a match —
+    ``"keep me" in "keep me \\n"`` is True, and that is the hook defect.
+    Mid-line substrings whose remainder is real text still match.
+    An empty payload is never a match (``str.find('')`` is always 0).
+    """
+    if not payload:
+        return False
+    start = 0
+    while True:
+        idx = source.find(payload, start)
+        if idx < 0:
+            return False
+        rest_of_line = source[idx + len(payload) :].split("\n", 1)[0]
+        lost_trailing = (
+            bool(rest_of_line)
+            and rest_of_line.strip(" \t") == ""
+            and not payload.endswith((" ", "\t"))
+        )
+        if not lost_trailing:
+            return True
+        start = idx + 1

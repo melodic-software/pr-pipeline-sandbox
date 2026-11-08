@@ -25,6 +25,7 @@ const GATE_SKIP_REASONS = {
   "list-unreadable": "prerequisite-missing",
   fork: "untrusted-trigger",
   "no-pr": "untrusted-trigger",
+  "head-lag": "superseded-sha",
   "bot-actor": "untrusted-trigger",
   "untrusted-actor": "untrusted-trigger",
   "untrusted-author": "untrusted-trigger",
@@ -298,6 +299,22 @@ test("an untrusted-rerunner trigger stop posts failure, not neutral", () => {
   assert.equal(posted(decide(v, i)).conclusion, "failure");
 });
 
+// A PR on a non-default base is judged by scripts it may have changed, so
+// its stop must not turn neutral either.
+test("an untrusted-base trigger stop posts failure, not neutral", () => {
+  const { verdict: v, inputs: i } = stoppedAt("untrusted-base");
+  assert.equal(posted(decide(v, i)).conclusion, "failure");
+});
+
+// The gated head is not the branch's current head, and the push that moved
+// the branch is gated by its own run, so the stop is a superseded-sha skip.
+test("a head-lag trigger stop posts neutral with superseded-sha", () => {
+  const { verdict: v, inputs: i } = stoppedAt("head-lag");
+  const report = posted(decide(v, i));
+  assert.equal(report.conclusion, "neutral");
+  assert.match(report.output.summary, /superseded-sha/);
+});
+
 test("a gate reason mapped outside the skip-reason enum posts failure", () => {
   const { verdict: v, inputs: i } = stoppedAt("fork");
   const report = posted(
@@ -380,9 +397,131 @@ test("a skip-reason never neutralizes a run job that did not succeed", () => {
   }
 });
 
+// The patch output mode of pr-run-activity-read.yml: the outcome is named in
+// the title, so a run that changed nothing reads differently from one that
+// wrote a patch.
+test("a written patch posts success titled for the patch", () => {
+  const report = posted(decide(verdict({ patch: "written" }), inputs()));
+  assert.equal(report.conclusion, "success");
+  assert.equal(report.output.title, "Passed: patch written");
+});
+
+test("an empty patch posts success with its own title", () => {
+  const report = posted(decide(verdict({ patch: "empty" }), inputs()));
+  assert.equal(report.conclusion, "success");
+  assert.equal(report.output.title, "Passed: no changes");
+});
+
+test("a run with no patch keeps the plain success title", () => {
+  for (const patch of [null, undefined]) {
+    const report = posted(decide(verdict({ patch }), inputs()));
+    assert.equal(report.output.title, "Passed", String(patch));
+  }
+});
+
+test("a patch never turns a failed act step, a failed run or a dirty tree into success", () => {
+  for (const [v, i] of [
+    [{ patch: "written" }, { actOutcome: "failure" }],
+    [{ patch: "empty" }, { runResult: "failure" }],
+    [{ patch: "written", "dirty-tree": true }, {}],
+  ]) {
+    const report = posted(decide(verdict(v), inputs(i)));
+    assert.equal(report.conclusion, "failure", JSON.stringify([v, i]));
+  }
+});
+
+test("a patch value outside written and empty is a malformed verdict", () => {
+  for (const patch of ["none", true, 1, ""]) {
+    const report = posted(decide(verdict({ patch }), inputs()));
+    assert.equal(report.conclusion, "failure", JSON.stringify(patch));
+    assert.equal(report.output.summary, "The verdict does not match its contract.");
+  }
+});
+
 test("a run job that did not succeed posts failure even when the act step succeeded", () => {
   const report = posted(decide(verdict(), inputs({ runResult: "failure" })));
   assert.equal(report.conclusion, "failure");
+});
+
+// A run job that fails before its act step, for example on a broker denial at
+// the lane-token step, leaves the act outcome skipped.
+const NOT_RUN = verdict({ config: "not-read", outcome: "not-run" });
+
+test("a run job that failed before the act step names the run-job failure, not the act step", () => {
+  const report = posted(
+    decide(NOT_RUN, inputs({ runResult: "failure", actOutcome: "skipped" })),
+  );
+  assert.equal(report.conclusion, "failure");
+  assert.equal(report.output.summary, "The run job did not succeed.");
+});
+
+test("a run job failure carries the failed step's reason into the summary", () => {
+  const runFailure =
+    "lane-token-denied: the broker answered 403 with reason workflow-modified";
+  const report = posted(
+    decide(
+      NOT_RUN,
+      inputs({ runResult: "failure", actOutcome: "skipped", runFailure }),
+    ),
+  );
+  assert.equal(report.conclusion, "failure");
+  assert.equal(
+    report.output.summary,
+    `The run job did not succeed: ${runFailure}`,
+  );
+});
+
+// A job that never ran its activity (publish-feedback after an
+// address-feedback run with no feedback round) reports with no verdict.
+test("a not-run reason on a skipped run posts neutral with that reason and needs no verdict", () => {
+  const report = posted(
+    decide(
+      null,
+      inputs({
+        runResult: "skipped",
+        actOutcome: "",
+        signedCommits: null,
+        notRunReason: "not-applicable",
+      }),
+    ),
+  );
+  assert.equal(report.conclusion, "neutral");
+  assert.equal(report.head_sha, HEAD);
+  assert.equal(report.output.summary, "Skip reason: not-applicable");
+});
+
+test("a round-count not-run detail joins the neutral summary; any other text is left out", () => {
+  const skip = (notRunDetail) =>
+    posted(decide(null, inputs({ runResult: "skipped", actOutcome: "", signedCommits: null, notRunReason: "awaiting-human", notRunDetail })));
+  const counted = skip("round 4 of max 4");
+  assert.equal(counted.conclusion, "neutral");
+  assert.equal(counted.output.title, "Skipped: awaiting-human");
+  assert.equal(counted.output.summary, "Skip reason: awaiting-human\n\nround 4 of max 4");
+  for (const detail of ["", "round 0 of max 4", "round 4 of max 4\n@someone", "[link](https://x)", "round 4 of max 4 "]) {
+    assert.equal(skip(detail).output.summary, "Skip reason: awaiting-human", JSON.stringify(detail));
+  }
+});
+
+test("a not-run reason outside the skip-reason enum posts failure", () => {
+  const report = posted(
+    decide(
+      null,
+      inputs({ runResult: "skipped", notRunReason: "looks-fine" }),
+    ),
+  );
+  assert.equal(report.conclusion, "failure");
+});
+
+test("a not-run reason never neutralizes a run job that ran", () => {
+  for (const runResult of ["success", "failure"]) {
+    const report = posted(
+      decide(
+        verdict(),
+        inputs({ runResult, actOutcome: "failure", notRunReason: "not-applicable" }),
+      ),
+    );
+    assert.equal(report.conclusion, "failure", runResult);
+  }
 });
 
 test("every key of the shipped gate-skip-reasons.json posts neutral with its mapped reason", () => {
@@ -433,6 +572,20 @@ test("signedCommits all_verified false posts failure", () => {
     decide(verdict(), inputs({ signedCommits: { all_verified: false } })),
   );
   assert.equal(report.conclusion, "failure");
+});
+
+test("the signed-commit failure says not GitHub-verified only when it names unverified commits", () => {
+  const named = posted(
+    decide(verdict(), inputs({ signedCommits: { all_verified: false, unverified: [HEAD] } })),
+  );
+  assert.equal(named.conclusion, "failure");
+  assert.match(named.output.summary, /not GitHub-verified/);
+  const unnamed = posted(
+    decide(verdict(), inputs({ signedCommits: { all_verified: false, unverified: [] } })),
+  );
+  assert.equal(unnamed.conclusion, "failure");
+  assert.match(unnamed.output.summary, /could not be verified/);
+  assert.doesNotMatch(unnamed.output.summary, /not GitHub-verified/);
 });
 
 test("an act step that did not succeed with no skip to explain it posts failure", () => {

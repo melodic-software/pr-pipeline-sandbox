@@ -111,11 +111,54 @@ check 'text-conflict: merge-state' conflicted "$(val merge-state)"
 check 'text-conflict: no escalation' '' "$(val escalation-reason)"
 check 'text-conflict: MERGE_HEAD is the trusted base' "$(tg rev-parse main)" "$(merge_head)"
 check 'text-conflict: snapshot holds stages 1 2 3' 123 "$(stages a.txt)"
-check 'text-conflict: snapshot hash printed' "$(sha_of "$DIR/index-snapshot")" "$(val snapshot-sha256)"
-check 'text-conflict: config copy hash is the pre-merge config' "$CONFIG_BEFORE" "$(val config-sha256)"
-check 'text-conflict: config copy saved' "$CONFIG_BEFORE" "$(sha_of "$DIR/config")"
-check 'text-conflict: no attributes file recorded as absent' absent "$(val attributes-sha256)"
+check 'text-conflict: prints only the merge keys' 'merge-state escalation-reason conflict-tree' "$(cut -d= -f1 <<<"$OUT" | paste -sd ' ')"
+check 'text-conflict: the config is untouched' "$CONFIG_BEFORE" "$(sha_of "$R/.git/config")"
 check 'text-conflict: unmerged path recorded' a.txt "$(tr '\0' '\n' <"$DIR/unmerged-paths")"
+
+echo '# conflict-tree'
+# T0: the merge's stage-0 entries plus the marker file git left at each
+# unmerged path, under the head's mode, written without touching the index.
+conflict a.txt 'one\n' 'pr\n' 'main\n'
+side main b.txt 'from main\n'
+run_prepare
+T0=$(val conflict-tree)
+check 'conflict-tree: a full tree id' 1 "$([[ $T0 =~ ^[0-9a-f]{40}$ ]] && echo 1)"
+check 'conflict-tree: the unmerged path holds the marker file' "$(git -C "$R" hash-object --no-filters a.txt)" "$(tg rev-parse "$T0:a.txt")"
+T0_A=$(tg cat-file -p "$T0:a.txt")
+if grep -q '^<<<<<<< ' <<<"$T0_A"; then ok 'conflict-tree: the marker file holds markers'; else not_ok 'conflict-tree: the marker file holds markers'; fi
+check 'conflict-tree: a base-side path is the merge stage-0 blob' "$(tg rev-parse main:b.txt)" "$(tg rev-parse "$T0:b.txt")"
+check 'conflict-tree: the head-side mode' "$(tg ls-tree pr a.txt | cut -d' ' -f1)" "$(tg ls-tree "$T0" a.txt | cut -d' ' -f1)"
+check 'conflict-tree: the live index stays unmerged' 123 "$(tg ls-files -u -- a.txt | awk '{s = s $3} END {print s}')"
+check 'conflict-tree: no scratch index is left behind' '' "$(find "$DIR" -name 't0-index*')"
+run_prepare
+check 'conflict-tree: a second run reaches the same tree' "$T0" "$(val conflict-tree)"
+# The version-bump script sorts under LC_ALL=C whatever the caller's locale,
+# so the three runs of one round reach the same tree.
+new_repo
+put plugins/p/CHANGELOG.md 'x\n'
+commit 'add changelog'
+on_pr
+side pr plugins/p/CHANGELOG.md 'pr\n'
+side main plugins/p/CHANGELOG.md 'main\n'
+BUMP="$TMP/sorting-bump.sh"
+printf '#!/usr/bin/env bash\nprintf "b\\nB\\na\\n_x\\n" | sort >plugins/p/sorted.txt\ngit add plugins/p/sorted.txt\nexit 1\n' >"$BUMP"
+run_prepare LC_ALL=C
+T0_C=$(val conflict-tree)
+run_prepare LC_ALL=en_US.UTF-8
+check 'conflict-tree: the same tree under another locale' "$T0_C" "$(val conflict-tree)"
+check 'conflict-tree: the bump sorted in the C locale' 'B _x a b ' "$(tg cat-file -p "$T0_C:plugins/p/sorted.txt" | tr '\n' ' ')"
+unset BUMP
+# A clean merge's T0 is the merged index's tree.
+new_repo
+on_pr
+side pr p.txt 'pr\n'
+side main m.txt 'main\n'
+run_prepare
+check 'conflict-tree: a clean merge is the merged tree' clean/"$(tg write-tree)" "$(val merge-state)/$(val conflict-tree)"
+# An escalation names no tree.
+conflict .github/workflows/ci.yml 'on: push\n' 'on: pull_request\n' 'on: workflow_dispatch\n'
+run_prepare
+check 'conflict-tree: an escalation names none' escalate/ "$(val merge-state)/$(val conflict-tree)"
 
 echo '# binary-conflict'
 conflict a.bin 'base\0bin\n' 'pr\0bin\n' 'main\0bin\n'
@@ -206,23 +249,23 @@ side main .github/workflows/ci.yml 'on: push\n'
 run_prepare
 check 'workflow-conflict: base-side workflow edit stays conflicted, not escalated' conflicted "$(val merge-state)"
 
-echo '# sensitive-conflict'
-for p in .claude/settings.json CLAUDE.md CLAUDE.local.md .mcp.json .claude.json .gitmodules .ripgreprc .husky/pre-commit; do
+echo '# protected-conflict'
+for p in .claude/settings.json plugins/p/Settings.local.json .gitmodules vendor/.gitmodules; do
   conflict "$p" 'base\n' 'pr\n' 'main\n'
   run_prepare
-  check "sensitive-conflict: $p escalates" escalate/protected-path-conflict "$(val merge-state)/$(val escalation-reason)"
+  check "protected-conflict: $p escalates" escalate/protected-path-conflict "$(val merge-state)/$(val escalation-reason)"
 done
-for p in docs/CLAUDE.md .claudex/a.txt .husky-like; do
+for p in CLAUDE.md CLAUDE.local.md .mcp.json .claude.json .claude/rules/r.md .ripgreprc .husky/pre-commit .github/scripts/x.mjs settings.md; do
   conflict "$p" 'base\n' 'pr\n' 'main\n'
   run_prepare
-  check "sensitive-conflict: $p is not a sensitive path" conflicted/ "$(val merge-state)/$(val escalation-reason)"
+  check "protected-conflict: $p goes to the model" conflicted/ "$(val merge-state)/$(val escalation-reason)"
 done
 # The head's .gitattributes cannot hide a protected conflict with a merge
 # driver: attributes come from the trusted base tree.
-conflict CLAUDE.md 'base\n' 'pr\n' 'main\n'
-side pr .gitattributes 'CLAUDE.md merge=union\n.github/workflows/* merge=union\n'
+conflict .claude/settings.json 'base\n' 'pr\n' 'main\n'
+side pr .gitattributes '.claude/settings.json merge=union\n.github/workflows/* merge=union\n'
 run_prepare
-check 'sensitive-conflict: a head merge=union attribute still escalates' escalate/protected-path-conflict "$(val merge-state)/$(val escalation-reason)"
+check 'protected-conflict: a head merge=union attribute still escalates' escalate/protected-path-conflict "$(val merge-state)/$(val escalation-reason)"
 
 echo '# clean-after-bump'
 conflict plugins/p/CHANGELOG.md '# Changelog\n' '# Changelog\n\n## [1.1.0]\n' '# Changelog\n\n## [1.0.1]\n'

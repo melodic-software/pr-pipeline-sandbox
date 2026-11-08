@@ -1,0 +1,757 @@
+#!/usr/bin/env node
+// publish-feedback.mjs: the reply job of the pr-unblock lane's address-feedback
+// round, a script activity with no model. The model job recorded its replies
+// in an artifact; this posts exactly what it wrote, or nothing, and adds no
+// judgment of its own.
+//
+//   1. Validates the whole artifact strictly: the select job's run.json (the
+//      head it read and the kept threads) and the model's replies.jsonl,
+//      one object per kept thread at most, each with exactly the template's
+//      fields, within the limits below. Any failure posts no reply.
+//   2. For VALID replies, which name no commit (the model job commits
+//      nothing), finds the one commit apply-feedback-patch pushed: the lanes
+//      App's, after the select job's head, carrying the review-threads
+//      row's Lane-Activity trailer (isLaneFix). Confirms it changes each
+//      VALID thread's path and that the branch changed no path outside the
+//      kept threads' scope (thread-scope.mjs) and none under
+//      .github/workflows/. With no such commit in that range and no patch
+//      written this round (a retry after a round whose fix landed but whose
+//      replies did not post), each VALID thread's fix is an earlier commit on
+//      the PR of the same kind, committed after the thread's newest reviewer
+//      or lane comment, that changed the thread's path and a line the
+//      reply's evidence cites, and that no lane reply already named as a
+//      fix (earlierFixOf). A push
+//      that was superseded, refused, escalated or held ends the round
+//      feedback-not-landed.
+//   3. Re-reads each thread and skips one that is resolved, moved, or has a
+//      comment the model job did not see; posts the templated reply on its
+//      root comment and resolves it only when it is VALID. The PR head is
+//      re-read before each post and each resolve: once it is not the head
+//      this job gated, nothing more is posted or resolved.
+//   4. Posts the round marker, as the lanes App, once per model run: a
+//      re-run of this job finds the marker naming that run and posts none.
+//   5. With no replies.jsonl, no scanned patch, no scan refusal, no upload
+//      the scan named and the selected head still current (no model turn)
+//      posts nothing and skips no-model-turn, escalating nothing; with a
+//      moved head it escalates feedback-not-landed, and beside a patch, a
+//      refusal or a named upload feedback-invalid. Otherwise escalates
+//      feedback-invalid, feedback-incomplete (a kept thread has no
+//      disposition), feedback-not-landed, feedback-partial (posting stopped
+//      after a reply), feedback-uncertain (an UNCERTAIN or VALID-defer reply),
+//      or a reason adjudicate-feedback.mjs settleDisputes gives for an
+//      INCORRECT reply: feedback-unadjudicated, feedback-question-intent,
+//      feedback-question-design, feedback-question-security, or
+//      feedback-disputed (the finding stood at an earlier adjudication and
+//      this round left it open). A finding that stands with the head unmoved
+//      skips finding-stands instead, which feedback-dispatch.mjs's sweep
+//      dispatches again.
+//
+// Environment:
+//   GH_TOKEN              the lane token (pull-requests: write, contents: read)
+//   GITHUB_REPOSITORY     owner/repo
+//   PR_NUMBER, HEAD_SHA   the gated pull request and its current head
+//   HEAD_REF              the PR branch, re-read for HEAD_SHA before each post
+//   GITHUB_RUN_ID, MODEL_RUN_ATTEMPT  the model run the round marker names
+//   APP_SENDER_ID         the lanes App bot's user id, the round marker author
+//   TRUSTED_ACTORS        the base's trusted-actors.json, for the reviewer bot
+//                         and the people whose replies are direction
+//   FEEDBACK_REPLIES_DIR  the downloaded artifacts: the select job's run.json
+//                         and the model run's scanned replies.jsonl
+//   RUN_SHA256            run.json's SHA-256, from the select job
+//   REPLIES_SHA256        replies.jsonl's SHA-256, from the scan job
+//   REVIEW_PATCH_STATE    the scan job's patch-state for the same model call
+//   SCAN_REFUSED_DIR, SCAN_REFUSED_READ  the scan-refusal job's markers for
+//                         the model call and their download's outcome
+//                         (address-feedback.mjs scanRefusal)
+//   ADJUDICATION_DIR, ADJUDICATION_SHA256  the adjudicate-feedback job's
+//                         verdicts.json and the SHA-256 that job recorded
+//   GITHUB_WORKSPACE      the PR head checkout evidence paths are checked in
+//   SKIP_REASON_FILE, ESCALATION_REASON_FILE  where the runner reads them
+
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+import {
+  countRounds,
+  createGitHubApi,
+  currentThreads,
+  isRoundMarker,
+  DEFAULT_MAX_ROUNDS,
+  FRESH_FIXER_ROUNDS,
+  roundLine,
+  maxRoundsFrom,
+  need,
+  positive,
+  reviewerIdFrom,
+  ROUND_MARKER,
+  scanRefusal,
+  SHA,
+  trustedHumansFrom,
+} from "./address-feedback.mjs";
+import { parseVerdicts, settleDisputes } from "./adjudicate-feedback.mjs";
+import { inThreadScope } from "./thread-scope.mjs";
+
+// bytes: replies.jsonl's cap, the read runner's carry, seal and scan cap too;
+// runBytes: run.json's, the 1 MiB the read runner accepts for it.
+export const LIMITS = { bytes: 49152, runBytes: 1048576, note: 2000, evidence: 10, files: 300 };
+// GitHub's web-flow user, the committer of a commit made through the API.
+const WEB_FLOW_ID = 19864447;
+// The trailer apply-patch.mjs writes from patch-rules.json's review-threads row.
+export const FIX_TRAILER = "Lane-Activity: pr-unblock/address-feedback";
+const THREAD_ID = /^PRRT_[A-Za-z0-9_-]{1,100}$/;
+const PATH_LINE = /^[A-Za-z0-9_@+.-]+(\/[A-Za-z0-9_@+.-]+)*:[1-9][0-9]{0,6}$/;
+const DOT_SEGMENT = /(^|\/)\.\.?(\/|:)/;
+// Tab and newline only, and no direction, zero-width or byte-order mark.
+const BAD_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f​-‏‪-‮⁠-⁩﻿]/u;
+// HTML comments carry markers; token shapes from
+// docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github#githubs-token-formats
+// and the stateless installation token (ghs_ then a JWT) from
+// https://github.blog/changelog/2026-05-15-github-app-installation-tokens-per-request-override-header/
+// whose header gh[opsur]_[A-Za-z0-9]{20} matches; this prefix check is not GitHub's recommended regex
+// (as of 2026-10-21; recheck when GitHub changes a token format or its recommended regex).
+const FORBIDDEN = /<!--|-->|gh[opsur]_[A-Za-z0-9]{20}|ghs_[0-9]+_|github_pat_/;
+const DISPOSITIONS = ["VALID", "INCORRECT", "UNCERTAIN", "VALID-defer"];
+const KEYS = ["disposition", "evidence", "fix_sha", "note", "thread"];
+const LABELS = {
+  VALID: "VALID, fixed",
+  INCORRECT: "INCORRECT, left open",
+  UNCERTAIN: "UNCERTAIN, left open for a person",
+  "VALID-defer": "VALID (defer), left open for a person",
+};
+
+class Invalid extends Error {}
+
+function check(condition, why) {
+  if (!condition) {
+    throw new Invalid(why);
+  }
+}
+
+const sameIds = (a, b) => a.length === b.length && a.every((id, i) => id === b[i]);
+
+// run.json is the select job's: the gated head and the threads it kept, with
+// the comment ids the model was shown.
+export function parseRun(text) {
+  let run;
+  try {
+    run = JSON.parse(text);
+  } catch {
+    throw new Invalid("run.json does not parse");
+  }
+  check(
+    run?.version === 1 &&
+      SHA.test(run.head_sha ?? "") &&
+      Array.isArray(run.threads) &&
+      (run.pr_paths === undefined || (Array.isArray(run.pr_paths) && run.pr_paths.every((path) => typeof path === "string"))),
+    "run.json is malformed",
+  );
+  for (const thread of run.threads) {
+    check(
+      THREAD_ID.test(thread?.id ?? "") &&
+        typeof thread.path === "string" &&
+        Array.isArray(thread.comment_ids) &&
+        thread.comment_ids.length > 0 &&
+        thread.comment_ids.every((id) => Number.isSafeInteger(id) && id > 0) &&
+        (thread.named_paths === undefined ||
+          (Array.isArray(thread.named_paths) && thread.named_paths.every((path) => typeof path === "string"))),
+      "run.json holds a malformed thread",
+    );
+  }
+  return run;
+}
+
+// replies.jsonl is model output: every line is checked before anything posts.
+export function parseReplies(text, run, fileExists) {
+  check(Buffer.byteLength(text) <= LIMITS.bytes, "the replies are over the size limit");
+  const kept = new Map(run.threads.map((thread) => [thread.id, thread]));
+  const seen = new Set();
+  const replies = [];
+  for (const line of text.split("\n").filter((row) => row !== "")) {
+    let reply;
+    try {
+      reply = JSON.parse(line);
+    } catch {
+      throw new Invalid("a reply line does not parse");
+    }
+    check(reply !== null && typeof reply === "object" && !Array.isArray(reply), "a reply is not an object");
+    check(Object.keys(reply).sort().join() === KEYS.join(), "a reply's fields are not the template's");
+    const { thread, disposition, evidence, fix_sha: fixSha, note } = reply;
+    check(typeof thread === "string" && kept.has(thread), "a reply names a thread the runner did not keep");
+    check(!seen.has(thread), "two replies name one thread");
+    seen.add(thread);
+    check(DISPOSITIONS.includes(disposition), "a reply's disposition is not one of the four");
+    check(
+      Array.isArray(evidence) &&
+        evidence.length <= LIMITS.evidence &&
+        evidence.every((ev) => typeof ev === "string" && PATH_LINE.test(ev) && !DOT_SEGMENT.test(ev)),
+      "a reply's evidence is not a list of path:line",
+    );
+    check(!["VALID", "INCORRECT"].includes(disposition) || evidence.length > 0, "a VALID or INCORRECT reply cites no evidence");
+    check(
+      evidence.every((ev) => fileExists(ev.slice(0, ev.lastIndexOf(":")))),
+      "a reply's evidence names a file not in the checkout",
+    );
+    // The model job commits nothing: this job finds the fix commit itself.
+    check(fixSha === "", "a reply's fix_sha is not empty");
+    check(
+      // Code points, as jq's length counts them in the review-thread tool.
+      typeof note === "string" && note.length > 0 && [...note].length <= LIMITS.note && !BAD_CHARS.test(note) && !FORBIDDEN.test(note),
+      "a reply's note is empty, too long, or holds a control character, an HTML comment or a token",
+    );
+    replies.push({ thread, disposition, evidence, fixSha, note });
+  }
+  return replies;
+}
+
+// The note sits in a fence longer than any backtick run in it.
+export function renderReply({ disposition, evidence, fixSha, note }) {
+  const fence = "`".repeat(Math.max(3, ...[...note.matchAll(/`+/g)].map((run) => run[0].length + 1)));
+  return [
+    `**pr-unblock / address-feedback: ${LABELS[disposition]}**`,
+    "",
+    evidence.length > 0 ? `Evidence: ${evidence.map((ev) => `\`${ev}\``).join(", ")}` : "Evidence: none in the checkout",
+    ...(fixSha ? [`Fix: ${fixSha}`] : []),
+    "",
+    `${fence}text`,
+    note,
+    fence,
+  ].join("\n");
+}
+
+const SKILL_FILE = /^((?:.*\/)?skills\/[^/]+\/)SKILL\.md$/;
+
+// Whether a unified diff's new side (a commit file's `patch`) holds `line` in
+// one of its hunks; false with no patch, as for a binary or very large file.
+export function lineChanged(patch, line) {
+  for (const [, start, count] of String(patch ?? "").matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+    const first = Number(start);
+    const size = count === undefined ? 1 : Number(count);
+    if (line >= first && line < first + size) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Whether a fix commit's changed files touch a thread's path: the path itself,
+// a file the pull request already changes whose line the reply's evidence
+// cites inside a hunk of the fix (`cited`), so a finding on one file fixed in another of the PR's files
+// lands, or for a skill's SKILL.md any file under that skill's directory.
+function touchesThread(changed, threadPath, cited) {
+  if (changed.some((file) => cited.has(file))) {
+    return true;
+  }
+  const skillDir = SKILL_FILE.exec(threadPath)?.[1];
+  return skillDir === undefined ? changed.includes(threadPath) : changed.some((file) => file.startsWith(skillDir));
+}
+
+// A commit the lanes App authored through the API (the web-flow committer,
+// with a valid signature, as upstreamHeadHolds in check-trusted-trigger.mjs
+// requires) with the fix trailer on a line of its own.
+const isLaneFix = (commit, appId) =>
+  commit.author?.id === appId &&
+  commit.committer?.id === WEB_FLOW_ID &&
+  commit.commit?.verification?.verified === true &&
+  commit.commit.verification.reason === "valid" &&
+  String(commit.commit?.message ?? "")
+    .split("\n")
+    .some((line) => line.replace(/\r$/, "") === FIX_TRAILER);
+
+// The newest of the PR's `commits` (oldest first, as GET /pulls/{n}/commits
+// lists them) that is a lane fix commit, committed (the date GitHub sets for
+// a web-flow commit) after `after` (epoch ms), not in `claimed` (a commit a
+// lane reply already named as another thread's fix), whose files touch
+// `threadPath` (the path, or for a SKILL.md any file in its skill's
+// directory), and in which one `evidence` path:line falls inside a hunk of
+// that path, a path no later PR commit changed, so the head's line numbers
+// are still that commit's; null for none. `filesOf` reads a commit's files,
+// each {filename, patch}.
+export async function earlierFixOf({ commits, appId, after, threadPath, evidence, claimed, filesOf }) {
+  const cites = evidence.map((ev) => [ev.slice(0, ev.lastIndexOf(":")), Number(ev.slice(ev.lastIndexOf(":") + 1))]);
+  for (let i = commits.length - 1; i >= 0; i -= 1) {
+    const commit = commits[i];
+    if (!isLaneFix(commit, appId) || claimed.has(commit.sha) || !(Date.parse(commit.commit?.committer?.date ?? "") > after)) {
+      continue;
+    }
+    const files = await filesOf(commit.sha);
+    if (!touchesThread(files.map((file) => file.filename), threadPath, new Set())) {
+      continue;
+    }
+    const later = new Set();
+    for (const next of commits.slice(i + 1)) {
+      for (const file of await filesOf(next.sha)) {
+        later.add(file.filename);
+      }
+    }
+    const patches = new Map(files.map((file) => [file.filename, file.patch]));
+    if (cites.some(([path, line]) => patches.has(path) && !later.has(path) && lineChanged(patches.get(path), line))) {
+      return commit.sha;
+    }
+  }
+  return null;
+}
+
+// The commits lane replies already named as a thread's fix (renderReply's
+// `Fix: <sha>` line), read from the PR's review comments.
+const claimedFixes = (reviewComments, appId) =>
+  new Set(
+    reviewComments
+      .filter((comment) => comment.user?.id === appId)
+      .flatMap((comment) => [...String(comment.body ?? "").matchAll(/^Fix: ([0-9a-f]{40})$/gm)].map((match) => match[1])),
+  );
+
+// Whenever the PR branch moved since the select job's head, or a reply is
+// VALID, that range may change only what inThreadScope allows around the kept
+// threads' paths and the PR's own files (run.json, whose SHA-256 the select
+// job recorded), adding none of those files, and nothing under
+// .github/workflows/. With a VALID reply the range must hold
+// exactly one fix commit (isLaneFix), and it must change every VALID thread's path, a
+// file the PR already changes at a line the reply's evidence cites, or for a
+// thread on a skill's SKILL.md any file in that skill's directory (touchesThread).
+// With no fix commit in the range and no patch written this round
+// (`patchWritten`, whose push then did not land), each VALID thread takes its
+// earlier fix on the PR instead (earlierFixOf, after the time `judgedAt` gives:
+// the thread's newest comment by the reviewer or the lane, so a commit the
+// lane already answered on that thread, or one a reviewer re-raised the
+// finding after, is not its fix; nor one a lane reply already named as a
+// fix, `claimed`). Returns each VALID thread's fix commit by
+// thread id (empty when no reply is VALID), or null.
+async function fixesLanded({ api, pr, run, headSha, replies, appId, judgedAt, patchWritten, claimed = new Set() }) {
+  const valid = replies.filter((reply) => reply.disposition === "VALID");
+  const landed = new Map();
+  if (valid.length === 0 && run.head_sha === headSha) {
+    return landed;
+  }
+  const comparison = await api.compare(run.head_sha, headSha);
+  const fixes = valid.length === 0 ? [] : (comparison.commits ?? []).filter((commit) => isLaneFix(commit, appId));
+  const fixSha = fixes.length === 1 ? fixes[0].sha : "";
+  const threadPath = new Map(run.threads.map((thread) => [thread.id, thread.path]));
+  const paths = new Set(threadPath.values());
+  const prPaths = new Set(run.pr_paths ?? []);
+  const files = comparison.files ?? [];
+  const inRange =
+    ["ahead", "identical"].includes(comparison.status) &&
+    fixes.length <= 1 &&
+    files.length < LIMITS.files &&
+    files.every((file) =>
+      [file.filename, file.previous_filename].every(
+        (path) =>
+          path === undefined ||
+          inThreadScope(path, paths, run.threads, {
+            prPaths,
+            added: path === file.filename && ["added", "renamed", "copied"].includes(file.status),
+          }),
+      ),
+    );
+  if (!inRange) {
+    return null;
+  }
+  if (fixSha) {
+    const commitFiles = (await api.getCommit(fixSha)).files ?? [];
+    const changed = commitFiles.map((file) => file.filename);
+    const patches = new Map(commitFiles.map((file) => [file.filename, file.patch]));
+    // The pr_paths files whose cited line the fix commit changed.
+    const cited = (reply) =>
+      new Set(
+        reply.evidence
+          .map((ev) => [ev.slice(0, ev.lastIndexOf(":")), Number(ev.slice(ev.lastIndexOf(":") + 1))])
+          .filter(([path, line]) => prPaths.has(path) && lineChanged(patches.get(path), line))
+          .map(([path]) => path),
+      );
+    if (!valid.every((reply) => touchesThread(changed, threadPath.get(reply.thread), cited(reply)))) {
+      return null;
+    }
+    for (const reply of valid) {
+      landed.set(reply.thread, fixSha);
+    }
+    return landed;
+  }
+  if (valid.length > 0) {
+    if (patchWritten) {
+      return null;
+    }
+    const commits = await api.listPullCommits(pr);
+    const read = new Map();
+    const filesOf = async (sha) => {
+      if (!read.has(sha)) {
+        read.set(sha, (await api.getCommit(sha)).files ?? []);
+      }
+      return read.get(sha);
+    };
+    for (const reply of valid) {
+      const sha = await earlierFixOf({
+        commits,
+        appId,
+        after: judgedAt(reply.thread),
+        threadPath: threadPath.get(reply.thread),
+        evidence: reply.evidence,
+        claimed,
+        filesOf,
+      });
+      if (sha === null) {
+        return null;
+      }
+      landed.set(reply.thread, sha);
+    }
+  }
+  return landed;
+}
+
+// Resolves a VALID thread only while it holds exactly the model's view plus
+// this reply, so a comment posted meanwhile is not resolved unread, and only
+// while the PR head is still the gated one. One retry covers a transient read
+// or resolve failure; false means the thread or the head changed.
+async function resolveAfterReply(api, id, expected, headMoved) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const after = await api.readThread(id);
+      if (!sameIds(after.commentIds, expected) || (await headMoved())) {
+        return false;
+      }
+      // A resolve that took effect before its answer was lost.
+      if (after.isResolved === true && attempt > 1) {
+        return true;
+      }
+      if (after.isResolved !== false) {
+        return false;
+      }
+      if ((await api.resolveThread(id)) !== true) {
+        throw new Error(`replied on ${id} but it does not read resolved`);
+      }
+      return true;
+    } catch (error) {
+      if (attempt >= 2) {
+        throw error;
+      }
+    }
+  }
+}
+
+// The line after the round marker naming the model run whose replies this job
+// posts; a re-run of this job alone reuses that run's artifact.
+export const modelRunLine = (modelRun) => `<!-- pr-unblock:address-feedback-model-run ${modelRun} -->`;
+
+export async function publish(args) {
+  const { api, pr, headSha, appId, modelRun, maxRounds = DEFAULT_MAX_ROUNDS, log = () => {} } = args;
+  let result = null;
+  let failure = null;
+  try {
+    result = await postReplies({ ...args, log });
+  } catch (error) {
+    failure = error;
+  }
+  // The round counts whatever happened above, so the cap holds. A marker
+  // that cannot be posted still leaves the replies' outcome to a person.
+  try {
+    const comments = await api.listIssueComments(pr);
+    // With no model run named, the marker is always posted: counting a round
+    // twice hands the PR to a person sooner; skipping one would not.
+    const runLine = modelRun ? modelRunLine(modelRun) : null;
+    if (runLine && comments.some((comment) => isRoundMarker(comment, appId) && String(comment.body).split("\n").includes(runLine))) {
+      log(`the round of model run ${modelRun} is already recorded`);
+    } else {
+      const rounds = countRounds(comments, appId) + 1;
+      // The max counts the fresh fixer's round past the cap (address-feedback.mjs).
+      const round = roundLine(rounds, maxRounds + FRESH_FIXER_ROUNDS);
+      await api.createIssueComment(
+        pr,
+        [ROUND_MARKER, ...(runLine ? [runLine] : []), `pr-unblock / address-feedback finished ${round} on ${headSha}.`].join("\n"),
+      );
+      log(`recorded round ${rounds}${result?.escalationReason ? `; escalating ${result.escalationReason}` : ""}`);
+    }
+  } catch (error) {
+    log(`could not record the round: ${String(error?.message ?? error).slice(0, 300)}`);
+    if (result !== null && result.escalationReason === "") {
+      result = { ...result, escalationReason: "feedback-partial" };
+    }
+  }
+  if (failure !== null) {
+    throw failure;
+  }
+  return result;
+}
+
+async function postReplies({ api, pr, headSha, headRef, appId, patchState = "", scanRefused = "", repliesExpected = false, reviewerId, trustedHumans, readArtifact, readAdjudication = () => null, fileExists, log }) {
+  let escalationReason = "";
+  // fixesLanded judged the range up to headSha; a push after it is unjudged.
+  const headMoved = async () => (await api.readBranch(headRef)) !== headSha;
+  {
+    let run;
+    let replies;
+    try {
+      const { runText, repliesText } = readArtifact();
+      run = parseRun(runText);
+      // No replies.jsonl. The run job decides that, so it is a skip only
+      // when the scan refused nothing, named no upload, handed on no patch,
+      // and the PR head is still the one the select job read: the model call
+      // never ran. The round still counts. A refused scan uploads nothing
+      // whatever the model did; named replies that did not arrive are a
+      // failed download; a moved head is a push nothing replied to; a patch
+      // with no replies is an artifact the model job left half-written.
+      if (repliesText === null) {
+        if (scanRefused !== "" || repliesExpected) {
+          log(`no reply is posted: ${scanRefused ? `the scan refused the model call's ${scanRefused}` : "the replies the scan uploaded did not arrive"}`);
+          return { escalationReason: "feedback-invalid", posted: [] };
+        }
+        if (headSha !== run.head_sha) {
+          log("no reply is posted: no replies, and the PR head moved since the select job read it");
+          return { escalationReason: "feedback-not-landed", posted: [] };
+        }
+        if (patchState !== "") {
+          log(`no reply is posted: no replies beside a ${patchState} patch`);
+          return { escalationReason: "feedback-invalid", posted: [] };
+        }
+        log("no reply is posted: no model turn uploaded replies");
+        return { escalationReason: "", skipReason: "no-model-turn", posted: [] };
+      }
+      replies = parseReplies(repliesText, run, fileExists);
+    } catch (error) {
+      if (!(error instanceof Invalid) && error.code !== "ENOENT") {
+        throw error;
+      }
+      log(`no reply is posted: ${error instanceof Invalid ? error.message : "the artifact is missing"}`);
+      escalationReason = "feedback-invalid";
+      return { escalationReason, posted: [] };
+    }
+    // Every kept thread needs its disposition: one left out would stay open
+    // with no reply, and the head's check run stops another dispatch.
+    if (replies.length !== run.threads.length) {
+      log(`no reply is posted: ${replies.length} of ${run.threads.length} kept threads have a disposition`);
+      escalationReason = "feedback-incomplete";
+      return { escalationReason, posted: [] };
+    }
+    const { kept, reviewComments } = await currentThreads({ api, pr, reviewerId, appId, trustedHumans });
+    const now = new Map(kept.map((thread) => [thread.id, thread]));
+    const shown = new Map(run.threads.map((thread) => [thread.id, thread]));
+    const createdAt = new Map(reviewComments.map((comment) => [comment.id, comment.created_at]));
+    // The newest of the thread's comments, as the reply job reads them now,
+    // by the reviewer, the verifier or the lane. NaN (no such comment, or no
+    // readable time) compares false, so it finds no earlier fix.
+    const judgedAt = (thread) => {
+      const times = (now.get(thread)?.comments ?? [])
+        .filter((comment) => ["reviewer", "verifier", "lane"].includes(comment.author))
+        .map((comment) => Date.parse(createdAt.get(comment.id) ?? ""));
+      // Math.max of an empty list is -Infinity, and of one NaN is NaN.
+      return times.length === 0 ? Number.NaN : Math.max(...times);
+    };
+    const landed = await fixesLanded({
+      api,
+      pr,
+      run,
+      headSha,
+      replies,
+      appId,
+      judgedAt,
+      patchWritten: patchState === "written",
+      claimed: claimedFixes(reviewComments, appId),
+    });
+    if (landed === null) {
+      log("no reply is posted: no one fix commit for the VALID replies reached the PR branch, or the branch changed another path");
+      escalationReason = "feedback-not-landed";
+      return { escalationReason, posted: [] };
+    }
+    replies = replies.map((reply) => (reply.disposition === "VALID" ? { ...reply, fixSha: landed.get(reply.thread) } : reply));
+    if (replies.some((reply) => reply.disposition === "UNCERTAIN" || reply.disposition === "VALID-defer")) {
+      escalationReason = "feedback-uncertain";
+    }
+    const posted = [];
+    for (const reply of replies) {
+      const ids = shown.get(reply.thread).comment_ids;
+      const fresh = now.get(reply.thread);
+      // Once a reply posts, no later round selects the thread again until a
+      // trusted person answers a reply that left it open: any failure in this
+      // loop stops the posting, and it or a VALID thread left open hands the
+      // PR to a person instead of stranding a thread.
+      try {
+        const reread = fresh && (await api.readThread(reply.thread));
+        if (
+          !fresh ||
+          !sameIds(fresh.comments.map((comment) => comment.id), ids) ||
+          reread.isResolved !== false ||
+          reread.pr !== pr ||
+          reread.commentCount !== ids.length ||
+          !sameIds(reread.commentIds, ids)
+        ) {
+          log(`skipped ${reply.thread}: it changed since the model job read it`);
+          continue;
+        }
+        if (await headMoved()) {
+          log(`stopped at ${reply.thread}: the PR head is no longer ${headSha}`);
+          escalationReason = posted.length === 0 ? "feedback-not-landed" : "feedback-partial";
+          break;
+        }
+        const answer = await api.replyToComment(pr, ids[0], renderReply(reply));
+        if (answer?.in_reply_to_id !== ids[0]) {
+          throw new Error(`the reply on ${reply.thread} did not land on its thread`);
+        }
+        posted.push({ thread: reply.thread, disposition: reply.disposition });
+        if (reply.disposition === "VALID" && !(await resolveAfterReply(api, reply.thread, [...ids, answer.id], headMoved))) {
+          log(`replied on ${reply.thread} but left it open: it or the PR head changed while the reply was posted`);
+          escalationReason = "feedback-partial";
+          continue;
+        }
+      } catch (error) {
+        log(`stopped at ${reply.thread}: ${String(error?.message ?? error).slice(0, 300)}`);
+        escalationReason = "feedback-partial";
+        break;
+      }
+      log(`replied on ${reply.thread} (${reply.disposition})${reply.disposition === "VALID" ? "; resolved" : ""}`);
+    }
+    // An INCORRECT thread goes to the adjudicator's verdict, not straight to
+    // a person (owner decision): it is resolved, handed back to the next round,
+    // or escalated with the question the verdict names; a thread whose finding
+    // stood at an earlier adjudication and is still open escalates
+    // feedback-disputed (adjudicate-feedback.mjs settleDisputes). The
+    // adjudicator read the select job's head, which this round's fix push
+    // may have moved past headSha.
+    // A head that moved this round gets a review run, which starts the next
+    // round; an earlier fix (#9560's fallback) moves nothing.
+    const settled = await settleDisputes({
+      api,
+      pr,
+      adjudicatedSha: run.head_sha,
+      posted,
+      replies,
+      shown,
+      now,
+      verdicts: posted.some((entry) => entry.disposition === "INCORRECT") ? parseVerdicts(readAdjudication(), run.head_sha) : new Map(),
+      pushed: run.head_sha !== headSha,
+      headMoved,
+      resolveAfterReply,
+      escalationReason,
+      log,
+    });
+    return { ...settled, posted };
+  }
+}
+
+export async function main(env, { api, log = (line) => console.log(line) } = {}) {
+  need(env, [
+    "GH_TOKEN",
+    "GITHUB_REPOSITORY",
+    "PR_NUMBER",
+    "HEAD_SHA",
+    "HEAD_REF",
+    "GITHUB_RUN_ID",
+    "APP_SENDER_ID",
+    "TRUSTED_ACTORS",
+    "FEEDBACK_REPLIES_DIR",
+    "GITHUB_WORKSPACE",
+    "SKIP_REASON_FILE",
+    "ESCALATION_REASON_FILE",
+  ]);
+  const pr = positive(env.PR_NUMBER, "PR_NUMBER");
+  const appId = positive(env.APP_SENDER_ID, "APP_SENDER_ID");
+  if (!SHA.test(env.HEAD_SHA)) {
+    throw new Error("HEAD_SHA is not a commit id");
+  }
+  // An empty attempt is a model run that uploaded no replies: it names no
+  // run, so its marker is always posted.
+  const attempt = env.MODEL_RUN_ATTEMPT ?? "";
+  if (attempt !== "" && !/^[1-9][0-9]{0,4}$/.test(attempt)) {
+    throw new Error("MODEL_RUN_ATTEMPT is not a run attempt");
+  }
+  const patchState = env.REVIEW_PATCH_STATE ?? "";
+  if (!["", "written", "empty"].includes(patchState)) {
+    throw new Error("REVIEW_PATCH_STATE is not a patch state");
+  }
+  const scanRefused = scanRefusal({ dir: env.SCAN_REFUSED_DIR ?? "", read: env.SCAN_REFUSED_READ ?? "" });
+  const runId = positive(env.GITHUB_RUN_ID, "GITHUB_RUN_ID");
+  const modelRun = attempt ? `${runId}-${attempt}` : null;
+  const dir = env.FEEDBACK_REPLIES_DIR;
+  const read = (name, limit = LIMITS.bytes + 1) => {
+    const path = join(dir, name);
+    const stat = lstatSync(path);
+    if (!stat.isFile()) {
+      throw new Invalid(`${name} is not a regular file`);
+    }
+    if (stat.size > limit) {
+      throw new Invalid(`${name} is over the size limit`);
+    }
+    return readFileSync(path, "utf8");
+  };
+  // run.json must be the bytes the select job wrote, whose SHA-256 that job
+  // passed out.
+  const readRun = () => {
+    const text = read("run.json", LIMITS.runBytes);
+    if (!/^[0-9a-f]{64}$/.test(env.RUN_SHA256 ?? "") || createHash("sha256").update(text).digest("hex") !== env.RUN_SHA256) {
+      throw new Invalid("run.json does not match the SHA-256 the select job recorded");
+    }
+    return text;
+  };
+  // A missing replies.jsonl is judged in postReplies; one present must be
+  // the bytes the scan job uploaded, whose SHA-256 it passed out.
+  const readReplies = () => {
+    let text;
+    try {
+      text = read("replies.jsonl");
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return null;
+      }
+      throw error;
+    }
+    if (!/^[0-9a-f]{64}$/.test(env.REPLIES_SHA256 ?? "") || createHash("sha256").update(text).digest("hex") !== env.REPLIES_SHA256) {
+      throw new Invalid("replies.jsonl does not match the SHA-256 the scan job recorded");
+    }
+    return text;
+  };
+  // The adjudicator's verdicts (adjudicate-feedback.mjs collect), when its
+  // job uploaded them; anything else reads as none, which escalates every
+  // INCORRECT thread as feedback-unadjudicated.
+  const readAdjudication = () => {
+    const path = join(env.ADJUDICATION_DIR ?? "", "verdicts.json");
+    if (!env.ADJUDICATION_DIR || !existsSync(path) || !lstatSync(path).isFile() || lstatSync(path).size > LIMITS.bytes) {
+      return null;
+    }
+    const text = readFileSync(path, "utf8");
+    const recorded = /^[0-9a-f]{64}$/.test(env.ADJUDICATION_SHA256 ?? "") && createHash("sha256").update(text).digest("hex") === env.ADJUDICATION_SHA256;
+    return recorded ? text : null;
+  };
+  const { escalationReason, skipReason } = await publish({
+    api:
+      api ??
+      createGitHubApi({
+        token: env.GH_TOKEN,
+        repository: env.GITHUB_REPOSITORY,
+        apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
+        graphqlUrl: env.GITHUB_GRAPHQL_URL ?? "https://api.github.com/graphql",
+      }),
+    pr,
+    headSha: env.HEAD_SHA,
+    headRef: env.HEAD_REF,
+    appId,
+    modelRun,
+    patchState,
+    scanRefused,
+    repliesExpected: attempt !== "" || (env.REPLIES_SHA256 ?? "") !== "",
+    maxRounds: maxRoundsFrom(env.REVIEW_ROUNDS),
+    reviewerId: reviewerIdFrom(env.TRUSTED_ACTORS),
+    trustedHumans: trustedHumansFrom(env.TRUSTED_ACTORS),
+    readArtifact: () => ({ runText: readRun(), repliesText: readReplies() }),
+    readAdjudication,
+    fileExists: (path) => existsSync(join(env.GITHUB_WORKSPACE, path)),
+    log,
+  });
+  if (escalationReason) {
+    writeFileSync(env.ESCALATION_REASON_FILE, `${escalationReason}\n`);
+    writeFileSync(env.SKIP_REASON_FILE, "awaiting-human\n");
+  } else if (skipReason) {
+    writeFileSync(env.SKIP_REASON_FILE, `${skipReason}\n`);
+  }
+  return 0;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main(process.env).then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (error) => {
+      console.log(`::error::publish-feedback failed: ${error.message}`);
+      process.exitCode = 1;
+    },
+  );
+}

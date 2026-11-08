@@ -1,0 +1,126 @@
+#!/usr/bin/env node
+/**
+ * List promotion candidates from triage manifest + claim-inventory sessions.
+ *
+ * Usage: node watch/list-promotion-candidates.js <slice-dir>
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+
+import { isMainModule } from "@melodic/video-digestion/shared/main-module";
+import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/terminal";
+
+import { LANES, lanePath } from "../lib/slice-lanes.js";
+import { indexSelectedFrames, readLaneJson } from "../lib/watch-frame-index.js";
+import {
+  parseSessionsFromClaimInventory,
+  SESSION_FORMAT_HINT,
+} from "../lib/watch-slice-sessions.js";
+import { compareTimesUntimedLast } from "../watching/timestamp-interleave.js";
+
+const MIN_CANDIDATES_PER_SESSION = 3;
+
+/**
+ * @typedef {object} PromotionCandidate
+ * @property {string} sourceFile
+ * @property {string} verdict
+ * @property {string} session
+ * @property {number|null} timestampSec
+ * @property {number} priorityScore
+ */
+
+/**
+ * @param {string} sliceDir
+ * @returns {PromotionCandidate[]}
+ */
+export function listPromotionCandidates(sliceDir) {
+  const absSlice = path.resolve(sliceDir);
+  const manifest = readLaneJson(absSlice, LANES.keyFrames, "triage", "manifest.json");
+  const selection = readLaneJson(absSlice, LANES.keyFrames, "selection.json");
+  const claimBody = fs.readFileSync(
+    lanePath(absSlice, LANES.research, "claim-inventory.md"),
+    "utf8",
+  );
+  const sessions = parseSessionsFromClaimInventory(claimBody);
+  if (sessions.length === 0) {
+    throw new Error(`no session parsed from research/claim-inventory.md: ${SESSION_FORMAT_HINT}`);
+  }
+  const byFile = indexSelectedFrames(selection);
+  const durationSec = selection.durationSec;
+
+  /** @type {Map<string, PromotionCandidate>} */
+  const candidates = new Map();
+
+  for (const sheet of manifest.sheets) {
+    for (const cell of sheet.cells) {
+      if (cell.verdict !== "promote-key-frame" && cell.verdict !== "keep-detail") continue;
+      const frame = byFile[cell.frame];
+      if (!frame) continue;
+      const ts = frame.timestampSec ?? null;
+      const session =
+        sessions.find((s) => ts != null && ts >= s.startSec && ts <= (s.endSec ?? durationSec))
+          ?.name ?? "unknown";
+
+      const existing = candidates.get(cell.frame);
+      const score = frame.priorityScore ?? 0;
+      if (!existing || score > existing.priorityScore) {
+        candidates.set(cell.frame, {
+          sourceFile: cell.frame,
+          verdict: cell.verdict,
+          session,
+          timestampSec: ts,
+          priorityScore: score,
+        });
+      }
+    }
+  }
+
+  // Snapshot BEFORE the backfill loop: top-ups added for one session must not
+  // count toward the per-session floor of a later session.
+  const triaged = [...candidates.values()];
+
+  for (const session of sessions) {
+    const end = session.endSec ?? durationSec;
+    const inSession = triaged.filter(
+      (c) => c.timestampSec != null && c.timestampSec >= session.startSec && c.timestampSec <= end,
+    );
+    if (inSession.length < MIN_CANDIDATES_PER_SESSION) {
+      const extras = selection.selectedFrames
+        .filter(
+          (f) =>
+            Number.isFinite(f.timestampSec) &&
+            f.timestampSec >= session.startSec &&
+            f.timestampSec <= end &&
+            !candidates.has(f.file),
+        )
+        .sort((a, b) => b.priorityScore - a.priorityScore)
+        .slice(0, MIN_CANDIDATES_PER_SESSION - inSession.length);
+      for (const frame of extras) {
+        candidates.set(frame.file, {
+          sourceFile: frame.file,
+          verdict: "keep-detail",
+          session: session.name,
+          timestampSec: frame.timestampSec,
+          priorityScore: frame.priorityScore,
+        });
+      }
+    }
+  }
+
+  return [...candidates.values()].sort(compareTimesUntimedLast);
+}
+
+if (isMainModule(import.meta.url)) {
+  const sliceDir = process.argv[2];
+  if (!sliceDir) {
+    writeStderr("Usage: node watch/list-promotion-candidates.js <slice-dir>");
+    process.exit(2);
+  }
+  try {
+    writeStdout(JSON.stringify(listPromotionCandidates(sliceDir), null, 2));
+  } catch (error) {
+    writeStderr(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
+}
