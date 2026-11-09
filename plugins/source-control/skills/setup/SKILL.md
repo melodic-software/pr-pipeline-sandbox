@@ -1,5 +1,5 @@
 ---
-description: "Configure the source-control plugin. check (read-only, default) reports the effective commit-subject / PR-title convention merged across the user-global, team, and personal-overlay layers plus the babysit-prs userConfig surface; apply interviews the repo, writes the convention config to a chosen layer, and walks the sanctioned babysit reconfigure paths. Use when setting up or inspecting this plugin's configuration, choosing or overriding a commit convention at any layer, configuring or checking babysit, or when /commit, /pull-request, or /babysit-prs report missing configuration. Re-runnable and safe."
+description: "Configure the source-control plugin. check (read-only, default) reports the effective commit-subject / PR-title convention merged across the user-global, team, and personal-override layers plus the babysit-prs userConfig surface; apply interviews the repo, writes the convention config to a chosen layer, and walks the sanctioned babysit reconfigure paths. Use when setting up or inspecting this plugin's configuration, choosing or overriding a commit convention at any layer, configuring or checking babysit, or when /commit, /pull-request, or /babysit-prs report missing configuration. Re-runnable and safe."
 argument-hint: "[check|apply] [layer=user|team|local] [subject_pattern=<pattern>] [branch_issue_pattern=<ERE>]"
 user-invocable: true
 disable-model-invocation: true
@@ -11,10 +11,10 @@ disable-model-invocation: true
 
 Inspect and configure the source-control plugin per the uniform setup contract
 (`docs/plugin-philosophy.md` "Setup is explicit and repeatable" in the marketplace repository):
-`check` reports the effective configuration, `apply` writes it. Two configuration surfaces:
+`check` reports the effective configuration, `apply` writes it. Two kinds of configuration:
 
 1. The commit-subject / PR-title convention config, layered across a user-global file, the tracked
-   team file, and a gitignored personal overlay and merged per key by
+   team file (`docs/conventions/source-control.yaml`), and a gitignored personal override and merged per key by
    [../../reference/config-resolution.md](../../reference/config-resolution.md). Resolved first by
    `/source-control:commit` and `/source-control:pull-request` before they fall back to inference or
    the bundled Conventional Commits default. Conventional Commits is genuinely optional, some orgs
@@ -51,9 +51,9 @@ single layer's value as the effective convention; a reader who cannot see which 
 tell why `/source-control:commit` behaves as it does.
 
 When `REPO_ROOT` is `$HOME` or an ancestor of it, or is not inside a git working tree, team and
-overlay are **not applicable**
+personal override are **not applicable**
 ([../../reference/config-resolution.md](../../reference/config-resolution.md), config-cascade #4672):
-do not read `${REPO_ROOT}/.claude/source-control.md` or the overlay as the team layer,
+do not read `${REPO_ROOT}/docs/conventions/source-control.yaml` or the personal override,
 report both as N/A with the reason (`project root is the home directory (or an ancestor of it)`
 or `project root is not inside a git repository`), and resolve user-global only.
 `parse-branch-issue.sh` prints the same note on stderr. Git
@@ -64,8 +64,8 @@ tracked/ignored probes do not apply: there is no consumer repository to answer a
 key                        value                       won by
 subject_pattern            ^[A-Z]+-\d+: .+             team
 pr_title_pattern           Same as subject_pattern      team
-trailer_policy             none                         local overlay
-pr_body_attribution        none                         local overlay
+trailer_policy             none                         personal override
+pr_body_attribution        none                         personal override
 pr_body_required_sections  briefing                     plugin default
 branch_issue_pattern       ^[^/]+/([0-9]+)-             team
 ```
@@ -98,22 +98,31 @@ Per-layer verdicts:
 
 - **User-global** (`~/.claude/source-control.md`): present → report which keys it contributes;
   absent → INFO. It is outside the repo, so no git check applies to it.
-- **Team** (`REPO_ROOT/.claude/source-control.md`): present → PASS. **FAIL** when excluded by
-  `.gitignore`. Teammates would never receive the shared convention; report the matching rule.
-  Absent → INFO, remediable by `apply`.
-- **Local overlay ignore rule** (the recursive `.claude/**/*.local.*`, covering
+- **Team** (`REPO_ROOT/docs/conventions/source-control.yaml`): present → PASS. **FAIL** when
+  excluded by `.gitignore`. Teammates would never receive the shared convention; report the matching
+  rule. Absent → INFO, remediable by `apply`. Per key, `bash "${CLAUDE_PLUGIN_ROOT}/lib/convention-key.sh" layer "$REPO_ROOT" <key>`
+  prints `yaml` or `none`; name the supplying file in `won by`. The probe does not check
+  trackedness, so first run `git ls-files --error-unmatch -- ":/docs/conventions/source-control.yaml"`:
+  a team file git does not track supplies no key, so never name it in `won by`, and report it as
+  untracked instead.
+- **Retired team file** (`REPO_ROOT/.claude/source-control.md`): when
+  `git ls-files --error-unmatch -- ":/.claude/source-control.md"` exits 0 → WARN: no longer read
+  by source-control; name the `## <key>` sections it still carries. `apply` copies every key the
+  schema declares into `docs/conventions/source-control.yaml` and removes its section; delete the
+  file once it carries none.
+- **Personal override ignore rule** (the recursive `.claude/**/*.local.*`, covering
   `REPO_ROOT/.claude/source-control.local.md`): probe the ignore rule whether or
-  not the overlay file exists. The rule's job is to be in place **before** the
-  first overlay is written; conditioning the probe on the file already existing
+  not the personal override file exists. The rule's job is to be in place **before** the
+  first personal override is written; conditioning the probe on the file already existing
   is the window that produces the exposure. Missing rule → FAIL, remediable by
   `apply` (which writes the line at team-layer bind, not only at `layer=local`).
-  Probe with `git check-ignore --no-index -v -- .claude/nested/overlay.local.md`
+  Probe with `git check-ignore --no-index -v -- .claude/nested/personal-override.local.md`
   (the path does not need to exist). The sentinel is nested so a leftover
-  `.claude/*.local.*` rule, which still matches the flat overlay path, is not
+  `.claude/*.local.*` rule, which still matches the flat personal override path, is not
   mistaken for the recursive rule. A match counts only when `-v` names a
   repository `.gitignore` as the source. `$GIT_DIR/info/exclude` and
   `core.excludesFile` are operator-local and do not protect a teammate.
-- **Local overlay file** (`REPO_ROOT/.claude/source-control.local.md`): when
+- **Personal override file** (`REPO_ROOT/.claude/source-control.local.md`): when
   present, PASS only when an ignore rule matches it **and** it is not in the
   index. Two distinct failures hide behind one symptom and need different
   remediations, so probe them separately. See the two-probe form under
@@ -140,7 +149,7 @@ diagnostics:
   unexpectedly blocked or allowed, so surface it here, naming the resolver's diagnostic and the
   remediation (restore the file, fix the pointer, or `apply` to rewrite it).
 - **Shadowed markdown → WARN.** A neutral file resolves (via pointer or the well-known default) **and**
-  `.claude/source-control.md` still carries a markdown-H2 `subject_pattern`/`pr_title_pattern` for the
+  the retired `.claude/source-control.md` still carries a markdown-H2 `subject_pattern`/`pr_title_pattern` for the
   same key: the neutral value wins (rungs 1–2 over rung 3) and the stale markdown is inert but
   misleading. Recommend `apply` to retire the duplicate (migration removes it), per
   [reference/apply-convention.md](reference/apply-convention.md) "Migration retires duplicates".
@@ -285,14 +294,15 @@ In brief:
   request's wording and state the pick before writing, the wrong layer either misses teammates or
   commits a personal preference to shared history. When `REPO_ROOT` is `$HOME` or an ancestor of
   it, or is not inside a git working tree, refuse `layer=team` and `layer=local` (at home they
-  would write the operator's personal `~/.claude/source-control.md` under a team label; outside a
+  would write the operator's personal files under a team label; outside a
   repository there is no team to share with) and offer `layer=user`.
 - **Non-interactive** (`subject_pattern=`): an in-place *update*, never a fresh file. Carry every
   independent key, recompute derived keys (`type_list`, `pr_title_pattern`), reject a
-  non-machine-checkable value, and for an overlay omit requested keys the layers below already
+  non-machine-checkable value, and for a `user` or `local` write omit requested keys the layers below already
   resolve identically.
-- **`branch_issue_pattern=`**: alone, it writes or replaces only the `## branch_issue_pattern`
-  section of the chosen layer, value in backticks, leaving every other section untouched; with
+- **`branch_issue_pattern=`**: alone, it writes or replaces only the `branch_issue_pattern` key of
+  the chosen layer (a quoted scalar in the team YAML; the `## branch_issue_pattern` section, value in
+  backticks, in a markdown layer), leaving every other key untouched; with
   `subject_pattern=`, both are written in one pass. Reject a value that is not a valid ERE, holds a
   backreference, or has no capture group, then confirm `parse-branch-issue.sh <sample-branch>`
   prints the expected number.
@@ -325,26 +335,35 @@ route to the finding-suppression convention, never a new consumer-side file.
 ### Babysit config
 
 `/source-control:babysit-prs` is configured through the plugin's native `userConfig`, which Claude
-Code owns (`pluginConfigs`), this skill never hand-edits it. It documents and walks the two
-sanctioned paths:
+Code owns (`pluginConfigs`), this skill never hand-edits it. It documents and walks the sanctioned
+routes:
 
 - **Interactive:** `/plugin configure source-control@<marketplace>` (or the `/plugin` dialog → source-control →
   configure), any time. Claude Code prompts per key using the manifest's types and defaults.
-- **Headless / CI:** rerun the install with the new values:
+- **Headless / CI, preferred (Claude Code 2.1.285 or later):** from the project the plugin is
+  installed in, `claude plugin configure source-control@<marketplace> --values-stdin < values.json`,
+  with `values.json` holding `{"KEY": "VALUE"}`: every value a string, booleans included, and keys
+  left out keep their saved values.
+- **Headless / CI, fallback (an older release):** rerun the install with the new values:
   `claude plugin install source-control@<marketplace> -s <scope> --config KEY=VALUE` (repeatable
-  per key). Multi-value keys (`babysit_watched_owners`, `babysit_self_logins`,
-  `babysit_review_bot_logins`, `babysit_extra_bot_logins`) are supplied comma-joined. Against an
-  already-installed plugin it prints `already installed` **and still writes the value** (per the
-  marketplace's plugin-reconfiguration convention,
-  <https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/plugin-reconfiguration/README.md>,
-  which owns the verified-version record). Do **not** uninstall to reconfigure: uninstalling drops
-  this plugin's entire stored `pluginConfigs` entry, resetting every option in the README's
-  Options reference to its manifest default. `-s` defaults to `user`; pass the scope
-  `claude plugin list` reports for this plugin, and run from that project's directory for a
-  `project`/`local` scope. A rerun at another scope adds an install record at that scope and
-  enables the plugin there (measured in both directions); the value itself always lands in user
-  settings. A rejected value
-  prints a warning yet exits 0, so read the output.
+  per key). Against an already-installed plugin it prints `already installed` **and still writes
+  the value**.
+
+Both routes follow the marketplace's plugin-reconfiguration convention
+(<https://github.com/melodic-software/claude-code-plugins/blob/main/docs/contracts/plugin-reconfiguration/README.md>,
+which owns the verified-version record). For the rerun, multi-value keys (`babysit_watched_owners`,
+`babysit_self_logins`, `babysit_review_bot_logins`, `babysit_extra_bot_logins`) are supplied
+comma-joined; the convention's record has not verified `configure` for these `multiple` options, so
+prefer the rerun or the interactive dialog for them. Do **not** uninstall to reconfigure:
+uninstalling drops this plugin's entire stored `pluginConfigs` entry, resetting every option in the
+README's Options reference to its manifest default. Scope: the value always lands in user settings.
+Run either route from the project the plugin is installed in (`configure` has no scope flag). For
+the rerun, `-s` defaults to `user`, so pass the scope `claude plugin list` reports for this plugin:
+a rerun at another scope adds an install record at that scope and enables the plugin there
+(measured in both directions). From the home directory, where the list can label one settings file
+both `user` and `project`, pass `user`. Check each route's own
+failure signal: `configure` rejects a bad value with exit 1 and saves nothing, but stores an empty
+string as `""`; the rerun prints a warning for a rejected value yet exits 0, so read its output.
 
 When an uninstall is warranted for a reason other than reconfiguring (troubleshooting, changing
 scopes, reinstalling a version), pass `--keep-data`. Uninstalling from the **last remaining scope**
@@ -359,7 +378,7 @@ check where the roots actually resolve before assuming the directory is disposab
 worktrees are ephemeral scratch that rebuild from the forge, but the state directory and any
 `/source-control:worktree` tree still holding uncommitted work do not.
 
-Reconfiguring `userConfig` does not reach the already-running session, after either path, the new
+Reconfiguring `userConfig` does not reach the already-running session, after any route, the new
 values become visible only in a fresh session. Do not re-run the babysit `check` in the same session
 expecting the change and report a false failure; instead report "reconfigured; verify with `check` in
 a fresh session".
@@ -391,12 +410,12 @@ in them would reach the Bash tool unsubstituted, and the Bash tool's environment
 - **`none` and absence are different states** for `trailer_policy`, `pr_body_attribution`, and
   `pr_body_required_sections`: absence falls through (ultimately to the bundled default), `none` is
   a resolved opt-out that wins its layer's per-key override.
-- **Gate inference on the resolved value, never file presence.** A `source-control.md` layer that
+- **Gate inference on the resolved value, never file presence.** A config layer that
   contributes only other keys leaves `subject_pattern` unresolved. Skipping inference because
   "some config file exists" recommends the bundled default over the repo's real convention.
 - **Nested-directory invocations silently read the wrong files.** Anchor every repo-relative read
   at `REPO_ROOT` (`${CLAUDE_PROJECT_DIR}`, else `git rev-parse --show-toplevel`), a cwd-relative
-  `.claude/source-control.md` read from a subdirectory misses the repo-root config and degrades
+  read of the team YAML from a subdirectory misses the repo-root config and degrades
   without an error. Re-resolve in each self-contained Bash call.
 - **Linked worktrees hide the hooks directory.** Resolve it with `git rev-parse --git-path hooks`,
   in a linked worktree `.git` is a file, and `core.hooksPath` can move the directory anywhere.
@@ -421,7 +440,7 @@ in them would reach the Bash tool unsubstituted, and the Bash tool's environment
   the authoritative gate; this config only tells the plugin's skills what shape to draft and
   pre-check against.
 - Write the consumer's `.gitignore`, except the one recursive `.claude/**/*.local.*` line at
-  team-layer bind / `apply`. That line must exist before any overlay is written,
+  team-layer bind / `apply`. That line must exist before any personal override is written,
   so `apply` appends it when missing and announces the edit. Everything else in
   `.gitignore` stays the consumer's.
 - Write the plugin cache, Claude Code user settings, or `pluginConfigs`. The convention lives in

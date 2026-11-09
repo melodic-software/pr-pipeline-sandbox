@@ -16,18 +16,19 @@ These axes work in any repo and don't change per team. Do not snapshot their mem
 | Axis | Mechanism | What it encodes |
 |------|-----------|-----------------|
 | Type | native Issue Type (org) · `type:` label (personal/non-org) | The kind of issue: `Bug` (broken vs. intent), `Feature` (new capability), `Task` (any other tracked work: maintenance, refactor, tests, docs, audits, chores). Commit-type granularity (`fix`/`feat`/`chore`/`docs`/`refactor`/`test`/`build`/`perf`) stays at the commit layer, not the issue axis. |
-| Priority | `priority:` | Urgency. Members from the live set. |
-| Status | `status:` | Exception and gate flags only (e.g. `needs-info`, `needs-decision`, `ready`). Members from the live set. **Claim is not a status label.** It is assignee + lease (see the seam claim protocol). **Blocked is not a status label.** It is a native `blocked-by` dependency edge. The triage floor is not a status value. |
-| Meta | (none) | Tool-owned flat markers the automation sets: `automated`, `good-first-issue`, `migrated`, `stale`, the triage floor `needs-triage` (bare; not a `priority:` or `status:` value), plus the three canonical-role labels (defaults `agent-ready`, `needs-human`, and `recurring`, listed under "Canonical roles" below). |
+| Priority | `Priority` issue field (org) · `priority:` label (no such field) | Urgency. Members from the live set: the field's options, else the labels. Set per [`tracker-seam.md`](tracker-seam.md) "Setting an item's priority". |
+| Status | `status:` | Exception and gate flags only (e.g. `confirmed`, `ready`). Members from the live set. **Claim is not a status label.** It is assignee + lease (see the seam claim protocol). **Blocked is not a status label.** It is a native `blocked-by` dependency edge. The triage floor is not a status value. Where the tracker also keeps a `Work status` field, read an item's status per [`tracker-seam.md`](tracker-seam.md) "Reading an item's status". |
+| Meta | (none) | Tool-owned flat markers the automation sets: `automated`, `good-first-issue`, `migrated`, `stale`, the triage floor `needs-triage` (bare; not a `priority:` or `status:` value), the idea-issue park `needs-spec` (bare; set by triage), the hold labels `needs-owner-decision` and `needs-reporter-info` (bare), plus the three canonical-role labels (defaults `agent-ready`, `needs-human`, and `recurring`, listed under "Canonical roles" below). |
 | Cadence | `cadence:` | Recurrence period for maintenance items. Members from the live set. |
-| Work class | `work-class:` | Semantic risk class (C1–C5) stamped at triage for the fail-closed admission gate and merge partition. Canonical members and migration: [`work-class-labels.md`](work-class-labels.md). Classification criteria: the `autonomy` plugin's [`work-classes.md`](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/plugins/autonomy/reference/guardrails/work-classes.md). |
+| Work class | `work-class:` | Semantic risk class (C1–C4), kept on older items as a record; nothing applies or reads it. C5 is marked on the provenance axis. Members: [`work-class-labels.md`](work-class-labels.md). Classification criteria: the `autonomy` plugin's [`work-classes.md`](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/plugins/autonomy/reference/guardrails/work-classes.md). |
+| Provenance | `provenance:` | Where an item came from. `provenance: untrusted` (C5) floors the item for a person and holds its merge; `provenance: signal` marks an item filed from a signal and floors it too. Members from the live set. |
 | Capability tier | `capability-tier:` | Execution capability tier for the work-loop frontier quota guard. Canonical members and migration: [`capability-tier-labels.md`](capability-tier-labels.md). Absent label = general tier (fail-closed); body prose is never authority. |
 
 ## Canonical roles
 
-Three meta-axis members are **canonical roles**: skill and action prose speaks the role name, and
-the repo-actual label string resolves from the tracker binding: `.work-item-tracker.json`, key
-`config.role_labels`. When the key (or an individual role entry) is absent, the defaults below
+Four labels are **canonical roles**: skill and action prose speaks the role name, and
+the repo-actual label string resolves from the tracker binding (the `tracker` mapping of
+`<home>/work-items.yaml`, else the legacy repo-root JSON binding), key `config.role_labels`. When the key (or an individual role entry) is absent, the defaults below
 apply, so existing repos need zero migration.
 
 | Role | Default label | What it marks |
@@ -35,6 +36,7 @@ apply, so existing repos need zero migration.
 | `autonomous-eligible` | `agent-ready` | Fully specified and briefed; eligible for autonomous (AFK) pickup from the frontier |
 | `human-gated` | `needs-human` | Needs human judgment (design decision, UX review, manual QA); excluded by `list-frontier --autonomous` |
 | `recurring-maintenance` | `recurring` | A scheduled maintenance item reconciled against `.github/recurring-schedule.json` |
+| `owner-decision` | `needs-owner-decision` | Parked on an owner's decision; the decision label `/work-items:morning-brief` lists and `/plugin-quality:audit` files an unresearched change under, and a hold label by default |
 
 Binding shape (every entry optional; unlisted roles keep their defaults):
 
@@ -44,7 +46,8 @@ Binding shape (every entry optional; unlisted roles keep their defaults):
     "role_labels": {
       "autonomous-eligible": "agent-ready",
       "human-gated": "needs-human",
-      "recurring-maintenance": "recurring"
+      "recurring-maintenance": "recurring",
+      "owner-decision": "needs-owner-decision"
     }
   }
 }
@@ -77,24 +80,41 @@ remapped label must exist (or route through the repo's label-as-code owner), and
 that already holds containers must relabel them when remapping, because the frontier exclusion is
 an exact match against the resolved string.
 
+### Hold lists and the wayfind prefix
+
+The labels and Work status states that keep an item off the autonomous frontier, and the
+wayfind label prefix, resolve from these `config` keys, siblings of `config.role_labels`.
+An absent or empty key keeps its default; a present value of the wrong shape is a
+configuration error.
+
+| Key | Default | What it holds |
+|-----|---------|---------------|
+| `hold_labels` | the `owner-decision` role label, `needs-reporter-info`, `needs-spec` | Labels that wait on a person |
+| `hold_states` | `needs-human`, `needs-owner-decision`, `needs-reporter-info`, `needs-spec` | Work status states that wait on a person |
+| `hold_state_labels` | `needs-human`, the `owner-decision` role label, `needs-reporter-info`, `needs-spec` | The hold states' labels: an item carrying one has its hold decided by its labels |
+| `wayfind_label_prefix` | `wayfind:` | The prefix of `/planning:wayfind`'s routing labels |
+
+A remap of the `owner-decision` role reaches the two defaults that name it. A key set
+explicitly replaces its whole default list.
+
 ### Recorded postures: fixed strings without a remap seam
 
 Two strings adjacent to the `recurring-maintenance` role are **fixed by design today**. No
 binding key remaps them (recorded posture per the consumer-configurability doctrine; #2942
 F3.7):
 
-- **`[Maintenance]` title prefix**: the exact-match key `due`/`work` use to reconcile a
-  schedule row with its open tracker item. Making it configurable is deferred until a consumer
-  asks for a different prefix; when that request lands it joins the binding as a sibling of
-  `config.role_labels` (a `config` key, not a parallel mechanism), and every reader named in
-  [`../skills/track/actions/due.md`](../skills/track/actions/due.md) and the setup
-  reconciliation steps resolves it the same way role labels resolve.
+- **`<!-- recurring-schedule id=<id> -->` body marker**: the exact-match key the recurring flows
+  use to reconcile a schedule row with its open tracker item
+  ([`issue-conventions.md`](issue-conventions.md) "Recurring marker"). Making it configurable is
+  deferred until a consumer asks for a different marker; when that request lands it joins the
+  binding as a sibling of `config.role_labels` (a `config` key, not a parallel mechanism), and
+  every reader that convention names resolves it the same way role labels resolve.
 - **`.github/recurring-schedule.json` path**: the schedule file's location. Deferred on the
   same first-request trigger; a future remap is a binding `config` key resolved once per
   invocation, never a second discovery climb.
 
 Both strings participate in exact-match lookups against provider data, so a repo changing
-either today would orphan existing `[Maintenance]` items and schedules, which is why the
+either today would orphan existing recurring items and schedules, which is why the
 remap, when it comes, arrives with a reconciliation step, not as a bare string swap.
 
 ## Project-specific axes
@@ -122,7 +142,7 @@ example is the `wayfind: *` axis: declared by the consuming repo's label-as-code
 but applied and removed only by `/planning:wayfind`, on its own map sub-issues, at sub-issue
 creation ("Never create labels ad hoc from this skill", per `/planning:wayfind` `SKILL.md` "Create or
 extend the map issue"). No work-items skill applies, strips, or requires a `wayfind:` value on the
-items it manages; it respects whatever role label (e.g. `needs-human`) a wayfind HITL item already
-carries, the same as any other item's role label. Members and semantics belong to the declaring
+items it manages, and `list-frontier` leaves out every item carrying a `wayfind:` label, whatever
+role label it carries, so `/work-items:work` never picks one. Members and semantics belong to the declaring
 repo and `/planning:wayfind`, per the resolved decision `melodic-software/github-iac#179`, so they are
 referenced here, not restated.

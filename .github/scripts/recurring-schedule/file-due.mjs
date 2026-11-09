@@ -21,7 +21,6 @@ import { rateLimitLatch } from "../../actions/log-api-budget/rate-guard.mjs";
 const guardedFetch = (url, init) => rateLimitLatch.guard(globalThis.fetch)(url, init);
 
 export const RECURRING = "recurring";
-export const cadenceLabel = (cadence) => `cadence: ${cadence}`;
 
 // A line of its own (issue-conventions.md "Recurring marker"). The shared
 // definition is .github/scripts/intake-triage/admit.mjs SCHEDULE_MARKER, which
@@ -37,21 +36,13 @@ const ID = /^[A-Za-z0-9._-]+$/;
 export const issueTitle = (row) => row.title;
 
 export function issueBody(row) {
-  const precondition = row.precondition?.prompt
-    ? [
-        "## Precondition",
-        "",
-        row.precondition.prompt,
-        "",
-      ]
-    : [];
   return [
     "## Context",
     "",
     `Schedule row \`${row.id}\` (cadence ${row.cadence}) in \`.github/recurring-schedule.json\` came due on ${row.next_due}. \`/work-items:track recheck ${row.id}\` closes this issue and advances \`next_due\`.`,
     "",
     ...(row.notes ? [row.notes, ""] : []),
-    ...precondition,
+    ...(row.precondition?.prompt ? ["## Precondition", "", row.precondition.prompt, ""] : []),
     `<!-- recurring-schedule id=${row.id} -->`,
   ].join("\n");
 }
@@ -84,13 +75,14 @@ const ISSUE_TYPE = "Task";
 // rather than filing a duplicate.
 export async function fileDue({ schedule, today, call, repo, wait = () => delay(1000) }) {
   const rows = Array.isArray(schedule?.items) ? schedule.items : [];
+  const entry = (row, isDue) => ({ id: row.id, next_due: row.next_due, due: isDue });
   const results = [];
   const due = [];
   for (const row of rows) {
     const problem = rowProblem(row);
     if (problem) results.push({ id: String(row?.id ?? ""), next_due: row?.next_due ?? null, due: false, outcome: "failed", reason: problem });
-    else if (row.next_due > today) results.push({ id: row.id, next_due: row.next_due, due: false, outcome: "not-due" });
-    else if (row.precondition?.requires_operator_confirmation === true) results.push({ id: row.id, next_due: row.next_due, due: true, outcome: "held", reason: HELD });
+    else if (row.next_due > today) results.push({ ...entry(row, false), outcome: "not-due" });
+    else if (row.precondition?.requires_operator_confirmation === true) results.push({ ...entry(row, true), outcome: "held", reason: HELD });
     else due.push(row);
   }
   if (due.length === 0) return results;
@@ -100,7 +92,7 @@ export async function fileDue({ schedule, today, call, repo, wait = () => delay(
       for (const id of scheduleIds(issue.body)) if (!covered.has(id)) covered.set(id, issue.number);
     }
   } catch (error) {
-    return [...results, ...due.map((row) => ({ id: row.id, next_due: row.next_due, due: true, outcome: "failed", reason: error.message }))];
+    return [...results, ...due.map((row) => ({ ...entry(row, true), outcome: "failed", reason: error.message }))];
   }
   // A label the repository lacks would be created by the write; one missing
   // `recurring` would leave the issue unlisted, so the next run files again.
@@ -110,14 +102,14 @@ export async function fileDue({ schedule, today, call, repo, wait = () => delay(
     return exists.get(name);
   };
   for (const row of due) {
-    const base = { id: row.id, next_due: row.next_due, due: true };
+    const base = entry(row, true);
     if (covered.has(row.id)) {
       results.push({ ...base, outcome: "covered", issue: covered.get(row.id) });
       continue;
     }
     try {
       if (!(await labelExists(RECURRING))) throw new Error(`label ${RECURRING} does not exist`);
-      const labels = [RECURRING, ...((await labelExists(cadenceLabel(row.cadence))) ? [cadenceLabel(row.cadence)] : [])];
+      const labels = [RECURRING];
       await wait();
       const issue = await call("POST", `/repos/${repo}/issues`, { title: issueTitle(row), body: issueBody(row), labels, type: ISSUE_TYPE });
       covered.set(row.id, issue.number);

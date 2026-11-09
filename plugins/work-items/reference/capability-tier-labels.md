@@ -21,8 +21,8 @@ the general adaptive cap ceiling. A body or brief that mentions frontier tier is
 operator; it does not select the quota guard.
 
 **Security-surface dispatch is separate.** Security-surface work still routes to the frontier
-capability tier for model selection via work-class rules in the admission gate. That path does
-not substitute for the label when the quota guard needs to bind.
+capability tier for model selection, per the convention's tier rules. That path does not
+substitute for the label when the quota guard needs to bind.
 
 ## Escalation
 
@@ -44,7 +44,7 @@ triage stamps it.
 1. **Label-as-code owner declared.** Route provisioning to that system; `/work-items:setup`
    validates presence only and never writes labels ad hoc.
 2. **No label-as-code owner.** `/work-items:setup apply` may create the label with an
-   interactive user present, using the same mechanics as the work-class axis migration. An
+   interactive user present, using the same mechanics as the provenance label migration. An
    unattended `apply` stops with explicit remediation instead of guessing.
 
 Triage preflights the label before stamping; when absent, it reports remediation and omits the

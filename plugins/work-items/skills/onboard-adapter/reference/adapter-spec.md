@@ -29,7 +29,8 @@ A self-hosted, forge-shaped provider with no lease support:
     "create-item": true, "get-item": true, "claim": false, "renew-lease": false,
     "release": false, "reclaim": false, "link-blocks": true, "add-sub-item": false,
     "list-items": true, "list-sub-items": false, "label-provenance": false,
-    "change-link": true, "capabilities": true
+    "set-fields": false, "get-field-options": false, "get-statuses": false, "change-link": true,
+    "add-recurrence": false, "capabilities": true
   },
   "features": {
     "cross_repo_edges": false, "sub_items": false, "leases": false, "labels": true
@@ -75,7 +76,19 @@ rather than defaulted, because an unlisted verb means the spec was written again
 different contract revision, and guessing produces a manifest that lies.
 
 `create-item`, `get-item`, `claim`, `renew-lease`, `release`, `reclaim`, `link-blocks`,
-`add-sub-item`, `list-items`, `list-sub-items`, `label-provenance`, `change-link`, `capabilities`.
+`add-sub-item`, `list-items`, `list-sub-items`, `label-provenance`, `set-fields`, `get-field-options`, `get-statuses`, `change-link`,
+`add-recurrence`, `capabilities`.
+
+`add-recurrence` records a signal's source link and a note on an item, and writes nothing when
+the item already records that link (`CONTRACT.md` "Verbs"). Declare it `false` unless the
+adapter can read back what it wrote before writing again.
+
+`set-fields` sets single-select issue fields by option id (`CONTRACT.md` "Verbs"). Declare it
+`false` unless the provider has such fields and the adapter refuses an option id that is not one
+of its field's options before writing. `get-field-options` is its read-only counterpart: declare it
+`false` unless the adapter can list one field's options. `get-statuses` reads each listed item's
+value of one single-select field, which the autonomous frontier asks for when status lives in the
+`Work status` field: declare it `false` unless the provider has such fields.
 
 `label-provenance` reports, for each label passed with `--label`, who applied it most
 recently, that person's permission on the repository, and whether the label is trusted
@@ -148,7 +161,7 @@ The manifest is a promise the core routes on, so these are refusals, not warning
 - `verbs["list-items"]` and `limits.list_items_max` must agree.
 - `link-blocks: true` needs a non-zero `dependencies_per_type`.
 
-One note, not a refusal: `list-items: false` is coherent, since the bundled `jira` adapter is
+One note, not a refusal: `list-items: false` is coherent, since the `jira` seed is
 consume-only, but `list-frontier` can then never succeed, so no work-selection flow will
 find anything. The generator says so on stderr.
 

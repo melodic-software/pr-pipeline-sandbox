@@ -2,7 +2,7 @@
 description: "Babysit the user's own open GitHub pull requests as a tiered fleet loop. The safe default discovers the user's own PRs under the current repo's owner, checks readiness, fixes clear branch-owned issues, and reports, it never resolves threads or merges. Explicit 'worker' tier adds auto-resolving outdated bot threads and gate-proven merges; explicit 'autopilot' adds all authors under the watched owners. Use when asked to babysit, watch, or advance open pull requests as a fleet (the safe tier), to run the worker or autopilot tier by name, or when pairing with /loop for continuous coverage; not for the single-PR lifecycle: prep, create, monitor one PR, or merge (use /pull-request)."
 user-invocable: true
 disable-model-invocation: false
-argument-hint: "[worker|autopilot|help] [owner/repo|#n|owner/repo#n]"
+argument-hint: "[worker|autopilot|help] [--unattended] [owner/repo|#n|owner/repo#n]"
 shell: bash
 metadata:
   workflow-stage: operator
@@ -10,7 +10,7 @@ metadata:
   cadence: continuous
 ---
 
-**Arguments.** `[worker|autopilot|help] [owner/repo|#n|owner/repo#n]`. Full form: [worker|autopilot|help] [owner/repo|#n|owner/repo#n] · default: configured default_tier (safe) over your own PRs; worker=fix+resolve-outdated+merge-ready; autopilot=max autonomy all authors; 'help' lists flows
+**Arguments.** `[worker|autopilot|help] [--unattended] [owner/repo|#n|owner/repo#n]`. Full form: [worker|autopilot|help] [--unattended] [owner/repo|#n|owner/repo#n] · default: configured default_tier (safe) over your own PRs; worker=fix+resolve-outdated+merge-ready; autopilot=max autonomy all authors; 'help' lists flows
 
 ## Pre-computed context
 
@@ -19,7 +19,7 @@ Current login: !`gh api user --jq .login 2>/dev/null || echo "unknown"`
 <!-- portability-ok: harness-executed pre-computed context; changing the command changes what the skill loads -->
 Own open PRs here: !`gh pr list --state open --author "@me" --limit 200 --json number --jq 'length' 2>/dev/null || echo "unknown"`
 
-Branch and working tree: gather with two separate Bash calls, `git branch --show-current` then `git status --porcelain`; treat a failure as an unknown value and carry on. Keep them out of the pre-computed block above: the harness composes that block into one shell invocation, and a worktree-isolated agent refuses a git-bearing compound command. The dated record for that composition claim is the `worktree` skill's [reference/gather-block.md](../worktree/reference/gather-block.md), "The pre-compute block runs as one shell invocation".
+Branch and working tree: gather with two separate Bash calls, `git branch --show-current` then `git status --porcelain`; treat a failure as an unknown value and carry on. Keep them out of the pre-computed block above: the harness composes that block into one shell invocation, and a worktree-isolated agent refuses a git-bearing compound command. The dated record for that composition claim is the [gather-block convention](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/gather-block/README.md#the-pre-compute-block-runs-as-one-shell-invocation), "The pre-compute block runs as one shell invocation".
 
 ## Purpose
 
@@ -42,12 +42,12 @@ and the `reference/` spokes already carry them.
 
 ## Modes and arguments
 
-An invocation is `[mode] [scope]`; mode and scope are orthogonal. Combine them freely (`worker owner/repo`, `worker #87`, etc.).
+An invocation is `[mode] [--unattended] [scope]`; mode and scope are orthogonal. Combine them freely (`worker owner/repo`, `worker #87`, etc.). `--unattended`, anywhere in the string and taking no value, is neither a mode nor a scope: it is the caller declaring that nobody is present, which governs only the `/autofix-pr` offer under "Boundary". Take it out first, then parse the rest, so `--unattended worker #87` and `worker #87 --unattended` both run the `worker` tier on `#87`, and `--unattended` alone runs the tier the invocation would run without it. It never selects or raises a tier, and this skill passes it to no script or skill: the merge gate's `--unattended` below is a separate path no tier passes, and `ready --unattended` is a separate flag on that skill. The bare word `unattended` and `--unattended=<value>` are not this modifier: stop and name `--unattended`, never guess a tier.
 
 | Mode | What it does |
 | --- | --- |
 | *(none)*, the configured `default_tier` (`safe` unless the consumer changed it) | Safe tier: discover in-scope PRs (your own, under the current repo's owner by default), check readiness, fix clear branch-owned issues and push, report blockers and the next cadence. Never resolves threads or merges. |
-| `worker` | Everything safe does, and additionally auto-resolves *pre-push-outdated* bot threads and merges PRs the merge gate proves 100% ready. Requires Python. For dedicated 24/7 loops over your own PRs. |
+| `worker` | Everything safe does, and additionally auto-resolves *pre-push-outdated* bot threads and merges PRs the merge gate proves 100% ready. On a PR you opened, it resolves only outdated bot threads a configured lane login already answered, never a CRITICAL or security thread and never one a person wrote or joined. Requires Python. For dedicated 24/7 loops over your own PRs. |
 | `autopilot` | Maximum autonomy for a solo owner: every open PR under the watched owners regardless of author; fix everything it can; resolve every thread it has addressed (bot, AI-review, and human); merge everything the gate proves ready. Requires Python. A deliberate power-user opt-in, never a default. |
 | `help` (or `?`) | Print the common flows and the effective configuration below; take no other action. |
 
@@ -71,9 +71,9 @@ Common flows (this is what `help` prints, along with the effective configuration
 /source-control:babysit-prs owner/repo#87       one specific PR
 /source-control:babysit-prs worker              full-auto (your PRs): fix + resolve-outdated + merge-ready
 /source-control:babysit-prs autopilot           max autonomy: ALL authors, fix+resolve+merge, escalate stuck PRs
-/source-control:babysit-prs help                list these flows and stop
-Looped worker:    /loop 15m /source-control:babysit-prs worker
-Looped autopilot: /loop 15m /source-control:babysit-prs autopilot
+/source-control:babysit-prs help                list these flows and stop; add --unattended to any flow when nobody is present
+Looped worker:    /loop 15m /source-control:babysit-prs worker --unattended
+Looped autopilot: /loop 15m /source-control:babysit-prs autopilot --unattended
 Explicit order (any tier): "merge owner/repo#87 now" | "resolve bot threads on #87"
 ```
 
@@ -111,7 +111,7 @@ Autonomy is decomposed per action, not per run. Irreversibility governs the gate
 | Dispatch a dedicated conflict worker (`git merge`, never rebase; it resolves locally and never pushes, the orchestrator re-verifies and pushes, [reference/orchestration.md](reference/orchestration.md)) | no, report (simple mechanical conflicts met while freshening a branch are still handled inline per [reference/loop.md](reference/loop.md)) | mechanical/textual conflicts only, escalate genuine ambiguity | mechanical/textual conflicts only, escalate genuine ambiguity |
 | Resolve review threads | no, report | **pre-push-outdated bot threads only** | any thread **it has addressed**, bot, AI-review, or human |
 | Merge a PR | no. Report readiness | only when the gate proves 100% ready | only when the gate proves 100% ready |
-| Mark a completed draft ready (`/source-control:pull-request ready`) | no, report | no, report | yes, via its worker's completeness assessment |
+| Mark a completed draft ready (`/source-control:pull-request ready --unattended`) | no, report | no, report | yes, via its worker's completeness assessment |
 | Refresh a stale (behind-base) branch, post a review trigger | orchestrator-only | orchestrator-only | orchestrator-only |
 | `CHANGES_REQUESTED`, security/P1, posture, design, dependency acceptance | escalate | escalate | attempt with research; escalate only when it cannot confidently and safely resolve |
 
@@ -123,7 +123,7 @@ which such a change never qualifies for). A verdict the evidence cannot settle i
 UNCERTAIN, naming the evidence that would settle it, and escalated. The per-finding form is D3
 and D4 in [review-discipline](../../reference/review-discipline.md) §3. Contract:
 [`${CLAUDE_PLUGIN_ROOT}/context/recommendation-basis.md`](../../context/recommendation-basis.md);
-full convention: [recommendation-basis](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/recommendation-basis/README.md#grounding-bar).
+full convention: [recommendation-basis](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/contracts/recommendation-basis/README.md#grounding-bar).
 
 **Reading the merge-conflict blocker string.** The snapshot classifier is mode-agnostic by
 design, it has no tier input, so it emits the same blocker string, `"merge conflict;
@@ -143,24 +143,24 @@ works harder to reach that state but never forces past it. A blocked action esca
 never routed around. Advisory-only fix attempts are bounded per PR (the fix-round cap in
 [reference/orchestration.md](reference/orchestration.md)); blocking defects are never capped.
 **Dependency hold-merge:** a dependency-manager-authored PR (Dependabot/Renovate-class) is
-never merged autonomously in ANY tier, the merge gate refuses it absent `--allow-dependency`,
-which is passed only on an explicit user instruction to merge that specific PR.
+never merged autonomously by this skill in ANY tier (a pr-merge lane with its Dependabot class on owns those merges);
+the merge gate refuses it absent `--allow-dependency`, passed only on an explicit user instruction to merge that specific PR.
 
 **Do-not-merge hold:** a PR whose body says "do not merge" (or "don't merge"), or has a line
 starting `Hold:`, is held in ANY tier: the merge gate reads the live body and reports a blocker, and a PR carrying a `do-not-merge`
-label is held the same way: the gate blocks on that label unconditionally, and `--block-labels`
-adds further labels in the autopilot merge tier. The PR is reported and left unmerged. The
-hyphenated label name in a body is not a hold.
+label is held the same way: the gate blocks on that label unconditionally (an `--unattended` run or the autopilot merge
+tier also on the human-gated label, `needs-human` by default), and `--block-labels` adds further labels in the autopilot
+merge tier. The PR is reported and left unmerged. The hyphenated label name in a body is not a hold.
 
 **Draft policy (per tier).** Drafts enter evaluation scope in every tier. There is no blanket
 draft skip. Safe: evaluate and report draft status, never flip a draft ready. Worker and
 autopilot: zero-blocker drafts always route through a worker (see Fan out). The ready flip
 happens only in autopilot, only for a draft its worker assesses complete, and it runs
-`/source-control:pull-request ready` rather than a bare draft flip: that step merges the base
+`/source-control:pull-request ready --unattended` rather than a bare draft flip: that step updates from the base
 branch and runs the security review and the verify gate before it flips, which a bare flip does
-not. A PR that `/source-control:pull-request create` opened ready for review, because the
-repository or its author set `pr_open_state: ready`, is handled as any non-draft PR; no tier turns
-it back into a draft.
+not. A PR that `/source-control:pull-request create` took through `ready`, because its
+`pr_open_state` resolved to `ready`, is handled as any non-draft PR; no tier turns it back into a
+draft.
 
 ## Autopilot
 
@@ -174,7 +174,7 @@ widens are the single home in [reference/autopilot.md](reference/autopilot.md).
 ## Autopilot merge tier
 
 A config-gated escalation of autopilot's merge authority, off by default and active only while the operator sets `babysit_autopilot_merge_tier`; with the key unset, every merge decision follows the base path above. When enabled, per candidate PR autopilot runs a **genuine review pass** under a **second bot account** (author ≠ approver) that submits an approving review **only when clean**, then runs the pinned merge gate with the `--autopilot-merge-tier` flags layered onto `--merge --expected-head <post-push-head-sha>`. The concrete enabled-path merge command, the second-account approve mechanic, and the review-workflow requiredness precondition for enabling the tier are the single home in [reference/safety.md](reference/safety.md).
-That gate merges **only when every criterion holds**, the criteria and the safety-contract rationale are codified in [reference/safety.md](reference/safety.md). It is **fail-closed** (the umbrella flag refuses unless all three parameter sets are supplied; predicates reused from the shared `babysit_classify` module), and any criterion failing falls back to the human merge-ready list, the tier never routes around the gate. The gate's `--unattended` flag is the unattended path, off unless the repository's `pr-pipeline.yaml` sets `merge.authority: local-babysit` and a `merge.agent-identity`: under that identity alone it enqueues a LOW, eligible, promoted pull request at its pinned head, writes the reasons comment for MED or HIGH, and dequeues on a stop or a hold. No tier passes it, and plain `--merge` refuses the configured identity: [reference/safety.md](reference/safety.md#unattended-merge-path).
+That gate merges **only when every criterion holds**, the criteria and the safety-contract rationale are codified in [reference/safety.md](reference/safety.md). It is **fail-closed** (the umbrella flag refuses unless all three parameter sets are supplied; predicates reused from the shared `babysit_classify` module), and any criterion failing falls back to the human merge-ready list, the tier never routes around the gate. The gate's `--unattended` flag is the unattended path, off unless the repository's `pr-pipeline.yaml` sets `merge.authority: local-babysit` and a `merge.agent-identity`: under that identity alone it enqueues a LOW, eligible pull request at its pinned head once the effective rung's promotion cells are promoted, writes the reasons comment for MED or HIGH, and dequeues on a stop or a hold. No tier passes it, and plain `--merge` refuses the configured identity: [reference/safety.md](reference/safety.md#unattended-merge-path).
 
 ## Guarded mutations: deterministic gates, agent judgment
 
@@ -261,11 +261,11 @@ snapshot and assessment, never an unattended unpinned override.
 
 **Zero-blocker drafts are the exception:** always route them through a worker, never directly
 to the merge gate. In autopilot, that worker assesses whether the draft is complete: a
-completed draft is marked ready with `/source-control:pull-request ready` and continues through
+completed draft is marked ready with `/source-control:pull-request ready --unattended` and continues through
 the normal guarded path; a genuinely in-progress draft stays draft and is reported and escalated with the reason.
 A draft cannot merge until it is marked ready (provider reference "Draft stage"). Completeness of the diff is not the
 only hold reason: an explicit unchecked human-only item named in the PR's own body holds the
-draft too, even when the content is finished and green. See the worker contract in
+draft too, even when the content is finished and green, as does a body line starting `Draft:` (create's mark of a requested or multi-session draft): no tier flips it. See the worker contract in
 [reference/orchestration.md](reference/orchestration.md).
 
 Each per-PR worker owns its local lifecycle end to end: acquire that PR's worker lease and its
@@ -291,7 +291,7 @@ this block. Values reach scripts ONLY as explicit CLI flags (option environment 
 | `babysit_merge_method` | `${user_config.babysit_merge_method}` | deprecated fallback `--method` (merge wrapper) | `auto`: repo convention, then squash |
 | `babysit_stacked_prs` | `${user_config.babysit_stacked_prs}` | `--stacked-prs` (merge gate, every form) when `true`; omit it otherwise | `false` (a stack layer is held for a human) |
 | `babysit_autopilot_merge_tier` | `${user_config.babysit_autopilot_merge_tier}` | prose only. Gates whether the tier's `--autopilot-merge-tier` merge flags are wired at all | `false` (tier disabled; PRs go to the human merge-ready list) |
-| `babysit_lane_logins` | `${user_config.babysit_lane_logins}` | `--lane-logins` (merge wrapper, autopilot merge tier) | tier refuses fail-closed when enabled |
+| `babysit_lane_logins` | `${user_config.babysit_lane_logins}` | `--lane-logins` (merge wrapper, autopilot merge tier); `--own-pr-lane-logins` (resolve-thread, worker `--autonomous` forms) | tier refuses fail-closed when enabled; on your own PRs the resolver uses the repository's `merge.agent-identity` from its base and default branch, else resolves nothing |
 | `babysit_approver_bot_logins` | `${user_config.babysit_approver_bot_logins}` | `--approver-bot-logins` (merge wrapper, autopilot merge tier) | tier refuses fail-closed when enabled |
 | `babysit_merge_block_labels` | `${user_config.babysit_merge_block_labels}` | deprecated fallback `--block-labels` (merge wrapper, autopilot merge tier); omit it when unset | tier refuses fail-closed when enabled and the target repository declares none |
 | `babysit_review_trigger_phrase` | `${user_config.babysit_review_trigger_phrase}` | `--trigger-phrase` (snapshot, request_review); omit it when unset | review-trigger module dormant |
@@ -313,9 +313,8 @@ this block. Values reach scripts ONLY as explicit CLI flags (option environment 
 Seven rows are repository policy: `babysit_merge_method`, `babysit_merge_block_labels`,
 `babysit_review_gate_context`, `babysit_ci_gateway_context`,
 `babysit_extra_dependency_manager_logins`, `babysit_approval_downgrade_logins`, and
-`babysit_skip_downgrade_logins`. Each PR's repository resolves them from its tracked
-`.claude/source-control.md` on the default branch, merged per key with the flag on its row by the
-modes in
+`babysit_skip_downgrade_logins`. Each PR's repository resolves them from its default branch's
+`docs/conventions/source-control.yaml`, merged per key with the flag on its row by the modes in
 [config-resolution.md](../../reference/config-resolution.md#babysit-prs-repository-policy-keys):
 hold lists union, `babysit_skip_downgrade_logins` is remove-only, and the rest take the repository
 value first. The flag is a deprecated fallback for every one of these except
@@ -430,10 +429,10 @@ either.
   session, under tiered autonomy, with deterministic gates on every mutation; the safe tier never
   resolves threads or merges.
 
-**Routing.** When the person wants one PR watched after this session ends, offer it to the
-person: you can run `/autofix-pr` instead of or alongside this skill for that PR. Prefer this
-skill for the fleet, for tiered merge authority, and for anything the gates must prove. An
-unattended run records the offer in its output instead of asking.
+**Routing.** When the person wants one PR watched after this session ends, offer it to the person:
+If /autofix-pr is available in your session (gate basis: it registers hidden and gated and needs forge CLI and cloud-session access;
+records in [reference/native-autofix-pr.md](reference/native-autofix-pr.md)), you can run it instead of or alongside this skill for that PR.
+Prefer this skill for the fleet, for tiered merge authority, and for anything the gates must prove. With `--unattended`, record the offer in the output instead of asking; without it, ask.
 
 **Mutation gate.** Both push to the PR branch. When `/autofix-pr` runs on a PR this skill also
 works, fetch before each fix commit and skip a finding the cloud session already fixed. This skill
@@ -471,13 +470,13 @@ in them would reach the Bash tool unsubstituted, and the Bash tool's environment
 - **Own prior replies re-processed as findings.** Classification-table replies from your own
   posting identities must be filtered during rescan or the loop chases its own tail
   ([review-discipline](../../reference/review-discipline.md) §1)
-- **Exit codes are not per-thread outcomes.** Both wrappers demand JSON `action`-field parsing;
-  a zero exit covers skipped and refused threads too
+- **Exit codes are not per-thread outcomes.** Both wrappers demand JSON `action`-field parsing; a zero exit covers skipped and refused threads too
 - **Self-blocking CI check.** A newly required check whose own fix PR carries that same check
   cannot be gate-merged, the check is failing or absent on the very PR that would make it pass,
   so the merge gate correctly refuses. Breaking the cycle is a one-time human admin-merge
   bootstrap of that fix PR; no tier automates it. Surface it as a blocker needing that bootstrap,
   never as a reason to route around the gate
+- **Every worker draws on one forge [API budget](../../reference/providers/github/README.md#api-budget):** one background watcher per PR at 60 s or slower, writes one at a time, stop at the first rate-limit error
 
 ## Reference index. Load on demand
 

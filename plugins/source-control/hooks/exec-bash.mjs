@@ -12,11 +12,6 @@
 //                                exactly `true` (a default-off option).
 //   --run-if-unset-or-true NAME  run unless that variable is set to something
 //                                other than `true` (a default-on option).
-//   --skip-if-all-false A,B,...  skip only when every named variable is
-//                                exactly `false`. Unset, empty, `true` or any
-//                                other value runs, so a row whose script holds
-//                                several default-on switches skips only when
-//                                all of them are provably off.
 //   --skip-unless-stdin-contains TEXT
 //                                buffer stdin; skip when the payload lacks
 //                                TEXT, else write the same bytes to the script.
@@ -33,12 +28,28 @@
 //   --skip-unless-marker SUBDIR  buffer stdin, read the payload's session_id,
 //                                and skip only when <marker-root>/SUBDIR exists
 //                                and neither it nor the tmp fallback
-//                                disk-hygiene-SUBDIR holds <session>.launched.
-//                                No session id, no such directory, or a stall
-//                                runs the script (fail closed).
+//                                disk-hygiene-SUBDIR holds <session>.launched,
+//                                or when each <session>.launched found holds a
+//                                launch token that <session>.seen beside it
+//                                repeats byte for byte. No session id, no such
+//                                directory, an empty, unreadable or malformed
+//                                .launched, a missing or unreadable .seen, or a
+//                                stall runs the script (fail closed).
 //   --marker-root DIR            the root for --skip-unless-marker, passed
 //                                explicitly. Empty or a literal
 //                                ${CLAUDE_PLUGIN_DATA} means none.
+//   --bps-seed LIB               on Windows only (elsewhere the flag is inert
+//                                and stdin stays inherited): buffer stdin and,
+//                                for a Bash or PowerShell payload, run
+//                                shfmt and jq on the command the way LIB's
+//                                hook::_bps_shfmt_to does (bpsSeed), passing
+//                                the list in HOOK_BPS_SEED_KEY/VAL. Never skips
+//                                the script; a stall or any failure passes no
+//                                list. An inherited pair is always dropped. The
+//                                script uses the pair only when its own row
+//                                says so (run-guards.sh --bps-seeded). Two
+//                                spawns here replace the Git Bash forks of a
+//                                parse in bash (#6634).
 //
 // Option flags are decided first, before stdin is touched. A stdin flag reads
 // stdin to EOF with an idle bound (2 s, or the stdin_read_timeout option read
@@ -46,7 +57,8 @@
 // exits 0 without running the script. That fails OPEN, so that flag is for
 // advisory rows only: the shared library treats a stalled payload as
 // fail-closed for a blocking guard, which must not use the flag as written.
-// On a stall --skip-unless-marker runs the script with the bytes that arrived.
+// On a stall --skip-unless-marker and --bps-seed run the script with the bytes
+// that arrived.
 // A row without a stdin flag keeps stdin inherited.
 //
 // Bare `bash` is not a legal exec-form command: on Windows it resolves to the
@@ -70,9 +82,35 @@
 // Claude Code ignores the exit code when stdout holds a JSON object, and
 // the hook would no longer be reported as an error. Exit 1 is a hook error,
 // not a guard block. A guard's own exit 2 passes through.
+//
+//   --fail-closed                (no value) for a blocking guard row: once bash
+//                                is resolved, any child outcome other than exit
+//                                0 or exit 2 (another exit code, a signal, a
+//                                spawn error) exits 2 with one stderr line, so
+//                                the call is denied. A closed option gate still
+//                                exits 0, and a missing bash still exits 1. On
+//                                Windows, Git Bash reports a death by signal N
+//                                as exit code N << 8 (SIGSEGV is 2816), and the
+//                                line names the signal (msysSignal).
+//   --require-verdict            (no value) for a row whose script writes a
+//                                verdict marker as its last action: the
+//                                launcher makes a fresh private directory,
+//                                names a file in it in the child's
+//                                EXEC_BASH_VERDICT_FILE, and a child exit 0
+//                                that left no file there exits 2 with one
+//                                stderr line, so the call is denied. Windows
+//                                Git Bash reports a crashed bash (a stack
+//                                overflow, 0xC0000005) as exit 0 with empty
+//                                stdout (#7681); the marker tells that apart
+//                                from an allow. Any other child outcome is
+//                                unchanged, and a directory the launcher cannot
+//                                make denies too. A row without the flag gets
+//                                no variable (an inherited one is dropped) and
+//                                behaves as before.
 
-import { spawn } from "node:child_process";
-import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -92,22 +130,14 @@ function isWslRelay(p) {
   );
 }
 
-function shellBase(p, platform) {
-  return pathApi(platform).basename(p).toLowerCase();
-}
-
 function acceptBash(p, platform, exists) {
   if (!p || !exists(p)) return false;
-  if (!SHELL_NAMES.has(shellBase(p, platform))) return false;
-  if (platform === "win32" && isWslRelay(p)) return false;
-  return true;
+  if (!SHELL_NAMES.has(pathApi(platform).basename(p).toLowerCase())) return false;
+  return !(platform === "win32" && isWslRelay(p));
 }
 
 function firstExisting(candidates, platform, exists) {
-  for (const candidate of candidates) {
-    if (acceptBash(candidate, platform, exists)) return candidate;
-  }
-  return null;
+  return candidates.find((candidate) => acceptBash(candidate, platform, exists)) ?? null;
 }
 
 const OPTION_NAME = /^[A-Z0-9_]+$/;
@@ -125,7 +155,7 @@ function nameList(value) {
 }
 
 function literal(value) {
-  return value ? value : null;
+  return value || null;
 }
 
 // A directory may be empty (an unset ${CLAUDE_PLUGIN_DATA}), but never a flag.
@@ -154,12 +184,6 @@ const FLAGS = {
     parse: oneName,
     problem: ONE_NAME,
     open: (names, env) => unsetOrTrue(optionValues(names, env)[0]),
-  },
-  "--skip-if-all-false": {
-    phase: "env",
-    parse: nameList,
-    problem: NAME_LIST,
-    open: (names, env) => !optionValues(names, env).every((v) => v === "false"),
   },
   "--run-if-any-set": {
     phase: "any",
@@ -194,14 +218,35 @@ const FLAGS = {
     parse: directory,
     problem: "needs a directory (empty means none)",
   },
+  // Never closes: it only buffers stdin so bpsSeed can parse the command.
+  "--bps-seed": {
+    phase: "stdin",
+    parse: literal,
+    problem: "needs the path of the hook-utils.sh the script sources",
+    onStall: true,
+    open: () => true,
+  },
 };
 
 const USAGE = "usage: node exec-bash.mjs [--FLAG VALUE]... <script> [args...] (flags: header of exec-bash.mjs)";
 
+// --fail-closed and --require-verdict take no value: they change what a child
+// outcome means, not whether the script runs, so they are not gates.
+const SWITCHES = { "--fail-closed": "failClosed", "--require-verdict": "requireVerdict" };
+
+// The variable that names the verdict marker under --require-verdict.
+export const VERDICT_ENV = "EXEC_BASH_VERDICT_FILE";
+
 export function parseLaunchArgs(argv) {
   const gates = [];
+  const switches = { failClosed: false, requireVerdict: false };
   let i = 0;
-  while (i < argv.length && Object.hasOwn(FLAGS, argv[i])) {
+  while (i < argv.length && (Object.hasOwn(SWITCHES, argv[i]) || Object.hasOwn(FLAGS, argv[i]))) {
+    if (Object.hasOwn(SWITCHES, argv[i])) {
+      switches[SWITCHES[argv[i]]] = true;
+      i += 1;
+      continue;
+    }
     const flag = argv[i];
     const value = FLAGS[flag].parse(argv[i + 1]);
     if (value === null) return { error: `usage: ${flag} ${FLAGS[flag].problem}` };
@@ -210,14 +255,14 @@ export function parseLaunchArgs(argv) {
   }
   const script = argv[i];
   if (!script) return { error: USAGE };
-  return { gates, script, args: argv.slice(i + 1) };
+  return { gates, ...switches, script, args: argv.slice(i + 1) };
 }
 
 const ofPhase = (gates, phase) => gates.filter((gate) => FLAGS[gate.flag].phase === phase);
 
 function withDefaults(gates, ctx) {
   const markerRoot = gates.find((gate) => gate.flag === "--marker-root")?.value ?? "";
-  return { env: process.env, platform: process.platform, script: "", fs: DISK, markerRoot, ...ctx };
+  return { env: process.env, platform: process.platform, uid: process.getuid?.(), script: "", fs: DISK, markerRoot, ...ctx };
 }
 
 // The option flags. A closed gate exits 0 before stdin is read or bash is
@@ -288,29 +333,23 @@ export function readStdin(idleMs, stream = process.stdin) {
 // two could differ it answers "run": the launcher may skip only where the
 // script would also exit at once.
 
+// fn(p), or fallback() when it throws.
+const orElse = (fn, fallback) => (p) => {
+  try {
+    return fn(p);
+  } catch {
+    return fallback();
+  }
+};
+
+const isFile = orElse((p) => statSync(p).isFile(), () => false);
+
 const DISK = {
   isFile,
-  isDir: (p) => {
-    try {
-      return statSync(p).isDirectory();
-    } catch {
-      return false;
-    }
-  },
-  read: (p) => {
-    try {
-      return readFileSync(p);
-    } catch {
-      return null;
-    }
-  },
-  list: (p) => {
-    try {
-      return readdirSync(p);
-    } catch {
-      return [];
-    }
-  },
+  isDir: orElse((p) => statSync(p).isDirectory(), () => false),
+  lstat: orElse((p) => lstatSync(p), () => null),
+  read: orElse((p) => readFileSync(p), () => null),
+  list: orElse((p) => readdirSync(p), () => []),
 };
 
 // The Git Bash root (the directory holding usr\bin), from the bash this
@@ -393,31 +432,64 @@ export function payloadSessionId(input) {
 }
 
 // run-python-hook.sh --skip-unless-marker skips when a candidate directory
-// exists and no candidate holds <session>.launched. This skips only when the
+// exists and no candidate holds <session>.launched, or when every trusted
+// candidate's <session>.launched is seen (launchSeen). This skips only when the
 // marker-root directory, or off Windows the script's own ${TMPDIR:-/tmp}
-// candidate, exists and no candidate it or Git Bash's /tmp could name holds the
-// file. On Windows the tmp list also holds TEMP and TMP, which the script never
-// reads, so there only the marker-root directory counts. A missing or
-// non-printable-ASCII session id (bash folds non-ASCII per locale) runs.
+// candidate that ownedMarkerDir passes, exists and no candidate it or Git
+// Bash's /tmp could name holds the file, or when every candidate holding the
+// file is one of those and its launch is seen. On Windows the tmp list also
+// holds TEMP and TMP, which the script never reads, so there only the
+// marker-root directory counts. A missing or non-printable-ASCII session id
+// (bash folds non-ASCII per locale) runs.
 // biome-ignore lint/suspicious/noTemplateCurlyInString: the unsubstituted placeholder, verbatim
 const DATA_PLACEHOLDER = "${CLAUDE_PLUGIN_DATA}";
 function markerSkips(subdir, input, ctx) {
   const session = payloadSessionId(input);
   if (!session || /[^\x20-\x7e]/.test(session)) return false;
-  const name = `${session.replace(/[^a-zA-Z0-9_-]/g, "_")}.launched`;
+  const base = session.replace(/[^a-zA-Z0-9_-]/g, "_");
   const rooted = ctx.markerRoot && ctx.markerRoot !== DATA_PLACEHOLDER;
   const rootDirs = rooted ? bashPaths(`${ctx.markerRoot}/${subdir}`, ctx) : [];
   const tmpRoots = [ctx.env.TMPDIR || "/tmp"];
   if (ctx.platform === "win32") tmpRoots.push(ctx.env.TEMP, ctx.env.TMP);
   const tmpDirs = tmpRoots.filter(Boolean).flatMap((t) => bashPaths(`${t}/disk-hygiene-${subdir}`, ctx));
-  if ([...rootDirs, ...tmpDirs].some((d) => ctx.fs.isFile(`${d}/${name}`))) return false;
-  const seenDirs = ctx.platform === "win32" ? rootDirs : [...rootDirs, ...tmpDirs];
-  return seenDirs.some((d) => ctx.fs.isDir(d));
+  const trusted = (d) => rootDirs.includes(d) || (ctx.platform !== "win32" && ownedMarkerDir(d, ctx));
+  const marked = [...rootDirs, ...tmpDirs].filter((d) => ctx.fs.isFile(`${d}/${base}.launched`));
+  if (marked.length > 0) return marked.every((d) => trusted(d) && launchSeen(`${d}/${base}`, ctx));
+  if (rootDirs.some((d) => ctx.fs.isDir(d))) return true;
+  return ctx.platform !== "win32" && tmpDirs.some((d) => ownedMarkerDir(d, ctx));
 }
 
-function pathCandidates(env, platform) {
+// run-python-hook.sh's launch token: epoch seconds, bash PID and $RANDOM.
+const LAUNCH_TOKEN = /^[0-9]{1,15}-[0-9]{1,10}-[0-9]{1,5}\n?$/;
+
+// run-python-hook.sh's _launch_seen: <base>.launched holds a launch token and
+// <base>.seen, which guard_launch_monitor.py writes after it ran, holds the same
+// bytes, so no guard launched since. An empty, unreadable or malformed
+// .launched, or a missing or unreadable .seen, is not seen.
+function launchSeen(base, ctx) {
+  const launched = ctx.fs.read(`${base}.launched`);
+  if (launched === null || !LAUNCH_TOKEN.test(launched.toString("latin1"))) return false;
+  const seen = ctx.fs.isFile(`${base}.seen`) ? ctx.fs.read(`${base}.seen`) : null;
+  return seen !== null && seen.equals(launched);
+}
+
+// run-python-hook.sh's _owned_marker_dir: the shared tmp candidate is evidence
+// only as a real directory, not a symlink, owned by this user, since another
+// local user can create either one there first. Where process.getuid does not
+// exist (Windows) the plain directory test stays; there markerSkips never
+// counts a tmp candidate anyway.
+function ownedMarkerDir(p, ctx) {
+  if (ctx.uid === undefined) return ctx.fs.isDir(p);
+  // lstat does not follow a symlink, so a symlink is not a directory here.
+  const st = ctx.fs.lstat(p);
+  return st?.isDirectory() === true && st.uid === ctx.uid;
+}
+
+// <name> in each absolute PATH entry: a relative entry, and on Windows the
+// working directory Node would search first, never supplies a program.
+function pathCandidates(env, platform, name = "bash") {
   const api = pathApi(platform);
-  const exe = platform === "win32" ? "bash.exe" : "bash";
+  const exe = platform === "win32" ? `${name}.exe` : name;
   return (env.PATH ?? env.Path ?? "")
     .split(api.delimiter)
     .map((entry) => (platform === "win32" ? entry.replace(/^"(.*)"$/, "$1") : entry))
@@ -425,12 +497,9 @@ function pathCandidates(env, platform) {
     .map((entry) => api.join(entry, exe));
 }
 
-function isFile(p) {
-  try {
-    return statSync(p).isFile();
-  } catch {
-    return false;
-  }
+// The absolute path of a PATH program for bpsSeed, or null.
+export function resolveTool(name, env, platform, exists) {
+  return pathCandidates(env, platform, name).find((p) => exists(p)) ?? null;
 }
 
 export function resolveBash(env, platform, exists) {
@@ -442,11 +511,10 @@ export function resolveBash(env, platform, exists) {
       env["ProgramFiles(x86)"],
       env.LOCALAPPDATA ? path.win32.join(env.LOCALAPPDATA, "Programs") : "",
     ].filter(Boolean);
-    const candidates = [];
-    for (const root of roots) {
-      candidates.push(path.win32.join(root, "Git", "bin", "bash.exe"));
-      candidates.push(path.win32.join(root, "Git", "usr", "bin", "bash.exe"));
-    }
+    const candidates = roots.flatMap((root) => [
+      path.win32.join(root, "Git", "bin", "bash.exe"),
+      path.win32.join(root, "Git", "usr", "bin", "bash.exe"),
+    ]);
     return firstExisting([...candidates, ...pathCandidates(env, platform)], platform, exists);
   }
   return firstExisting([...pathCandidates(env, platform), "/bin/bash", "/usr/bin/bash"], platform, exists);
@@ -464,6 +532,9 @@ const FAILURE_LINES = {
   signal: (c) =>
     `exec-bash: ${c.name} was killed by ${c.detail} before it finished, so it enforced nothing for this call.`,
   usage: (c) => `exec-bash: the launcher itself was called wrongly, so no hook ran: ${c.detail}`,
+  deny: (c) => `exec-bash: ${c.name} failed (${c.detail}), so this call is blocked (--fail-closed).`,
+  "no-verdict": (c) =>
+    `exec-bash: ${c.name} ${c.detail || "exited 0 without writing its verdict marker"}, so this call is blocked (--require-verdict).`,
 };
 
 // The one stderr line for a launcher failure. Claude Code shows only the
@@ -475,45 +546,157 @@ export function failureLine(kind, { script = "", bash = "", platform = "", detai
   return FAILURE_LINES[kind]({ name, bash, platform, detail }).replace(/\s+/g, " ").trim();
 }
 
-function fail(line) {
+function fail(line, code = 1) {
   process.stderr.write(`${line}\n`);
-  process.exit(1);
+  process.exit(code);
+}
+
+// Under --fail-closed a child outcome other than exit 0 or exit 2 is a deny:
+// exit 2 with one line naming the script and the cause. Otherwise the launcher
+// failure keeps its exit 1.
+function childFailure(parsed, ctx, kind, detail) {
+  if (parsed.failClosed) fail(failureLine("deny", { ...ctx, detail: kind === "spawn" ? `could not start: ${detail}` : detail }), 2);
+  fail(failureLine(kind, { ...ctx, detail }));
+}
+
+// --bps-seed: the env pair that carries one shfmt parse to the script. The
+// launcher always drops an inherited pair, so only its own parse reaches bash.
+export const BPS_SEED_ENV = ["HOOK_BPS_SEED_KEY", "HOOK_BPS_SEED_VAL"];
+// Bounds on what is seeded: a Windows environment variable holds at most
+// 32,767 characters, and a longer command is rare enough to parse in bash.
+const BPS_SEED_MAX_CMD = 8192;
+const BPS_SEED_MAX_LIST = 24576;
+const BPS_SEED_TIMEOUT_MS = 5000;
+export const bpsSeedPlatform = (platform) => platform === "win32";
+
+// The jq list hook::_bps_shfmt_to would keep for the payload's command (a
+// Bash or PowerShell call: guardrails reads both through shfmt), as
+// { key, value }, or null. It runs the same shfmt and jq with the library's
+// own HOOK_BPS_JQ, so the list is the one bash would compute; on anything
+// else (another tool, non-ASCII or long text, a missing tool, a failure, a
+// timeout, a list too long) it returns null and bash parses as before, with
+// its own refusals. ASCII only, because the environment is re-encoded on its
+// way into Git Bash and the key must reach bash byte for byte.
+export function bpsSeed(input, libPath, run = spawnSync, resolve = (name) => resolveTool(name, process.env, process.platform, isFile)) {
+  let command;
+  try {
+    const payload = JSON.parse(input.toString("utf8"));
+    if (payload?.tool_name !== "Bash" && payload?.tool_name !== "PowerShell") return null;
+    command = payload.tool_input?.command;
+  } catch {
+    return null;
+  }
+  if (typeof command !== "string" || command.length > BPS_SEED_MAX_CMD || /[^\x01-\x7f]/.test(command)) return null;
+  let program;
+  try {
+    program = readFileSync(libPath, "utf8").match(/^HOOK_BPS_JQ='([^']*)'/m)?.[1];
+  } catch {
+    return null;
+  }
+  if (!program) return null;
+  // Absolute paths, so a shfmt.exe or jq.exe in the project directory never runs.
+  const shfmt = resolve("shfmt");
+  const jq = resolve("jq");
+  if (!shfmt || !jq) return null;
+  const opts = { timeout: BPS_SEED_TIMEOUT_MS, windowsHide: true, maxBuffer: 64 << 20 };
+  const json = run(shfmt, ["-ln", "bash", "--to-json"], { ...opts, input: command });
+  if (json.error || json.status !== 0) return null;
+  const list = run(jq, ["-j", program], { ...opts, input: json.stdout });
+  if (list.error || list.status !== 0) return null;
+  // As `$( )` and `${out%$'\r'}` leave it in hook::_bps_shfmt_to.
+  const value = list.stdout.toString("utf8").replace(/\n+$/, "").replace(/\r$/, "");
+  if (value.length > BPS_SEED_MAX_LIST || value.includes("\0")) return null;
+  return { key: command, value };
+}
+
+// The POSIX kill numbers that are fixed on every platform, plus SIGSEGV.
+const MSYS_SIGNALS = { 1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 6: "SIGABRT", 9: "SIGKILL", 11: "SIGSEGV", 14: "SIGALRM", 15: "SIGTERM" };
+
+// The signal a Windows Git Bash exit code stands for under --fail-closed, or
+// null. Such a code is N << 8 with N a signal number from 1 to 64, so its low
+// byte is 0; anything else, such as an NTSTATUS crash code (0xC0000005), is
+// not decoded. Without the flag the raw code passes through unchanged.
+export function msysSignal(code, platform, failClosed) {
+  if (!failClosed || platform !== "win32" || !Number.isInteger(code) || code < 0x100 || code > 0x4000 || (code & 0xff) !== 0) return null;
+  const n = code >> 8;
+  return MSYS_SIGNALS[n] ?? `signal ${n}`;
 }
 
 async function main() {
   const parsed = parseLaunchArgs(process.argv.slice(2));
   if (parsed.error) fail(failureLine("usage", { detail: parsed.error }));
   const gateCtx = { script: parsed.script };
+  // --bps-seed acts on Windows only, where a parse in Git Bash costs several
+  // Win32 process creations; on Linux and macOS a fork is cheap, and the
+  // seed (two spawns and a buffered stdin) measured slower than bash's parse.
+  const gates = bpsSeedPlatform(process.platform) ? parsed.gates : parsed.gates.filter((gate) => gate.flag !== "--bps-seed");
   if (!optionGateOpen(parsed.gates, process.env, gateCtx)) process.exit(0);
   let input = null;
-  if (needsStdin(parsed.gates)) {
+  let seed = null;
+  // Under --bps-seed a stalled stdin stays open to the script, which then
+  // stalls too and refuses the call as it would have with stdin inherited; an
+  // ended pipe would read as a cut-short payload instead.
+  let holdOpen = false;
+  if (needsStdin(gates)) {
     const read = await readStdin(stdinIdleMs(process.env));
     input = read.input;
-    const open = read.stalled ? stdinStallOpen(parsed.gates) : stdinGateOpen(parsed.gates, input, gateCtx);
+    const open = read.stalled ? stdinStallOpen(gates) : stdinGateOpen(gates, input, gateCtx);
     if (!open) process.exit(0);
+    const seedGate = gates.find((gate) => gate.flag === "--bps-seed");
+    if (seedGate && !read.stalled) seed = bpsSeed(input, seedGate.value);
+    holdOpen = Boolean(seedGate) && read.stalled;
   }
   const { platform } = process;
   const bash = resolveBash(process.env, platform, isFile);
   const ctx = { script: parsed.script, bash, platform };
   if (!bash) fail(failureLine("no-bash", ctx));
+  // Under --require-verdict the marker lives in a directory made for this launch
+  // alone, removed however the launcher exits. Git Bash takes the path with
+  // forward slashes. A marker inherited from an outer launch is dropped, so a
+  // nested script never answers for it.
+  let marker = null;
+  let env = process.env;
+  const dropped = [VERDICT_ENV, ...BPS_SEED_ENV];
+  if (Object.keys(env).some((k) => dropped.includes(k.toUpperCase()))) env = Object.fromEntries(Object.entries(env).filter(([k]) => !dropped.includes(k.toUpperCase())));
+  if (seed) env = { ...env, [BPS_SEED_ENV[0]]: seed.key, [BPS_SEED_ENV[1]]: seed.value };
+  if (parsed.requireVerdict) {
+    let dir;
+    try {
+      dir = mkdtempSync(path.join(tmpdir(), "exec-bash-verdict-"));
+    } catch (err) {
+      fail(failureLine("no-verdict", { ...ctx, detail: `could not get a verdict marker (${err.message})` }), 2);
+    }
+    process.on("exit", () => {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    });
+    marker = path.join(dir, "verdict");
+    env = { ...env, [VERDICT_ENV]: platform === "win32" ? marker.replaceAll("\\", "/") : marker };
+  }
   const child = spawn(bash, [parsed.script, ...parsed.args], {
     stdio: input !== null ? ["pipe", "inherit", "inherit"] : "inherit",
+    env,
     windowsHide: true,
     shell: false,
   });
   if (input !== null) {
     // A script that exits without reading closes the pipe; that is not a failure.
     child.stdin.on("error", () => {});
-    child.stdin.end(input);
+    if (holdOpen) child.stdin.write(input);
+    else child.stdin.end(input);
   }
   const forward = (signal) => {
     if (!child.killed) child.kill(signal);
   };
   process.on("SIGTERM", () => forward("SIGTERM"));
   process.on("SIGINT", () => forward("SIGINT"));
-  child.on("error", (err) => fail(failureLine("spawn", { ...ctx, detail: err.message })));
+  child.on("error", (err) => childFailure(parsed, ctx, "spawn", err.message));
   child.on("exit", (code, signal) => {
-    if (signal) fail(failureLine("signal", { ...ctx, detail: signal }));
+    const killedBy = signal ?? msysSignal(code, platform, parsed.failClosed);
+    if (killedBy) childFailure(parsed, ctx, "signal", killedBy);
+    if (parsed.failClosed && code !== 0 && code !== 2) childFailure(parsed, ctx, "code", `exit ${code}`);
+    if (marker !== null && code === 0 && !existsSync(marker)) fail(failureLine("no-verdict", ctx), 2);
     process.exit(code ?? 1);
   });
 }

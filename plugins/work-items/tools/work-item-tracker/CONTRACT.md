@@ -327,11 +327,11 @@ validates against (same `read:org` need). An adapter that declares no `get-field
 `6`, which a caller reads as "unsupported", not as a failure. Label groups are not read by this verb.
 
 `get-statuses` reads, for each `<id>`, the item's value of one single-select issue field, by its
-exact name: the autonomous frontier asks for `Work status`. It prints `{schema_version,
+exact name: the autonomous frontier asks for `Work status`, `/work-items:work` for `Priority`. It prints `{schema_version,
 statuses: {"<id>": "<option name>" | null}}`, null for an item whose field is unset. Only the
 GitHub adapter implements it, from GraphQL `Issue.issueFieldValues`, one query per repository per
 100 items, so a session whose proxy refuses GraphQL exits `3`. When the binding sets
-`config.github.status_trust`, the GitHub adapter answers only values a trusted account set: the
+`config.github.status_trust` and the field is `Work status`, the GitHub adapter answers only values a trusted account set: the
 state the newest counted field event left, or null when that event removed the value, so an
 uncounted change neither sets nor clears a counted state. A missing or invalid trust
 configuration exits `3`; a read whose window may hide the counted event, or a counted state the
@@ -383,16 +383,16 @@ assignee AND not a container (a `work-map` item is never its own frontier item, 
 default `wayfind:`; a wayfind map item belongs to
 `/planning:wayfind`, never to `/work-items:work`). With `--autonomous`, items labeled
 `needs-human` are additionally excluded, as are items carrying the **human-floor class**
-label `provenance: untrusted` (C5; its legacy name is in [`work-class-labels.md`](../../reference/work-class-labels.md)) or the
+label `provenance: untrusted` (C5) or the
 `provenance: signal` label, which are human-gated regardless of any other signal, and items carrying a hold label
-(`config.hold_labels`, default the `owner-decision` role label, `status: needs-info` and `needs-spec`),
+(`config.hold_labels`, default the `owner-decision` role label, `needs-reporter-info` and `needs-spec`),
 which wait on a person. When `status-storage` reports
 `field` and the adapter declares `get-statuses`, core reads the `Work status` of each open,
 unblocked, unassigned item and puts it on the item as `status`. The field can only add a hold:
 an item whose `status` is a hold state (`config.hold_states`, default `needs-human`,
 `needs-owner-decision`, `needs-reporter-info` and `needs-spec`), and that carries none of those
 states' labels (the `human-gated` role label plus `config.hold_state_labels`, default `needs-human`,
-the `owner-decision` role label, `needs-owner-decision`, `status: needs-info` and `needs-spec`), is held
+the `owner-decision` role label, `needs-reporter-info` and `needs-spec`), is held
 too, and the labels decide everything else, since labels are written first
 and reach the field afterwards. Core checks no setter; it takes each value `get-statuses` answers,
 which counts only trusted setters when the binding configures that (`get-statuses` above). A `get-statuses` read that fails, or a `status-storage`

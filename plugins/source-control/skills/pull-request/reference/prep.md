@@ -13,22 +13,25 @@ Classify the branch's changed files by the table below and run the steps each cl
 
 | Class | Which files | What it owes | Where it runs |
 |---|---|---|---|
-| `code` | source files (`.sh`, `.bash`, `.py`, `.mjs`, `.js`, `.cjs`, `.ts`, `.ps1`, `.cs`, project files) | one fresh-context review (`review:quality-gate` under 50 changed lines, `review:fanout` above), then `simplify`, then `verification:confirm` | §1.2 to §1.5 |
+| `code` | source files (`.sh`, `.bash`, `.py`, `.mjs`, `.js`, `.cjs`, `.ts`, `.ps1`, `.cs`, project files) | one fresh-context review (`review:quality-gate` under 50 changed lines, `review:fanout` above) unless the CI code-review lane covers it ([review-venue.md](review-venue.md)), then `simplify`, then the comment pass (`code-tidying:remove-comments`), then `verification:confirm` | §1.2 to §1.5 |
 | `markdown` | `.md` files | `ai-slop:audit` and `docs-hygiene:audit-noise` over the changed `.md` files | §1.2.1 |
 | `renames` | any `R` line in the name-status output | a `docs-hygiene:rename-references` audit | §1.2.1 |
 | `skills` | `plugins/*/skills/**`, `plugins/*/agents/**` | `skill-quality:check` over each changed skill | §1.2.1 |
 | `rules` | `.claude/rules/**` | `instruction-placement:check` | §1.2.1 |
-| `security` | any diff that is not docs-only | `review:security-review` over the pull request's diff | [ready-for-review.md](ready-for-review.md) §2.5.3 |
+| `tests` | test files the branch added or changed | the `testing:audit` judge pass over them | §1.2.1 |
+| `security` | any diff that is not docs-only, as [ready-for-review.md](ready-for-review.md#docs-only-and-instruction-surfaces) defines it (a diff touching an instruction surface is not) | `review:security-review` over the pull request's diff | [ready-for-review.md](ready-for-review.md) §2.5.3 |
 
-**Check whether the branch holds more than one change.** While classifying, ask whether the diff breaks into parts that do not need each other: no part reads a file, symbol or behavior another part adds, and each could be reviewed, reverted and released alone. A dependency upgrade, a parser bug fix and a new CLI flag on one branch are three such parts. When the diff breaks apart this way, name the parts and the files in each, propose one pull request per part, and ask before going on; several narrow pull requests are each read and reverted more easily than one that mixes them. This is advice, not a gate: the user may keep one pull request. In a run with no one to ask, put the proposed split in the 1.6 report and continue with one pull request.
+**Check whether the branch holds more than one change.** While classifying, ask whether the diff breaks into parts that do not need each other: no part reads a file, symbol or behavior another part adds, and each could be reviewed, reverted and released alone. A dependency upgrade, a parser bug fix and a new CLI flag on one branch are three such parts. When the diff breaks apart this way, name the parts and the files in each, propose one pull request per part, and ask before going on; narrow pull requests are easier to read and revert than one that mixes them. This is advice, not a gate: the user may keep one pull request. In a run with no one to ask, put the proposed split in the 1.6 report and continue with one pull request.
 
-**The order of the steps is not this file's to set.** It is the fleet's pre-PR order, owned by [`docs/conventions/pre-pr-ordering/README.md`](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/conventions/pre-pr-ordering/README.md). Read the order there; this file cites it rather than restating it.
+**The order of the steps is not this file's to set.** It is the fleet's pre-PR order, owned by [`docs/contracts/pre-pr-ordering/README.md`](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/contracts/pre-pr-ordering/README.md). Read it there; this file cites it, never restates it.
 
 Every skill named below is invoked through the Skill tool when its plugin is enabled, and replaced by the inline fallback stated beside it when it is not. Report each fallback and what it covered.
 
-**No `code` class?** Skip 1.2 to 1.4; the verify gate (1.5) reduces to lint. The other classes still owe their audits, so a docs-only branch is not exempt: it owes the prose audits in 1.2.1. If the consuming project layers extra prep requirements on PR creation (hooks, gates), satisfy those per its own docs.
+**No `code` class?** Skip 1.2 to 1.4; the verify gate (1.5) reduces to lint. The other classes still owe their audits: a docs-only branch owes the prose audits in 1.2.1. Satisfy any extra prep requirements (hooks, gates) the consuming project layers on PR creation, per its own docs.
 
 ## 1.2 Review the changes (the `code` class)
+
+**Read the review venue first** ([review-venue.md](review-venue.md)). When its `code-review` line reads `ci`, the CI code-review lane reviews the pull request once it is ready: skip this review (the 1.2.1 audits still run) and report the skip with the line's detail. When it reads `local`, or the read fails, run the review below and report it as the CI lane's stand-in, except under `review_venue: ci`, which skips it whatever the read returns. The `review_venue` setting decides what reads `ci` or `local`, and the report line under it. `prep review-only` follows the same rule.
 
 Run **one** fresh-context review over the branch diff: `/review:quality-gate` under 50 changed lines, `/review:fanout` above it, when the `review` plugin is enabled.
 
@@ -43,9 +46,12 @@ Run the audit each detected class owes, over the changed files of that class onl
 - **`renames`**: `/docs-hygiene:rename-references audit` when `docs-hygiene` is enabled, otherwise grep the old path and the old name for every surviving reference. The class fires only when the diff reports a rename
 - **`skills`**: `/skill-quality:check` when the `skill-quality` plugin is enabled, otherwise run the project's own skill lint, or read each changed skill's frontmatter against the contract the project documents
 - **`rules`**: `/instruction-placement:check` when the `instruction-placement` plugin is enabled, otherwise confirm each changed rule's `paths:` glob still matches a tracked file
+- **`tests`**: `/testing:audit --judge <remote>/<base-branch>` when the `testing` plugin is enabled; it asks a separate model where each changed test's expected value came from, and its FLAG verdicts are findings for 1.3. Otherwise put `judge pass not run: testing plugin not installed or not enabled` in the 1.6 report; there is no inline fallback, because the writer cannot judge its own tests
 - **`security`**: not here. It reviews the pull request's own diff, so it runs in the ready step
 
-**Added suppressions (any diff that is not docs-only).** When `/code-metrics:audit-suppressions` is among the available skills, run it in its change scope against the base the pull request targets (`--base <remote>/<base-branch>`), and list in the 1.6 report every suppression the change adds, each with its file, line, rule ids and reason. This list is advisory: it never blocks pull request creation, and no suppression is removed or rewritten on its account without the user. When the skill is not available, or the scan exits non-zero, put `suppression check not run: <reason>` in the report (for example `suppression check not run: /code-metrics:audit-suppressions is not available`) and continue.
+**Added suppressions (any diff that is not docs-only by file type; the instruction-surface definition in [ready-for-review.md](ready-for-review.md#docs-only-and-instruction-surfaces) does not widen it).** When `/code-metrics:audit-suppressions` is among the available skills, run it in its change scope against the pull request's base (`--base <remote>/<base-branch>`), and list in the 1.6 report every suppression the change adds, with its file, line, rule ids and reason. The list is advisory: it never blocks pull request creation, and no suppression is removed or rewritten on its account without the user. When the skill is not available, or the scan exits non-zero, put `suppression check not run: <reason>` in the report (for example `suppression check not run: /code-metrics:audit-suppressions is not available`) and continue.
+
+**Pre-push warnings (every branch).** Run `bash "<skill-dir>/scripts/prep-warnings.sh" --base <remote>/<base-branch>` and list each line it prints in the 1.6 report. A `skill-cut` line names an existing `SKILL.md` or agent body that loses lines while no file under its eval home is added or changed; `/playbooks:skill-authoring` ships such a cut only with eval evidence of no loss. A `protected-path` line names a path the unattended merge (`/source-control:babysit-prs`) holds for a person, or a plugin manifest it holds when an executable key or plugin entry changes. The list is advisory, never blocking pull request creation, since a person may make either change on purpose. When the script exits non-zero, put `prep warnings not run: <reason>` in the report and continue.
 
 Audits that persist findings hand them to one `/review:fanout fix` pass when the `review` plugin is enabled, and are applied by hand otherwise. Either way each finding goes through 1.3 first.
 
@@ -67,14 +73,15 @@ Present the findings in a structured table, leading with the verified findings y
 Unless `quick` or `review-only` scope:
 
 1. Run `/simplify` over the branch diff when that capability resolves in this session; otherwise do a manual pass for dead code, needless indirection, and duplication introduced by the branch
-2. **Show the simplify diff**: run `git diff` and present what changed. Automated simplification fixes are NOT research-verified; treat them like any code-review finding: inspect each change, approve or revert
-3. **Pause for user review**: let the user approve/reject simplify changes before proceeding
-4. Re-run tests on approved changes
-5. Run the verify gate (1.5)
+2. **Run the comment pass** over the comments the branch adds, after simplify and before any review of the result: `/code-tidying:remove-comments --pipeline --added-since <remote>/<base-branch>` when the `code-tidying` plugin is enabled. `--pipeline` makes its `auto` posture `necessary`, which deletes warnings about this repository's own code, a security warning included, and stages each in its report. An unattended run (invoked with `--unattended`, or no person drives it: a loop lane, a CI lane, a `dontAsk` session, a dispatched worker) applies no comment edit unless the consuming project's instructions pre-approve applied comment edits in unattended runs: without that, run `/code-tidying:remove-comments report --pipeline --added-since <remote>/<base-branch>` and put its proposals in the 1.6 report. Without the plugin, put `comment pass not run: code-tidying plugin not enabled` in the 1.6 report
+3. **Show the simplify and comment-pass diff**: run `git diff` and present what changed. Automated simplification fixes and comment deletions are NOT research-verified; treat them like any code-review finding: inspect each change, approve or revert
+4. **Pause for user review**: let the user approve/reject simplify and comment-pass changes before proceeding
+5. Re-run tests on approved changes
+6. Run the verify gate (1.5)
 
 ## 1.5 Verify gate (HARD: blocks PR creation)
 
-Run the project's full build + test + lint surface, via `/verification:confirm` when the `verification` plugin is enabled (or `/toolchain:check` for the mechanical half alone) and otherwise the ecosystem-native commands (`dotnet build && dotnet test`, `npm test`, `pytest`, shellcheck, markdownlint, …) for every ecosystem the branch touches. **All results must be clean before proceeding to PR creation.**
+Run the project's full build + test + lint surface, via `/verification:confirm` when the `verification` plugin is enabled (or `/toolchain:check` for the mechanical half alone) and otherwise the ecosystem-native commands (`dotnet build && dotnet test`, `npm test`, `pytest`, shellcheck, markdownlint, …) for every ecosystem the branch touches. **All results must be clean before proceeding to PR creation.** A `/verification:confirm` `NOT VERIFIED` whose only cause is `verification: skipped (<level>)`, from the default branch's level, counts as clean here (`/verification:confirm`'s PR-prep gate rule).
 
 **Run the full cross-cutting surface, not just the "obvious" ecosystem.** A branch that "looks dotnet-only" can still break CI through a touched README, an unmarked `.sh` script, or a modified workflow file. Mirror locally whatever CI will run. The project's CI workflows are the canonical list of what must pass.
 
@@ -86,10 +93,10 @@ Run the project's full build + test + lint surface, via `/verification:confirm` 
 
 **This gate runs last**, so nothing that edits the tree may run after it.
 
-**Why this gate is hard:** cost asymmetry. Each mechanical issue caught locally costs seconds; the same issue in CI burns a full multi-minute round trip plus rebase/repush overhead. A single sloppy PR can waste half a dozen CI cycles on issues that were all catchable locally.
+**Why this gate is hard:** cost asymmetry. A mechanical issue caught locally costs seconds; in CI it costs a multi-minute round trip plus rebase/repush overhead, and one sloppy PR can waste half a dozen CI cycles on issues all catchable locally.
 
 ## 1.6 Report
 
-Report: findings verified/dropped, simplify ran/skipped, verify gate pass/fail per ecosystem, which classes 1.1 detected, and any split 1.1 proposed with the user's answer. Proceed to PR creation.
+Report: the review venue's `code-review` line and whether the 1.2 review ran or was skipped for it, findings verified/dropped, simplify ran/skipped, the comment pass applied, report-only or not run (with its proposals when report-only), verify gate pass/fail per ecosystem, which classes 1.1 detected, the pre-push warnings from 1.2.1, and any split 1.1 proposed with the user's answer. Proceed to PR creation.
 
-**Prep before create is the developer loop.** The rebase in [create.md](create.md) §2.2 and the base merge in [ready-for-review.md](ready-for-review.md) §2.5.2 both move HEAD after prep, which is why the ready step re-runs the verify gate on the head it flips.
+**Prep before create is the developer loop.** The branch updates in [create.md](create.md) §2.2 and [ready-for-review.md](ready-for-review.md) §2.5.2 both move HEAD after prep, so the ready step re-runs the verify gate on the head it flips.

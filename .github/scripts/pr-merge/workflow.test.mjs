@@ -432,7 +432,7 @@ const prEvent = (action, number = 5) => ({
   event_name: "pull_request",
   ref: `refs/pull/${number}/merge`,
   repository: "o/r",
-  workflow: "pr-require-checks",
+  workflow: "PR Require Checks",
   run_id: 900 + number,
   event: { action, pull_request: { number, head: { repo: { full_name: "o/r" } } }, changes: {} },
 });
@@ -442,12 +442,12 @@ test("pr-require-checks.yml holds main's dispatches in one group that cancels no
   const on = checks.slice(checks.indexOf("\non:\n"), checks.indexOf("\npermissions:\n"));
   assert.doesNotMatch(on, /\n {2}push:/);
   assert.doesNotMatch(block[0], /queue:/);
-  const main = (run_id, run_attempt = 1) => ({ event_name: "workflow_dispatch", ref: "refs/heads/main", workflow: "pr-require-checks", run_id, run_attempt, event: { pull_request: { head: { repo: {} } }, changes: {} } });
+  const main = (run_id, run_attempt = 1) => ({ event_name: "workflow_dispatch", ref: "refs/heads/main", workflow: "PR Require Checks", run_id, run_attempt, event: { pull_request: { head: { repo: {} } }, changes: {} } });
   assert.equal(group(main(1)), group(main(2)));
   assert.equal(cancel(main(1)), false);
   // A re-run keeps its own group, so no newer dispatch replaces the one
   // re-run a red run waits on (babysit_postmerge.py reads it red otherwise).
-  assert.equal(group(main(3, 2)), "pr-require-checks-3");
+  assert.equal(group(main(3, 2)), "PR Require Checks-3");
   assert.equal(cancel(main(3, 2)), true);
 });
 
@@ -456,15 +456,15 @@ test("pr-require-checks.yml keeps every other run's group and cancel", () => {
   // A missing event field reads null in an expression; this stands in for it.
   const none = { pull_request: { head: { repo: {} } }, changes: {} };
   const other = [
-    { event_name: "workflow_dispatch", ref: "refs/heads/feat/x", workflow: "pr-require-checks", run_id: 7, event: none },
-    { event_name: "schedule", ref: "refs/heads/main", workflow: "pr-require-checks", run_id: 8, event: none },
-    { event_name: "merge_group", ref: "refs/heads/gh-readonly-queue/main/pr-1", workflow: "pr-require-checks", run_id: 9, event: none },
+    { event_name: "workflow_dispatch", ref: "refs/heads/feat/x", workflow: "PR Require Checks", run_id: 7, event: none },
+    { event_name: "schedule", ref: "refs/heads/main", workflow: "PR Require Checks", run_id: 8, event: none },
+    { event_name: "merge_group", ref: "refs/heads/gh-readonly-queue/main/pr-1", workflow: "PR Require Checks", run_id: 9, event: none },
   ];
   for (const github of other) {
-    assert.equal(group(github), `pr-require-checks-${github.run_id}`, github.event_name);
+    assert.equal(group(github), `PR Require Checks-${github.run_id}`, github.event_name);
     assert.equal(cancel(github), true, github.event_name);
   }
-  assert.equal(group(prEvent("synchronize")), "pr-require-checks-5");
+  assert.equal(group(prEvent("synchronize")), "PR Require Checks-5");
   assert.equal(group(prEvent("labeled")), "ci-contract-5-905");
   assert.equal(cancel(prEvent("synchronize")), true);
 });
@@ -577,7 +577,7 @@ test("pr-merge takes a pr input, runs every 30 minutes and names a PR-scoped run
 // step is skipped and nothing arms.
 const KEEP_STEP = "Keep the last sweep's report only while nothing it read has moved";
 const FRESH_SHA = "f".repeat(40);
-const keepReport = ({ code = "0", settles = [0], fresh = 0, files = true, attempts = false } = {}) => {
+const keepReport = ({ code = "0", settles = [0], fresh = 0, files = true, attempts = false, refusal = "idle tick needs-dispatch" } = {}) => {
   const arm = job("enable-auto-merge");
   const body = new RegExp(`- name: ${KEEP_STEP.replace(/[.']/g, "\\$&")}\\n([\\s\\S]*?)(?=\\n {6}- name: )`).exec(arm)?.[1];
   assert.ok(body, "a PR-scoped run settles the last sweep's report");
@@ -598,7 +598,7 @@ case "$1" in
   *babysit_postmerge.py) echo '{"fresh":true}'; exit ${fresh} ;;
 esac
 next=$(head -n1 '${join(dir, "settles")}'); sed -i 1d '${join(dir, "settles")}'
-if [ "\${next:-1}" = 0 ]; then echo '{"reuse": true, "reason": null}'; else echo '{"reuse": false, "reason": "idle tick needs-dispatch"}'; fi
+if [ "\${next:-1}" = 0 ]; then echo '{"reuse": true, "reason": null}'; else echo '{"reuse": false, "reason": "${refusal}"}'; fi
 exit "\${next:-1}"
 `,
     { mode: 0o755 },
@@ -694,6 +694,16 @@ test("a PR-scoped run whose report does not stand runs the post-merge check fres
     if (check > 0) assert.match(run.calls[0], SETTLE("c{40}"), why);
     assert.equal(run.calls.length, check + 2, why);
   }
+});
+
+test("a PR-scoped run whose last report is refused as code-changed runs no fresh check and keeps no report", () => {
+  const run = keepReport({ settles: [1], refusal: "post-merge answer code-changed" });
+  assert.equal(run.status, 0);
+  assert.equal(run.kept, false);
+  assert.equal(run.output, "stands=false\nfresh=\nfresh-reason=\n");
+  assert.equal(run.calls.length, 1);
+  assert.match(run.calls[0], SETTLE("c{40}"));
+  assert.match(run.stdout, /::notice::the last sweep's post-merge report predates a code change/);
 });
 
 test("the fresh check answers the last check's completed attempts with no read", () => {

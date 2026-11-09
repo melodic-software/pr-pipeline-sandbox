@@ -2,15 +2,15 @@
 
 The `source-control` skill bodies name operations (open a draft change request, read its checks,
 reply on a review thread). This file is how GitHub, the one forge the plugin supports today, does
-each of them, with the `gh` CLI. Read it before the first forge operation a skill performs. The
-decision that skill bodies stay forge-neutral and the provider detail lives here is
+each with the `gh` CLI. Read it before a skill's first forge operation. Skill bodies stay
+forge-neutral and the provider detail lives here per
 [ADR 0060](../../../../../docs/adr/0060-abstract-provider-details-in-skills-behind-consumer-conventions-and-adapters.md).
 
-This file is the index from an operation to its command; a skill's spoke is the authority on the
-full step around it. A spoke whose steps need more than a table row has a provider file of the same
-name under a directory named for its skill: [`pull-request/`](pull-request/) holds the GitHub
-commands, scripts and `gh` facts behind the pull-request skill's `create.md`, `ready-for-review.md`,
-`monitor.md`, `readiness.md` and `merge.md`, and each spoke links its steps there. The worktree
+This file indexes operations to commands; a skill's spoke is the authority on the full step around
+each. A spoke whose steps need more than a table row has a provider file of the same name under a
+directory named for its skill: [`pull-request/`](pull-request/) holds the GitHub commands, scripts
+and `gh` facts behind the pull-request skill's `create.md`, `ready-for-review.md`, `monitor.md`,
+`readiness.md`, `merge.md` and `review-venue.md`, and each spoke links its steps there. The worktree
 skill's spokes need only the rows below. The babysit-prs and babysit-loop skills' spokes link
 their commands in [`babysit-prs/`](babysit-prs/) and [`babysit-loop/`](babysit-loop/).
 
@@ -38,7 +38,7 @@ A pull request is GitHub's change request; this file uses its terms.
 | Mergeability | `gh pr view <N> --json mergeable`; `CONFLICTING` means GitHub runs no workflows until the base is integrated |
 | The PR for a branch | `gh pr list --head <branch> --json number,title,state` |
 | Whether a branch's PR merged (worktree cleanup) | `gh pr list --state merged --head <branch>`; a non-empty result means merged |
-| Every PR, one batched read for worktree cross-reference | `gh pr list --state all --json number,title,state,headRefName` |
+| PRs for worktree cross-reference (one call per worktree branch, all states) | `gh pr list --head <branch> --state all --json number,title,state,headRefName`; a PR whose head is `<branch>` is a match, and a failed call marks that branch's PR lookup incomplete |
 | Your own open PRs here | `gh pr list --state open --author "@me" --json number` |
 | Your own open PRs across an owner | `gh search prs --state open --author @me --owner <owner> --json repository` |
 
@@ -51,9 +51,9 @@ entry and pass it to every later `gh` call in that phase.
 |---|---|
 | Open a draft PR | `gh pr create --draft` (with `--head <branch>` on the PR-only entry), never `--reviewer` |
 | Check out the PR head | `gh pr checkout <N>`, or `gh pr checkout <N> --detach` when the branch is locked in another worktree. It is fork-safe: a fork's head branch is not fetchable from `origin` by name |
-| Merge the base into the head | `gh pr update-branch <N>` (pull-request `ready-for-review.md`) |
+| Merge the base into the head | `gh api --method PUT repos/{owner}/{repo}/pulls/<N>/update-branch -f expected_head_sha=<sha>`, pinned to the decision's head (pull-request `ready-for-review.md`) |
 | Flip a draft ready | `gh pr ready <N>`, run only inside `/source-control:pull-request ready`, never bare |
-| Merge pinned to the reviewed head | `gh pr merge <N> --squash --match-head-commit <sha>`, never `--admin` or `--auto` (pull-request `merge.md` §4.2.1 owns the merge-queue form; its commands are in [pull-request/merge.md](pull-request/merge.md#merge-after-ai-review)). A babysit lane merges only through its merge-gate wrapper (babysit-prs `safety.md`) |
+| Merge a PR | `gh pr merge <N> -R <owner>/<repo>` with the PR number and repository written literally, plus the flags the repository needs: `--squash`, `--auto` on a merge-queue or auto-merge base, `--admin` only where a code-owner review or merge queue blocks an otherwise ready merge and the consumer's policy allows it; `--match-head-commit <sha>` is optional for an immediate merge and required with `--auto`. A refused merge is reported, never handed to the user or retried in another shape ([pull-request/merge.md](pull-request/merge.md#merge-command); pull-request `merge.md` §4.2.1 owns when to merge without asking). A babysit lane merges only through its merge-gate wrapper (babysit-prs `safety.md`) |
 | Open a tracking issue | `gh issue create` |
 
 ## Checks and CI logs
@@ -110,8 +110,8 @@ A cloud session behind the GitHub proxy is served no GraphQL operation: every Gr
 [Configure cloud environments § GitHub proxy](https://code.claude.com/docs/en/cloud-environments#github-proxy).
 As-of: 2026-10-11. Recheck trigger: that section changes its GraphQL entry, or a release note names
 the GitHub proxy. `gh pr view --json`, `gh repo view --json`, `gh pr create`, `gh pr ready`
-and `gh pr merge` all run over GraphQL. The 403 reads like an expired token or a missing scope and
-is neither: switch to the REST route the spoke names rather than re-authenticating. Probe it
+and `gh pr merge` all run over GraphQL. The 403 looks like an expired token or a missing scope but
+is neither: switch to the REST route the spoke names rather than re-authenticating. Probe
 read-only:
 
 ```bash
@@ -133,3 +133,34 @@ restriction is handled in the pull-request skill's `create.md` §2.4.0 and the
 A draft cannot merge until it is marked ready
 ([changing the stage of a pull request](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/changing-the-stage-of-a-pull-request),
 read 2026-10-11; recheck when GitHub changes the draft-stage rules).
+
+## API budget
+
+Every `gh` call by every agent and session under one user shares that user's hourly budget: 5,000
+REST requests and 5,000 GraphQL points. `gh` never retries or backs off. Every unattended loop
+follows this cadence:
+
+- **Which bucket.** GraphQL: `gh pr view`, `gh pr list`, `gh pr checks` (`--watch` re-queries every
+  10 s), `gh pr create`, `edit`, `ready` and `merge`, `gh issue`, `gh api graphql`. REST: `gh run`,
+  `gh api <path>`.
+- **Waiting.** One watcher per PR or run, in the background, polling at 60 s or longer:
+  `gh run watch <id> --exit-status -i 60` (the default is every 3 s), or REST reads of
+  `repos/<owner>/<repo>/pulls/<n>` and `commits/<sha>/check-runs`. Never loop `gh pr view` and
+  never run `gh pr checks --watch`. 60 s is a floor per watcher, not a budget: with several
+  watchers, poll every 2 s × watchers × requests per poll or slower, which keeps them near a third
+  of the hourly REST budget (ten pull-request monitors at about seven requests a poll: 140 s,
+  set as the monitor's `INTERVAL`).
+- **GraphQL-only fields** (`isInMergeQueue`, `statusCheckRollup`): read once, at the point you
+  decide.
+- **Writes.** One at a time, at least 1 s apart, never in a retry loop. Secondary limits cap
+  content-creating requests at 80 a minute and 500 an hour, and all requests at 100 concurrent.
+- **Rate-limit errors.** Stop at the first one; never retry in a loop or probe for recovery. Wait
+  until `x-ratelimit-reset`, or `retry-after` when a secondary limit sends it, else at least one
+  minute, then back off exponentially and give up after a few tries. `gh api rate_limit` does not
+  show secondary limits and can count against them.
+
+Pointer: [best practices for using the REST API](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api),
+[REST rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api),
+[GraphQL rate limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api).
+As-of: 2026-10-17. Recheck trigger: either rate-limits page changes a figure, or a `gh` release
+changes the `run watch` or `pr checks --watch` interval or adds retries.

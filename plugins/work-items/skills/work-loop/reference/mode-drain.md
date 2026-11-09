@@ -28,8 +28,7 @@ errored, was truncated, or came back empty because a read failed has already abo
 point, and a snapshot of unknown completeness never satisfies it: an empty id set passes the test
 vacuously, so it may be trusted only when the reads behind it were complete.
 
-Satisfied → the drain is complete: propose first-drain completion per
-[first-drain-ratification.md](first-drain-ratification.md), write the final report (items
+Satisfied → the drain is complete: write the final report (items
 escalated to a human first, then items closed and PR'd), apply the post-snapshot intake report below, and stop cleanly.
 
 When the drain stays open because a retained id is covered only by a draft closing PR or by the
@@ -46,6 +45,22 @@ When every remaining open item in the snapshot is human-gated or escalated and n
 (a stale PR whose item was escalated does not count), report and stop cleanly rather than idling forever, leading the report with those human-gated and
 escalated items. Apply the post-snapshot intake report below
 before stopping.
+
+Human-gated here means held for a person per the tracker seam's "Reading an item's status"
+([`tracker-seam.md`](../../../reference/tracker-seam.md)): the human-gated role label, a hold-state
+label, or a status in `WIT_HUMAN_FLOOR_STATUS_STATES`, read from the snapshot's status read
+([snapshot-reads.md](snapshot-reads.md)), whose values count only trusted setters when the binding
+configures that.
+
+## Cordoned items
+
+An open retained item whose row carries a `milestone` listed in `cordoned-milestones` counts toward
+neither the exit condition nor the drain-terminal test. Those names live only in
+`.github/actions/resolve-config/admission-rules.json` on the target's default branch
+([snapshot-reads.md](snapshot-reads.md), "The reads"); no such file means no cordoned milestones.
+A row whose `milestone` is `null` or absent counts. Only the GitHub adapter reads a milestone today
+([`CONTRACT.md`](../../../tools/work-item-tracker/CONTRACT.md), "JSON output contract"),
+so on another adapter nothing is cordoned.
 
 ## Post-snapshot intake report (every drain exit)
 

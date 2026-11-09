@@ -2,8 +2,8 @@
 
 A Claude Code plugin bundling the git/GitHub delivery workflow as six
 composable skills. Commit mechanics, the single-PR lifecycle, the tiered
-babysit fleet loop, worktree lifecycle management, convention setup, and
-merge-conflict resolution.
+babysit fleet loop and its merge lane, worktree lifecycle management, and
+convention setup. The PR lifecycle also resolves merge conflicts.
 
 ## Contents
 
@@ -13,7 +13,6 @@ merge-conflict resolution.
   - [`/source-control:babysit-prs`](#source-controlbabysit-prs)
   - [`/source-control:worktree`](#source-controlworktree)
   - [`/source-control:setup`](#source-controlsetup)
-  - [`/source-control:resolve-conflicts`](#source-controlresolve-conflicts)
 - [Hooks](#hooks)
   - [`pr-body-linkage-gate`](#pr-body-linkage-gate)
   - [`pr-linkage-mcp-gate`](#pr-linkage-mcp-gate)
@@ -31,7 +30,7 @@ merge-conflict resolution.
 ### `/source-control:commit`
 
 Builds a commit the safe way: drafts a subject matching the resolved
-convention, the layered `source-control.md` config (written by
+convention, the layered source-control config (written by
 `/source-control:setup`) → the consuming project's own
 `CLAUDE.md`/rules/commit-msg hook → Conventional Commits (11-type vocabulary)
 as the default. Pre-checks it against the
@@ -54,20 +53,35 @@ research-gated:
 - **prep**. Review the branch diff (via your review agents/skills when
   installed, inline otherwise), verify findings, simplify, then run the
   project's build+test+lint gate as a hard block.
-- **create**. Branch-name check, default-branch rebase, unrelated-changes
+- **create**. Branch-name check, default-branch update, unrelated-changes
   triage, `Closes #N` derivation from the branch name (validated against the
   live issue), safely-assembled PR body, `gh pr create`.
+- **ready**. Updates the branch from its base by the method the shared
+  [branch update criteria](reference/branch-update-criteria.md) choose (a team
+  can force `merge` or `rebase` on some rows with `pr_update_method` in
+  `docs/conventions/source-control.yaml`), and resolves a
+  conflicted merge intent-first: it reads the commits behind both sides
+  before editing, composes both changes, never picks a side with
+  `--ours`/`--theirs`, then sweeps for semantic conflicts the markers don't
+  show. `conflicts --ci` is the same discipline for the pr-unblock lane.
 - **monitor**. Async event loop over CI checks + review comments. Event
   delivery prefers a push channel when your environment ships one, falls back
-  to a Monitor watch re-armed at each deadline (30s `gh` poll), or plain `gh`
-  polling in cloud sessions. CI failures are read from complete logs via the
+  to a Monitor watch re-armed at each deadline (60s REST poll), or polling in
+  cloud sessions, which also subscribe to the PR's activity so reviews and
+  failed checks wake them early. CI failures are read from complete logs via the
   bundled annotation/ZIP fetch scripts (`gh run view --log-failed`
   truncates); every reviewer comment gets explore → research → classify →
   react → reply → fix → verify-on-GitHub treatment.
 - **merge**. 6-Gate readiness re-verification, squash merge, worktree
   reuse/cleanup, post-merge CI health check. Merges or enqueues without
-  asking only once the AI review checks pass on the pinned head commit; otherwise
-  merges on approval. Never arms auto-merge.
+  asking only once the AI review checks pass on the reviewed head commit;
+  otherwise merges on approval. Merges with plain `gh pr merge` and the flags
+  the repository needs, `--auto` only pinned to the reviewed head; a refused merge is reported, never handed to the user
+  or retried in another shape.
+- **reassess**. Judges whether one open PR should still land, even when it is
+  green and mergeable: `continue`, `rework` or `close`, with the goal, the base
+  range and the PRs it searched. Report-only unless `--act` carries it out, and
+  it never closes a PR or lifts a label.
 - **fetch-logs**. Tiered CI-log retrieval (annotations → full untruncated
   ZIP via the REST API → per-job text).
 - **view / list**. Read-only PR reads for other skills: one PR's facts
@@ -97,7 +111,9 @@ Tiered, self-pacing fleet loop over your own open PRs (designed for
   addressed, merges through the same gate, escalates only what it genuinely
   cannot solve. Requires Python 3.
 
-Cross-tier invariants: never an unprotected force-push, never `--admin`,
+Cross-tier invariants of the babysit tiers (an interactive
+`/source-control:pull-request merge` follows its own merge phase): never an
+unprotected force-push, never `--admin`,
 never GitHub settings or branch-protection changes, never a repository
 outside the watched owners, and dependency-manager-authored PRs
 (Dependabot/Renovate-class) are never merged autonomously in any tier. A
@@ -139,50 +155,43 @@ Supply `subject_pattern=` to write it non-interactively, and
 `layer=user|team|local` to pick which layer receives it (default: the tracked
 team file). Re-runnable to reconfigure.
 
-### `/source-control:check`
+### Prerequisite check
 
-Read-only and model-invocable. Reports whether `jq` resolves for the plugin's
-hooks, with the install route from `prerequisites.json` when it does not. It
-never installs.
-
-### `/source-control:resolve-conflicts`
-
-Resolves in-progress merge/rebase/cherry-pick conflicts intent-first: reads
-the history behind BOTH sides of every hunk before editing (log/blame,
-commit messages, PR/issue context via `gh` when available), composes both
-changes by default, and drops a side only with evidence, never mechanical
-`--ours`/`--theirs` picking. After the markers are gone it sweeps for
-semantic conflicts the merge machinery can't flag (renamed symbol vs new
-call site) and runs the project's build/test gates before concluding via
-`--continue`. `--abort` is never a resolution strategy. Only an explicit
-user decision to abandon the integration.
+`node "<plugin root>/lib/prerequisites.mjs" check "<plugin root>"` reports whether
+`jq` resolves for the plugin's hooks, with the install route from `prerequisites.json` when it
+does not. It never installs.
 
 ## Hooks
 
-An installed mod can stop this plugin's `PreToolUse` hooks from running: they run after the last
-mod calls `next`, so a mod that answers a `tool.call` without calling it skips them
-([where settings hooks run in the order](https://code.claude.com/docs/en/plugins/mods/events#where-settings-hooks-run-in-the-order)).
-A mod can also approve a call they blocked, because its `tool.check` hook runs after them
-([approve or refuse a tool call before the user is asked](https://code.claude.com/docs/en/plugins/mods/events#approve-or-refuse-a-tool-call-before-the-user-is-asked)).
+In a session that loads a mod, don't rely on this plugin's `PreToolUse` hooks alone.
+
+- **Pointer**: when a mod is installed beside this plugin, read
+  [where settings hooks run in the order](https://code.claude.com/docs/en/plugins/mods/events#where-settings-hooks-run-in-the-order)
+  and
+  [precedence among rules, hooks, and mods](https://code.claude.com/docs/en/permissions#precedence-among-rules-hooks-and-mods)
+  live for how a mod can skip or override these hooks.
+- **As of**: 2026-11-01
+- **Recheck trigger**: either section changes where plugin `PreToolUse` hooks run in the mod chain
+  or when a mod's `tool.check` approval overrides them.
 
 ### `pr-body-linkage-gate`
 
 A `PreToolUse` hook on the Bash tool. When a `gh pr create` / `gh pr edit`
-carries a PR body the hook can read statically, it validates that body against
-the same contract the repository's required PR-contract check enforces,
-a closing keyword, a tracker's link line as `/work-items:track link` prints it
-(`Closes ENG-123`, `Refs: SW2-12`), or an explicit no-linked-issue marker, plus four non-empty
-contract sections (`## Summary`, `## Fix`, `## Verification`, `## Related`),
-and blocks the call with every missing or empty requirement named, so the
-failure surfaces before the PR exists rather than a CI round trip later.
+carries a PR body the hook can read statically, it blocks the call only when
+that body carries a negated closing reference (`does not close #N`), which
+GitHub's parser still closes on merge, and names each one with the `Refs: #N`
+line to use instead. The rest of the PR-contract check (a closing line and
+non-empty `## Summary`, `## Fix`, `## Verification` and `## Related` sections)
+is advisory in CI, so a body missing any of it passes.
 `/source-control:pull-request create` already gates its own body; this covers
 the calls that bypass the skill.
 
 Enforcement is keyed to the consuming repository's own policy: it runs only
 where one of the repo's `.github/workflows/*.yml` / `*.yaml` files `uses:` the
-`pr-contract` composite step (the SHA-pinned
-`melodic-software/ci-workflows/.github/actions/pr-contract@<sha>` form, or
-ci-workflows' own local `./.github/actions/pr-contract`). A body the hook
+contract composite step, at its current path `pr-require-checks/check-contract`
+or its old path `pr-contract` (the SHA-pinned
+`melodic-software/ci-workflows/.github/actions/<path>@<sha>` form, or
+ci-workflows' own local `./.github/actions/<path>`). A body the hook
 cannot read statically always passes: an unexpanded variable, an absent body
 flag, a body flag with no value, an unreadable file, a `--repo`-targeted
 invocation, or a call following a `cd`/`pushd` on the same command line, which
@@ -212,7 +221,7 @@ it, and the dotfiles fan-out harness reports those spawns as `RAN(best-effort)` 
 
 #### Measured cost
 
-Its share of the [hook budget](../../docs/conventions/hook-budget/README.md),
+Its share of the [hook budget](../../docs/contracts/hook-budget/README.md),
 counted as kernel process creations rather than wall time: the host that
 reported this hook timing out pays 0.3-0.9 s per spawn, so wall time there says
 more about contention than about the hook. Counted with
@@ -234,7 +243,7 @@ with no headroom, and proves itself non-vacuous against three mutants.
 #### Telemetry (opt-in)
 
 The hook emits one structured
-[hook-telemetry](../../docs/conventions/hook-telemetry/README.md) envelope per
+[hook-telemetry](../../docs/contracts/hook-telemetry/README.md) envelope per
 run to whatever `HOOK_TELEMETRY_SINK` names. Carrying `status` (`blocked` on a
 block, `ok` otherwise), `duration_ms`, and a `data` payload of labels only: the
 outcome and which body form was read (`body-literal`, `body-file`,
@@ -250,16 +259,16 @@ refused by the cloud GitHub proxy (see
 [docs/cloud-sessions.md](../../docs/cloud-sessions.md#github-mcp-tools-vs-the-gh-cli)). It
 covers both the `mcp__github__<tool>` names and the
 `mcp__plugin_<plugin>_github__<tool>` names of a plugin-bundled server.
-Same contract, same authority (a workflow in the consuming repository's own
-`.github/workflows/` that `uses:` the `pr-contract` composite step), same
-block-with-the-fix-named behavior. The MCP payload hands over the body as a plain JSON field, so the
+It blocks only the same negated closing reference, under the same authority (a
+workflow in the consuming repository's own `.github/workflows/` that `uses:` the
+`pr-contract` composite step), with the same block message. The MCP payload hands over the body as a plain JSON field, so the
 Bash sibling's static-readability caveats don't apply here; the scope guards
 that remain are the workflow scan above, an origin-remote match on the call's
 `owner`/`repo` (another repository's PR is not this repo's policy), and an
 `update_pull_request` that carries no `body` field, which changes nothing CI
 already validated and passes. A `create_pull_request` with no `body` at all
-blocks. GitHub would open the PR with an empty body, which the CI check
-rejects. Set `pr_linkage_mcp_gate_enabled` to `false` to turn it off.
+is judged as an empty body and passes. Set `pr_linkage_mcp_gate_enabled` to
+`false` to turn it off.
 
 Telemetry matches the sibling's: one envelope per run (`ok`/`blocked`,
 `duration_ms`, and the tool name as its only data label), only when
@@ -288,7 +297,10 @@ fail closed with a message naming the floor and the installed version.
 stops; `release <path> --session-id <id>` unlocks a claim this session armed
 and refuses a foreign one; `stale <path>` is a read-only test (exit 0) that a
 claim's session has no live transcript on this host, which `cleanup` combines
-with a merged or landed branch before offering to remove a locked worktree. Set `worktree_add_claim_gate_enabled` to `false` to turn the hook
+with a merged or landed branch before offering to remove a locked worktree;
+`stale --batch --repo-dir <repo>` gives the same verdict for each NUL-delimited path on stdin from
+one worktree list and one transcript scan, which is how `cleanup` checks every
+locked candidate at once. Set `worktree_add_claim_gate_enabled` to `false` to turn the hook
 off; the script remains the documented gate.
 
 This hook and its `PreToolUse` sibling `worktree-add-containment-gate` are registered
@@ -330,6 +342,21 @@ third time, and a block message that names a configured root reads the
 numbers as ceilings, proves itself non-vacuous against seven mutants, one per change, and
 fails when a gate feeds its payload to a reader by here-string.
 
+### `worktree-remove-gate`
+
+A `WorktreeRemove` hook. When Claude Code removes a worktree the `WorktreeCreate` gate created
+(a `--worktree` session exit, `ExitWorktree`, a background-session delete, a
+`claude remote-control` cleanup), it hands the removal to this hook instead of running git.
+The hook runs `scripts/reap-project-plugin-records.sh` for the worktree, so its project- and
+local-scope plugin install records go with it, then removes the worktree with plain
+`git worktree remove`. It leaves the worktree on disk and exits non-zero for uncommitted or
+untracked changes (so `ExitWorktree` with `discard_changes: true` cannot discard them), an
+operation in progress, a detached HEAD holding commits no ref holds, submodules, a lock whose
+reason names another session, or a reap that exits non-zero; `/source-control:worktree cleanup`
+then handles it. The branch is kept. Subagent and workflow-agent worktrees never reach it: Claude Code keeps
+them ([hooks: WorktreeRemove](https://code.claude.com/docs/en/hooks#worktreeremove), as of
+2026-10-26), so `/source-control:worktree cleanup` removes them.
+
 ## Works in any repo
 
 - **Self-contained.** Everything else runs on `git`, `gh` (authenticated), `jq`,
@@ -344,10 +371,10 @@ fails when a gate feeds its payload to a reader by here-string.
   provides them and replaced by inline guidance when absent. No phase blocks
   on a missing tool.
 - **Reads your conventions, assumes none.** Commit-subject / PR-title
-  convention resolves from the `source-control.md` config (written by
+  convention resolves from the layered source-control config (written by
   `/source-control:setup`) first, a `~/.claude` user-global file, the tracked
-  team file, and a gitignored `.claude/source-control.local.md` personal
-  overlay, merged per key, then the consuming project's own
+  team file `docs/conventions/source-control.yaml`, and a gitignored `.claude/source-control.local.md` personal
+  override, merged per key, then the consuming project's own
   `CLAUDE.md`, rules, and hooks; branch naming, PR template, merge style, and
   bot-identity wrappers also come from the project's own `CLAUDE.md` and
   rules. Defaults (Conventional Commits, squash merge) apply only when the
@@ -355,18 +382,23 @@ fails when a gate feeds its payload to a reader by here-string.
 
 ## Requirements
 
+- **shfmt v3.14.1 or later**, which the PR-linkage and worktree gates read commands through.
+  Without it the gates deny the commands they read, naming the cause.
 - **Node.js** on `PATH`. Every hook row launches through `node hooks/exec-bash.mjs`, and Claude
   Code's native binary neither ships nor uses Node
   ([setup](https://code.claude.com/docs/en/setup), fetched 2026-09-29; recheck when the setup page
   says the native binary ships or uses Node). Without `node` the hooks do
   not launch and the PR-linkage and worktree gates are not enforced. The setup `check` reports
   whether `node` resolves.
+- **The `claude` CLI** on the hooks' `PATH`, for `worktree-remove-gate`: it reaps install records
+  through `claude plugin uninstall`, and without the CLI it refuses, so a worktree Claude Code
+  removes stays on disk until `/source-control:worktree cleanup` removes it.
 
 ## Install
 
 ```shell
 /plugin marketplace add melodic-software/claude-code-plugins
-/plugin install source-control@<marketplace>
+/plugin install source-control@melodic-software
 ```
 
 ## Configuration
@@ -381,6 +413,7 @@ repo's owner.
 | Key | Type | Default / absent behavior |
 |---|---|---|
 | `lane_instance` | string | sanitized lowercased hostname (writer identity suffixing `babysit-loop`'s telemetry marker; must be distinct across concurrent lane instances) |
+| `lane_app_slug` | string | none (the telemetry write identity comes from the token's user; set it under a GitHub App installation token so `babysit-loop` resolves `<slug>[bot]`) |
 | `pr_body_linkage_gate_enabled` | boolean | `true` (the PR-body hook above; inert in a repo with no workflow using the `pr-contract` step) |
 | `pr_linkage_mcp_gate_enabled` | boolean | `true` (the MCP-surface sibling; inert in a repo with no workflow using the `pr-contract` step) |
 | `babysit_watched_owners` | string (multiple) | infer the current repo's owner |
@@ -407,21 +440,22 @@ repo's owner.
 | `promotion_evidence_source` | file | no evidence source; every promotable cell stays effective-unpromoted (absolute path to the operator-published epoch-scoped events file, outside the target repository, read-only to the lane) |
 | `promotion_evidence_checker` | file | no checker; every promotable cell stays effective-unpromoted (absolute path to the autonomy plugin's `check-security-binding.mjs` from an install the operator trusts, outside the target repository, read-only to the lane) |
 | `promotion_evidence_credential_roots` | string | no `--credential-roots`; an isolation proof resting on a filesystem credential probe stays unproven (comma-separated absolute paths on the probe host, each not a filesystem root, with no `..` segment, not under an ephemeral base (`tmp`, `temp`, `shm`), and outside the target repository) |
+| `promotion_evidence_max_age_hours` | string | after a demotion record, no cell re-earns promotion (a positive whole number of hours the events file's `evidence.meta.json` `generated_at` may age before a re-earn read from it fails closed) |
 | `worktree_root` | directory | `worktrees/` under the plugin data dir (external root for `/source-control:worktree create`; never inside a repository or a repository-discovery root) |
 | `worktree_stale_days` | number | 14 (staleness threshold for `/source-control:worktree status`) |
 | `worktree_reap_after_hours` | number | 48 (last-commit age past which `/source-control:worktree cleanup` proposes a safe worktree by default) |
 | `fetch_logs_max_bytes` | number | 52428800 (CI-log ZIP size cap for `fetch-logs`) |
-| `branch_issue_pattern` | string | deprecated fallback: set the `branch_issue_pattern` key on the layered `.claude/source-control.md` surface instead, which wins when present. Absent in both: the built-in `<type>/<N>-<slug>` (and `routine-issue-<N>`) branch-to-issue grammar; set an ERE (last capture group = the numeric GitHub issue number) for a scheme that places the number differently, e.g. `^[^/]+/([0-9]+)-` (`alice/1234-slug`) or `-([0-9]+)$` (`feat/add-widget-1234`) |
+| `branch_issue_pattern` | string | deprecated fallback: set the `branch_issue_pattern` key in `docs/conventions/source-control.yaml` or another layer of the source-control config instead, which wins when present. Absent in both: the built-in `<type>/<N>-<slug>` (and `routine-issue-<N>`) branch-to-issue grammar; set an ERE (last capture group = the numeric GitHub issue number) for a scheme that places the number differently, e.g. `^[^/]+/([0-9]+)-` (`alice/1234-slug`) or `-([0-9]+)$` (`feat/add-widget-1234`) |
 | `setup_inference_window` | string | `1 year` (`git log --since` window for `/source-control:setup`'s commit-history convention inference; any git-approxidate) |
 | `setup_inference_recency_days` | number | 90 (recent-vs-older split boundary in the inference report) |
 | `setup_inference_min_commits` | number | 50 (below this many classifiable subjects, inference widens to full history and reports low confidence) |
 
 The commit-subject / PR-title convention is separate: run
 **`/source-control:setup`** to interview your repo and write the
-`source-control.md` config. Idempotent and safe to re-run. `apply layer=team`
+source-control config. Idempotent and safe to re-run. `apply layer=team`
 appends the recursive `.claude/**/*.local.*` line to your `.gitignore` when it is missing, so the
-personal overlay layer stays out of version control; `layer=local` never edits `.gitignore` and
-fails with a recommendation when the overlay is exposed.
+personal override layer stays out of version control; `layer=local` never edits `.gitignore` and
+fails with a recommendation when the personal override is exposed.
 Remaining optional environment variables:
 
 | Variable | Used by | Effect |
@@ -434,15 +468,16 @@ The plugin-scope finding-classification gate accepts extra posting identities vi
 
 ### Option details
 
-**`pr_body_linkage_gate_enabled`.** The required sections are `## Summary`, `## Fix`,
-`## Verification`, and `## Related`. Enforced only in a repository whose `.github/workflows` carry
-a workflow that uses the `pr-contract` composite step.
+**`pr_body_linkage_gate_enabled`.** Blocks only a negated closing reference. A missing closing
+line or a missing or empty `## Summary`, `## Fix`, `## Verification` or `## Related` section
+passes, since CI reports those as advisory. Enforced only in a repository whose
+`.github/workflows` carry a workflow that uses the `pr-contract` composite step.
 
 **`pr_linkage_mcp_gate_enabled`.** The MCP-surface sibling of `pr-body-linkage-gate`, covering
 cloud and remote sessions that open PRs through MCP tools rather than `gh` (see
-[docs/cloud-sessions.md](../../docs/cloud-sessions.md#github-mcp-tools-vs-the-gh-cli)). It checks the same closing keyword
-and non-empty sections, with the same policy scope: enforced only in a repository whose
-`.github/workflows` carry a workflow that uses the `pr-contract` composite step.
+[docs/cloud-sessions.md](../../docs/cloud-sessions.md#github-mcp-tools-vs-the-gh-cli)). It blocks
+the same negated closing reference, with the same policy scope: enforced only in a repository
+whose `.github/workflows` carry a workflow that uses the `pr-contract` composite step.
 
 **`branch_issue_pattern`.** The last capture group must resolve to digits (`Closes #N` honors only
 a numeric issue). Set it for a non-default branch scheme that places the number differently, for
@@ -453,14 +488,14 @@ than reading it from the environment (it is not per-plugin in a Bash-tool subpro
 deliberately outside the repository tree and outside repository-discovery roots such as a ghq root,
 which a checkout-relative default would land inside. The in-repo `.claude/worktrees/` default is
 never used because the nesting invariant forbids its nested placement; that claim is stated,
-measured, dated and given an expiry in exactly one place: `skills/worktree/SKILL.md` "The nesting
+measured, dated and given an expiry in exactly one place: `skills/worktree/reference/nesting-invariant.md` "The nesting
 invariant, dated measurement".
 
 **`worktree_add_containment_gate_enabled`.** The message names the external root resolved from the
 `worktreeroot.path` git config key, then the `worktree_root` plugin option, then the plugin data
 dir. The hook blocks only the nesting class: a conforming target passes with no advisory, and a
 target it cannot resolve statically (dynamic path, prior `cd`, unreadable payload) always passes.
-The nesting invariant's measurement, disputed arms and expiry live in `skills/worktree/SKILL.md`
+The nesting invariant's measurement, disputed arms and expiry live in `skills/worktree/reference/nesting-invariant.md`
 "The nesting invariant, dated measurement".
 
 **`worktree_add_claim_gate_enabled`.** Only the parsed add target is claimed, not every currently
@@ -513,7 +548,7 @@ opaque id if a machine name should not be published in a public tracker.
 **`promotion_evidence_binding`, `promotion_evidence_root`, `promotion_evidence_source`,
 `promotion_evidence_checker`.** The resolution helper reads each from user or managed plugin
 settings only, never from `--settings`, the `CLAUDE_PLUGIN_OPTION_*` mirror,
-`.claude/source-control.md`, or any repository file. Contract:
+or any repository file. Contract:
 [promotion-evidence-bootstrap.md](skills/babysit-loop/reference/promotion-evidence-bootstrap.md).
 The binding is the binding argument of the autonomy plugin's `check-security-binding.mjs`. The
 probe root is the protected evidence surface the seam resolves isolation probe transcripts against.
@@ -521,7 +556,8 @@ The checker is the autonomy plugin's `skills/setup/scripts/check-security-bindin
 whether a cell is promoted, which is why it must sit outside the target repository and every lane
 worktree. The optional `promotion_evidence_credential_roots`, read the same way, is the checker's
 `--credential-roots`: the probe host's trusted credential locations, checked as text because they
-need not exist on the lane's host.
+need not exist on the lane's host. The optional `promotion_evidence_max_age_hours`, read the same
+way, bounds the age of the events file a re-earn after a demotion record is read from.
 
 **`setup_inference_min_commits`.** Still below the threshold after widening, the inference is
 reported low-confidence rather than authoritative.
@@ -530,113 +566,83 @@ reported low-confidence rather than authoritative.
 
 ### Options reference
 
-Generated from this plugin's `.claude-plugin/plugin.json`. Every option Claude Code
-will prompt for when the plugin is enabled, with the environment variable each hook
-reads it from.
+Generated from this plugin's `.claude-plugin/plugin.json`. For how Claude Code asks for
+these and hands them to the plugin, see [User configuration](https://code.claude.com/docs/en/plugins/manifest-reference#user-configuration).
 
-| Option | Type | Default | Environment variable | Description |
-| --- | --- | --- | --- | --- |
-| `pr_body_linkage_gate_enabled` | boolean | `true` | `CLAUDE_PLUGIN_OPTION_PR_BODY_LINKAGE_GATE_ENABLED` | Blocks a gh pr create or gh pr edit whose statically readable PR body would fail the repository's required PR-contract check: no closing keyword, or a missing or empty Summary, Fix, Verification, or Related section. On by default. A body the hook cannot read statically always passes. |
-| `pr_linkage_mcp_gate_enabled` | boolean | `true` | `CLAUDE_PLUGIN_OPTION_PR_LINKAGE_MCP_GATE_ENABLED` | Blocks a GitHub MCP create_pull_request or update_pull_request whose PR body would fail the repository's required PR-contract check, covering sessions that open PRs without the gh CLI. On by default. Enforced only for the repository the origin remote names. |
-| `branch_issue_pattern` | string | *(none)* | `CLAUDE_PLUGIN_OPTION_BRANCH_ISSUE_PATTERN` | Deprecated fallback: set branch_issue_pattern in .claude/source-control.md instead, which wins. A POSIX ERE whose last capture group extracts the numeric GitHub issue number from the branch name. Absent: the built-in <type>/<N>-<slug> (and routine-issue-<N>) convention. |
-| `pr_open_state` | string | `"draft"` | `CLAUDE_PLUGIN_OPTION_PR_OPEN_STATE` | State /source-control:pull-request create opens a PR in. draft (default) opens a draft that the ready action flips later; ready opens it for review at once. A repository's pr_open_state in docs/conventions/source-control.yaml wins over this value. |
-| `fetch_logs_max_bytes` | number<br>*min 1* | `52428800` | `CLAUDE_PLUGIN_OPTION_FETCH_LOGS_MAX_BYTES` | Aborts a CI-log ZIP fetch larger than this many bytes. Default 52428800 (50 MiB). |
-| `worktree_root` | directory | *(none)* | `CLAUDE_PLUGIN_OPTION_WORKTREE_ROOT` | External root under which /worktree create places worktrees, as <root>/<owner>-<repo>-<slug>, a path outside every repository (on Windows, the same drive as the repo). Absent: the worktrees/ subdirectory of the plugin data dir. Never the in-repo .claude/worktrees/ default. |
-| `worktree_stale_days` | number<br>*min 1* | `14` | `CLAUDE_PLUGIN_OPTION_WORKTREE_STALE_DAYS` | Days since last commit before /worktree status classifies a worktree as stale. Default 14. |
-| `worktree_reap_after_hours` | number<br>*min 1* | `48` | `CLAUDE_PLUGIN_OPTION_WORKTREE_REAP_AFTER_HOURS` | Hours since last commit before /worktree cleanup proposes an already-safe worktree for removal by default. Default 48. |
-| `worktree_add_containment_gate_enabled` | boolean | `true` | `CLAUDE_PLUGIN_OPTION_WORKTREE_ADD_CONTAINMENT_GATE_ENABLED` | Blocks a raw Bash git worktree add whose resolved target lands inside a git repository (a working tree, or a .git or bare directory), naming the configured external root. On by default. A conforming target, or one the hook cannot resolve statically, passes silently. |
-| `worktree_add_claim_gate_enabled` | boolean | `true` | `CLAUDE_PLUGIN_OPTION_WORKTREE_ADD_CLAIM_GATE_ENABLED` | After a raw Bash git worktree add, locks the parsed add target with a session-distinct claim (host, session id, timestamp) so concurrent adds cannot steal each other's trees. On by default. Off leaves plain-add trees unclaimed. |
-| `worktree_create_gate_enabled` | boolean | `true` | `CLAUDE_PLUGIN_OPTION_WORKTREE_CREATE_GATE_ENABLED` | Redirects a WorktreeCreate away from Claude Code's default location, which may be inside the repository, to the configured worktree_root. On by default. Off does not hand placement back to Claude Code: the gate refuses and every harness-driven worktree creation fails. |
-| `babysit_watched_owners` | string (multiple) | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_WATCHED_OWNERS` | GitHub owners (users or orgs) babysit-prs may act under. Absent: the current repo's owner is inferred per run. |
-| `babysit_self_logins` | string (multiple) | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_SELF_LOGINS` | Extra GitHub posting identities (for example a project bot account) added to your gh api user login to form the self set babysit-prs treats as its own. Not a discovery filter. Absent: your gh login alone. |
-| `babysit_intended_write_identity` | string | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_INTENDED_WRITE_IDENTITY` | The single GitHub login babysit-prs's own writes should land under, typically the bot posting identity; a recorded write landing under a different self login surfaces an attribution-drift finding. Set it to one of your self logins. Absent: the check is dormant. |
-| `babysit_default_tier` | string | `"safe"` | `CLAUDE_PLUGIN_OPTION_BABYSIT_DEFAULT_TIER` | Tier an explicit bare /source-control:babysit-prs invocation runs. safe (default) checks, fixes, and reports; worker adds resolving outdated bot threads and gate-proven merges; autopilot adds all authors under the watched owners. Never applies to auto-routed invocations. |
-| `babysit_merge_method` | string | `"auto"` | `CLAUDE_PLUGIN_OPTION_BABYSIT_MERGE_METHOD` | Merge method for gate-proven merges. auto (default) uses the repository's declared method, then squash; squash, merge, or rebase forces that method when the repository declares none. |
-| `babysit_stacked_prs` | boolean | `false` | `CLAUDE_PLUGIN_OPTION_BABYSIT_STACKED_PRS` | Lets the merge gate merge a native stacked PR layer, which lands every open layer below it. Each of those layers must pass the same gate. Off by default: a stack layer is held for a human. |
-| `babysit_autopilot_merge_tier` | boolean | `false` | `CLAUDE_PLUGIN_OPTION_BABYSIT_AUTOPILOT_MERGE_TIER` | Turns on the autopilot merge tier: a distinct bot account submits an approving review, then the gate merges only when every criterion holds. Off by default; PRs go to the human merge-ready list. Requires babysit_lane_logins, babysit_approver_bot_logins, and babysit_merge_block_labels. |
-| `babysit_lane_logins` | string (multiple) | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_LANE_LOGINS` | Author logins recognized as pipeline lanes for the autopilot merge tier's lane-authored criterion. Absent: the tier (when on) refuses fail-closed. |
-| `babysit_approver_bot_logins` | string (multiple) | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_APPROVER_BOT_LOGINS` | Bot logins whose approving review satisfies the autopilot merge tier's author-is-not-approver criterion. Absent: the tier (when on) refuses fail-closed. |
-| `babysit_merge_block_labels` | string (multiple) | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_MERGE_BLOCK_LABELS` | Labels that veto an autopilot-merge-tier merge, for example do-not-merge. Absent and undeclared in the target repository: the tier (when on) refuses fail-closed. |
-| `babysit_review_trigger_phrase` | string | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_REVIEW_TRIGGER_PHRASE` | Comment phrase that requests an AI re-review (posted and recognized). Read only from this option: a target repository cannot supply it. Absent: the review-trigger module stays dormant. |
-| `babysit_review_bot_logins` | string (multiple) | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_REVIEW_BOT_LOGINS` | Logins of the AI review bots the trigger phrase addresses, and whose review of the live head the merge gate waits for. Absent: the review-trigger module and the merge gate's review-settle hold stay dormant. |
-| `babysit_review_settle_minutes` | number | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_REVIEW_SETTLE_MINUTES` | How long after a head appears a review bot's re-review may still be in flight; the merge gate holds an unreviewed head until the window elapses. Requires babysit_review_bot_logins. Absent: the hold stays dormant. Set it above the reviewer's observed latency. |
-| `babysit_review_gate_context` | string | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_REVIEW_GATE_CONTEXT` | Check or status context name of the AI-review gate. Absent: the gate is treated as absent (degrade). |
-| `babysit_ci_gateway_context` | string | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_CI_GATEWAY_CONTEXT` | Check or status context name of a CI gateway check. Absent: gateway classification unused. |
-| `babysit_extra_bot_logins` | string (multiple) | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_EXTRA_BOT_LOGINS` | Additional logins to treat as bots when structural detection cannot identify them. Absent: structural detection only. |
-| `babysit_extra_dependency_manager_logins` | string (multiple) | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_EXTRA_DEPENDENCY_MANAGER_LOGINS` | Dependency-manager bot logins beyond the built-in dependabot and renovate set whose PRs the merge gate holds unless --allow-dependency is passed, the same as the built-ins. Absent: the built-in set only. |
-| `babysit_approval_downgrade_logins` | string (multiple) | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_APPROVAL_DOWNGRADE_LOGINS` | AI reviewer logins whose approval carrying blocking-looking prose is surfaced as a material finding instead of ignored. Every bot's such approval is downgraded to non-blocking regardless. Absent: such approvals are ignored for every bot. |
-| `babysit_skip_downgrade_logins` | string (multiple) | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_SKIP_DOWNGRADE_LOGINS` | AI reviewer logins whose skip or no-op review is not treated as an approval. Absent: the downgrade heuristic stays dormant. |
-| `babysit_max_quiet_recheck_seconds` | number | `14400` | `CLAUDE_PLUGIN_OPTION_BABYSIT_MAX_QUIET_RECHECK_SECONDS` | Longest a quiet PR may go without a worker recheck, in seconds. Default 14400. |
-| `babysit_stuck_check_age_seconds` | number | `1800` | `CLAUDE_PLUGIN_OPTION_BABYSIT_STUCK_CHECK_AGE_SECONDS` | Minimum age before a pending non-required check under UNSTABLE is reported stuck (a stuck_queued or never_settling material finding). Default 1800. Orphaned status contexts with no backing run are detected structurally and ignore this threshold. |
-| `babysit_advisory_fix_round_cap` | number | `100` | `CLAUDE_PLUGIN_OPTION_BABYSIT_ADVISORY_FIX_ROUND_CAP` | Per-PR cap on advisory-only fix rounds; never caps blocking defects. Default 100. |
-| `babysit_worker_concurrency_cap` | number | `10` | `CLAUDE_PLUGIN_OPTION_BABYSIT_WORKER_CONCURRENCY_CAP` | Maximum per-PR workers dispatched concurrently in one cycle. Default 10. |
-| `babysit_worktree_root` | directory | *(none)* | `CLAUDE_PLUGIN_OPTION_BABYSIT_WORKTREE_ROOT` | Root directory for babysit-managed ephemeral worktrees. Absent: the worktrees/ subdirectory of the plugin data dir. |
-| `lane_instance` | string | *(none)* | `CLAUDE_PLUGIN_OPTION_LANE_INSTANCE` | Writer identity for this machine's babysit-loop telemetry, the suffix of its telemetry marker, so concurrent lane instances never overwrite each other. Absent: the sanitized lowercased hostname. Must match ^\[a-z0-9\]\[a-z0-9-\]{0,31}$. It appears verbatim in tracker comments. |
-| `promotion_evidence_binding` | file | *(none)* | `CLAUDE_PLUGIN_OPTION_PROMOTION_EVIDENCE_BINDING` | Absolute path to the security binding document the babysit-loop promotion-evidence seam reads, outside the target repository and lane worktrees, read-only to the lane. User or managed settings only; --settings does not count. Absent: every promotable cell stays effective-unpromoted. |
-| `promotion_evidence_root` | directory | *(none)* | `CLAUDE_PLUGIN_OPTION_PROMOTION_EVIDENCE_ROOT` | Absolute path to the protected --probe-evidence-root directory isolation probe transcripts resolve against, outside the target repository and lane worktrees, read-only to the lane. User or managed settings only; --settings does not count. Absent: every promotable cell stays effective-unpromoted. |
-| `promotion_evidence_source` | file | *(none)* | `CLAUDE_PLUGIN_OPTION_PROMOTION_EVIDENCE_SOURCE` | Absolute path to the operator-published, epoch-scoped promotion-evidence events file (--evidence), outside the target repository and lane worktrees, read-only to the lane. User or managed settings only; --settings does not count. Absent: every promotable cell stays effective-unpromoted. |
-| `promotion_evidence_checker` | file | *(none)* | `CLAUDE_PLUGIN_OPTION_PROMOTION_EVIDENCE_CHECKER` | Absolute path to the check-security-binding.mjs the seam runs, from an autonomy install the operator trusts, outside the target repository and lane worktrees, read-only to the lane. User or managed settings only; --settings does not count. Absent: every promotable cell stays effective-unpromoted. |
-| `promotion_evidence_credential_roots` | string | *(none)* | `CLAUDE_PLUGIN_OPTION_PROMOTION_EVIDENCE_CREDENTIAL_ROOTS` | Comma-separated absolute paths trusted as credential stores (--credential-roots): no filesystem root, no .. segment, none under tmp/temp/shm or inside the repository or lane worktrees. User or managed settings only; --settings does not count. Absent: credential-probe isolation proofs stay unproven. |
-| `setup_inference_window` | string | `"1 year"` | `CLAUDE_PLUGIN_OPTION_SETUP_INFERENCE_WINDOW` | git log --since window /source-control:setup samples for commit-subject convention inference; any git approxidate, for example 1 year or 6 months. Default 1 year. |
-| `setup_inference_recency_days` | number<br>*min 1* | `90` | `CLAUDE_PLUGIN_OPTION_SETUP_INFERENCE_RECENCY_DAYS` | Boundary for the recency split in /source-control:setup's convention-inference report: subjects newer than this many days are the recent bucket, weighted as the live convention when its share diverges from the older bucket. Default 90. |
-| `setup_inference_min_commits` | number<br>*min 1* | `50` | `CLAUDE_PLUGIN_OPTION_SETUP_INFERENCE_MIN_COMMITS` | Below this many classifiable subjects in the window, /source-control:setup widens inference to full history; still below it, the inference is reported low-confidence. Default 50. |
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `pr_body_linkage_gate_enabled` | boolean | `true` | Blocks a gh pr create or gh pr edit whose statically readable PR body carries a negated closing reference (does not close #N), which GitHub still closes on merge. A missing closing line or section is advisory and passes. On by default. A body the hook cannot read statically always passes. |
+| `pr_linkage_mcp_gate_enabled` | boolean | `true` | Blocks a GitHub MCP create_pull_request or update_pull_request whose PR body carries a negated closing reference, covering sessions that open PRs without the gh CLI. On by default. Enforced only for the repository the origin remote names. |
+| `branch_issue_pattern` | string | *(none)* | Deprecated fallback: set branch_issue_pattern in docs/conventions/source-control.yaml instead, which wins. A POSIX ERE whose last capture group extracts the numeric GitHub issue number from the branch name. Absent: the built-in <type>/<N>-<slug> (and routine-issue-<N>) convention. |
+| `pr_open_state` | string | `"ready"` | State /source-control:pull-request create leaves a PR in. ready (default) runs the ready action's gates and flips it; draft leaves it for ready to flip later. A repository's pr_open_state in docs/conventions/source-control.yaml wins over this value; a request for a draft wins over both. |
+| `review_venue` | string | `"auto"` | Who reviews a PR before the ready flip. auto (default) reviews locally only where no healthy CI lane does; local always reviews locally; ci leaves it to the CI lanes; both does both. A repository's review_venue in docs/conventions/source-control.yaml wins over this value. |
+| `fetch_logs_max_bytes` | number<br>*min 1* | `52428800` | Aborts a CI-log ZIP fetch larger than this many bytes. Default 52428800 (50 MiB). |
+| `worktree_root` | directory | *(none)* | External root under which /worktree create places worktrees, as <root>/<owner>-<repo>-<slug>, a path outside every repository (on Windows, the same drive as the repo). Absent: the worktrees/ subdirectory of the plugin data dir. Never the in-repo .claude/worktrees/ default. |
+| `worktree_stale_days` | number<br>*min 1* | `14` | Days since last commit before /worktree status classifies a worktree as stale. Default 14. |
+| `worktree_reap_after_hours` | number<br>*min 1* | `48` | Hours since last commit before /worktree cleanup proposes an already-safe worktree for removal by default. Default 48. |
+| `worktree_add_containment_gate_enabled` | boolean | `true` | Blocks a raw Bash git worktree add whose resolved target lands inside a git repository (a working tree, or a .git or bare directory), naming the configured external root. On by default. A conforming target, or one the hook cannot resolve statically, passes silently. |
+| `worktree_add_claim_gate_enabled` | boolean | `true` | After a raw Bash git worktree add, locks the parsed add target with a session-distinct claim (host, session id, timestamp) so concurrent adds cannot steal each other's trees. On by default. Off leaves plain-add trees unclaimed. |
+| `worktree_create_gate_enabled` | boolean | `true` | Redirects a WorktreeCreate away from Claude Code's default location, which may be inside the repository, to the configured worktree_root. On by default. Off does not hand placement back to Claude Code: the gate refuses and every harness-driven worktree creation fails. |
+| `babysit_watched_owners` | string (multiple) | *(none)* | GitHub owners (users or orgs) babysit-prs may act under. Absent: the current repo's owner is inferred per run. |
+| `babysit_self_logins` | string (multiple) | *(none)* | Extra GitHub posting identities (for example a project bot account) added to your gh api user login to form the self set babysit-prs treats as its own. Not a discovery filter. Absent: your gh login alone. |
+| `babysit_intended_write_identity` | string | *(none)* | The single GitHub login babysit-prs's own writes should land under, typically the bot posting identity; a recorded write landing under a different self login surfaces an attribution-drift finding. Set it to one of your self logins. Absent: the check is dormant. |
+| `babysit_default_tier` | string | `"safe"` | Tier an explicit bare /source-control:babysit-prs invocation runs. safe (default) checks, fixes, and reports; worker adds resolving outdated bot threads and gate-proven merges; autopilot adds all authors under the watched owners. Never applies to auto-routed invocations. |
+| `babysit_merge_method` | string | `"auto"` | Merge method for gate-proven merges. auto (default) uses the repository's declared method, then squash; squash, merge, or rebase forces that method when the repository declares none. |
+| `babysit_stacked_prs` | boolean | `false` | Lets the merge gate merge a native stacked PR layer, which lands every open layer below it. Each of those layers must pass the same gate. Off by default: a stack layer is held for a human. |
+| `babysit_autopilot_merge_tier` | boolean | `false` | Turns on the autopilot merge tier: a distinct bot account submits an approving review, then the gate merges only when every criterion holds. Off by default; PRs go to the human merge-ready list. Requires babysit_lane_logins, babysit_approver_bot_logins, and babysit_merge_block_labels. |
+| `babysit_lane_logins` | string (multiple) | *(none)* | Logins recognized as pipeline lanes: the autopilot merge tier's lane-authored criterion, and the worker tier's resolve of outdated bot threads a lane already answered on your own PRs. Absent: the tier (when on) refuses fail-closed, and the worker resolves nothing on your own PRs. |
+| `babysit_approver_bot_logins` | string (multiple) | *(none)* | Bot logins whose approving review satisfies the autopilot merge tier's author-is-not-approver criterion. Absent: the tier (when on) refuses fail-closed. |
+| `babysit_merge_block_labels` | string (multiple) | *(none)* | Labels that veto an autopilot-merge-tier merge, for example do-not-merge. Absent and undeclared in the target repository: the tier (when on) refuses fail-closed. |
+| `babysit_review_trigger_phrase` | string | *(none)* | Comment phrase that requests an AI re-review (posted and recognized). Read only from this option: a target repository cannot supply it. Absent: the review-trigger module stays dormant. |
+| `babysit_review_bot_logins` | string (multiple) | *(none)* | Logins of the AI review bots the trigger phrase addresses, and whose review of the live head the merge gate waits for. Absent: the review-trigger module and the merge gate's review-settle hold stay dormant. |
+| `babysit_review_settle_minutes` | number | *(none)* | How long after a head appears a review bot's re-review may still be in flight; the merge gate holds an unreviewed head until the window elapses. Requires babysit_review_bot_logins. Absent: the hold stays dormant. Set it above the reviewer's observed latency. |
+| `babysit_review_gate_context` | string | *(none)* | Check or status context name of the AI-review gate. Absent: the gate is treated as absent (degrade). |
+| `babysit_ci_gateway_context` | string | *(none)* | Check or status context name of a CI gateway check. Absent: gateway classification unused. |
+| `babysit_extra_bot_logins` | string (multiple) | *(none)* | Additional logins to treat as bots when structural detection cannot identify them. Absent: structural detection only. |
+| `babysit_extra_dependency_manager_logins` | string (multiple) | *(none)* | Dependency-manager bot logins beyond the built-in dependabot and renovate set whose PRs the merge gate holds unless --allow-dependency is passed, the same as the built-ins. Absent: the built-in set only. |
+| `babysit_approval_downgrade_logins` | string (multiple) | *(none)* | AI reviewer logins whose approval carrying blocking-looking prose is surfaced as a material finding instead of ignored. Every bot's such approval is downgraded to non-blocking regardless. Absent: such approvals are ignored for every bot. |
+| `babysit_skip_downgrade_logins` | string (multiple) | *(none)* | AI reviewer logins whose skip or no-op review is not treated as an approval. Absent: the downgrade heuristic stays dormant. |
+| `babysit_max_quiet_recheck_seconds` | number | `14400` | Longest a quiet PR may go without a worker recheck, in seconds. Default 14400. |
+| `babysit_stuck_check_age_seconds` | number | `1800` | Minimum age before a pending non-required check under UNSTABLE is reported stuck (a stuck_queued or never_settling material finding). Default 1800. Orphaned status contexts with no backing run are detected structurally and ignore this threshold. |
+| `babysit_advisory_fix_round_cap` | number | `100` | Per-PR cap on advisory-only fix rounds; never caps blocking defects. Default 100. |
+| `babysit_worker_concurrency_cap` | number | `10` | Maximum per-PR workers dispatched concurrently in one cycle. Default 10. |
+| `babysit_worktree_root` | directory | *(none)* | Root directory for babysit-managed ephemeral worktrees. Absent: the worktrees/ subdirectory of the plugin data dir. |
+| `lane_instance` | string | *(none)* | Writer identity for this machine's babysit-loop telemetry, the suffix of its telemetry marker, so concurrent lane instances never overwrite each other. Absent: a random id made once and kept in the plugin data dir. Must match ^\[a-z0-9\]\[a-z0-9-\]{0,31}$. It appears verbatim in tracker comments. |
+| `lane_app_slug` | string | *(none)* | Slug of the GitHub App whose installation token this lane runs under; babysit-loop's telemetry upsert resolves its write identity as <slug>\[bot\]. Absent: the identity comes from the token's user. Must match ^\[a-z0-9\]\[a-z0-9-\]*$. |
+| `promotion_evidence_binding` | file | *(none)* | Absolute path to the security binding document the babysit-loop promotion-evidence seam reads, outside the target repository and lane worktrees, read-only to the lane. User or managed settings only; --settings does not count. Absent: every promotable cell stays effective-unpromoted. |
+| `promotion_evidence_root` | directory | *(none)* | Absolute path to the protected --probe-evidence-root directory isolation probe transcripts resolve against, outside the target repository and lane worktrees, read-only to the lane. User or managed settings only; --settings does not count. Absent: every promotable cell stays effective-unpromoted. |
+| `promotion_evidence_source` | file | *(none)* | Absolute path to the operator-published, epoch-scoped promotion-evidence events file (--evidence), outside the target repository and lane worktrees, read-only to the lane. User or managed settings only; --settings does not count. Absent: every promotable cell stays effective-unpromoted. |
+| `promotion_evidence_checker` | file | *(none)* | Absolute path to the check-security-binding.mjs the seam runs, from an autonomy install the operator trusts, outside the target repository and lane worktrees, read-only to the lane. User or managed settings only; --settings does not count. Absent: every promotable cell stays effective-unpromoted. |
+| `promotion_evidence_credential_roots` | string | *(none)* | Comma-separated absolute paths trusted as credential stores (--credential-roots): no filesystem root, no .. segment, none under tmp/temp/shm or inside the repository or lane worktrees. User or managed settings only; --settings does not count. Absent: credential-probe isolation proofs stay unproven. |
+| `promotion_evidence_max_age_hours` | string | *(none)* | Positive whole number of hours: after a demotion record restarts the evidence window, a cell re-earns promotion only when the events file's sidecar generated_at is no older than this. User or managed settings only; --settings does not count. Absent: a demoted cell stays effective-unpromoted. |
+| `setup_inference_window` | string | `"1 year"` | git log --since window /source-control:setup samples for commit-subject convention inference; any git approxidate, for example 1 year or 6 months. Default 1 year. |
+| `setup_inference_recency_days` | number<br>*min 1* | `90` | Boundary for the recency split in /source-control:setup's convention-inference report: subjects newer than this many days are the recent bucket, weighted as the live convention when its share diverges from the older bucket. Default 90. |
+| `setup_inference_min_commits` | number<br>*min 1* | `50` | Below this many classifiable subjects in the window, /source-control:setup widens inference to full history; still below it, the inference is reported low-confidence. Default 50. |
 
 ### How to set these
 
-Three supported routes, in the order most people want them:
+Set the options above for `source-control@<marketplace>`, replacing `<marketplace>` with the
+marketplace you installed this plugin from:
 
-1. **Interactively.** Claude Code prompts for declared options when you enable the
-   plugin. To change them later: `/plugin configure source-control@<marketplace>`.
-2. **Headless.** Repeat `--config` for each option. Replace
-   `<marketplace>` with the marketplace you installed this plugin from:
+- **In a session or headless:** [`/plugin` in a session](https://code.claude.com/docs/en/plugins/cli-reference#plugin-in-a-session) or
+  [`claude plugin configure`](https://code.claude.com/docs/en/plugins/cli-reference#plugin-configure). The configure command is the preferred
+  headless route in the [plugin-reconfiguration convention](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/contracts/plugin-reconfiguration/README.md), which records its limits.
+- **By hand:** under [`pluginConfigs`](https://code.claude.com/docs/en/settings-reference#pluginconfigs) in your **user** settings.
 
-   ```shell
-   claude plugin install source-control@<marketplace> -s <scope> --config pr_body_linkage_gate_enabled=<value>
-   ```
-
-   The same command reconfigures a plugin that is **already installed**: it prints
-   `already installed` and still writes the value. The short-circuit message is
-   about the install, not the config write. Do **not** `claude plugin uninstall` to
-   reconfigure: uninstalling drops this plugin's whole stored `pluginConfigs` entry,
-   resetting every option in the table above to its default. `-s` defaults to `user`,
-   so pass the scope `claude plugin list` reports for this plugin. The verified-version
-   record lives in the [plugin-reconfiguration convention](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/plugin-reconfiguration/README.md).
-
-   The value is stored immediately; the session you are in does not change. Hooks are
-   handed their `CLAUDE_PLUGIN_OPTION_*` when the session starts, so start a fresh
-   Claude Code session before expecting new behavior. A check run in the old session
-   still reports the old value, and that is not a failed write.
-
-3. **By hand, in settings.** Add the value under `pluginConfigs` in your **user**
-   settings (`~/.claude/settings.json`):
-
-   ```json
-   {
-     "pluginConfigs": {
-       "source-control@<marketplace>": {
-         "options": {
-           "pr_body_linkage_gate_enabled": <value>
-         }
-       }
-     }
-   }
-   ```
-
-   Plugin option values are read from **user**, `--settings`, and managed settings
-   only, **not** from a project's `.claude/settings.json`. To vary behavior per
-   repository, enable or disable the plugin in that project's `enabledPlugins`
-   instead of setting an option there.
-
-Do not set the `CLAUDE_PLUGIN_OPTION_*` variables yourself. They are how Claude Code
-hands a configured value to a hook process; the value comes from the routes above.
+Do **not** uninstall the plugin to reconfigure it: see [What an uninstall deletes and keeps](https://code.claude.com/docs/en/plugins/cli-reference#what-an-uninstall-deletes-and-keeps).
+For a Claude Code release without `plugin configure`, see [Plugin install](https://code.claude.com/docs/en/plugins/cli-reference#plugin-install).
 
 ### Upstream documentation
 
-- [User configuration](https://code.claude.com/docs/en/plugins/manifest-reference#user-configuration): the `userConfig` schema and the `CLAUDE_PLUGIN_OPTION_<KEY>` export
-- [Plugin install options](https://code.claude.com/docs/en/plugins/cli-reference#plugin-install): the `--config` flag's reference entry
-- [Plugins and skills settings](https://code.claude.com/docs/en/settings-reference#plugins-and-skills): `enabledPlugins`, `extraKnownMarketplaces`, `pluginConfigs`
-- [Settings files and who they affect](https://code.claude.com/docs/en/settings#settings-files-and-who-they-affect): user vs project vs local precedence
-- [Manage installed plugins](https://code.claude.com/docs/en/plugins/install#manage-installed-plugins): enabling, disabling, `/plugin list`
+- [User configuration](https://code.claude.com/docs/en/plugins/manifest-reference#user-configuration)
+- [Plugin configure](https://code.claude.com/docs/en/plugins/cli-reference#plugin-configure)
+- [Plugin install options](https://code.claude.com/docs/en/plugins/cli-reference#plugin-install)
+- [Plugins and skills settings](https://code.claude.com/docs/en/settings-reference#plugins-and-skills)
+- [Settings files and who they affect](https://code.claude.com/docs/en/settings#settings-files-and-who-they-affect)
+- [Manage installed plugins](https://code.claude.com/docs/en/plugins/install#manage-installed-plugins)
+
+As of 2026-11-04. Recheck trigger: one of these sections moves, or a Claude Code
+release note changes how plugin options are set or stored.
 
 <!-- END GENERATED: plugin options -->
 

@@ -1,11 +1,11 @@
 {
   "name": "source-control",
-  "version": "1.5.2",
-  "description": "Git and GitHub delivery: /commit (convention-checked subject, Co-authored-by trailer, surgical staging), /pull-request (prep, create, CI monitoring, review triage, merge, CI logs), /babysit-prs (safe-by-default PR fleet loop, opt-in worker and autopilot tiers), /babysit-loop (merge lane; merge is human until the repo adopts it), /worktree, /resolve-conflicts (intent-first), /check, and /setup (layered source-control.md convention config; Conventional Commits by default).",
+  "description": "Git and GitHub delivery: /commit (convention-checked subject, Co-authored-by trailer, surgical staging), /pull-request (prep, create, conflict resolution, CI monitoring, review triage, merge, CI logs), /babysit-prs (safe-by-default PR fleet loop, opt-in worker and autopilot tiers), /babysit-loop (merge lane; merge is human until the repo adopts it), /worktree, /check, and /setup (layered source-control convention config; Conventional Commits by default).",
   "author": {
     "name": "Melodic Software",
     "email": "info@melodicsoftware.com"
   },
+  "version": "8.10.0",
   "license": "MIT",
   "keywords": [
     "git",
@@ -21,30 +21,40 @@
     "delivery",
     "skill"
   ],
+  "metadata": {
+    "category": "development"
+  },
   "userConfig": {
     "pr_body_linkage_gate_enabled": {
       "type": "boolean",
       "title": "PR-body-linkage-gate hook",
-      "description": "Blocks a gh pr create or gh pr edit whose statically readable PR body would fail the repository's required PR-contract check: no closing keyword, or a missing or empty Summary, Fix, Verification, or Related section. On by default. A body the hook cannot read statically always passes.",
+      "description": "Blocks a gh pr create or gh pr edit whose statically readable PR body carries a negated closing reference (does not close #N), which GitHub still closes on merge. A missing closing line or section is advisory and passes. On by default. A body the hook cannot read statically always passes.",
       "default": true
     },
     "pr_linkage_mcp_gate_enabled": {
       "type": "boolean",
       "title": "PR-linkage-MCP-gate hook",
-      "description": "Blocks a GitHub MCP create_pull_request or update_pull_request whose PR body would fail the repository's required PR-contract check, covering sessions that open PRs without the gh CLI. On by default. Enforced only for the repository the origin remote names.",
+      "description": "Blocks a GitHub MCP create_pull_request or update_pull_request whose PR body carries a negated closing reference, covering sessions that open PRs without the gh CLI. On by default. Enforced only for the repository the origin remote names.",
       "default": true
     },
     "branch_issue_pattern": {
       "type": "string",
       "title": "Branch-to-issue pattern (ERE)",
-      "description": "Deprecated fallback: set branch_issue_pattern in .claude/source-control.md instead, which wins. A POSIX ERE whose last capture group extracts the numeric GitHub issue number from the branch name. Absent: the built-in <type>/<N>-<slug> (and routine-issue-<N>) convention."
+      "description": "Deprecated fallback: set branch_issue_pattern in docs/conventions/source-control.yaml instead, which wins. A POSIX ERE whose last capture group extracts the numeric GitHub issue number from the branch name. Absent: the built-in <type>/<N>-<slug> (and routine-issue-<N>) convention."
     },
     "pr_open_state": {
       "type": "string",
       "title": "PR open state",
-      "description": "State /source-control:pull-request create opens a PR in. draft (default) opens a draft that the ready action flips later; ready opens it for review at once. A repository's pr_open_state in docs/conventions/source-control.yaml wins over this value.",
-      "default": "draft",
+      "description": "State /source-control:pull-request create leaves a PR in. ready (default) runs the ready action's gates and flips it; draft leaves it for ready to flip later. A repository's pr_open_state in docs/conventions/source-control.yaml wins over this value; a request for a draft wins over both.",
+      "default": "ready",
       "options": ["draft", "ready"]
+    },
+    "review_venue": {
+      "type": "string",
+      "title": "Review venue",
+      "description": "Who reviews a PR before the ready flip. auto (default) reviews locally only where no healthy CI lane does; local always reviews locally; ci leaves it to the CI lanes; both does both. A repository's review_venue in docs/conventions/source-control.yaml wins over this value.",
+      "default": "auto",
+      "options": ["auto", "local", "ci", "both"]
     },
     "fetch_logs_max_bytes": {
       "type": "number",
@@ -145,7 +155,7 @@
     "babysit_lane_logins": {
       "type": "string",
       "title": "Babysit pipeline lane logins",
-      "description": "Author logins recognized as pipeline lanes for the autopilot merge tier's lane-authored criterion. Absent: the tier (when on) refuses fail-closed.",
+      "description": "Logins recognized as pipeline lanes: the autopilot merge tier's lane-authored criterion, and the worker tier's resolve of outdated bot threads a lane already answered on your own PRs. Absent: the tier (when on) refuses fail-closed, and the worker resolves nothing on your own PRs.",
       "multiple": true
     },
     "babysit_approver_bot_logins": {
@@ -242,7 +252,12 @@
     "lane_instance": {
       "type": "string",
       "title": "Lane instance ID",
-      "description": "Writer identity for this machine's babysit-loop telemetry, the suffix of its telemetry marker, so concurrent lane instances never overwrite each other. Absent: the sanitized lowercased hostname. Must match ^[a-z0-9][a-z0-9-]{0,31}$. It appears verbatim in tracker comments."
+      "description": "Writer identity for this machine's babysit-loop telemetry, the suffix of its telemetry marker, so concurrent lane instances never overwrite each other. Absent: a random id made once and kept in the plugin data dir. Must match ^[a-z0-9][a-z0-9-]{0,31}$. It appears verbatim in tracker comments."
+    },
+    "lane_app_slug": {
+      "type": "string",
+      "title": "Lane GitHub app slug",
+      "description": "Slug of the GitHub App whose installation token this lane runs under; babysit-loop's telemetry upsert resolves its write identity as <slug>[bot]. Absent: the identity comes from the token's user. Must match ^[a-z0-9][a-z0-9-]*$."
     },
     "promotion_evidence_binding": {
       "type": "file",
@@ -268,6 +283,11 @@
       "type": "string",
       "title": "Promotion-evidence credential roots",
       "description": "Comma-separated absolute paths trusted as credential stores (--credential-roots): no filesystem root, no .. segment, none under tmp/temp/shm or inside the repository or lane worktrees. User or managed settings only; --settings does not count. Absent: credential-probe isolation proofs stay unproven."
+    },
+    "promotion_evidence_max_age_hours": {
+      "type": "string",
+      "title": "Promotion-evidence maximum age (hours)",
+      "description": "Positive whole number of hours: after a demotion record restarts the evidence window, a cell re-earns promotion only when the events file's sidecar generated_at is no older than this. User or managed settings only; --settings does not count. Absent: a demoted cell stays effective-unpromoted."
     },
     "setup_inference_window": {
       "type": "string",

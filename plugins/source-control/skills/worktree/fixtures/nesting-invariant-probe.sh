@@ -27,8 +27,11 @@
 # for this event; if you probe the shell form here, RECORD the result, because
 # whether it fires for `InstructionsLoaded` via `--settings` is unprobed.
 #
-# Passed via `claude -p --settings <file>` because a project-scope hook in an
-# unapproved `settings.json` does not run headlessly.
+# Passed via `claude -p --settings <file>` so the trace hook comes from this
+# script's own file, not from anything the fixture commits; which settings-file
+# hooks a `-p` session runs is at
+# <https://code.claude.com/docs/en/hooks#workspace-trust> (as of 2026-11-04;
+# recheck when that section changes what a `-p` session runs).
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # STATUS: RUN 2026-09-30 on Claude Code 2.1.285, authenticated, ADJUDICATED. The
@@ -183,4 +186,4 @@ arm unrelated-nested "$P4" "$UNREL/nested/wt" "src/target.md"
 
 printf 'traces: %s\n' "$TRACE_DIR"
 printf 'Record the outcome — including a null — in fixtures/README.md, and refresh\n'
-printf 'the as-of stamp in skills/worktree/SKILL.md with the verdict.\n'
+printf 'the as-of stamp in skills/worktree/reference/nesting-invariant.md with the verdict.\n'

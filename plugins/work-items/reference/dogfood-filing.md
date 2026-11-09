@@ -54,7 +54,7 @@ Four beats, in order. The two **mechanical** beats reuse existing machinery verb
    in [`issue-conventions.md`](issue-conventions.md).
 
 4. **Label `needs-triage`, then hand off (mechanical label + policy).** Apply `needs-triage` when that exact name exists in the live set ([`label-taxonomy.md`](label-taxonomy.md)). **The filer does not self-triage.** Filing surfaces the problem into raw intake; triage verifies,
-   categorizes definitively, and routes it. The org floor workflow applies the same bare label when an issue opens with no `priority:` label (`#506`). Filing still applies it so the item is in the queue on a repository that does not run that workflow.
+   categorizes definitively, and routes it. The org floor workflow applies the same bare label when an issue opens with no value in the org Priority field and no `priority:` label (`#506`). Filing still applies it so the item is in the queue on a repository that does not run that workflow.
 
 ## Mechanical core is already scripted: reference it, do not duplicate
 
@@ -69,12 +69,13 @@ calling a new binary.
 
 Model-initiated filing is gated: on the interactive path a lane drafts the item and asks before
 creating it ([`../skills/track/actions/add.md`](../skills/track/actions/add.md) "Authorization
-gate"). On an **autonomous lane**, a `/loop` or `/schedule` session whose standing rules already
-authorize tracker mutations, those standing rules **are** the authorization, the same resolution
-triage's direction gate makes ([`../skills/triage/SKILL.md`](../skills/triage/SKILL.md) "Direction
-gate"). An autonomous lane prefixes every item and comment it creates with the lane-neutral AI
-disclaimer ([`ai-disclaimer.md`](ai-disclaimer.md)), substituting this lane's short name for
-`{lane}`.
+gate"), unless that gate names the calling skill's step as authorization. On an **autonomous
+lane**, a `/loop` or `/schedule` session whose standing rules already authorize tracker mutations,
+those standing rules **are** the authorization, the same resolution triage's direction
+gate makes ([`../skills/triage/SKILL.md`](../skills/triage/SKILL.md) "Direction
+gate"). Whether an autonomous lane prefixes each item and comment it creates with the lane-neutral
+AI disclaimer, and its form, are in [`ai-disclaimer.md`](ai-disclaimer.md); substitute this lane's
+short name for `{lane}`.
 
 ## Reconciliation note
 

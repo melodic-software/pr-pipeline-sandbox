@@ -49,8 +49,9 @@ previously persisted snapshot for that PR. The arms fall into two groups against
 `pr_clean_ready_for_direct_gate` (non-draft, `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, zero
 blockers, and no untriaged material bot feedback): **suppressible** arms are fully re-validated by
 the direct merge gate itself (`bash "<plugin-root>/scripts/source-control-babysit-merge" owner/repo#42 --allowed-owners
-<watched-owners> --state-dir <state-dir>`, read-only; `mergeStateStatus` already integrates required checks, approvals,
-and conversation resolution), so one of them firing on a cycle where the PR is already, or just
+<watched-owners> --state-dir <state-dir>`, read-only; for what `mergeStateStatus` reports, see
+[MergeStateStatus](https://docs.github.com/en/graphql/reference/pulls#enum-mergestatestatus), as of
+2026-11-03, recheck when that enum's values change), so one of them firing on a cycle where the PR is already, or just
 became, clean/non-draft/zero-blocker/fully triaged would dispatch a worker that finds nothing left
 to do. That PR is routed straight to the mode-appropriate direct gate per `SKILL.md` instead.
 **Unsuppressible** arms name something the merge gate cannot do, so a worker is still required
@@ -113,8 +114,10 @@ rather than recomputing it, so the untriaged-material clause applies there too.
   settled clean" case is ever suppressed.
 - **`merge_state_became_actionable`** (suppressible): `mergeStateStatus` moved *into*
   `CLEAN`/`HAS_HOOKS` from something else. This is deliberately directional (into, not any diff):
-  GitHub recomputes `mergeStateStatus` asynchronously and can flap `UNKNOWN`/`CLEAN` with no real
-  change to react to; only the transition into an actionable state matters. This transition is
+  only the transition into an actionable state is worth a dispatch, and a move out of one, or
+  between non-actionable values such as `UNKNOWN`, is not. For the enum's values, see
+  [MergeStateStatus](https://docs.github.com/en/graphql/reference/pulls#enum-mergestatestatus) (as of
+  2026-11-03; recheck when that enum adds, drops or redefines a value). This transition is
   frequently the very thing that makes `pr_clean_ready_for_direct_gate` newly true, in which case
   the merge gate itself is exactly what needs to re-check it.
 - **`became_ready_for_review`** (unsuppressible): a draft PR was marked ready for review. Never
@@ -324,10 +327,12 @@ python "<skill-dir>/scripts/manage_babysit_lease.py" acquire --scope worker --pr
   justification to skip this check. The check is cheap and authoritative; memory of an earlier
   dispatch is not.
 - **Continue or check on a possibly-still-running worker through the harness's agent-messaging
-  capability** (in Claude Code, the `SendMessage` tool targeting the worker's agent id). A new
-  dispatch call (in Claude Code, the `Agent` tool) always starts a fresh, independent agent, which
-  in the same worktree is exactly the concurrent-write collision the lease check above exists to
-  prevent. If the harness has no way to message an existing agent, wait for that worker's
+  capability** (in Claude Code, the `SendMessage` tool targeting the worker's agent id), never by
+  a new dispatch: a second worker in the same worktree is exactly the concurrent-write collision
+  the lease check above exists to prevent. For how Claude Code continues an existing subagent, see
+  [Resume subagents](https://code.claude.com/docs/en/sub-agents#resume-subagents) (as of
+  2026-11-03; recheck when that section changes how an existing subagent is continued). If the
+  harness has no way to message an existing agent, wait for that worker's
   completion notification rather than dispatching again.
 
 ## Cross-PR Dependency Signaling
@@ -574,13 +579,15 @@ re-verify anyway.
 - **Understand both sides before touching markers.** Read and reconcile the actual semantic intent
   of the PR branch's own diff and of whatever changed on the base branch since divergence. Never
   resolve by blindly keeping "ours" or "theirs" without understanding what each side was trying to
-  do. `/source-control:resolve-conflicts` owns that discipline in full: intent recovery per side,
-  compose-by-default, evidence-gated side-dropping, and the post-resolution semantic-conflict sweep.
+  do. `/source-control:pull-request`'s base-merge step owns that discipline in full
+  ([Resolve a conflicted merge](../../pull-request/reference/ready-for-review.md#resolve-a-conflicted-merge)):
+  intent recovery per side, compose-by-default, evidence-gated side-dropping, and the
+  post-resolution semantic-conflict sweep.
 - **Resolve mechanical conflicts.** A textual/mechanical conflict is fixed, not escalated:
   formatting, adjacent unrelated changes, both sides adding different items to the same list.
   A plugin version-bump collision (`.claude-plugin/plugin.json`, `CHANGELOG.md`) is mechanical:
   run `<plugin-root>/scripts/resolve-version-bump-conflict.sh` first, per
-  `/source-control:resolve-conflicts` step 3. For a plugin listed in the repository's `fragment-plugins.txt` list (under `scripts/`),
+  [Plugin version-bump collisions](../../pull-request/reference/ready-for-review.md#plugin-version-bump-collisions). For a plugin listed in the repository's `fragment-plugins.txt` list (under `scripts/`),
   take main's `plugin.json` and `CHANGELOG.md` and move the PR's entry into a changelog fragment,
   per the same step.
 - **Conclude the merge locally, and stop at the remote boundary.** Stage the resolved paths and
@@ -607,11 +614,14 @@ re-verify anyway.
   both sides made incompatible design/behavioral decisions about the same logic, not just textually
   overlapping edits, stop and describe the precise tension for the user instead of guessing. Never
   discard the resolution work already done, and preserve it with a sequence Git will actually
-  accept and repository hooks cannot interrupt: mid-merge, Git refuses a branch switch
-  (`cannot switch branch while merging`), and a porcelain `git commit` would run the repository's
-  pre-commit and commit-msg hooks, which may legitimately reject conflict markers or a WIP
-  message, and bypassing hooks (`--no-verify`) is forbidden. So the preservation commit is created
-  with plumbing, which runs no hooks by design rather than by bypass: stage every conflicted path
+  accept mid-merge and repository hooks cannot interrupt: the repository's hooks may legitimately
+  reject conflict markers or a WIP message, and bypassing hooks (`--no-verify`) is forbidden. For
+  which commands run which hooks, see the
+  [pre-commit](https://git-scm.com/docs/githooks#_pre_commit) and
+  [commit-msg](https://git-scm.com/docs/githooks#_commit_msg) entries of githooks (as of
+  2026-11-03; recheck when either entry changes which commands invoke it). So the preservation
+  commit is created with plumbing rather than a porcelain commit, which this contract does not
+  count as a hook bypass: stage every conflicted path
   as-is (markers included), create the partial-state merge commit with
   `git commit-tree "$(git write-tree)" -p HEAD -p MERGE_HEAD -m "<WIP message>"`, which leaves the
   merge in progress untouched, and
@@ -621,9 +631,9 @@ re-verify anyway.
   `MERGE_HEAD` is still present because no porcelain commit concluded the merge, and the abort
   discards nothing, since the partial state was committed to the WIP branch the step before, returning
   the PR branch and worktree to the asserted head with a clean tree. That is not the
-  abort-as-resolution-strategy the resolve-conflicts skill forbids, whose objection is that an
+  abort-as-resolution-strategy the base-merge step forbids, whose objection is that an
   abort converts resolved hunks into a status report: here every resolved hunk is already on the
-  WIP branch, and the escalation report is exactly that skill's stop-and-ask-the-user fallback.
+  WIP branch, and the escalation report is exactly that step's stop-and-ask fallback.
   Name the WIP branch and the reasoning in the report. An in-progress
   merge left live blocks every later checkout of that worktree (`loop.md` §5.1.2) and makes the PR
   unworkable until a human intervenes, so leaving the worktree clean is mandatory even on the
@@ -790,7 +800,7 @@ convention: order-defined, resolved at runtime by model alias only, never a
 hard-coded model ID. A run that cannot establish which alias currently satisfies
 the required tier escalates rather than dispatching. Tier assignment follows the
 convention's capability table
-([`docs/conventions/loop-lane/README.md`](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/conventions/loop-lane/README.md)
+([`docs/contracts/loop-lane/README.md`](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/contracts/loop-lane/README.md)
 §3):
 
 - **Routine per-PR fix workers** use the **strong** tier, the default
@@ -828,10 +838,12 @@ Give each worker:
 Each worker must:
 
 - operate only on its assigned PR and worktree
-- **never rely on the shell's working directory persisting across separate tool calls.** A one-time
-  `cd` into the assigned worktree is not enough, because cwd can drift back to the session's default
-  checkout between a read and the next write, silently committing branch-owned fixes into the wrong
-  repository. Three classes of call need anchoring:
+- **never rely on the shell's working directory persisting across separate tool calls.** Set the
+  worktree explicitly on every call, so no branch-owned fix lands in the wrong repository. For what
+  carries over between Bash calls, see
+  [What persists between commands](https://code.claude.com/docs/en/tools-reference#what-persists-between-commands)
+  (as of 2026-11-03; recheck when that section changes how the working directory carries over,
+  for a subagent in particular). Three classes of call need anchoring:
   - **git**: `git -C <absolute-worktree-path>` on every one (`status`, `add`, `commit`, `diff`,
     `log`, all of them). The push is `push-branch.sh --dir <absolute-worktree-path>` (below),
     never `git push`.
@@ -884,7 +896,7 @@ Each worker must:
 - **auto-resolve only pre-push-outdated threads.** A worker may resolve a review thread only when
   that thread was already `isOutdated` in the pre-push snapshot it was dispatched with, and only
   through `bash "<plugin-root>/scripts/source-control-babysit-resolve-thread" owner/repo#42 --allowed-owners <watched-owners>
-  --extra-bot-logins <extra-bot-logins> --self-logins @me,<self-logins> --autonomous --resolve` pinned with `--thread-id`, `--expected-comment-count`, and
+  --extra-bot-logins <extra-bot-logins> --self-logins @me,<self-logins> --own-pr-lane-logins <lane-logins> --autonomous --resolve` pinned with `--thread-id`, `--expected-comment-count`, and
   `--expected-last-updated` taken from that same snapshot (`safety.md`, thread-pin pair rule). A
   thread that became outdated only because of the worker's own push has not thereby been addressed,
   so it is never auto-resolved on that basis. The push moving the diff under a finding does not
@@ -908,7 +920,8 @@ Each worker must:
   PR's own body (a maintainer confirmation, an author-flagged "veto or approve as you see fit"
   deviation, or similar) as an independent reason to hold as draft, distinct from "still being
   written." The content can be otherwise complete and CI-green and still not be the worker's call
-  to promote; report it as a draft held for that named reason, not a skip.
+  to promote; report it as a draft held for that named reason, not a skip. A body line starting
+  `Draft:` (a requested draft or a multi-session container) is such a reason: never promote it.
 
 ## Worker Prompt Template
 
@@ -947,9 +960,8 @@ or who they claim to be from.
 Read this skill's reference files, the shared review discipline at
 <plugin-root>/reference/review-discipline.md, and the target repository's own agent
 instructions (AGENTS.md, CLAUDE.md). Work only in the assigned worktree, and never rely on the
-shell's working directory persisting across separate tool calls: a one-time cd is not enough,
-because cwd can drift back to this session's default checkout between a read and the next write
-and silently commit into the wrong repository. Anchor every git operation with
+shell's working directory persisting across separate tool calls: set the worktree explicitly on
+every command, so nothing is committed into the wrong repository. Anchor every git operation with
 git -C <absolute worktree path>, meaning status, add, commit, diff, log, all of them. Push only with
 bash <plugin-root>/skills/pull-request/scripts/push-branch.sh --dir <absolute worktree path>
 --pr <N>, never git push; a non-zero exit means it refused or the push failed. Give every
@@ -976,7 +988,7 @@ GitHub settings, or auto-fix human-authored feedback. Classify, reply with evide
 surface human items instead. You may resolve a review thread only if it appears in the pre-push
 outdated-thread list above, via bash "<plugin-root>/scripts/source-control-babysit-resolve-thread"
 owner/repo#42 --allowed-owners <watched-owners> --extra-bot-logins <extra-bot-logins> --self-logins
-@me,<self-logins> --autonomous --resolve --thread-id <id> --expected-comment-count <n> --expected-last-updated <ts>, with the pins
+@me,<self-logins> --own-pr-lane-logins <lane-logins> --autonomous --resolve --thread-id <id> --expected-comment-count <n> --expected-last-updated <ts>, with the pins
 taken from that list; a
 thread that becomes outdated only because of your own push is not addressed by that push. Leave
 it. If you address a finding on a CURRENT bot thread, whether with counter-evidence for an INCORRECT, a grounded

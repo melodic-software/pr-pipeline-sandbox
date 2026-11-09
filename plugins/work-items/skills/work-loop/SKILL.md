@@ -1,5 +1,5 @@
 ---
-description: "Drain the work-item backlog as a self-paced autonomous loop, launched via /loop: each cycle triages raw intake, admits items through the fail-closed work-class gate, runs them through /work-items:work under an adaptive cap, and checks the drain exit. Authors PRs, never merges. Use when: 'work loop', 'run the work loop', 'start the worker loop', 'drain the backlog', 'autonomous drain', 'loop the backlog', 'drain the issue backlog to done'. Escalations: /work-items:attend-queue."
+description: "Drain the work-item backlog as a self-paced autonomous loop, launched via /loop: each cycle triages raw intake, admits items through the fail-closed admission gate, runs them through /work-items:work under an adaptive cap, and checks the drain exit. Authors PRs, never merges. Use when: 'work loop', 'run the work loop', 'start the worker loop', 'drain the backlog', 'autonomous drain', 'loop the backlog', 'drain the issue backlog to done'. Escalations: /work-items:attend-queue."
 argument-hint: "[<owner/repo>] [--drain|--standing] [--single-pass] [--shard <i>/<n>] [--ordering newest-first…]"
 user-invocable: true
 disable-model-invocation: false
@@ -40,7 +40,7 @@ queue (`/work-items:attend-queue`).
 ## Loop-lane contract (cited, never restated)
 
 Every shared cross-lane concern is owned by the loop-lane convention,
-`docs/conventions/loop-lane/README.md` in this plugin's marketplace repository, and this skill
+`docs/contracts/loop-lane/README.md` in this plugin's marketplace repository, and this skill
 holds those contracts **by citation**: the three-session topology and the autonomy merge ladder
 (including seam-only rung raises), the escalation contract, order-defined capability tiers
 (frontier / strong / fast; runtime resolution by model alias only, never a hard-coded model ID),
@@ -71,19 +71,20 @@ block every cycle as a report; run config is never read back from it (that file 
 ## Telemetry and durable loop state
 
 The telemetry home is a **per-lane tracking issue in the target repository**, resolved from launch
-config; default: the open issue titled `Lane telemetry: work-loop` (exact match), created through
-the seam `create-item` verb when absent (announce the creation). Maintain exactly ONE status
+config; default: the open issue titled `Lane telemetry: work-loop` (exact match) whose author is the
+lane's write identity (the login the upsert script resolves), created through the seam `create-item`
+verb when none is left (announce the creation). Anyone can open an issue with that title, so skip an
+exact-title match by any other author and name it in the cycle report. Maintain exactly ONE status
 comment on it **per lane instance**, sentinel-identified and edited in place (the `harness-ops`
 lane-telemetry contract; one writer identity owns a marker). The upsert itself, lane-instance
 validation, the singleton lookup, the body gate, the write-status check and read-back, the
 POST/PATCH, and the creation-race reconcile, runs as `${CLAUDE_PLUGIN_ROOT}/scripts/lane-telemetry-upsert.sh`. Its
 arguments, its exit codes and what each one tells the lane to do, and the `$BODY_FILE` contract are
-owned by [reference/telemetry-upsert.md](reference/telemetry-upsert.md). Compose the body and
-invoke the script; do not write the comment by hand.
+owned by [reference/telemetry-upsert.md](reference/telemetry-upsert.md); its `<plugin-data>` is `${CLAUDE_PLUGIN_DATA}`.
+Compose the body there, pass it as `--body-dir`, and invoke the script; do not write the comment by hand.
 
 When the bound provider is not `github`, this upsert is unavailable: carry the same telemetry
-content, state block included, in the lane's cycle report/log, noting the comment surface is
-absent.
+content, state block included, in the lane's cycle report/log, noting the comment surface is absent.
 
 The comment carries the human-readable cycle report plus a machine-readable **durable loop state**
 block, re-read at every cycle start (conversation context is compaction-lossy, the comment is
@@ -91,13 +92,13 @@ the source of truth for these counters):
 
 ```json
 {"schema":"work-items/loop-state@2","cycle":12,"clean_streak":1,"no_progress_streak":0,
- "item_cap":2,"rate_limit_latch":false,"first_drain_proposed":false,"guard_mode":"proactive",
+ "item_cap":2,"rate_limit_latch":false,"guard_mode":"proactive",
  "stop_mode":"standing","ordering":"oldest-first","shard":null,"scope":null,
- "lane_instance":"melo-lap-001","writer_nonce":"9f3c1a7e","heartbeat_at":"2026-07-23T15:04:05Z",
+ "lane_instance":"lane-3e7a91c4","writer_nonce":"9f3c1a7e","heartbeat_at":"2026-07-23T15:04:05Z",
  "paused_until":null,"latched_account":null,"effort":"unset",
  "loop_started_at":"2026-07-23T15:00:00Z","restart_request":null,
  "usage_sample":{"at":"2026-07-23T15:04:05Z","five_hour_pct":23.5,"seven_day_pct":41.2,
- "five_hour_delta_pct":1.8}}
+ "five_hour_delta_pct":1.8,"seven_day_delta_pct":0.4}}
 ```
 
 `stop_mode`, `ordering`, `shard` (`{"index":i,"count":n}` or `null`), and `scope` (label string or
@@ -111,9 +112,8 @@ is the tripping account's fingerprint (see [reference/paused-wait.md](reference/
 
 Every counter here is **per-instance**, the marker partitions the block, so `item_cap`,
 `clean_streak`, `no_progress_streak`, and `rate_limit_latch` measure *this* instance's experience.
-The block is lane-writable, so it may throttle or report but never widen autonomy (no gate reads
-`first_drain_proposed`); [reference/first-drain-ratification.md](reference/first-drain-ratification.md)
-owns the proposal, the label that alone ends the earn-trust period, and which fields may stay here.
+The block is lane-writable, so it may throttle or report but never widen autonomy: no admission
+gate reads it.
 
 **Instance-collision check (cycle start, before any write).** After the re-read, compare
 `writer_nonce` and `heartbeat_at` and adopt, hand off, or stop per
@@ -124,19 +124,19 @@ a paused lane is never adopted as a dead one. That reference also owns the `inst
 line.
 
 `usage_sample` copies the **same** two window percentages the rate-limit guard step below already
-read at this cycle's **start**, never a second reading, so `at` is when the lane read the snapshot file,
-not the snapshot's own `captured_at` (which the staleness rule lets lag it) and never the report
-time. `at` is always written, so a cycle that could not observe stays distinguishable from one
-that never sampled. `five_hour_pct` / `seven_day_pct` are the readings as taken: both `null` when
-the guard is not proactive, and independently `null` when a window is unreadable, absent, or
-rejected as unknown, never the rejected value, a stale reading carried forward, or a fabricated
-one. `five_hour_delta_pct` is `null` whenever either side's `five_hour_pct` is unavailable, no
-previous sample at all (so a first cycle's always is), or a `null` reading on either side, and
-`null` when the current reading is **lower** than the previous one (the window rolled over); only
-the five-hour window carries a delta, since a seven-day window moves too little per cycle to clear
-the readings' own approximation. Everything else, the single permitted readback, the delta
-covering the interval *preceding* its reporting cycle, and the three properties bounding what the
-data supports, is the convention's (§4, "Per-cycle usage sample"), held by citation.
+read at this cycle's **start**, never a second reading, so `at` is when the lane read the snapshot
+file, not the snapshot's own `captured_at` (which the staleness rule lets lag it) and never the
+report time. `at` is always written, so a cycle that could not observe stays distinguishable from
+one that never sampled. `five_hour_pct` / `seven_day_pct` are the readings as taken: both `null`
+when the guard is not proactive, and independently `null` when a window is unreadable, absent, or
+rejected as unknown, never the rejected value, a stale reading carried forward, or a fabricated one.
+`five_hour_delta_pct` and `seven_day_delta_pct` are per window, since an account may report only
+some windows: `null` when that window's reading is unavailable on either side, on a first cycle, and
+when the current reading is **lower** than the previous one (a rollover). Pointer: for which windows
+exist, the `windows` keys `mcp__rate-limit-guard__status` returns. As of: 2026-10-30. Recheck
+trigger: the guard changes which windows it carries. Everything else, the single permitted readback,
+each delta covering the interval *preceding* its reporting cycle, and the three properties bounding
+what the data supports, is the convention's (§4, "Per-cycle usage sample"), held by citation.
 
 ## Rate-limit guard floor (inlined)
 
@@ -219,39 +219,42 @@ the former default-on pause).
    union, not the open ids alone: the two are one derivation apart on paper, but nothing here says
    the snapshot is one read, and an item created between two reads would otherwise be captured yet
    never tested. **A snapshot counts only when every read behind it is complete**: an errored,
-   truncated, or unparsable read aborts the cycle with no state change and never proposes
-   first-drain completion; a truncated one escalates at once ([reference/snapshot-reads.md](reference/snapshot-reads.md), read first).
+   truncated, or unparsable read aborts the cycle with no state change and never satisfies the
+   drain exit; a truncated one escalates at once, and drain mode adds a status read ([reference/snapshot-reads.md](reference/snapshot-reads.md), read first).
    Pass the resolved `--scope` label to both reads as `--label`, then apply the `--shard <i>/<n>`
    partition to the retained ids before any later step reads the snapshot. The drain exit is
    evaluated against this filtered snapshot. New automated intake arriving mid-cycle is
    **reported, never chased** (per the convention).
 2. **Intake sweep.** Invoke `/work-items:triage` via the Skill tool over untriaged intake in its **autonomous lane**,
    this loop's launch-prompt standing rules are the direction its mutation gate requires, and every
-   comment or item it creates carries the AI disclaimer. Sweep hardening: an advisory issue
-   authored by a workflow bot routes to the human-gated role label by default (this also lets drain
-   exits terminate against automated intake). Applied together with a machine-marked
-   `kind=routed-advisory` escalation comment (step 5's marker shape and record write), so the
-   routing surfaces in the attended queue's escalated view instead of vanishing behind a bare
-   label. When the launch prompt bars this lane from writing `work-class:` labels, a delegable or
-   decision-defaulted outcome takes triage's "Lane barred from recording a class" branch (human-gated
-   role plus a `kind=escalated` marker carrying the proposed class), and that marker carries
-   step 5's record write the same way.
+   comment or item it creates carries the AI disclaimer when the setting resolves `true`
+   ([`${CLAUDE_PLUGIN_ROOT}/reference/ai-disclaimer.md`](${CLAUDE_PLUGIN_ROOT}/reference/ai-disclaimer.md);
+   the per-user value it reads is `${user_config.ai_disclaimer}`). Sweep hardening: an advisory issue
+   authored by a workflow bot routes to the human-gated role label by default (this also lets drain exits
+   terminate against automated intake). Applied together with a machine-marked `kind=routed-advisory`
+   escalation comment (step 5's marker shape and record write), so the routing surfaces in the attended
+   queue's escalated view instead of vanishing behind a bare label. **By default the sweep writes
+   no autonomous-eligible role label**, since the labeler precondition cannot tell
+   this lane's label writes from a person's: a delegable, decision-defaulted or stub outcome takes
+   the human-gated role label plus a `kind=escalated` marker proposing the role-label swap
+   (step 5's marker shape and record write), per "Work-loop intake sweep: propose, never admit" in
+   [`${CLAUDE_PLUGIN_ROOT}/skills/triage/context/apply-outcome.md`](${CLAUDE_PLUGIN_ROOT}/skills/triage/context/apply-outcome.md).
+   Only a launch prompt that explicitly opts the sweep into writing that label lifts this.
 3. **Admission gate.** Drop every frontier candidate that is already in flight (the gate's
    in-flight precondition below) or held by its Objection window ([reference/objection-window.md](reference/objection-window.md),
-   which also escalates an objected one), then classify the rest and admit per the gate. Fail-closed.
+   which also escalates an objected one), then admit the rest per the gate. Fail-closed.
 4. **Execute.** Work admitted items by invoking `/work-items:work` via the Skill tool (one invocation per item slot), up to
-   the adaptive item cap. When more than one item was admitted, sort the admitted set on the
-   `created_at` each snapshot item already carries (the seam `CONTRACT.md`, "JSON output
-   contract") before filling cap slots, with no further read: `oldest-first` ascending,
-   `newest-first` descending. An item whose `created_at` is `null` or absent sorts after every
-   timestamped item; among those, and on equal timestamps, order by item number in the same
-   direction, a fixed tie-break so the order is deterministic. Each invocation uses that skill's **autonomous
-   invocation** path: it
-   names the admitted item id and states that this loop's admission gate (and any required
-   ratification marker) passed, so `/work-items:work` proceeds without its interactive confirmation prompt.
-   Selection, claim (assignee + lease), staleness pre-check, dispatch
-   mechanics, the PR contract, the review pass, and the never-merge boundary are all owned there,
-   this loop restates none of them. Loop-level deltas only:
+   the adaptive item cap. When more than one item was admitted, sort the admitted set before filling cap slots, with no
+   read beyond the one that fetches the items' Priority field ([reference/snapshot-reads.md](reference/snapshot-reads.md)): first by each item's priority rank in the `work_priority_order` setting, resolved and applied
+   as `/work-items:work`'s "Selection Priority" states, then between equal ranks on the `created_at` each snapshot item
+   already carries (the seam `CONTRACT.md`, "JSON output contract"): `oldest-first` ascending, `newest-first`
+   descending. An item whose `created_at` is `null` or absent sorts after every timestamped item of its rank; among
+   those, and on equal timestamps, order by item number in the same direction, a fixed tie-break so the order is
+   deterministic. Each invocation uses that skill's **autonomous invocation** path: it names the admitted item id and
+   states that this loop's admission gate passed, so `/work-items:work` proceeds
+   without its interactive confirmation prompt. Selection, claim (assignee + lease), staleness pre-check, dispatch
+   mechanics, the PR contract, the review pass, and the never-merge boundary are all owned there, this loop restates
+   none of them. Loop-level deltas only:
    - **Worker-side provisioning, owned by `/work-items:work`.** The dispatched subagent
      materializes its own out-of-tree worktree first and works against it via `git -C` without
      entering it; the orchestrator never invokes `/source-control:worktree create`, whose
@@ -270,7 +273,7 @@ the former default-on pause).
    convention's escalation contract: the human-gated role label **resolved from
    `config.role_labels`, never a literal**, plus a machine-marked escalation comment per
    [`${CLAUDE_PLUGIN_ROOT}/reference/escalation-marker.md`](${CLAUDE_PLUGIN_ROOT}/reference/escalation-marker.md)
-   (`lane=work-loop`, `kind=escalated|ratify-c3|ratify-first-drain|routed-advisory`), the marker,
+   (`lane=work-loop`, `kind=escalated|routed-advisory`), the marker,
    not a second label, is what discriminates a worker-escalated item from an operator-parked one.
    The same step performs the contract's escalation record write, **immediately before posting
    that comment**: create `.claude/lane-escalations/<UTC-stamp>-<item>-work-loop.json` (stamp
@@ -279,8 +282,9 @@ the former default-on pause).
    same bytes but emits only a `Bash` event the seam's `Write` matcher never sees. Body
    `{"schema":"loop-lane/escalation-record@1","lane":"work-loop","kind":"<marker kind>","repo":"<owner>/<repo>","item":"<item URL>","summary":"<the marker comment's one-line question>","written_at":"<UTC ISO-8601>"}`.
    Duplicate suppression is the marker read this step already performs before escalating: an item
-   whose marker already stands while it still wears the human-gated label (a marker left after
-   the operator answered and returned the item to the frontier is not standing), a still-unratified `ratify-c3`, an idempotent label re-convergence,
+   whose marker already stands while it is still held for a person per the tracker seam's
+   "Reading an item's status" (a marker left after
+   the operator answered and returned the item to the frontier is not standing), an idempotent label re-convergence,
    is not a new escalation, so the cycle files no second comment and writes no second record.
    **Record before marker is load-bearing, not incidental**: a stop between the two then loses the
    tracker comment, which the next cycle re-files (one duplicate notification), whereas the reverse
@@ -295,15 +299,14 @@ the former default-on pause).
    and skips the move when the session already sits in a linked worktree, so the Write lands in
    place. A live probe (`claude --bg`, Claude Code 2.1.285) from a linked worktree outside
    `.claude/worktrees` wrote the record file there with no refusal, as did an earlier lane
-   (worktree `cc-plugins-lane-2`). A launch from a checkout that is not a linked worktree is not
-   the recommended mode: one lane's record Write there was refused with "parent bg session
-   hasn't isolated yet, so writes to the shared checkout are blocked", and otherwise the session
-   moves into an auto-created worktree under `.claude/worktrees/`; that launch was not probed
-   here. Either
-   way the tracker marker comment is the escalation of record, and a refused record Write does
-   not stop the cycle. This lane must not call `EnterWorktree` (it would end the long-lived
-   orchestrator), so isolation comes from where the operator launches it. Foreground on the
-   default-branch checkout remains the known-good mode.
+   (worktree `cc-plugins-lane-2`). A launch from a checkout that is not a linked worktree is not the
+   recommended mode: one lane's record Write there was refused with "parent bg session hasn't
+   isolated yet, so writes to the shared checkout are blocked", and otherwise the session moves into
+   an auto-created worktree under `.claude/worktrees/`; that launch was not probed here. Either way
+   the tracker marker comment is the escalation of record, and a refused record Write does not stop
+   the cycle. This lane must not call `EnterWorktree` (it would end the long-lived orchestrator), so
+   isolation comes from where the operator launches it. Foreground on the default-branch checkout
+   remains the known-good mode.
 
    Verification record for that paragraph. Claim: a background session launched inside a linked
    git worktree keeps the record Write in place; one launched from a non-linked checkout is
@@ -318,38 +321,30 @@ the former default-on pause).
    changes its block or skip rules, or a release note changes background-session isolation.
 6. **Report and pace.** Update the no-progress streak, and, at the threshold, raise the stall
    escalation, per the detector below; upsert the telemetry comment (cycle report + updated state
-   block + guard mode + the `usage_sample` built from step 1's cycle-start reading, whose delta
-   covers the preceding interval and never this cycle's work); then evaluate the exit condition; if
+   block + guard mode + the `usage_sample` built from step 1's cycle-start reading, whose deltas
+   cover the preceding interval and never this cycle's work); then evaluate the exit condition; if
    not exiting, `ScheduleWakeup` the next cycle (`--single-pass`: start it now or end the run).
    **Ground every claim in the cycle report against a tool result from this cycle, and say which work
    is unverified rather than omitting the distinction.** Nobody watched this cycle, so the report is
    the only record of it and a fabricated line is indistinguishable from a true one until someone re-does the work.
 
-## Admission gate (work-class, fail-closed)
+## Admission gate (fail-closed)
 
-Class vocabulary and admission policy are governing policy owned by the `autonomy` plugin's
-guardrail references (its `work-classes.md` and `admission-policy.md`), per the convention; when
-that plugin is enabled, read those references for classification. Enabled or not, these
-dispositions bind:
+The gate does not decide by work class. A candidate that passes the in-flight check, the objection
+window, the labeler precondition and the hard gates below is admitted, whatever its other labels.
+Of the provenance labels, only `provenance: signal` or `provenance: untrusted` holds a
+candidate for a person: `list-frontier --autonomous` already drops each
+([`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md)),
+and a candidate found carrying any of them is escalated through step 5, never dispatched. A candidate
+whose latest removal of any of them came from an actor below `write` is held the same way (the provenance-removal hold below).
 
-| Class | Disposition |
-|---|---|
-| C1 read-only | Autonomous |
-| C2 mechanical | Autonomous |
-| C3 scoped, bug-fix-shaped | Autonomous, but see first-drain ratification below |
-| C3 scoped, feature-shaped | Human-gated (operator tightening, permitted without justification) |
-| C4 structural/contract, C5 untrusted-provenance | Human-gated / per-contract floors |
-| Unclassified | **Fail-closed human-gated** |
-
-An item labeled `provenance: signal` is C5 whatever its `work-class:` label.
-
-**In-flight precondition (before any classification).** A frontier candidate that already has an
+**In-flight precondition (before the other checks).** A frontier candidate that already has an
 open closing PR from its own repository (not a fork) is work in flight, not a candidate. Apply
 `/work-items:work`'s "Exclude in-flight frontier candidates (open linked PR)" rule in
 [`${CLAUDE_PLUGIN_ROOT}/skills/work/context/candidate-discovery.md`](${CLAUDE_PLUGIN_ROOT}/skills/work/context/candidate-discovery.md)
 as written, through the bound adapter's "Open linked PRs" operation: the closing-keyword linkage is
 the signal, a draft closing PR counts, a failed check excludes the candidate for this cycle, and a
-binding with no PR host keeps it. An excluded candidate is neither dispatched nor ratify-queued,
+binding with no PR host keeps it. An excluded candidate is not dispatched,
 and within the age bound below it is not escalated and this cycle changes none of its labels. The
 cycle report lists it as `in flight: #<item> (PR #<pr>, draft|ready, open <age>)`, oldest PR first,
 or as `in-flight check failed: #<item>` when the query errored. The gate itself stays boolean; for
@@ -358,68 +353,72 @@ the PR number, draft state, and age from `createdAt`.
 
 The exclusion is bounded by age. Read `${user_config.work_loop_in_flight_stale_days}` (default 14;
 a surviving literal `${user_config.…}` placeholder means the key is unset, so apply the manifest
-default). A PR open longer than that stops silently excluding its item: it is still not dispatched
-or classified, and step 5 escalates it as `kind=escalated`, whose one-line question names the PR
+default). A PR open longer than that stops silently excluding its item: it is still not dispatched,
+and step 5 escalates it as `kind=escalated`, whose one-line question names the PR
 number, draft or ready state, and age, and asks the human to land, close, or unlink it. Step 5's
-marker read suppresses duplicates only while the item still wears the human-gated label; an item
+marker read suppresses duplicates only while the item is still held for a person; an item
 back on the frontier gets a fresh marker naming the PR, and the labeled item leaves the
 autonomous frontier. The cycle report lists it as `stale in flight: #<item> (PR #<pr>, draft|ready, open <age>) -> escalated`.
 A failed check has no age and stays excluded. The escalation is not progress: it does not reset
 the no-progress streak. `/work-items:work`'s dispatch-time staleness pre-check does not cover
-this: it runs only for dispatched items, never a queued or escalated one.
+this: it runs only for dispatched items, never an escalated one.
 
-**Labeler precondition (after the in-flight check, before classification).** A label is admission
+**Labeler precondition (after the in-flight check).** A label is admission
 evidence only when someone allowed to grant admission applied it. On GitHub the triage role can
-apply labels but holds only `read`, so the labels alone do not show that. For each remaining
+apply labels but holds only `read`, so the label alone does not show that. For each remaining
 candidate, run the bound adapter's `label-provenance` operation over the autonomous-eligible role
-label and the item's `work-class:` label, whichever of the two it carries:
-`work-item-tracker.sh label-provenance "<id>" --label "<role label>" --label "<work-class label>"`.
-Pass the id and each label name as separate quoted arguments, read the result with `jq --arg`, and
+label only:
+`work-item-tracker.sh label-provenance "<id>" --label "<role label>"`.
+Pass the id and the label name as separate quoted arguments, read the result with `jq --arg`, and
 never splice a label name, actor login or issue title into a command or a jq program. Admit the
 candidate only when the operation exits `0` with `admitted: true`, meaning the latest application
-of every named label came from an actor with `write`, `maintain` or `admin`. Anything else fails
+of the role label came from an actor with `write`, `maintain` or `admin`. Anything else fails
 closed for this cycle: a triage or read labeler, a label with no `labeled` event, a failed or empty
 timeline or permission read, an adapter without the operation (exit `6`), and a harness-denied
-call. A refused candidate is neither dispatched nor ratify-queued, the cycle changes none of its
-labels, except the body-edit escalation below, and the run continues with the other candidates. The cycle report lists each refused row as
+call. A refused candidate is not dispatched, the cycle changes none of its
+labels, except the body edit-time escalation below, and the run continues with the other candidates. The cycle report lists each refused row as
 `labeler refused: #<item> "<label>" applied by <actor> (<role or permission>)`, or, with no actor
 to name, `labeler check failed: #<item> (<reason>)`. A refusal is not progress and does not reset
 the no-progress streak. The contract for the operation is in
 [`tools/work-item-tracker/CONTRACT.md`](${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/CONTRACT.md)
-"Verbs (core public surface)". Unlike the other refusals, one refused only for a body edited after
-admission is escalated once (`kind=escalated`, to human attention), not refused again each cycle. **Rule admission** then runs as a second path, through `${CLAUDE_PLUGIN_ROOT}/scripts/rule-admit.sh`: read [reference/rule-admission.md](reference/rule-admission.md).
+"Verbs (core public surface)". One refused only on its body edit time is escalated once instead: read [reference/body-edit-escalation.md](reference/body-edit-escalation.md).
+The gate admits no other way: a candidate with no admitted autonomous-eligible role label is not dispatched.
 
 Pointer: for the permission each GitHub role maps to (`admin`, `write`, `read`, `none`; maintain
 maps to `write`, triage to `read`), see
 [Get repository permissions for a user](https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user).
 As of: 2026-10-04. Recheck trigger: the endpoint's role mapping changes.
 
-Hard gates that override any classification:
+Hard gates:
 
+- **Provenance hold.** A candidate carrying `provenance: signal` or
+  `provenance: untrusted` is human-gated.
+  Step 5 escalates it as `kind=escalated`; it is never dispatched.
+- **Provenance-removal hold.** The provenance hold tests only whether a label is present, so its
+  absence counts only when someone allowed to grant admission removed it. For each candidate, and
+  for each of `provenance: untrusted` and
+  `provenance: signal`, run the bound adapter's "Label-removal provenance" operation (GitHub: the
+  adapter README section of that name). Its latest-removal read names the actor of the label's latest removal, and its actor-permission read
+  reads that actor's permission with the labeler precondition's permission mapping. A candidate whose latest removal of
+  any of these labels came from an actor below `write` (a triage or read actor, `none`, or a permission
+  that does not read) is human-gated: step 5 escalates it as `kind=escalated`, and it is never
+  dispatched. The escalation's one-line question names the label, the actor and the permission,
+  and gives the human both ways to settle it. If the item is trusted, a person with `write`
+  applies the label again and then removes it, which clears the hold, because the latest removal
+  decides. If it really is untrusted, they apply the label again and leave it on, so the
+  provenance hold takes over. A role-label flip alone does not clear this hold: the next cycle reads
+  the same removal and escalates again. A failed or empty timeline read, a removal event with no
+  usable actor login, and a binding that cannot read removal events fail closed for this cycle the
+  way the labeler precondition does: not dispatched, no label changed, reported as
+  `provenance-removal check failed: #<item> (<reason>)`, and not progress. Pass the label names to
+  the operation as `jq --arg` values, never spliced into a command or jq program. An actor login
+  reaches the permission read's API path only after the operation's login check.
 - **Path/topic hard gate.** An item touching dependency SHA pins, checksum or pin recomputation,
   or any surface the consuming repository's `CLAUDE.md` declares as inviolable ground rules is
-  human-gated regardless of class, such items surface-read as mechanical dependency bumps but are
+  human-gated, such items surface-read as mechanical dependency bumps but are
   trust-on-first-download changes on security-critical surfaces. Workers escalate these, never
   edit them.
-- **First-drain C3 ratification (earn-trust).** A C3 bug-fix-shaped item dispatches only when
-  EITHER it carries its own recorded ratification, the ratification reply
-  `/work-items:attend-queue` writes on the item's `kind=ratify-c3` machine-marked comment, which
-  is the recorded human ratification the autonomy matrix's promotion contract requires, OR
-  `${CLAUDE_PLUGIN_ROOT}/scripts/first-drain-ratified.sh` exits 0 this cycle: a person applied
-  `loop-lane: first-drain-ratified` to the telemetry issue, ending the blanket period. Durable
-  state never ends it, and this lane never applies that label
-  ([reference/first-drain-ratification.md](reference/first-drain-ratification.md)).
-  Before that, an unratified C3 bug-fix candidate is queued, not dispatched: human-gated role
-  label + a `kind=ratify-c3` comment stating the classification and intended dispatch. Once
-  ratified it returns to the frontier autonomous-eligible and dispatches on a later cycle, the
-  ratification travels with the item, so it is never re-queued.
-
-  Queuing an unratified C3 has write mechanics of its own; a wrong order leaves the item
-  unreachable. Read [reference/c3-ratification-queue.md](reference/c3-ratification-queue.md)
-  before writing the comment or the labels: it owns their ordering, the at-most-one marker rule
-  and its author check, the role-label convergence, why a body-recorded ratification is never
-  dispatch authority, and this gate's manual check. The dispositions above bind regardless.
-- **Security-surface work.** Any security-surface class routes to the frontier capability tier,
+- **Security-surface work.** Security-surface work routes to the frontier capability tier,
   always (per the convention's tier rules).
 
 ## Adaptive item cap
@@ -445,8 +444,8 @@ apply the manifest default:
 
 **Clean** = the item's pipeline verdict passed and its PR opened without gate failures.
 **Dirty** = a failed verdict or gate, an escalation off the item mid-execution, or a seam exit 8
-(provider unavailable / secondary forge limits). Exit 8 is backoff-and-retry, counted dirty per
-the convention. The streak counter and cap persist in durable state.
+(provider unavailable / secondary forge limits). Exit 8 is backoff-and-retry, counted dirty per the convention: the cycle makes no further provider call, and the next try waits for the reset
+the provider's API budget names ([`tracker-seam.md`](${CLAUDE_PLUGIN_ROOT}/reference/tracker-seam.md) "Gotchas"), never a retry loop. The streak counter and cap persist in durable state.
 
 **Composed budget:** total in-flight subagents ≤ item cap × the per-item dispatch wave cap owned
 by `/implementation:implement-dispatch`, that skill's resolved cap (`--wave-cap` argument, then
@@ -479,11 +478,11 @@ claimable, never closed by this lane, openness means the map exists), are exclud
 cycle-start snapshot, the intake sweep, the exit evaluation, and the post-snapshot intake report.
 The loop never works, closes, or waits on them; an open telemetry issue is the lane operating, not
 backlog, and an open container is lane infrastructure for the same reason, not unresolved backlog
-blocking drain exit.
+blocking drain exit. [reference/mode-drain.md](reference/mode-drain.md) "Cordoned items" owns the drain exits' other exclusion.
 
 ## Next
 
-`/work-items:attend-queue` for the escalations and first-drain ratification items that wait.
+`/work-items:attend-queue` for the escalations that wait.
 
 ## Gotchas
 

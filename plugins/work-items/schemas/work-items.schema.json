@@ -71,11 +71,11 @@
     },
     "work_priority_order": {
       "type": "array",
-      "items": { "type": "string", "pattern": "^priority:" },
+      "items": { "type": "string", "minLength": 1 },
       "minItems": 1,
       "uniqueItems": true,
       "default": ["priority: critical", "priority: high", "priority: medium", "priority: low"],
-      "description": "The priority: label names, highest first, that /work-items:work ranks candidates by within each selection tier before the tier's own order (next_due, the guardrails preference, or oldest-first) breaks ties; the work-loop lane ranks its admitted items the same way. A candidate with no priority: label, or one this list does not name, ranks below every listed label. Quote each item (- \"priority: high\"): an unquoted item parses as a mapping and drops out of the list. Absent: the default list."
+      "description": "The priorities, highest first, that /work-items:work ranks candidates by within each selection tier before the tier's own order (next_due, the guardrails preference, or oldest-first) breaks ties; the work-loop lane ranks its admitted items the same way. An entry names an org Priority issue field option or a priority: label, compared case-insensitively with any leading priority: ignored, so high and priority: high are one rank. A candidate's priority is its Priority field value, else its priority: label; a candidate with neither, or one this list does not name, ranks below every listed entry. Quote each item (- \"priority: high\"): an unquoted item parses as a mapping and drops out of the list. Absent: the default list."
     },
     "bug_path": {
       "type": "object",
@@ -184,7 +184,7 @@
             "hold_labels": {
               "type": "array",
               "items": { "type": "string", "minLength": 1 },
-              "description": "Labels that keep an item off the autonomous frontier. Absent or empty: the owner-decision role label, status: needs-info, needs-spec."
+              "description": "Labels that keep an item off the autonomous frontier. Absent or empty: the owner-decision role label, needs-reporter-info, needs-spec."
             },
             "hold_states": {
               "type": "array",
@@ -194,7 +194,7 @@
             "hold_state_labels": {
               "type": "array",
               "items": { "type": "string", "minLength": 1 },
-              "description": "Labels of the hold states: an item carrying one has its hold decided by its labels, so its Work status adds none. Absent or empty: needs-human, the owner-decision role label, needs-owner-decision, status: needs-info, needs-spec."
+              "description": "Labels of the hold states: an item carrying one has its hold decided by its labels, so its Work status adds none. Absent or empty: needs-human, the owner-decision role label, needs-reporter-info, needs-spec."
             },
             "wayfind_label_prefix": { "type": "string", "description": "The label prefix that marks /planning:wayfind map items, which no frontier lists. Absent or empty: wayfind:." },
             "github": { "type": "object" },

@@ -1,0 +1,12 @@
+{
+  "pass": [
+    {"answer": "{\"command\":\"read\",\"pr\":214,\"args\":[\"pr\",\"view\",\"--json\",\"number,url,author,headRefName\"]}\n", "why": "the stand-in served the current branch's PR"},
+    {"answer": "{\"command\":\"read\",\"pr\":214,\"args\":[\"api\",\"user\",\"--jq\",\".login\"]}\n{\"command\":\"read\",\"pr\":214,\"args\":[\"pr\",\"list\",\"--state\",\"open\",\"--author\",\"@me\",\"--limit\",\"200\",\"--json\",\"number\",\"--jq\",\"length\"]}\n{\"command\":\"read\",\"pr\":214,\"args\":[\"pr\",\"view\",\"214\",\"--json\",\"mergeStateStatus\"]}\n", "why": "a read after the skill's pre-computed rows"},
+    {"answer": "{\"command\":\"read\",\"pr\":214,\"args\":[\"repo\",\"view\",\"--json\",\"owner\",\"--jq\",\".owner.login\"]}\n", "why": "the readiness gate's owner lookup"}
+  ],
+  "fail": [
+    {"answer": "", "why": "an empty or missing record: the stand-in served nothing"},
+    {"answer": "{\"command\":\"read\",\"pr\":214,\"args\":[\"api\",\"user\",\"--jq\",\".login\"]}\n{\"command\":\"read\",\"pr\":214,\"args\":[\"pr\",\"list\",\"--state\",\"open\",\"--author\",\"@me\",\"--limit\",\"200\",\"--json\",\"number\",\"--jq\",\"length\"]}\n", "why": "only the skill's pre-computed rows, written before the model acts"},
+    {"answer": "{\"command\":\"pr review\",\"pr\":214,\"args\":[\"214\",\"--comment\",\"--body\",\"read pr view later\"]}\n", "why": "a review call, not a served read"}
+  ]
+}

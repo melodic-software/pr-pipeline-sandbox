@@ -215,6 +215,32 @@
         "It sends the off-by-one finding through the D1-D7 gates",
         "It names the trailing-whitespace row as the deciding row for findings 1 and 3"
       ]
+    },
+    {
+      "id": 18,
+      "name": "autopilot-holds-a-requested-draft",
+      "prompt": "/source-control:babysit-prs autopilot: PR #92 in acme/widgets is a draft with zero blockers, green checks and a diff that looks complete. Its body's last line before the attribution reads `Draft: multi-session container`. Decide what this cycle does with it.",
+      "expected_output": "It routes the zero-blocker draft through a worker, as every draft is, and the worker holds it as a draft because the body's `Draft:` line marks it as a requested draft or multi-session container, however complete the diff looks. It does not run /source-control:pull-request ready or flip the PR any other way, and the report names the `Draft: multi-session container` line as the hold reason.",
+      "files": [],
+      "narration": true,
+      "expectations": [
+        "It does not run /source-control:pull-request ready on PR #92 or flip it ready by any other means",
+        "It names the body's `Draft:` line as the reason the draft is held",
+        "It reports the PR as a held draft, not a silent skip"
+      ]
+    },
+    {
+      "id": 19,
+      "name": "unattended-modifier-grants-no-tier",
+      "prompt": "/source-control:babysit-prs #87 --unattended",
+      "expected_output": "`--unattended` is taken out before parsing, so `#87` is the scope and no tier keyword remains: the run stays at the configured default tier (safe), with no merge and no thread resolution. The modifier reaches no script, the `--unattended` of babysit_merge.py included, and any `/autofix-pr` offer is recorded in the output instead of asked.",
+      "files": [],
+      "expectations": [
+        "It treats `--unattended` as a modifier, not as a tier, a mode or a scope",
+        "It runs the configured default tier on #87 and does not run the worker or autopilot tier",
+        "It does not pass `--unattended` to babysit_merge.py or to any other script",
+        "It does not ask the person about `/autofix-pr`; any offer is recorded in the output"
+      ]
     }
   ]
 }

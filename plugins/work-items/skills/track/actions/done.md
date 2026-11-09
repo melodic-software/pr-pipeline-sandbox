@@ -18,15 +18,12 @@ Close a work item with a completion comment.
 
 1. **Resolve the item.** Every item read and write below targets the item's own repository (the qualified ID's `<owner>/<repo>`, else the current one). If a qualified ID (`<provider>:<owner>/<repo>#<n>`) or a number is given, use it directly. If text, search open items (adapter: "Search items").
 
-1. **Check if recurring.** Read `.github/recurring-schedule.json` and check if the item's title matches any recurring item. Items created by the recurring-issues automation have a `[Maintenance]` prefix, so strip it before comparing. Skip gracefully when the repo has no recurring schedule:
+1. **Check if recurring.** Read the item's body and labels (adapter: "View item"). When it carries the resolved `recurring-maintenance` label (`config.role_labels["recurring-maintenance"]` from the binding, default `recurring`) and its body has a `<!-- recurring-schedule id=<id> -->` line ([`reference/issue-conventions.md`](../../../reference/issue-conventions.md) "Recurring marker"), check that `<id>` against `.github/recurring-schedule.json`; the title plays no part. Skip gracefully when the repo has no recurring schedule:
 
 ```bash
 SCHEDULE="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/.github/recurring-schedule.json"
 if [[ -f "$SCHEDULE" ]]; then
-  jq --arg title "<item title>" '
-    ($title | ltrimstr("[Maintenance] ")) as $stripped |
-    [.items[] | select(.title == $stripped or .title == $title or .id == "<kebab-id>")] | length
-  ' "$SCHEDULE"
+  jq --arg id "<id from the marker>" '[.items[] | select(.id == $id)] | length' "$SCHEDULE"
 else
   echo 0  # no recurring schedule configured
 fi
@@ -48,7 +45,7 @@ The summary is institutional memory someone reads later, so lead with what was d
    - **This item's `closes` line is present (or the keyword step just added it)** → do NOT close manually: post the completion summary as a plain comment (adapter: "Comment on item") and report "will auto-close when #{pr} merges".
    - **The PR body carries a deliberate opt-out for THIS item (its `refs` line, any other opt-out marker the adapter "PR closing-keyword mechanics" section lists such as GitHub's `Refs #<num>`, or `No related issue:`), or `closes` is `null`, so a merge will NOT close it** → do NOT claim auto-close. Post the completion comment and leave the item open, reporting that #{pr} will not close it. For an opt-out, which was intentional, ask the user if they actually want it closed; for a `null` `closes`, close it with this action once the PR merges. A closing line for a *different* item never counts as this item's auto-close.
 
-   Closing now would mark the item done before the work has landed. A failed or abandoned PR would leave it wrongly closed. Close directly (adapter: "Close item", WRITE via the adapter's identity policy), passing the closing comment and `--reason completed` (or `not planned` for `--not-planned`), ONLY when there is no `--pr` or the named PR has already merged.
+   Closing now would mark the item done before the work has landed. A failed or abandoned PR would leave it wrongly closed. Before any direct close, run "Dependents on close" in [`reference/issue-conventions.md`](../../../reference/issue-conventions.md); a `completed` close is the delivered case. Close directly (adapter: "Close item", WRITE via the adapter's identity policy), passing the closing comment and `--reason completed` (or `not planned` for `--not-planned`), ONLY when there is no `--pr` or the named PR has already merged.
 
    The seam claim is a lease (assignee + lease comment), not a label. Closing removes the item from the frontier, so no `status:*` label cleanup is part of this flow.
 

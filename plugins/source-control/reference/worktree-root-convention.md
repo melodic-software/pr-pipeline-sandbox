@@ -1,8 +1,7 @@
 # Worktree root convention: `worktreeroot.path`
 
 Owner doc for the fleet's worktree-placement convention. The machine truth is
-a **git config key**, so the convention is readable by anything that can run
-`git config --get`: humans, scripts, CI, and every agent, not just this
+a **git config key**, readable by anything that can run `git config --get`: humans, scripts, CI, and every agent, not just this
 plugin. Prose surfaces (a repository's `AGENTS.md` / `CLAUDE.md`, skill text)
 should **cite this key, never copy the path**: restating the path in several
 places is the drift a git-config-readable convention exists to prevent.
@@ -15,10 +14,10 @@ places is the drift a git-config-readable convention exists to prevent.
 ```
 
 - **Name:** `worktreeroot.path`. Deliberately NOT under `worktree.*`,
-  because git owns that namespace (`worktree.guessRemote`,
-  `worktree.useRelativePaths`; git-worktree(1) Configuration). git-config(1)
-  Variables invites third-party tools to invent their own variables, provided
-  they do not collide with Git or other popular tools and are documented.
+  which git owns (`worktree.guessRemote`, `worktree.useRelativePaths`;
+  git-worktree(1) Configuration). git-config(1) Variables invites third-party
+  tools to invent their own variables if they do not collide with Git or other
+  popular tools and are documented.
   Popular tools typically name the section after the tool (`ghq.root`,
   `git-town.*`, `lfs.*`, `wt.basedir`); a publisher-named key is an
   org-agnosticism defect, and a plugin-named key still couples consumers to
@@ -32,9 +31,11 @@ places is the drift a git-config-readable convention exists to prevent.
   and unsets it. Delete that peel after 2026-12-31. Fleet audit stays read-only
   and does not write.
 - **Value:** a directory OUTSIDE every repository, and outside
-  repository-discovery roots such as a ghq root (`ghq list` enumerates each
-  worktree there as a repository of its own; a leading dot does not hide it).
-  On Windows, the same drive as the repositories it serves.
+  repository-discovery roots such as a ghq root. For what ghq discovers under
+  its root, see the `list` entry under COMMANDS in the
+  [ghq README](https://github.com/x-motemen/ghq#commands) (as of 2026-11-03;
+  recheck when that entry changes what `ghq list` enumerates). On Windows, the
+  same drive as the repositories it serves.
 
 ## Reading it (any consumer)
 
@@ -69,19 +70,19 @@ Two hazards, both verified on git 2.55 in #2610 and both silent:
    plugin can read the option while every consumer can read the key.
 4. The plugin data directory (`--data-root-file` → `<data-dir>/worktrees`).
 5. Absent all: refuse (exit 3). Never the in-repo `.claude/worktrees/`.
-   [The nesting invariant](../skills/worktree/SKILL.md) the `worktree` skill
+   [The nesting invariant](../skills/worktree/reference/nesting-invariant.md) the `worktree` skill
    publishes owns that claim.
 
 Whatever rung supplies the root, the helper's containment guard then rejects
-a root that itself resolves inside a working tree or a git directory. A
+a root that itself resolves inside a working tree or a git directory: a
 misconfigured key is a refusal, not a licensed nesting.
 
 Enforcement hooks: `hooks/worktree-create-gate.sh` (harness-driven
 creations) and `hooks/worktree-add-containment-gate.sh` (a raw Bash
 `git worktree add` targeting a path inside a repository, #2611).
 `EnterWorktree(name:)` is not a Bash call and lands in the in-repo default;
-the skill is contractually forbidden from calling the name form, and
-harness-driven creation is covered by the `WorktreeCreate` hook. That pair
+the skill is contractually forbidden from calling the name form, and the
+`WorktreeCreate` hook covers harness-driven creation. That pair
 is this plugin's handling of the `EnterWorktree(name:)` gap. Pointers:
 [worktrees: ask Claude to create a worktree](https://code.claude.com/docs/en/worktrees#ask-claude-to-create-a-worktree)
 for where the name form lands, and
@@ -124,16 +125,17 @@ so last-wins picks it up) alongside the identity keys. Verified properties
   `$GIT_DIR` is always under its main repository, so a tree-anchored
   `gitdir:` gives every worktree of a repository the same answer. Corollary:
   a pattern anchored at a worktree's own tree path matches nothing, ever.
-  That presents as "includeIf is broken", and it is the likely first
-  misdiagnosis.
+  That presents as "includeIf is broken", the likely first misdiagnosis.
 
 ### Hazards (all fail silently: rc=0, zero stderr)
 
-- **Use `gitdir/i:` for the identity layer, not `hasconfig:`.** libgit2
-  clients (gitui, TortoiseGit, git2/nodegit/pygit2) implement `gitdir:`,
-  `gitdir/i:`, `onbranch:` but NOT `hasconfig:`, and fail unrecognized
-  conditions silently; JGit and go-git resolve no `includeIf` at all.
-  `hasconfig:` is fine for `worktreeroot.*`, which only CLI-shelling tools read.
+- **Use `gitdir/i:` for the identity layer, not `hasconfig:`.** Git clients
+  other than the CLI read the identity layer too, and their condition support
+  is their own. `hasconfig:` is fine for `worktreeroot.*`, which only
+  CLI-shelling tools read. For the conditions git defines, see
+  [git-config: Conditional includes](https://git-scm.com/docs/git-config#_conditional_includes),
+  and check a client's own docs before relying on one there (as of 2026-11-03;
+  recheck when that section adds or changes a condition keyword).
 - **`gitdir:` is case-sensitive even on case-insensitive NTFS.** Only the
   pattern author's spelling matters. Always `gitdir/i:` on Windows.
 - **Precedence is parse order, not specificity.** A plain
@@ -156,12 +158,15 @@ so last-wins picks it up) alongside the identity keys. Verified properties
 - **Per-worktree overrides need `config.worktree`** behind
   `extensions.worktreeConfig`, since no `gitdir:` pattern can distinguish two
   worktrees of one repository.
-- **Identity includes must set more than `user.email`.** `user.signingkey`,
-  `gpg.ssh.allowedSignersFile`, `core.sshCommand`, and `url.*.insteadOf` all
-  leak from global otherwise, and a wrong SSH signing key **verifies Good
-  locally** (git derives the principal from the signature; only the forge
-  shows Unverified). `user.useConfigOnly` is inert if a global `user.email`
-  exists.
+- **Identity includes must set more than `user.email`.** Every
+  identity-bearing key an include leaves unset falls through to the global
+  value. The template above keeps `user.email` out of the global file for the
+  same reason, so `user.useConfigOnly` can do its job. For which keys carry
+  identity (signing, SSH and URL rewriting among them) and what
+  `user.useConfigOnly` does, see
+  [git-config: Variables](https://git-scm.com/docs/git-config#_variables) (as
+  of 2026-11-03; recheck when that section changes a `user.*`, `gpg.*`,
+  `core.sshCommand` or `url.*` entry).
 
 ## Doctor
 
