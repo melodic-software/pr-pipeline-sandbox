@@ -9,13 +9,25 @@
 // --window-start restarts the evidence window after a demotion: the checker reads a copy of the
 // evidence source, written to a fresh temporary directory outside the checkout and every
 // worktree root and removed on exit, with one gate-failure event per promotable cell at that
-// instant appended, so a cell stays unpromoted until it is re-ratified after it. An empty or
-// malformed value, or a source that cannot be read as a JSON array, fails closed.
+// instant appended, so a cell stays unpromoted until the source holds a `re-earned` event for it
+// whose `since` is at or after that instant (the publisher's `since` is the later of the demotion
+// record's creation and its discovery, so it never precedes the restart). An empty or malformed
+// value, or a source that cannot be read as a JSON array, fails closed.
+// Every cell that resolves promoted under --window-start is a re-earn, so the source must also be
+// fresh: its sidecar (evidence.json -> evidence.meta.json, written by
+// publish-promotion-evidence.mjs) must hold the source's sha256 and a generated_at no older than
+// promotion_evidence_max_age_hours, a positive whole number read from settings like the options
+// below. An unset or malformed bound, a missing, mismatched or lane-writable sidecar, or a stale
+// generated_at fails closed, so a demoted cell stays demoted while the publisher is not running.
+// Without --window-start a `re-earned` event in the source can still lift a contrary event the
+// file holds, so a source that reads as a JSON array holding any `re-earned` event must pass the
+// same freshness test; one that does not read as a JSON array goes to the checker, which reports
+// it unavailable.
 //
 // The four bootstrap values (promotion_evidence_binding, promotion_evidence_root,
 // promotion_evidence_source, promotion_evidence_checker) are not arguments: the helper reads
 // them from the operator's own managed and user settings (operator-options.mjs, channel F
-// of docs/conventions/hook-config-delivery), so a path the caller chose cannot stand in for
+// of docs/contracts/hook-config-delivery), so a path the caller chose cannot stand in for
 // one, and the CLAUDE_PLUGIN_OPTION_* mirror and repository files are never read for them. The
 // optional fifth, promotion_evidence_credential_roots, read the same way, becomes the checker's
 // --credential-roots when set; a malformed entry fails closed (credentialRootsArgs).
@@ -38,26 +50,9 @@
 // values from a repository's settings env block never reach it. It reports only what the
 // checker printed and never re-derives the resolution algorithm. It writes no file but the
 // --window-start copy and reads nothing in the checkout.
-//
-// Inline mode, for the CI pr-merge lane, computes the events instead of reading a file:
-//   node resolve-promotion-evidence.mjs --inline --repo <owner/name> --binding <file> --checker <file>
-//     --probe-evidence-root <dir> --lane-login <login> [--lane-login ...] --gate-check <name> [--gate-check ...]
-//     [--credential-roots <path,...>] [--missed-blocking-label <name>] [--window-start <ISO>]
-// It runs publish-promotion-evidence.mjs collect() (its report-mode GitHub reads, through `gh` and
-// GH_TOKEN) from 5 days before the earliest ratified_at of a cell the binding bounds promoted
-// (LOOKBACK_DAYS) through now, and pipes the events to the checker as `--evidence -`. It prints the same JSON and exits 0, fail-closed
-// included, with source "github:<owner/name>" and the arguments under options (scope "argument").
-// The arguments are trusted as given: its caller is a workflow running from the default branch
-// (reference/promotion-evidence-resolution.md, "Inline mode"), so none of the settings, checkout or
-// writability rules above apply. It also fails closed on a missing or malformed argument; a binding
-// with no promoted cell or a promoted cell with no ISO 8601 ratified_at ("epoch-start-missing:");
-// an epoch start more than 85 days before now ("epoch-start-expired:"); a --repo other than a set
-// GITHUB_REPOSITORY ("repo-mismatch:"); a publisher that cannot be imported
-// ("publisher-unavailable:"); a deleted run or issue the publisher finds in the window
-// ("run-deleted:", "issue-deleted:", "issue-missing:"); and any GitHub read that fails
-// ("github-read-failed:").
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { accessSync, constants, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -65,6 +60,23 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { managedSettingsFiles, OptionsError, readOperatorOptions, resolveInstall } from "./operator-options.mjs";
+
+// The first four are required; promotion_evidence_credential_roots is optional, and unset it
+// passes the checker no --credential-roots. promotion_evidence_max_age_hours is required only
+// with --window-start or when the source holds a `re-earned` event.
+export const OPTION_KEYS = [
+  "promotion_evidence_binding",
+  "promotion_evidence_root",
+  "promotion_evidence_source",
+  "promotion_evidence_checker",
+  "promotion_evidence_credential_roots",
+  "promotion_evidence_max_age_hours",
+];
+const MAX_AGE = "promotion_evidence_max_age_hours";
+const HOUR_MS = 3_600_000;
+// How far the publisher's clock may run ahead of this host's before a generated_at reads as
+// forged: a future one would keep the evidence fresh past the bound.
+const CLOCK_SKEW_MS = 300_000;
 
 const PROMOTABLE_CELLS = ["C2-auto-merge", "C3-auto-merge", "C3-ai-review-blocking"];
 const BLOCK_HEADER = "Effective promotion state (evaluation mode):";
@@ -180,17 +192,66 @@ function isStrictIso(value) {
 
 const restartEvents = (events, at) => [...events, ...PROMOTABLE_CELLS.map((cell) => ({ cell, event: "gate-failure", at }))];
 
-// The source's events plus one gate-failure per promotable cell at `at`, written outside every
-// root and removed on exit.
-function restartedCopy(path, at, roots) {
-  if (!isStrictIso(at)) emit(source, `--window-start ${JSON.stringify(at)} is not an ISO 8601 date-time with an offset`);
+// Fails closed unless the publisher's sidecar describes `text`, the source as read, and its
+// generated_at is within the operator's age bound of now.
+function requireFresh(path, text, judge) {
+  const bound = options[MAX_AGE]?.value?.trim();
+  if (!bound) emit(source, `${MAX_AGE} not set in managed or user settings, so a re-earn cannot be read`);
+  if (!/^[1-9]\d{0,5}$/.test(bound)) emit(source, `${MAX_AGE} ${JSON.stringify(bound)} is not a whole number of hours from 1 to 999999`);
+  refuseLaneWritable(options[MAX_AGE].file, options[MAX_AGE].file, judge);
+  const sidecar = `${path.replace(/\.json$/, "")}.meta.json`;
+  let meta;
+  try {
+    meta = JSON.parse(readFileSync(sidecar, "utf8"));
+  } catch (error) {
+    emit(source, `promotion_evidence_source ${path} has no readable sidecar ${sidecar} (${error.code ?? error.message})`);
+  }
+  refuseLaneWritable(sidecar, sidecar, judge);
+  if (meta?.sha256 !== createHash("sha256").update(text).digest("hex")) {
+    emit(source, `the sidecar ${sidecar} does not hold the sha256 of promotion_evidence_source ${path}`);
+  }
+  const generatedAt = meta.generated_at;
+  if (typeof generatedAt !== "string" || !isStrictIso(generatedAt)) {
+    emit(source, `the sidecar ${sidecar} has no ISO 8601 generated_at: ${JSON.stringify(generatedAt)}`);
+  }
+  const age = Date.now() - Date.parse(generatedAt);
+  if (age < -CLOCK_SKEW_MS) emit(source, `the sidecar ${sidecar} has a generated_at ${generatedAt} in the future`);
+  if (age > Number(bound) * HOUR_MS) {
+    emit(source, `promotion_evidence_source ${path} is stale: generated_at ${generatedAt} is older than ${MAX_AGE} ${bound}`);
+  }
+}
+
+// The source as given, once a source holding a `re-earned` event has passed requireFresh: without
+// --window-start such an event lifts a contrary event the file holds with no demotion record, so
+// a stale file must not keep its cell promoted. A source that does not read as a JSON array is
+// left to the checker, which reports it unavailable.
+function checkedSource(path, judge) {
+  let text;
   let events;
   try {
-    events = JSON.parse(readFileSync(path, "utf8"));
+    text = readFileSync(path, "utf8");
+    events = JSON.parse(text);
+  } catch {
+    return path;
+  }
+  if (Array.isArray(events) && events.some((event) => event?.event === "re-earned")) requireFresh(path, text, judge);
+  return path;
+}
+
+// The source's events plus one gate-failure per promotable cell at `at`, written outside every
+// root and removed on exit.
+function restartedCopy(path, at, roots, judge) {
+  if (!isStrictIso(at)) emit(source, `--window-start ${JSON.stringify(at)} is not an ISO 8601 date-time with an offset`);
+  let text;
+  let events;
+  try {
+    text = readFileSync(path, "utf8");
+    events = JSON.parse(text);
   } catch (error) {
     emit(source, `promotion_evidence_source ${path} cannot be read as JSON (${error.code ?? error.message})`);
   }
   if (!Array.isArray(events)) emit(source, `promotion_evidence_source ${path} is not a JSON array`);
+  requireFresh(path, text, judge);
   const dir = realpathSync.native(mkdtempSync(join(tmpdir(), "promotion-evidence-")));
   process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
   for (const root of roots) {
@@ -266,7 +327,7 @@ export function main({ platform = process.platform, ...judge } = {}) {
   // never from the environment.
   const pluginRoot = resolve(dirname(realpathSync.native(fileURLToPath(import.meta.url))), "..", "..", "..");
   try {
-    options = readOperatorOptions(resolveInstall(pluginRoot), managedSettingsFiles());
+    options = readOperatorOptions(resolveInstall(pluginRoot), managedSettingsFiles(), OPTION_KEYS);
   } catch (error) {
     if (!(error instanceof OptionsError)) throw error;
     emit(null, error.message);
@@ -295,7 +356,7 @@ export function main({ platform = process.platform, ...judge } = {}) {
   const probeRoot = option("promotion_evidence_root", roots);
   const sourcePath = option("promotion_evidence_source", roots);
   const evidence =
-    values["window-start"] === undefined ? sourcePath : restartedCopy(sourcePath, values["window-start"], roots);
+    values["window-start"] === undefined ? checkedSource(sourcePath, judge) : restartedCopy(sourcePath, values["window-start"], roots, judge);
   // The roots name the probe host, so only the settings file that set them is judged.
   const credentialSetting = options.promotion_evidence_credential_roots;
   if (credentialSetting) refuseLaneWritable(credentialSetting.file, credentialSetting.file, judge);
@@ -303,8 +364,8 @@ export function main({ platform = process.platform, ...judge } = {}) {
   emitVerdict(runChecker(checker, [binding, "--evidence", evidence, "--probe-evidence-root", probeRoot, ...credentialRoots]));
 }
 
-// The checker, run with an allowlisted environment; `input`, when given, is its stdin.
-function runChecker(checker, args, input) {
+// The checker, run with an allowlisted environment.
+function runChecker(checker, args) {
   const checkerEnv = Object.fromEntries(
     CHECKER_ENV_KEYS.filter((key) => key in process.env).map((key) => [key, process.env[key]]),
   );
@@ -315,7 +376,6 @@ function runChecker(checker, args, input) {
     shell: false,
     timeout: TIMEOUT_MS,
     maxBuffer: 16 * 1024 * 1024,
-    input,
   });
 }
 
@@ -343,117 +403,6 @@ function emitVerdict(run) {
   emit(source, null, printed);
 }
 
-// GitHub keeps a public repository's workflow runs, checks and commit statuses at most 90 days
-// (reference/promotion-evidence-resolution.md, "Inline mode"); 5 days of margin.
-const EPOCH_MAX_AGE_DAYS = 85;
-const DAY_MS = 86_400_000;
-// Merges are read from this far before the epoch, so a merge made just before it whose post-merge
-// gate fails inside it still yields that event; the checker ignores the pre-epoch events this
-// also finds. The publisher's 6-hour dispatch deadline is no bound here: a red run counts until
-// the merge is verified, for merges inside the lookback. The margin keeps every read within the
-// 90 days, so a still-unverified merge older than the lookback whose run goes red inside the epoch
-// yields no event (reference/promotion-evidence-resolution.md, "Inline mode").
-const LOOKBACK_DAYS = 90 - EPOCH_MAX_AGE_DAYS;
-
-// The earliest ratified_at among the binding's cells bound promoted: the instant from which every
-// contrary event must still be readable.
-function epochStart(path) {
-  let binding;
-  try {
-    binding = JSON.parse(readFileSync(path, "utf8"));
-  } catch (error) {
-    emit(source, `--binding ${path} cannot be read as JSON (${error.code ?? error.message})`);
-  }
-  const promoted = Object.entries(binding?.promotion_state ?? {}).filter(([, entry]) => entry?.state === "promoted");
-  if (promoted.length === 0) emit(source, "epoch-start-missing: no cell is bound promoted");
-  for (const [cell, entry] of promoted) {
-    if (typeof entry.ratified_at !== "string" || !isStrictIso(entry.ratified_at)) {
-      emit(source, `epoch-start-missing: ${cell} is bound promoted with no ISO 8601 ratified_at`);
-    }
-  }
-  return Math.min(...promoted.map(([, entry]) => Date.parse(entry.ratified_at)));
-}
-
-// gh and now are the test seam; the CLI entry below passes neither.
-export async function inline({ argv = process.argv.slice(3), gh, now = Date.now() } = {}) {
-  let values;
-  try {
-    ({ values } = parseArgs({
-      args: argv,
-      options: {
-        repo: { type: "string" },
-        binding: { type: "string" },
-        checker: { type: "string" },
-        "probe-evidence-root": { type: "string" },
-        "credential-roots": { type: "string" },
-        "lane-login": { type: "string", multiple: true, default: [] },
-        "gate-check": { type: "string", multiple: true, default: [] },
-        "missed-blocking-label": { type: "string" },
-        "window-start": { type: "string" },
-      },
-      strict: true,
-      allowPositionals: false,
-    }));
-  } catch (error) {
-    emit(null, `usage: ${error.message}`);
-  }
-  if (!/^[\w.-]+\/[\w.-]+$/.test(values.repo ?? "") || values["lane-login"].length === 0 || values["gate-check"].length === 0) {
-    emit(null, "usage: --inline needs --repo <owner/name>, --binding, --checker, --probe-evidence-root, and at least one --lane-login and --gate-check");
-  }
-  source = `github:${values.repo}`;
-  // In Actions, a repository other than the run's own would read no merges and so no demotions.
-  const own = process.env.GITHUB_REPOSITORY;
-  if (own && values.repo !== own) emit(source, `repo-mismatch: --repo ${values.repo} is not GITHUB_REPOSITORY ${own}`);
-  const supplied = {
-    promotion_evidence_binding: values.binding,
-    promotion_evidence_root: values["probe-evidence-root"],
-    promotion_evidence_checker: values.checker,
-    promotion_evidence_credential_roots: values["credential-roots"],
-  };
-  options = Object.fromEntries(
-    Object.entries(supplied)
-      .filter(([, value]) => value !== undefined)
-      .map(([key, value]) => [key, { value, scope: "argument", file: null }]),
-  );
-
-  const checker = resolveInput("--checker", values.checker, []);
-  const binding = resolveInput("--binding", values.binding, []);
-  const probeRoot = resolveInput("--probe-evidence-root", values["probe-evidence-root"], []);
-  const credentialRoots = credentialRootsArgs(values["credential-roots"], []);
-  const epoch = epochStart(binding);
-  if (now - epoch > EPOCH_MAX_AGE_DAYS * DAY_MS) {
-    emit(
-      source,
-      `epoch-start-expired: the promotion epoch started ${new Date(epoch).toISOString()}, over ${EPOCH_MAX_AGE_DAYS} days ago, and GitHub may already have deleted contrary evidence from its start`,
-    );
-  }
-  const at = values["window-start"];
-  if (at !== undefined && !isStrictIso(at)) emit(source, `--window-start ${JSON.stringify(at)} is not an ISO 8601 date-time with an offset`);
-
-  let collect;
-  try {
-    ({ collect } = await import("./publish-promotion-evidence.mjs"));
-  } catch (error) {
-    emit(source, `publisher-unavailable: ${error.message}`);
-  }
-  let events;
-  try {
-    ({ events } = collect({
-      repo: values.repo,
-      since: new Date(epoch - LOOKBACK_DAYS * DAY_MS).toISOString(),
-      through: new Date(now).toISOString(),
-      laneLogins: values["lane-login"],
-      gateChecks: values["gate-check"],
-      missedBlockingLabel: values["missed-blocking-label"],
-      ...(gh ? { gh } : {}),
-    }));
-  } catch (error) {
-    emit(source, error.failClosedReason ?? `github-read-failed: ${error.message}`);
-  }
-  const evidence = at === undefined ? events : restartEvents(events, at);
-  emitVerdict(runChecker(checker, [binding, "--evidence", "-", "--probe-evidence-root", probeRoot, ...credentialRoots], JSON.stringify(evidence)));
-}
-
 function isEntry() {
   try {
     return realpathSync.native(process.argv[1]) === realpathSync.native(fileURLToPath(import.meta.url));
@@ -461,7 +410,4 @@ function isEntry() {
     return false;
   }
 }
-if (isEntry()) {
-  if (process.argv[2] === "--inline") await inline();
-  else main();
-}
+if (isEntry()) main();

@@ -10,15 +10,15 @@ metadata:
 
 ## Variables
 
-Arguments: `$ARGUMENTS`. `[stats|list|add|start|done|due|recheck|search|audit|publish-plan|link|view|edit|changes|labels|help] [args]`. The default action is stats. The actions are stats, list, add, start, done, due, recheck, search, audit, publish-plan, link, view, edit, changes, labels, and help.
+Arguments: `$ARGUMENTS`. `[stats|list|add|start|done|due|recheck|search|audit|publish-plan|link|view|edit|changes|labels|help] [args]`. The default action is stats.
 
 ## Shared tracker context
 
 The seam, operation routing, label taxonomy, canonical-role remapping, recurring schedule, and
 memory-tier write rule that every work-items skill relies on live in
 [`${CLAUDE_PLUGIN_ROOT}/reference/tracker-seam.md`](${CLAUDE_PLUGIN_ROOT}/reference/tracker-seam.md)
-(and the references it links). Read it at the start of an invocation. Two invariants bear on the
-actions below in particular:
+(and the references it links). Read it at the start of an invocation. Two invariants bind the
+actions below:
 
 - **Provider-neutral over the seam.** Coordination goes through
   `${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/work-item-tracker.sh <verb>`; provider mechanics (filtered listing,
@@ -26,17 +26,18 @@ actions below in particular:
   reference. The core inlines no provider commands.
 - **Role-label resolution is an action-entry invariant.** `add`, `due`, `recheck`, and `audit`
   query, create, or filter items by a canonical role. Resolve each role from
-  `.work-item-tracker.json` `config.role_labels` at action entry and use the resolved strings in
+  `config.role_labels` of the binding the seam resolves (the `tracker` mapping of
+  `<home>/work-items.yaml`, else the legacy repo-root JSON binding) at action entry and use the resolved strings in
   every query. An absent file or entry falls back to the documented default without a warning (a
   conforming binding omits entries that keep their default); a present malformed, empty, or
   non-string value is a hard stop.
 
-`add` and `recheck` also draw on reference files the seam doc above does not itself carry:
+`add` and `recheck` also read:
 
 - [`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md):
   the label structure `add` validates against and `list --category` filters by.
 - [`${CLAUDE_PLUGIN_ROOT}/reference/issue-conventions.md`](${CLAUDE_PLUGIN_ROOT}/reference/issue-conventions.md):
-  the title convention `add` applies.
+  the item shape `add` follows; its title rule points at the house style.
 - [`${CLAUDE_PLUGIN_ROOT}/reference/agent-brief.md`](${CLAUDE_PLUGIN_ROOT}/reference/agent-brief.md):
   the brief template `add --agent-ready` uses instead of the default body.
 - [`${CLAUDE_PLUGIN_ROOT}/reference/standing-item-preconditions.md`](${CLAUDE_PLUGIN_ROOT}/reference/standing-item-preconditions.md):
@@ -44,17 +45,13 @@ actions below in particular:
 
 ## Scope
 
-`track` is the centralized, concurrent-safe backlog-CRUD surface: create, claim, close, list,
-search, dashboard, and the recurring-schedule checks. It keeps a sub-action router over the verbs
-in the table below.
-Auto-selecting and executing one item is the sibling `/work-items:work` skill; raw-intake
-evaluation is `/work-items:triage`; plan decomposition is `/work-items:decompose`; the codebase
-marker sweep is `/work-items:scan-todos`.
+`track` is the concurrent-safe backlog-CRUD surface, routed by the action table below. Selecting
+and executing one item, raw-intake evaluation, plan decomposition and the marker sweep belong to
+the sibling skills under "Sibling-skill verbs".
 
 ## Emit checklist
 
-For the multi-step actions (`add`, `start`, `done`, `recheck`), instruct the agent to copy the
-matching action section of
+For the multi-step actions (`add`, `start`, `done`, `recheck`), copy the matching action section of
 [`${CLAUDE_PLUGIN_ROOT}/templates/checklist.md`](${CLAUDE_PLUGIN_ROOT}/templates/checklist.md) into
 `<memory_dir>/<slug>/work-items-checklist.md` (default `.work/`), a memory-tier write
 ([`${CLAUDE_PLUGIN_ROOT}/reference/tracker-seam.md`](${CLAUDE_PLUGIN_ROOT}/reference/tracker-seam.md)
@@ -94,6 +91,5 @@ If `$ARGUMENTS` is empty, run `stats` (the default dashboard). If the action is 
 action table.
 
 **Sibling-skill verbs.** `work`, `triage`, `decompose`, and `scan` are standalone skills, not
-`track` sub-actions. If `$ARGUMENTS` names one of them, point the user
-at the skill instead of erroring: `work` → `/work-items:work`, `triage` → `/work-items:triage`,
+`track` sub-actions. If `$ARGUMENTS` names one, point the user at the skill instead of erroring: `work` → `/work-items:work`, `triage` → `/work-items:triage`,
 `decompose` → `/work-items:decompose`, `scan` → `/work-items:scan-todos`.

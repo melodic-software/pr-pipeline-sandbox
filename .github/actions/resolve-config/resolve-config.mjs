@@ -12,10 +12,10 @@ import {
   createGitHub,
   paginate,
 } from "../check-trusted-trigger/check-trusted-trigger.mjs";
-import { issueStatus } from "./issue-status.mjs";
+import { issueStatus, issueStatusSetter } from "./issue-status.mjs";
 import { checkPatchRules } from "./patch-rules.mjs";
 import { pipelineEvent } from "./predicate.mjs";
-import { statusLabels } from "./read-status.mjs";
+import { DISAGREEMENT_WAIT_MS, fieldStatusSetter, statusLabels } from "./read-status.mjs";
 import {
   checkAppliedBySupported,
   checkConfigPath,
@@ -178,6 +178,11 @@ export const MAX_ISSUE_PAGES = 20;
 // Work status setter is the newest Work status event among them, and a field
 // value with none among a full window throws rather than read as unset.
 const LISTED_FIELD_EVENTS = 100;
+// Issues per listing whose Work status disagrees in the listing and is read
+// again alone (read-status.mjs fieldStatusSetter): 10. Each re-read costs two
+// calls, or four and a 3 s wait when it disagrees once more; an eleventh
+// disagreeing issue is left out unread.
+export const MAX_STATUS_REREADS = 10;
 const OPEN_ISSUES = `query($owner: String!, $name: String!, $cursor: String, $since: DateTime) {
   repository(owner: $owner, name: $name) {
     issues(states: OPEN, first: 100, after: $cursor, filterBy: { since: $since }) {
@@ -205,12 +210,24 @@ ${FIELD_FRAGMENTS}`;
 // it. A field value is read by its option name, a state name; a counted name
 // `config` does not map throws `unmapped-status`. More than MAX_ISSUE_PAGES
 // pages, a GraphQL error, a malformed answer or a Work status value whose
-// setter falls outside LISTED_FIELD_EVENTS throws.
-export async function issuesByStatus(github, repository, states, { since, config, trustedActors } = {}) {
+// setter falls outside LISTED_FIELD_EVENTS throws. An issue whose listed value
+// and events disagree (StatusDisagreement), since the listing's events can
+// lag, is read again alone (fieldStatusSetter, which waits with `sleep`) and
+// that read decides; a re-read that fails otherwise throws. One that still
+// disagrees, a write still landing, or any past MAX_STATUS_REREADS (not read
+// again) is left out of the result, logged as a ::notice::, and named in the
+// result's non-enumerable `held`, each {number, created_at, reason}, so one
+// issue mid-write fails only itself; a caller that must not undercount reads
+// `held`.
+export async function issuesByStatus(github, repository, states, { since, config, trustedActors, sleep = wait } = {}) {
   const [owner, name] = repository.split("/");
   const option = Object.fromEntries(Object.entries(config.options).map(([id, state]) => [state, Number(id)]));
   const wanted = new Set(states.flatMap((state) => config.labels[state] ?? []).map((label) => label.toLowerCase()));
+  const statusField = String(config["field-id"]);
   const found = [];
+  const held = [];
+  Object.defineProperty(found, "held", { value: held });
+  let rereads = 0;
   let cursor = null;
   for (let page = 1; page <= MAX_ISSUE_PAGES; page += 1) {
     const answer = await github("POST", "/graphql", { query: OPEN_ISSUES, variables: { owner, name, cursor, since: since ?? null } });
@@ -224,6 +241,7 @@ export async function issuesByStatus(github, repository, states, { since, config
     }
     for (const node of issues.nodes) {
       const labels = (node?.labels?.nodes ?? []).map((label) => label?.name).filter((label) => typeof label === "string");
+      const labeled = labels.some((label) => wanted.has(label.toLowerCase()));
       const fieldValues = (node?.issueFieldValues?.nodes ?? [])
         .filter((value) => typeof value?.name === "string" && typeof value.field?.fullDatabaseId === "string")
         .map((value) => ({ field: Number(value.field.fullDatabaseId), option: option[value.name] ?? value.name }));
@@ -233,13 +251,12 @@ export async function issuesByStatus(github, repository, states, { since, config
       }
       // The value and its events come from one read, so no fieldNames check.
       const events = eventsFrom(nodes);
-      const statusField = String(config["field-id"]);
       // An issue whose status cannot be read fails the listing only when it
       // could be one of `states`: a wanted label, or a Work status value or
       // event naming one of them. Any other is skipped, so one issue's
       // unreadable field cannot stop a listing it has no part in.
       const couldMatch = () =>
-        labels.some((label) => wanted.has(label.toLowerCase())) ||
+        labeled ||
         (node?.issueFieldValues?.nodes ?? []).some((value) => value?.field?.fullDatabaseId === statusField && states.includes(value?.name)) ||
         events.some((event) => event.field === statusField && states.includes(event.to));
       let state;
@@ -249,12 +266,32 @@ export async function issuesByStatus(github, repository, states, { since, config
         }
         state = issueStatus({ fieldValues, fieldEvents: events, fieldEventsFull: nodes.length >= LISTED_FIELD_EVENTS }, config, trustedActors);
       } catch (error) {
-        if (couldMatch()) {
+        if (!couldMatch()) {
+          continue;
+        }
+        if (error?.name !== "StatusDisagreement") {
           throw error;
         }
-        continue;
+        let disagreement = error;
+        if (rereads < MAX_STATUS_REREADS) {
+          rereads += 1;
+          try {
+            ({ state } = await fieldStatusSetter({ github, repository, number: node.number, config, trustedActors, issueStatusSetter, fieldEvents, sleep }));
+            disagreement = null;
+          } catch (again) {
+            if (again?.name !== "StatusDisagreement") {
+              throw again;
+            }
+            disagreement = again;
+          }
+        }
+        if (disagreement) {
+          held.push({ number: node.number, created_at: node.createdAt, reason: disagreement.message });
+          console.log(`::notice title=issuesByStatus::#${node.number} is left out of this listing: ${String(disagreement.message).replaceAll(/[\r\n%]/g, " ")}`);
+          continue;
+        }
       }
-      if (state === null ? labels.some((label) => wanted.has(label.toLowerCase())) : states.includes(state)) {
+      if (state === null ? labeled : states.includes(state)) {
         found.push({ number: node.number, created_at: node.createdAt, labels, state });
       }
     }
@@ -312,7 +349,8 @@ async function gatherFacts(
   if (issue !== undefined) {
     // The issue's org field values: REST answers the integer field and
     // option ids the config maps (GraphQL answers only node ids). Each read
-    // once, shared by the dimensions and the Work status.
+    // once, shared by the dimensions and the Work status; a Work status
+    // disagreement reads both again for both.
     let values;
     let events;
     const readValues = async () => {
@@ -357,12 +395,35 @@ async function gatherFacts(
       // matches `labels`, and a field hold matches `labels-absent`. A failed
       // read throws rather than fall back to the labels, which could miss a hold.
       if (status?.config) {
-        const fieldEventsRead = await readEvents();
-        const state = issueStatus(
-          { fieldValues: await readValues(), fieldEvents: fieldEventsRead, fieldEventsFull: fieldEventsRead.full === true },
-          status.config,
-          status.trustedActors,
-        );
+        const readState = async () => {
+          const fieldEventsRead = await readEvents();
+          return issueStatus(
+            { fieldValues: await readValues(), fieldEvents: fieldEventsRead, fieldEventsFull: fieldEventsRead.full === true },
+            status.config,
+            status.trustedActors,
+          );
+        };
+        let state;
+        try {
+          state = await readState();
+        } catch (error) {
+          if (error?.name !== "StatusDisagreement") {
+            throw error;
+          }
+          // A read racing a write, as read-status.mjs fieldStatusSetter
+          // treats it: both reads once more, and a second disagreement throws.
+          await sleep(DISAGREEMENT_WAIT_MS);
+          values = undefined;
+          events = undefined;
+          state = await readState();
+          // The dimensions come from the read the status agreed on.
+          if (needed.includes("fieldValues")) {
+            facts.fieldValues = await readValues();
+          }
+          if (needed.includes("fieldSetters")) {
+            facts.fieldSetters = settersOf(await readEvents());
+          }
+        }
         facts.labels = statusLabels(state, facts.labels, status.config);
       }
     }
@@ -464,6 +525,12 @@ const escapeCommand = (text) =>
 
 const wait = (ms) => new Promise((done) => setTimeout(done, ms));
 
+// The base-path and config-path env names, with their defaults.
+const pathsOf = (env) => ({
+  basePath: env.BASE_PATH || DEFAULT_BASE_PATH,
+  configPath: env.CONFIG_PATH || DEFAULT_CONFIG_PATH,
+});
+
 // `readRules` reads a rule file beside this module; tests replace it.
 function filesUnderBase(basePath, configPath, readRules = readOwn) {
   checkConfigPath(configPath);
@@ -495,12 +562,12 @@ const modelRung = (value) => (value === undefined || value === "" ? undefined : 
 // payload; by default it is read from EVENT_PATH. With `absentAsNull`, a valid
 // config whose lane holds no slot for the activity resolves to null.
 export async function resolveFromBase({ env, github, sleep = wait, event, absentAsNull = false, readRules }) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  const { basePath, configPath } = pathsOf(env);
   const files = filesUnderBase(basePath, configPath, readRules);
+  const doc = loadConfig(files, { configPath });
   // A lane run checks the patch rules before anything else; the token
   // broker, which calls loadConfig and resolveGrant itself, never reads them.
-  checkPatchRules(files.patchRules, files.patchRulesSchema, loadConfig(files, { configPath }).activities);
+  checkPatchRules(files.patchRules, files.patchRulesSchema, doc.activities);
   const request = {
     lane: env.LANE,
     activity: env.ACTIVITY || undefined,
@@ -513,7 +580,7 @@ export async function resolveFromBase({ env, github, sleep = wait, event, absent
     return null;
   }
   const facts = await gatherFacts(neededFacts(files, request), {
-    status: { config: loadConfig(files, { configPath }).models?.["issue-status"] ?? null, trustedActors: files.trustedActors },
+    status: { config: doc.models?.["issue-status"] ?? null, trustedActors: files.trustedActors },
     splitChild: env.SPLIT_CHILD,
     eventName: env.EVENT_NAME,
     event: event ?? JSON.parse(readFileSync(env.EVENT_PATH, "utf8")),
@@ -541,49 +608,41 @@ export async function resolveFromBase({ env, github, sleep = wait, event, absent
 // The base config's resolved `limits`, for a script that resolves no lane
 // slot; a config the resolver refuses throws.
 export function limitsFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  const { basePath, configPath } = pathsOf(env);
   return resolveLimits(filesUnderBase(basePath, configPath), { configPath });
 }
 
 // The base config's resolved limits and its wip leaf as set, read once, for
 // the WIP cap check.
 export function wipFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  const { basePath, configPath } = pathsOf(env);
   const files = filesUnderBase(basePath, configPath);
   return { limits: resolveLimits(files, { configPath }), wip: resolveWipLeaf(files, { configPath }) };
 }
 
 // The base config's resolved `loop` caps, likewise.
 export function loopFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  const { basePath, configPath } = pathsOf(env);
   return resolveLoop(filesUnderBase(basePath, configPath), { configPath });
 }
 
 // The base config's `adoption` section as set, after the same file checks as
 // resolve(), for fix-ci-dispatch.mjs, which applies its defaults.
 export function adoptionFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
-  return loadConfig(filesUnderBase(basePath, configPath), { configPath }).adoption ?? {};
+  return configFromBase(env).adoption ?? {};
 }
 
 // The base config's `merge.refire-skip-branches`, the head branches a workflow
 // owns and rebuilds, after the same file checks as resolve(), for the fix-ci
 // dispatcher and context job, which never run fix-ci on one.
 export function ownedBranchesFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
-  return loadConfig(filesUnderBase(basePath, configPath), { configPath }).merge?.["refire-skip-branches"] ?? [];
+  return configFromBase(env).merge?.["refire-skip-branches"] ?? [];
 }
 
 // The base config as resolve() loads it, after the same file checks, for
-// pr-refine's plan job.
+// pr-refine's plan job and the readers below.
 export function configFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  const { basePath, configPath } = pathsOf(env);
   return loadConfig(filesUnderBase(basePath, configPath), { configPath });
 }
 
@@ -596,17 +655,13 @@ export function tidyCutoffsFromBase(env) {
 // The base config's `models.issue-dimensions` leaf as set, or null, after the
 // same file checks as resolve(), for intake triage's verdict writer.
 export function issueDimensionsFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
-  return loadConfig(filesUnderBase(basePath, configPath), { configPath }).models?.["issue-dimensions"] ?? null;
+  return configFromBase(env).models?.["issue-dimensions"] ?? null;
 }
 
 // The base config's `models.issue-status` leaf as set, or null, after the
 // same file checks as resolve(), for the label writers' Work status mirror.
 export function issueStatusFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
-  return loadConfig(filesUnderBase(basePath, configPath), { configPath }).models?.["issue-status"] ?? null;
+  return configFromBase(env).models?.["issue-status"] ?? null;
 }
 
 // The base config's `red-main` leaf as set and `merge.agent-identity`, after
@@ -614,9 +669,7 @@ export function issueStatusFromBase(env) {
 // leaf's defaults have one copy, in
 // .github/scripts/post-merge-demotion-alert/red-main.mjs, which applies them.
 export function redMainFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
-  const doc = loadConfig(filesUnderBase(basePath, configPath), { configPath });
+  const doc = configFromBase(env);
   return { redMain: doc["red-main"] ?? {}, agentIdentity: doc.merge?.["agent-identity"] ?? "" };
 }
 
@@ -624,34 +677,26 @@ export function redMainFromBase(env) {
 // likewise, for .github/scripts/post-merge-demotion-alert/merge-path.mjs,
 // which applies them.
 export function postMergeFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
-  const doc = loadConfig(filesUnderBase(basePath, configPath), { configPath });
+  const doc = configFromBase(env);
   return { paths: doc["post-merge"]?.paths ?? {}, agentIdentity: doc.merge?.["agent-identity"] ?? "" };
 }
 
 // The hosts the issue lane (resolve-issue) may read, for intake admission:
 // its web-access domains, "any", or [] when web access is off.
 export function issueLaneWebHostsFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
-  const web = loadConfig(filesUnderBase(basePath, configPath), { configPath }).activities?.["resolve-issue"]?.["web-access"];
+  const web = configFromBase(env).activities?.["resolve-issue"]?.["web-access"];
   return web?.enabled ? web.domains : [];
 }
 
 // The base config's attended classes, {name: meaning}, or {} when unset.
 export function attendedClassesFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
-  return loadConfig(filesUnderBase(basePath, configPath), { configPath }).attended?.classes ?? {};
+  return configFromBase(env).attended?.classes ?? {};
 }
 
 // The base config's `branch-cleanup` leaf as set, likewise; its defaults have
 // one copy, in .github/scripts/branch-cleanup/rules.mjs.
 export function branchCleanupFromBase(env) {
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
-  return loadConfig(filesUnderBase(basePath, configPath), { configPath })["branch-cleanup"] ?? {};
+  return configFromBase(env)["branch-cleanup"] ?? {};
 }
 
 // A run that is no lane activity resolves only its model route.
@@ -659,8 +704,7 @@ function resolveRouteFromBase(env) {
   if (env.LANE) {
     throw new Error("set lane or model-route, not both");
   }
-  const basePath = env.BASE_PATH || DEFAULT_BASE_PATH;
-  const configPath = env.CONFIG_PATH || DEFAULT_CONFIG_PATH;
+  const { basePath, configPath } = pathsOf(env);
   const models = resolveRoute(filesUnderBase(basePath, configPath), {
     route: env.MODEL_ROUTE,
     configPath,

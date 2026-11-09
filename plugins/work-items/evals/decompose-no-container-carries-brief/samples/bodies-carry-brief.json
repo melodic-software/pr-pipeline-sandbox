@@ -1,0 +1,34 @@
+{
+  "pass": [
+    {
+      "answer": "---\nid: \"local-markdown:local/markdown#1\"\nnumber: 1\ntitle: \"Monthly refund query\"\nstate: \"open\"\nassignees: []\nlabels: [\"agent-ready\"]\ntype: null\nparent: null\nurl: \"file:///tmp/ws/.work-items/1.md\"\ncreated_at: \"2026-10-26T04:00:00Z\"\n---\n\n## Parent\n\nSource: PLAN Phase 1, topic refund-export\n\n## Outcome\n\nA month's refunds can be listed.\n\nGoal: Finance staff reconcile refunds against the bank statement each month without asking engineering for a database query.\nConstraints:\n- The nightly ledger job's schedule and output stay untouched.\n- The export reads only from the reporting replica, never the primary database.\n\n## Done when\n\n- [ ] edge test passes\n",
+      "why": "Goal and both Constraints copied"
+    },
+    {
+      "answer": "---\nid: \"local-markdown:local/markdown#1\"\nnumber: 1\ntitle: \"Monthly refund query\"\nstate: \"open\"\nassignees: []\nlabels: [\"agent-ready\"]\ntype: null\nparent: null\nurl: \"file:///tmp/ws/.work-items/1.md\"\ncreated_at: \"2026-10-26T04:00:00Z\"\n---\n\n## Parent\n\nSource: PLAN Phase 1, topic refund-export\n\n## Outcome\n\nA month's refunds can be listed.\n\nGOAL: Finance staff reconcile refunds against the Bank Statement each month.\nConstraints:\n- Nightly Ledger job: schedule and output untouched.\n- Read only from the Reporting Replica.\n\n## Done when\n\n- [ ] edge test passes\n",
+      "why": "capitalized copy"
+    },
+    {
+      "answer": "---\nid: \"local-markdown:local/markdown#1\"\nnumber: 1\ntitle: \"Monthly refund query\"\nstate: \"open\"\nassignees: []\nlabels: [\"agent-ready\"]\ntype: null\nparent: null\nurl: \"file:///tmp/ws/.work-items/1.md\"\ncreated_at: \"2026-10-26T04:00:00Z\"\n---\n\n## Parent\n\nSource: PLAN Phase 1, topic refund-export\n\n## Outcome\n\nA month's refunds can be listed.\n\nConstraints:\n- The ledger job that runs nightly stays untouched.\n- Reporting replica only.\n\nGoal: reconcile refunds against the bank statement monthly.\n\n## Done when\n\n- [ ] edge test passes\n",
+      "why": "reordered sections"
+    }
+  ],
+  "fail": [
+    {
+      "answer": "",
+      "why": "item file missing or empty"
+    },
+    {
+      "answer": "---\nid: \"local-markdown:local/markdown#1\"\nnumber: 1\ntitle: \"Monthly refund query\"\nstate: \"open\"\nassignees: []\nlabels: [\"agent-ready\"]\ntype: null\nparent: null\nurl: \"file:///tmp/ws/.work-items/1.md\"\ncreated_at: \"2026-10-26T04:00:00Z\"\n---\n\n## Parent\n\nSource: PLAN Phase 1, topic refund-export\n\n## Outcome\n\nA month's refunds can be listed.\n\nGoal: Finance staff reconcile refunds against the bank statement each month without asking engineering for a database query.\n\n## Done when\n\n- [ ] edge test passes\n",
+      "why": "Goal without Constraints"
+    },
+    {
+      "answer": "---\nid: \"local-markdown:local/markdown#1\"\nnumber: 1\ntitle: \"Monthly refund query\"\nstate: \"open\"\nassignees: []\nlabels: [\"agent-ready\"]\ntype: null\nparent: null\nurl: \"file:///tmp/ws/.work-items/1.md\"\ncreated_at: \"2026-10-26T04:00:00Z\"\n---\n\n## Parent\n\nSource: PLAN Phase 1, topic refund-export\n\n## Outcome\n\nA month's refunds can be listed.\n\nSee .work/refund-export/PLAN.md for the goal and constraints.\n\n## Done when\n\n- [ ] edge test passes\n",
+      "why": "links the plan instead of carrying the text"
+    },
+    {
+      "answer": "---\nid: \"local-markdown:local/markdown#1\"\nnumber: 1\ntitle: \"Monthly refund query\"\nstate: \"open\"\nassignees: []\nlabels: [\"agent-ready\"]\ntype: null\nparent: null\nurl: \"file:///tmp/ws/.work-items/1.md\"\ncreated_at: \"2026-10-26T04:00:00Z\"\n---\n\n## Parent\n\nSource: PLAN Phase 1, topic refund-export\n\n## Outcome\n\nA month's refunds can be listed.\n\nGoal: Finance staff reconcile refunds against the bank statement.\nConstraints:\n- The nightly ledger job stays untouched.\n\n## Done when\n\n- [ ] edge test passes\n",
+      "why": "replica Constraint missing"
+    }
+  ]
+}

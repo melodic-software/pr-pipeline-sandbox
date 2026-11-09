@@ -330,7 +330,7 @@ test("read-only work on ordinary files carries no hold line", () => {
   assert.ok(!decideDone().body.includes("Hold: a human merges this"));
 });
 
-for (const label of ["work-class: untrusted-provenance", "provenance: untrusted"]) {
+for (const label of ["provenance: untrusted"]) {
   test(`untrusted-provenance work labeled only ${label} carries the hold line`, () => {
     const plan = decideDone({ issueLabels: [label] });
     assert.ok(plan.body.split("\n").includes("Hold: a human merges this"), plan.body);
@@ -1905,7 +1905,7 @@ test("main on done with Refs opens the PR and writes nothing to the issue", asyn
 
 // A create that fails on the network may still have opened the PR: it is read
 // back, and never sent again, since a create is a non-idempotent write
-// (element 1 of docs/outage-posture-audit.md). When the read finds none, the
+// (element 1 of docs/conventions/pr-pipeline/README.md#outage-posture). When the read finds none, the
 // run fails for a rerun to settle. A read that lost its socket is sent again.
 test("main after a dropped PR create reads the PR back, and never creates it again", async () => {
   const dropped = () => Object.assign(new TypeError("fetch failed"), { cause: { code: "UND_ERR_SOCKET" } });
@@ -4459,7 +4459,7 @@ test("a hold on the Work status field alone, an unread field, or a field off age
   const decision = [late(5, OWNER_ID, DECISION_BODY, { login: "kyle-sexton" })];
   for (const [name, options] of [
     ["needs-human on the field", { statusOf: async (number, names) => [...names, "needs-human"] }],
-    ["needs-reporter-info on the field", { statusOf: async (number, names) => [...names, "status: needs-info"] }],
+    ["needs-reporter-info on the field", { statusOf: async (number, names) => [...names, "needs-reporter-info"] }],
     ["an unread field", { statusOf: async () => { throw new Error("#77's Work status could not be read: HTTP 502"); } }],
     ["an unread state", { state: new Error("HTTP 502") }],
     ["the field at ready", { state: "ready" }],
@@ -5133,7 +5133,7 @@ test("main fails a crashed run whose retries are spent: Work status to needs-tri
   });
 });
 
-// Element 4 of docs/outage-posture-audit.md: a fault is no evidence about the
+// Element 4 of docs/conventions/pr-pipeline/README.md#outage-posture: a fault is no evidence about the
 // issue, so retries that were all faults do not fail it. The earlier retries'
 // comments here are the ones main itself posts, for the crash below.
 const crashRetryComment = async () =>
@@ -5373,7 +5373,6 @@ const HOLD_CASES = {
   "the compare request failed": { changedFiles: null },
   "the listing is cut at the cap while a path is denied": { changedFiles: CAPPED },
   "a changed path is denied": { changedFiles: ["README.md", ".github/workflows/x.yml"] },
-  "the issue is labeled untrusted-provenance": { issueLabels: ["agent-ready", "work-class: untrusted-provenance"] },
   "the issue is labeled provenance: untrusted": { issueLabels: ["agent-ready", "provenance: untrusted"] },
   "a trusted labeler set merge: human": { humanMerge: true },
 };
@@ -5745,7 +5744,7 @@ test("refireStale re-fires a stale run's issue at once with work-unblock's re-fi
 test("refireStale skips an issue a hold on the Work status field alone holds, and one whose field cannot be read", async () => {
   for (const [statusOf, why] of [
     [async (number, names) => [...names, "needs-human"], "skipped: held by needs-human"],
-    [async (number, names) => [...names, "status: needs-decision"], "skipped: held by status: needs-decision"],
+    [async (number, names) => [...names, "needs-owner-decision"], "skipped: held by needs-owner-decision"],
     [async () => {
       throw new Error("#77's Work status could not be read: HTTP 502");
     }, "skipped: the Work status could not be read"],
@@ -5762,7 +5761,7 @@ test("refireStale skips an issue a hold on the Work status field alone holds, an
 test("refireStale reads holds through the real Work status reader: a field-only hold or an unread field skips", async () => {
   for (const [fields, why] of [
     [{ 77: { state: "needs-human" } }, "skipped: held by needs-human"],
-    [{ 77: { state: "needs-owner-decision" } }, "skipped: held by status: needs-decision"],
+    [{ 77: { state: "needs-owner-decision" } }, "skipped: held by needs-owner-decision"],
     [{ 77: new Error("HTTP 502") }, "skipped: the Work status could not be read"],
   ]) {
     const run = staleFetch({ labels: ["work-class: read-only"] });
@@ -5847,7 +5846,7 @@ test("main on a workflow-stale stop re-fires through refireStale and reads no ou
 // One hold set for the lane, which work-unblock's sweep reads too: every hold
 // on it stops the immediate re-fire, the owner-only ones included.
 test("refireStale re-fires nothing on any of the lane's holds", async () => {
-  assert.ok(LANE_HOLDS.has("attended") && LANE_HOLDS.has("host-run") && LANE_HOLDS.has("security: outside-actor") && LANE_HOLDS.has("work-class: untrusted-provenance") && LANE_HOLDS.has("provenance: untrusted"));
+  assert.ok(LANE_HOLDS.has("attended") && LANE_HOLDS.has("host-run") && LANE_HOLDS.has("security: outside-actor") && LANE_HOLDS.has("provenance: untrusted"));
   for (const hold of LANE_HOLDS) {
     const run = staleFetch({ labels: [hold] });
     assert.equal(await refire(run), `skipped: held by ${hold}`, hold);

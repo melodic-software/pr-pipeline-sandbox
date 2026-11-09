@@ -8,7 +8,7 @@ import { test } from "node:test";
 
 import { parse } from "yaml";
 
-import { StatusWriteError, statusWriter, writeState } from "./write-status.mjs";
+import { postOptionNames, RESTART_GAP_MS, StatusWriteError, statusWriter, writeState } from "./write-status.mjs";
 
 const CONFIG = parse(readFileSync(new URL("../../../docs/conventions/pr-pipeline.yaml", import.meta.url), "utf8")).models[
   "issue-status"
@@ -93,7 +93,7 @@ function fieldWorld(option, setter) {
   };
   return { github, posts, put };
 }
-const writerOver = (github, env = { BASE_PATH: ROOT }) => statusWriter({ env, github, repository: "o/r" });
+const writerOver = (github, env = { BASE_PATH: ROOT }, sleep = async () => {}) => statusWriter({ env, github, repository: "o/r", sleep });
 
 test("statusWriter set writes a state once per issue in a process, and skips one `fields` shows", async () => {
   const w = fieldWorld(null);
@@ -121,6 +121,30 @@ test("statusWriter restart clears the field and sets agent-ready even after this
   assert.equal((await restart(7)).outcome, "written");
   assert.deepEqual(deletes, [["/repos/o/r/issues/7/issue-field-values/48484079", "2026-03-10"]]);
   assert.deepEqual(w.posts().map(([, , body]) => body.issue_field_values[0].value), ["agent-ready", "agent-ready"]);
+});
+
+test("statusWriter restart waits between the clear and the set, and not after a 404 clear", async () => {
+  const run = async (clear) => {
+    const w = fieldWorld(null);
+    const order = [];
+    const github = async (method, path, body) => {
+      if (method === "DELETE") {
+        order.push("clear");
+        return clear();
+      }
+      if (method === "POST" && path.endsWith("/issue-field-values")) order.push("set");
+      return w.github(method, path, body);
+    };
+    await (await writerOver(github, undefined, async (ms) => order.push(ms))).restart(7);
+    return order;
+  };
+  assert.deepEqual(await run(() => null), ["clear", RESTART_GAP_MS, "set"]);
+  assert.deepEqual(
+    await run(() => {
+      throw new Error("GitHub answered status 404");
+    }),
+    ["clear", "set"],
+  );
 });
 
 test("statusWriter restart treats a 404 clear as nothing set, and stops on a person's hold", async () => {
@@ -283,4 +307,61 @@ test("statusWriter leaveAgentReady throws when the field cannot be read", async 
   const github = async () => ({ message: "Not Found" });
   const { leaveAgentReady } = await writerOver(github);
   await assert.rejects(() => leaveAgentReady(7, "needs-triage"), (error) => error instanceof StatusWriteError && /could not be read/.test(error.message));
+});
+
+// A POST that takes a batch only when GitHub's options, in `spelled`, hold every name.
+function optionPoster(spelled) {
+  const posts = [];
+  const post = async (batch) => {
+    posts.push(batch.map(({ value }) => value));
+    if (!batch.every(({ value }) => spelled.has(value))) {
+      throw Object.assign(new Error("refused"), { status: 422, detail: "no such option" });
+    }
+    return batch.map(({ field_id }) => ({ issue_field_id: field_id }));
+  };
+  return { post, posts };
+}
+const OPTION_VALUES = [
+  { field_id: 1, value: "needs-triage" },
+  { field_id: 2, value: "small" },
+  { field_id: 3, value: "low" },
+];
+const TITLED = new Set([2, 3]);
+const quietly = () => {};
+
+test("postOptionNames sends the lowercase names once when GitHub takes them", async () => {
+  const { post, posts } = optionPoster(new Set(["needs-triage", "small", "low"]));
+  assert.deepEqual(await postOptionNames(post, OPTION_VALUES, TITLED, quietly), [{ issue_field_id: 1 }, { issue_field_id: 2 }, { issue_field_id: 3 }]);
+  assert.deepEqual(posts, [["needs-triage", "small", "low"]]);
+});
+
+test("postOptionNames Title-cases only the titled fields when GitHub refuses the lowercase names", async () => {
+  const { post, posts } = optionPoster(new Set(["needs-triage", "Small", "Low"]));
+  await postOptionNames(post, OPTION_VALUES, TITLED, quietly);
+  assert.deepEqual(posts, [
+    ["needs-triage", "small", "low"],
+    ["needs-triage", "Small", "Low"],
+  ]);
+});
+
+test("postOptionNames sends each field on its own, in either casing, while part of a rename has landed", async () => {
+  const { post, posts } = optionPoster(new Set(["needs-triage", "small", "Low"]));
+  const rows = await postOptionNames(post, OPTION_VALUES, TITLED, quietly);
+  assert.deepEqual(rows, [{ issue_field_id: 1 }, { issue_field_id: 2 }, { issue_field_id: 3 }]);
+  assert.deepEqual(posts.slice(2), [["needs-triage"], ["small"], ["low"], ["Low"]]);
+});
+
+test("postOptionNames throws when a field takes neither casing", async () => {
+  const { post } = optionPoster(new Set(["needs-triage", "small"]));
+  await assert.rejects(() => postOptionNames(post, OPTION_VALUES, TITLED, quietly), { status: 422 });
+});
+
+test("postOptionNames throws any other refusal without another write", async () => {
+  const posts = [];
+  const post = async (batch) => {
+    posts.push(batch);
+    throw Object.assign(new Error("forbidden"), { status: 403 });
+  };
+  await assert.rejects(() => postOptionNames(post, OPTION_VALUES, TITLED, quietly), { status: 403 });
+  assert.equal(posts.length, 1);
 });

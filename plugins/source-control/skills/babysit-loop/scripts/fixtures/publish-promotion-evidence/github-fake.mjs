@@ -8,13 +8,11 @@ import { ghFailure } from "../../publish-promotion-evidence.mjs";
 // Real `gh api` responses, recorded 2026-10-12 and 2026-10-13 and trimmed to the fields the
 // publisher reads: from this repository (PRs #7352 and #7063, a merge commit, a check run, a
 // status, an issue event, a review, a comment page, workflow runs, a compare, NOT_FOUND and 422
-// answers) and one ConnectedEvent from cli/cli #14616. The comment page's body is trimmed to its
-// first line. Each case copies a record and varies number, labels, merger and timestamps.
+// answers). The comment page's body is trimmed to its first line. Each case copies a record and
+// varies number, labels, merger, timestamps and the rung its pin names.
 export const REC = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "recorded.json"), "utf8"));
 export const REPO = "melodic-software/claude-code-plugins";
 export const LANE = "lane-bot[bot]";
-export const MECHANICAL = "work-class: mechanical";
-export const SCOPED = "work-class: scoped";
 export const MISSED = "ai-review: missed-blocking";
 // The recorded check run and status name the post-merge gate in every case.
 export const GATE = [REC.checkRun.name, REC.status.context];
@@ -31,21 +29,23 @@ export const page1 = (nodes, hasNextPage = false) => ({ pageInfo: { hasNextPage 
 export function pr(
   number,
   mergedAt,
-  { labels = [], merger = LANE, title = REC.pullListItem.title, body = REC.pullListItem.body, linked = [], timeline = [], lastEditedAt = null, patch = {}, base = "main", head = shaOf(number + 0x100000) } = {},
+  { rung, labels = [], merger = LANE, title = REC.pullListItem.title, body = REC.pullListItem.body, timeline = [], patch = {}, base = "main", head = shaOf(number + 0x100000) } = {},
 ) {
   const names = labels.map((name) => ({ name }));
   return {
+    // The rung the default pin comment names (none when unset).
+    pinRung: rung,
     graph: {
       ...REC.pullGraph.data.repository.pullRequest,
       number,
       headRefOid: head,
       mergedAt,
-      lastEditedAt,
       mergeCommit: { oid: shaOf(number) },
       mergedBy: actorOf(merger),
-      labels: page1(names),
-      closingIssuesReferences: page1(linked),
       timelineItems: page1(timeline),
+      autoMerge: { nodes: [] },
+      author: actorOf(LANE),
+      isCrossRepository: false,
       ...patch,
     },
     list: {
@@ -85,10 +85,15 @@ export const wfRun = (id, event, sha, created, { conclusion = "success", status 
 // `workflowRuns`: {<workflow file>: [run]}; `attempts`: {<run id>: {<n>: run}}; `history`: the
 // default branch's commits oldest first (linear, as a merge-queue branch is), defaulting to the
 // merge commits in merge order.
+// `offBranch`: commits not on the default branch that descend from it, as on a tag named main.
+// `onTop`: commits on top of the branch tip but not on the branch (a tag named main one commit
+// ahead), which a compare against the tip answers `behind`. `unknownCompare`: commits whose
+// compare answers no status. `tip`: what `refs/heads/main` reads, default the last commit.
 // `diverged`: head SHAs a compare reports as diverged. A PR number not in `pulls` answers with the
 // recorded NOT_FOUND response.
 // The lane posts a pin comment on every PR it enqueues and dispatches a full run after every merge
-// (babysit_merge.py --unattended, babysit_postmerge.py), so each PR gets a correct pin and a green
+// (babysit_merge.py --unattended, babysit_postmerge.py), so each PR gets a correct pin (naming the
+// rung `pr()` was given, if any) and a green
 // lane dispatch run on its merge commit an hour after merging, unless `comments` sets that PR's
 // comments or `noDefaultDispatch` is set; an explicit run with the same id replaces the default.
 // Each workflow's runs carry run_number 1, 2, ... in creation order unless a run sets its own (a
@@ -99,7 +104,8 @@ export const wfRun = (id, event, sha, created, { conclusion = "success", status 
 // is a hole); `goneIssues`: numbers a read of answers 410 Gone; `missingIssues`: numbers it answers
 // 404; `discussions`: discussion number to author login, whose numbers also read 404 as issues;
 // `lateRuns`: run ids the run listing shows on every page but the first, as if listed mid-read.
-export const pinComment = (sha) => ({ author: actorOf(LANE), body: `<!-- babysit-merge-pin sha=${sha} -->\nThe unattended merge path enqueued this pull request at head \`${sha}\`.`, lastEditedAt: null });
+// babysit_postmerge.py pin_comment: the old shape names no rung, the new one `rung=C2|C3`.
+export const pinComment = (sha, rung) => ({ author: actorOf(LANE), body: `<!-- babysit-merge-pin sha=${sha}${rung ? ` rung=${rung}` : ""} -->\nThe unattended merge path enqueued this pull request at head \`${sha}\`.`, lastEditedAt: null });
 export const demotionIssue = (number, createdAt, { author = "github-actions[bot]", body = REC.demotionIssue.body, updatedAt = createdAt, comments = [], edits = [], editCount = edits.length } = {}) => ({
   ...REC.demotionIssue,
   number,
@@ -122,7 +128,7 @@ export const issueItem = (number, created, { pull = false } = {}) => ({
   created_at: created,
   pull_request: pull ? { url: `https://api.github.com/repos/${REPO}/pulls/${number}` } : null,
 });
-export function github({ pulls = [], commits = [], checkRuns = {}, statuses = {}, issueEvents = {}, reviews = {}, issues = {}, workflowRuns: explicitRuns = {}, attempts = {}, history, diverged = [], comments = {}, noDefaultDispatch = false, bumpOnPage2, deletedRuns = [], demotionIssues = [], issueList = [], goneIssues = [], missingIssues = [], discussions = {}, lateRuns = [] }) {
+export function github({ pulls = [], commits = [], checkRuns = {}, statuses = {}, issueEvents = {}, reviews = {}, issues = {}, workflowRuns: explicitRuns = {}, attempts = {}, history, diverged = [], comments = {}, noDefaultDispatch = false, bumpOnPage2, deletedRuns = [], demotionIssues = [], issueList = [], goneIssues = [], missingIssues = [], discussions = {}, lateRuns = [], offBranch = [], onTop = [], unknownCompare = [], tip }) {
   const defaultDispatch = noDefaultDispatch ? [] : pulls.map((p) => wfRun(900000 + p.graph.number, "workflow_dispatch", p.graph.mergeCommit.oid, later(p.graph.mergedAt, 60), { actor: LANE }));
   const explicitIds = new Set(Object.values(explicitRuns).flat().map((r) => r.id));
   const numbered = (runs) =>
@@ -146,7 +152,7 @@ export function github({ pulls = [], commits = [], checkRuns = {}, statuses = {}
       assert.doesNotMatch(graphql.query, /mutation/);
       if (/pullRequest\(number:\$number\)\{comments\(/.test(graphql.query)) {
         const pull = pulls.find((p) => p.graph.number === graphql.variables.number);
-        const all = comments[graphql.variables.number] ?? [pinComment(pull.graph.headRefOid)];
+        const all = comments[graphql.variables.number] ?? [pinComment(pull.graph.headRefOid, pull.pinRung)];
         const n = Number(graphql.variables.c ?? 0);
         const nodes = all.slice(n * 100, (n + 1) * 100);
         const more = all.length > (n + 1) * 100;
@@ -224,7 +230,14 @@ export function github({ pulls = [], commits = [], checkRuns = {}, statuses = {}
       return { total_count: Math.min(runs.length, 2500), workflow_runs: runs.slice((n - 1) * size, n * size) };
     }
     if ((m = /^actions\/runs\/(\d+)\/attempts\/(\d+)$/.exec(rest))) return attempts[m[1]][m[2]];
+    if (rest === "git/ref/heads/main") return { ref: "refs/heads/main", object: { sha: tip === undefined ? branch.at(-1) : tip } };
     if ((m = /^compare\/([0-9a-f]{40})\.\.\.([0-9a-f]{40})\?/.exec(rest))) {
+      // An off-branch commit (a tag named main) descends from every branch commit and is
+      // diverged from the tip.
+      if (unknownCompare.includes(m[1]) || unknownCompare.includes(m[2])) return { ...REC.compare, status: undefined };
+      if (onTop.includes(m[1])) return { ...REC.compare, status: "behind", ahead_by: 0, total_commits: 0, commits: [] };
+      if (offBranch.includes(m[2]) || onTop.includes(m[2])) return { ...REC.compare, status: "ahead", ahead_by: 1, total_commits: 1, commits: [] };
+      if (offBranch.includes(m[1])) return { ...REC.compare, status: "diverged", ahead_by: 0, total_commits: 0, commits: [] };
       const [base, head] = [branch.indexOf(m[1]), branch.indexOf(m[2])];
       assert.ok(base >= 0 && head >= 0, `compare outside the recorded history: ${rest}`);
       const status = diverged.includes(m[2]) ? "diverged" : head > base ? "ahead" : head === base ? "identical" : "behind";

@@ -22,8 +22,8 @@
 // - 2: the Issue Type is in `types`, or in `types-under-parent` under an open
 //   parent issue a listed human filed that awaits no decision; a type in
 //   `types-parent-if-present` needs that parent only when it has one (Q83).
-//   A parent awaits a decision while it carries needs-human or
-//   needs-owner-decision, or `status: needs-decision` with a decision open
+//   A parent awaits a decision while it carries needs-human, or
+//   needs-owner-decision with a decision open
 //   (parentDecisionOpen): the lanes App may not lift that label (a person
 //   set it, or its verdict holds for a flag other than intent), or the
 //   parent's newest refinement asks questions no later `**Decision
@@ -103,7 +103,7 @@
 //   (admissionsSince); otherwise, or when that read fails, it stays deferred.
 //
 // A refusal a person must settle swaps `status: ready` for
-// `status: needs-decision`; a blocker, an open pull request or an open
+// `needs-owner-decision`; a blocker, an open pull request or an open
 // sub-issue (a size split's, owner Q93) keeps `status: ready`. Either way one App comment carrying ADMIT_MARKER says why;
 // a hold's also names its owner reason, security, cost or intent, as the
 // stop-reason marker and line (heldRefusalText).
@@ -128,6 +128,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { appCloseKind, isTrustedClose, paginate } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
+import { carried, DECISION_LABELS, isStatusLabel, readyWhileDeferred } from "../../actions/resolve-config/read-status.mjs";
 import { isDecisionComment, selectTrustedIssueComments } from "../../actions/select-trusted-text/select-trusted-text.mjs";
 import { PROTECTED_REFUSALS } from "../apply-patch/protected-paths.mjs";
 import { OUTSIDE_ACTOR_LABEL, UNTRUSTED_LABEL, UNTRUSTED_LABELS } from "../pr-merge/merge-holds.mjs";
@@ -135,6 +136,7 @@ import { ADMIT_MARKER, refusalText, sayWhy as writeWhy } from "../lib/admission-
 import { writeAdmissionRecord } from "../lib/admission-record.mjs";
 import { stopLine, subIssueLeftOpen } from "../lib/done-evidence.mjs";
 import { PERSON_REASONS, personReasonLines } from "../lib/stop-reason.mjs";
+import { closingPulls } from "../work-resolve-issue/report-outcome.mjs";
 
 export { ADMIT_MARKER, refusalText };
 
@@ -155,8 +157,6 @@ export function heldRefusalText(reasons, code) {
   const [marker, line] = personReasonLines(INTAKE_LANE, code);
   return `${refusalText(reasons)}\n\n${line}\n${marker}`;
 }
-import { closingPulls } from "../work-resolve-issue/report-outcome.mjs";
-import { readyWhileDeferred } from "../../actions/resolve-config/read-status.mjs";
 
 export const AGENT_READY = "agent-ready";
 export const DEFERRED = "admission-deferred";
@@ -208,7 +208,7 @@ export const SIZE_SPLIT_MARKER = "<!-- intake-triage size-split -->";
 // Opens the body of each sub-issue that split files.
 export const SPLIT_CHILD_MARKER = "<!-- intake-triage size-split child -->";
 export const READY = "status: ready";
-export const NEEDS_DECISION = "status: needs-decision";
+export const NEEDS_DECISION = "needs-owner-decision";
 export const CONFIRMED = "status: confirmed";
 // The owner-present label (owner decision 2026-10-28): only a listed human
 // removes it.
@@ -227,7 +227,7 @@ const LANES_APP_LOGIN = "melodic-automation-lanes[bot]";
 export const UNTRUSTED = UNTRUSTED_LABEL;
 // Marks a standing item linked to a .github/recurring-schedule.json row.
 const RECURRING = "recurring";
-const PARENT_HOLDS = new Set(["needs-human", "needs-owner-decision"]);
+const PARENT_HOLDS = new Set(["needs-human"]);
 // A body line opening with `Hold:`, as the merge gate reads one in a pull
 // request body a person wrote (pr-merge/merge-holds.mjs BODY_HOLD).
 export const BODY_HOLD = /^[^\S\r\n]*hold:/im;
@@ -307,6 +307,8 @@ const here = (url, repository) =>
   String(url ?? "")
     .toLowerCase()
     .endsWith(`/repos/${repository}`.toLowerCase());
+// Whether a GraphQL `nameWithOwner` is `repository`, in any case.
+const sameRepository = (nameWithOwner, repository) => String(nameWithOwner ?? "").toLowerCase() === repository.toLowerCase();
 
 const BLOCKER_NUMBER = /^[1-9][0-9]{0,9}$/;
 
@@ -366,9 +368,7 @@ export function openPullsNaming(timeline, repository, number, closing = []) {
     .map((event) => (event?.event === "cross-referenced" ? event.source?.issue : null))
     .filter((source) => source?.pull_request && source.state === "open" && here(source.repository_url, repository) && refsNames(source.body, number))
     .map((source) => source.number);
-  const closes = closing
-    .filter((node) => String(node?.repository?.nameWithOwner ?? "").toLowerCase() === repository.toLowerCase())
-    .map((node) => node.number);
+  const closes = closing.filter((node) => sameRepository(node?.repository?.nameWithOwner, repository)).map((node) => node.number);
   return [...new Set([...closes, ...linked])];
 }
 
@@ -381,7 +381,7 @@ export function openPullsNaming(timeline, repository, number, closing = []) {
 export function mergedRefsAfter(node, number, repository, humans, appId) {
   const at = (text) => {
     const time = Date.parse(text);
-    return Number.isFinite(time) ? time : null;
+    return Number.isFinite(time) ? time : Number.NEGATIVE_INFINITY;
   };
   const decision = (comment) =>
     comment?.author?.__typename === "User" &&
@@ -391,18 +391,15 @@ export function mergedRefsAfter(node, number, repository, humans, appId) {
     );
   const refinement = (comment) =>
     appId !== undefined && comment?.author?.__typename === "Bot" && comment.author.databaseId === appId && String(comment.body ?? "").startsWith(REFINE_MARKER);
-  const since = Math.max(
-    at(node?.createdAt) ?? Number.NEGATIVE_INFINITY,
-    ...(node?.comments?.nodes ?? []).filter((comment) => decision(comment) || refinement(comment)).map((comment) => at(comment.createdAt) ?? Number.NEGATIVE_INFINITY),
-  );
+  const since = Math.max(at(node?.createdAt), ...(node?.comments?.nodes ?? []).filter((comment) => decision(comment) || refinement(comment)).map((comment) => at(comment.createdAt)));
   const pulls = (node?.timelineItems?.nodes ?? [])
     .map((event) => event?.source)
     .filter(
       (source) =>
         Number.isSafeInteger(source?.number) &&
         source.merged === true &&
-        String(source.repository?.nameWithOwner ?? "").toLowerCase() === repository.toLowerCase() &&
-        (at(source.mergedAt) ?? Number.NEGATIVE_INFINITY) > since &&
+        sameRepository(source.repository?.nameWithOwner, repository) &&
+        at(source.mergedAt) > since &&
         refsNames(source.body, number),
     )
     .map((source) => source.number);
@@ -1031,7 +1028,7 @@ export function workflowFiles() {
 const ROOT_NAMES = new Set(["codeowners", ".gitmodules", "gitmodules"]);
 const isRootName = (token, quoted) => (quoted ? ROOT_NAMES.has(token.toLowerCase()) : token === "CODEOWNERS" || token.toLowerCase() === ".gitmodules");
 const pathTokens = (text, workflows) => {
-  const workflowNames = new Set([...workflows].map((name) => name.toLowerCase()));
+  const lowerWorkflows = new Set([...workflows].map((name) => name.toLowerCase()));
   return [
     ...[...text.matchAll(/`([^`]+)`/g)].map((m) => ({ token: m[1], quoted: true })),
     ...text
@@ -1039,14 +1036,13 @@ const pathTokens = (text, workflows) => {
       .split(/\s+/)
       .map((token) => ({ token, quoted: false })),
   ]
-    .map(({ token, quoted }) => ({
-      token: token
+    .map(({ token, quoted }) => {
+      const bare = token
         .replace(/^["'(\[]+/, "")
         .replace(/[.,;:!?"')\]]+$/, "")
-        .replace(/:\d+(-\d+)?$/, ""),
-      quoted,
-    }))
-    .map(({ token, quoted }) => ({ token: workflowNames.has(token.toLowerCase()) ? `.github/workflows/${token}` : token, quoted }))
+        .replace(/:\d+(-\d+)?$/, "");
+      return { token: lowerWorkflows.has(bare.toLowerCase()) ? `.github/workflows/${bare}` : bare, quoted };
+    })
     .filter(({ token, quoted }) => isRootName(token, quoted) || (token.includes("/") && !/^[/~]/.test(token) && !token.includes("://")))
     .map(({ token }) => token);
 };
@@ -1112,6 +1108,13 @@ const NEGATED = new RegExp(
 );
 const withoutNegated = (text) => text.replace(NEGATED, " ");
 
+// The paths `texts` name (pathTokens), outside a shape that leaves them
+// unmodified (NEGATED), that apply-patch refuses under `names`, read with a
+// dot-led name's dot left off (DOTLESS), in order, each once. Pure.
+const refusedPaths = (texts, names, workflows) => [
+  ...new Set(texts.flatMap((text) => pathTokens(withoutNegated(text), workflows).filter((path) => names.some((name) => PROTECTED_REFUSALS[name].test({ path: dotted(path) }))))),
+];
+
 // The paths the task-list items in `body`, with the wrapped text below each up
 // to its first nested bullet outside a code fence, read as plainText, name
 // that apply-patch refuses under `names` (issuePushRefusals) in any case or
@@ -1126,10 +1129,11 @@ export function unpushablePaths(body, taskList, names, workflows) {
     const end = more.findIndex((index) => blocks[index] === 0 && BULLET.test(lines[index]));
     return (end === -1 ? more : more.slice(0, end)).map((index) => lines[index]);
   };
-  const paths = taskItems(body, taskList).flatMap(({ text, more }) =>
-    pathTokens(withoutNegated(plainText([text, ...wrapped(more)].join("\n"))), workflows).filter((path) => names.some((name) => PROTECTED_REFUSALS[name].test({ path: dotted(path) }))),
+  return refusedPaths(
+    taskItems(body, taskList).map(({ text, more }) => plainText([text, ...wrapped(more)].join("\n"))),
+    names,
+    workflows,
   );
-  return [...new Set(paths)];
 }
 
 // A body line that cites evidence ("Basis: ...", "See ..."), and a path cited
@@ -1190,10 +1194,11 @@ export function bodyUnpushablePaths(body, taskList, names, workflows) {
     }
     open = !hash;
   });
-  const paths = paragraphs.flatMap(({ text, cites }) =>
-    pathTokens(withoutNegated(cites ? text : text.replace(CITED_AT, " ")), workflows).filter((path) => names.some((name) => PROTECTED_REFUSALS[name].test({ path: dotted(path) }))),
+  return refusedPaths(
+    paragraphs.map(({ text, cites }) => (cites ? text : text.replace(CITED_AT, " "))),
+    names,
+    workflows,
   );
-  return [...new Set(paths)];
 }
 
 // The refusal reason for unrunnableCriteria's result, with the split it
@@ -1215,6 +1220,13 @@ export function unrunnableReason({ items, found }) {
 
 const names = (labels) => (labels ?? []).map((label) => (typeof label === "string" ? label : label?.name));
 
+// Whether the newest `labeled` or `unlabeled` event of `label` in `events` is
+// a removal by an actor `trusted(actor)` does not accept. Pure.
+const removedByUntrusted = (events, label, trusted) => {
+  const newest = (events ?? []).filter((event) => ["labeled", "unlabeled"].includes(event?.event) && event.label?.name === label).at(-1);
+  return newest?.event === "unlabeled" && !trusted(newest.actor);
+};
+
 // Whether untrusted provenance holds the issue: one of UNTRUSTED_LABELS is on
 // it, or, for one of them, its newest add or removal is a removal by neither
 // a listed human (`humans`, ids) nor the lanes App (`isApp(actor)`). Each name
@@ -1222,10 +1234,7 @@ const names = (labels) => (labels ?? []).map((label) => (typeof label === "strin
 // a stranger's removal of the other. Admission and the issue lane's gate both
 // judge provenance here. Pure.
 export function untrustedHold({ labels, events, humans, isApp }) {
-  const removedByOther = UNTRUSTED_LABELS.some((label) => {
-    const newest = (events ?? []).filter((event) => ["labeled", "unlabeled"].includes(event?.event) && event.label?.name === label).at(-1);
-    return newest?.event === "unlabeled" && !humans.has(newest.actor?.id) && !isApp(newest.actor);
-  });
+  const removedByOther = UNTRUSTED_LABELS.some((label) => removedByUntrusted(events, label, (actor) => humans.has(actor?.id) || isApp(actor)));
   return names(labels).some((name) => UNTRUSTED_LABELS.includes(name)) || removedByOther;
 }
 
@@ -1241,7 +1250,7 @@ export function authorAdmitted(issue, humans, appId) {
 // Whether status: confirmed is the issue's only status label and agent-ready is
 // off, whether admission parked it there or a person confirmed it. Pure.
 export const confirmedOnly = (labels) =>
-  labels.includes(CONFIRMED) && !labels.some((label) => label === AGENT_READY || (label?.startsWith("status:") && label !== CONFIRMED));
+  labels.includes(CONFIRMED) && !labels.some((label) => label === AGENT_READY || (isStatusLabel(label) && label !== CONFIRMED));
 
 // Whether admission parked the issue at status: confirmed, which is also
 // triage's verified status: no other status, no agent-ready, and the lanes
@@ -1324,8 +1333,7 @@ export function deferralLapsed({ labels, events, editedAt, humans, appId }) {
 // event is a removal by anyone but a listed human (`humans`, ids), the lanes
 // App included. Only a listed human lifts it. Pure.
 export function attendedHold(events, humans) {
-  const newest = (events ?? []).filter((event) => ["labeled", "unlabeled"].includes(event?.event) && event.label?.name === ATTENDED).at(-1);
-  return newest?.event === "unlabeled" && !humans.has(newest.actor?.id);
+  return removedByUntrusted(events, ATTENDED, (actor) => humans.has(actor?.id));
 }
 
 // The External state the counted refinement on `spec` records: {state,
@@ -1373,7 +1381,7 @@ export function removalStands(events, isRemoval, isMark = () => true, isReMark =
 
 // The holds a lane stop adds beside its agent-ready removal. Lifting one
 // releases the issue, and no `status: ready` add follows a lift.
-const STOP_HOLDS = ["needs-human", NEEDS_DECISION];
+const STOP_HOLDS = ["needs-human", ...DECISION_LABELS];
 
 // Why admission leaves an issue alone whatever its verdict, or null: its
 // trusted Work status `state` (read-status.mjs statusReader's state) is
@@ -1432,27 +1440,26 @@ export function decide({ issue, verdict, rules, parent, blockers, trustedCloses,
   if (!labels.includes(READY)) {
     return { verdict: "skip", reasons: [`no ${READY}`] };
   }
+  const isApp = appActor(appId);
+  const trustedActor = (actor) => humans.has(actor?.id) || isApp(actor);
   // Only the App's or a listed human's status: ready or hold lift lifts a
   // removal: the App's agent-ready starts a credentialed run.
-  const settled = admissionSettled(labels, events, (event) => humans.has(event.actor?.id) || (appId !== undefined && event.actor?.id === appId), fieldState);
+  const settled = admissionSettled(labels, events, (event) => trustedActor(event.actor), fieldState);
   if (settled) {
     return { verdict: "skip", reasons: [settled] };
   }
+  const taskList = rules["task-list"];
 
   const refuse = [];
   // Refusals a host or builder session takes (stop-routes.json routes the
   // run's own patch-protected-path stop to host-run the same way).
   const hostWork = new Set();
-  let hold = false;
   // The owner reason each hold is for; the strongest names the stop.
   const holdCodes = new Set();
-  const holdFor = (code) => {
-    hold = true;
-    holdCodes.add(code);
-  };
+  const holdFor = (code) => holdCodes.add(code);
   // A trusted size-split sub-issue never splits again, so Size Large neither
   // parks nor refuses it; a run has no turn or time cap (owner Q93, C13).
-  const splitChild = splitChildBody(spec, humans, rules["task-list"]) !== null;
+  const splitChild = splitChildBody(spec, humans, taskList) !== null;
   if (splitChild && !rules.sizes.includes("large")) {
     rules = { ...rules, sizes: [...rules.sizes, "large"] };
   }
@@ -1470,13 +1477,13 @@ export function decide({ issue, verdict, rules, parent, blockers, trustedCloses,
   } else if (underParent || (rules["types-parent-if-present"].includes(type) && parent !== null)) {
     // An App-set needs-decision with no open decision does not hold
     // (parentDecisionOpen); a parent read without that fact holds.
-    const held = (label) => PARENT_HOLDS.has(label) || (label === NEEDS_DECISION && parent.decisionOpen !== false);
+    const held = (label) => PARENT_HOLDS.has(label) || (DECISION_LABELS.includes(label) && parent.decisionOpen !== false);
     const parentOk = parent !== null && parent.state === "open" && humans.has(parent.user?.id) && !names(parent.holdLabels ?? parent.labels).some(held);
     if (!parentOk) {
       refuse.push(`a ${type} needs an open parent issue a listed human filed that awaits no decision`);
     }
   }
-  if (verdict.untrusted || untrustedHold({ labels, events, humans, isApp: (actor) => appId !== undefined && actor?.id === appId })) {
+  if (verdict.untrusted || untrustedHold({ labels, events, humans, isApp })) {
     refuse.push(`${UNTRUSTED} work needs a person`);
     holdFor("security");
   }
@@ -1529,16 +1536,15 @@ export function decide({ issue, verdict, rules, parent, blockers, trustedCloses,
   // The body's checks a person runs (personChecks) leave the checks below.
   // personChecks counts a refinement only on a body a listed human wrote, so
   // that body is the first trusted text.
-  const texts = trustedSpecTexts(spec, humans, appId, rules["task-list"]);
-  const moved = personChecks(spec, humans, appId, rules["task-list"], webHosts);
+  const texts = trustedSpecTexts(spec, humans, appId, taskList);
+  const moved = personChecks(spec, humans, appId, taskList, webHosts);
   if (moved.length > 0) {
-    texts[0] = withoutItems(texts[0], rules["task-list"], moved);
+    texts[0] = withoutItems(texts[0], taskList, moved);
   }
-  const lines = texts.flatMap((text) => text.split("\n"));
-  if (!hasTrustedCriteria(spec, humans, rules["task-list"], appId)) {
-    refuse.push(noTrustedSpec(rules["task-list"]));
+  if (!hasTrustedCriteria(spec, humans, taskList, appId)) {
+    refuse.push(noTrustedSpec(taskList));
   }
-  const criteria = unrunnableCriteria(lines.join("\n"), rules["task-list"], webHosts);
+  const criteria = unrunnableCriteria(texts.join("\n"), taskList, webHosts);
   const unrunnable = unrunnableReason(criteria);
   // An issue a listed human or the App put in the host queue parks at
   // status: confirmed. A paid eval names a billing account and can bill the
@@ -1568,8 +1574,8 @@ export function decide({ issue, verdict, rules, parent, blockers, trustedCloses,
   const body = String(spec?.body ?? issue.body ?? "");
   const unpushable = [
     ...new Set([
-      ...texts.flatMap((text) => unpushablePaths(text, rules["task-list"], pushRefusals, workflows)),
-      ...bodyUnpushablePaths(moved.length > 0 ? withoutItems(body, rules["task-list"], moved) : body, rules["task-list"], pushRefusals, workflows),
+      ...texts.flatMap((text) => unpushablePaths(text, taskList, pushRefusals, workflows)),
+      ...bodyUnpushablePaths(moved.length > 0 ? withoutItems(body, taskList, moved) : body, taskList, pushRefusals, workflows),
     ]),
   ];
   if (unpushable.length > 0) {
@@ -1580,7 +1586,7 @@ export function decide({ issue, verdict, rules, parent, blockers, trustedCloses,
   // A metered or renewing charge needs the owner's decision, whatever the
   // verdict flagged. A word an edit moved into code leaves this read, so that
   // edit needs the same decision; a history that fails to read does not.
-  const charged = workCharges({ title: issue.title, body: issue.body }, charges, isPublic, rules["task-list"]);
+  const charged = workCharges(issue, charges, isPublic, taskList);
   if (charged.length > 0) {
     refuse.push(`its title or stated work names a charge (${charged.join(", ")}), which needs an owner decision`);
     holdFor("cost");
@@ -1639,9 +1645,10 @@ export function decide({ issue, verdict, rules, parent, blockers, trustedCloses,
   if (doneBy.length > 0 && !finished) {
     refuse.push(doneReason(doneBy));
   }
+  const hold = holdCodes.size > 0;
   const wait = [];
   const retriage = [];
-  const after = Math.max(judgedSince(events, (actor) => humans.has(actor?.id) || (appId !== undefined && actor?.id === appId)), Date.parse(verdict.writtenAt) || Number.NEGATIVE_INFINITY);
+  const after = Math.max(judgedSince(events, trustedActor), Date.parse(verdict.writtenAt) || Number.NEGATIVE_INFINITY);
   for (const blocker of blockers) {
     if (!blockerDone(blocker, repository, (b) => trustedCloses.has(blockerKey(b, repository)))) {
       const name = here(blocker.repository_url, repository) ? `#${blocker.number}` : blockerKey(blocker, repository);
@@ -1674,8 +1681,8 @@ export function decide({ issue, verdict, rules, parent, blockers, trustedCloses,
   // refinement (refineDue) may supply them, so the issue waits at status:
   // ready, and refine.mjs asks triage again once its refinement holds them.
   // The criteria gate itself stands: only the refusal becomes a wait.
-  const criteriaOnly = refuse.length === 1 && refuse[0] === noTrustedSpec(rules["task-list"]);
-  if (criteriaOnly && !hold && parked.length === 0 && wait.length === 0 && verdict.writtenAt !== undefined && !labels.includes("needs-human") && refineDue(spec, humans, appId, rules["task-list"])) {
+  const criteriaOnly = refuse.length === 1 && refuse[0] === noTrustedSpec(taskList);
+  if (criteriaOnly && !hold && parked.length === 0 && wait.length === 0 && verdict.writtenAt !== undefined && !labels.includes("needs-human") && refineDue(spec, humans, appId, taskList)) {
     return { verdict: "wait", reasons: [`${refuse[0]}; intake's refinement of this body is due and may supply them`], pulls: [] };
   }
   if (refuse.length > 0) {
@@ -1776,7 +1783,7 @@ export const blockerKey = (blocker, repository) =>
 // blocking.
 export async function trustedElsewhere(github, blocker, humans) {
   const repo = repoOf(blocker.repository_url);
-  if (repo === null || !/^[1-9][0-9]{0,9}$/.test(String(blocker.number))) {
+  if (repo === null || !BLOCKER_NUMBER.test(String(blocker.number))) {
     return false;
   }
   try {
@@ -1802,6 +1809,10 @@ export async function parentOf(github, base) {
 // either way) is the lanes App's; never for an unknown id or App.
 export const isAppId = (id, appId) => appId !== undefined && id !== undefined && id !== null && String(id) === String(appId);
 
+// Whether a REST actor is the lanes App (`appId`, compared strictly); never
+// for an unknown App.
+const appActor = (appId) => (actor) => appId !== undefined && actor?.id === appId;
+
 // The lanes App's own earlier verdict comment, if any.
 export const ownVerdict = (comments, appId) =>
   comments.find((c) => isAppId(c.user?.id, appId) && String(c.body ?? "").startsWith(`${VERDICT_MARKER}\n`));
@@ -1826,16 +1837,16 @@ export function earlierFlags(comments, appId) {
   ];
 }
 
-// Why the lanes App may not lift `status: needs-decision` on the issue at
+// Why the lanes App may not lift `needs-owner-decision` on the issue at
 // `base`, or null: someone else set it, or the App's verdict comment lists a
 // flag other than the intent a refinement resolves, or records that an
 // earlier flag is unknown (earlierFlags null). Once lifted, a re-triage sees
 // no hold and so carries no earlier flag. No such comment lifts: refine's own
 // question hold writes none. `events()` reads the issue's status history
 // (read-status.mjs statusEvents, where the field's needs-owner-decision reads
-// as a `status: needs-decision` add); by default its REST events.
+// as a `needs-owner-decision` add); by default its REST events.
 export async function decisionStays(github, base, comments, appId, events = () => paginate(github, `${base}/events`)) {
-  const setter = (await events()).filter((event) => event?.event === "labeled" && event.label?.name === NEEDS_DECISION).at(-1)?.actor?.id;
+  const setter = (await events()).filter((event) => event?.event === "labeled" && DECISION_LABELS.includes(event.label?.name)).at(-1)?.actor?.id;
   if (setter !== appId) {
     return `a person set its ${NEEDS_DECISION}`;
   }
@@ -1857,7 +1868,7 @@ export const refinementExact = (body) => {
   return last === REFINE_FOOTERS.retriage || last === REFINE_FOOTERS.confirm;
 };
 
-// Whether `parent` (an issue at `status: needs-decision`, as just read) still
+// Whether `parent` (an issue at `needs-owner-decision`, as just read) still
 // awaits a decision: the lanes App (`appId`) may not lift the label
 // (decisionStays), or the App's newest refinement on it is not exact
 // (refinementExact), or it has no refinement but an App verdict flagging
@@ -1941,9 +1952,7 @@ export function refineDue(spec, humans, appId, taskList) {
     return false;
   }
   const version = bodyVersion(body);
-  return !(spec.comments ?? []).some(
-    (comment) => comment?.author?.__typename === "Bot" && comment.author.databaseId === appId && String(comment.body ?? "").startsWith(REFINE_MARKER) && String(comment.body).split("\n")[1] === version,
-  );
+  return !(spec.comments ?? []).some((comment) => appRefinement(comment, appId) && String(comment.body).split("\n")[1] === version);
 }
 
 export const noTrustedSpec = (taskList) =>
@@ -1983,19 +1992,21 @@ export async function trustedSplitChild(github, repository, number, humans, appI
 // wrote; resolve-pr.mjs linkedIssues shares this rule and also requires the
 // comment to predate the pull request. Pure.
 export function refinementSpec(comments, appId) {
-  const newest = (comments ?? []).findLast(
-    (comment) =>
-      appId !== undefined &&
-      comment?.author?.__typename === "Bot" &&
-      comment.author.databaseId === appId &&
-      String(comment.body ?? "").startsWith(REFINE_MARKER),
-  );
+  const newest = (comments ?? []).findLast((comment) => appRefinement(comment, appId));
   return newest?.lastEditedAt == null ? newest : undefined;
 }
 
+// Whether a GraphQL comment is a refinement of the lanes App's (a Bot whose
+// id is `appId`): it opens with REFINE_MARKER. Pure.
+const appRefinement = (comment, appId) =>
+  appId !== undefined && comment?.author?.__typename === "Bot" && comment.author.databaseId === appId && String(comment.body ?? "").startsWith(REFINE_MARKER);
+
+// Whether a GraphQL actor is a User among `humans`.
+const humanActor = (humans) => (actor) => actor?.__typename === "User" && humans.has(actor.databaseId);
+
 // Whether a User among `humans` wrote the item, and last edited it if ever.
 const writtenBy = (humans) => {
-  const trusted = (actor) => actor?.__typename === "User" && humans.has(actor.databaseId);
+  const trusted = humanActor(humans);
   return (item) => trusted(item?.author) && (item.lastEditedAt == null || trusted(item.editor));
 };
 
@@ -2176,7 +2187,7 @@ export function splitChildBody(spec, humans, taskList) {
   if (typeof taskList !== "string" || taskList === "" || parent?.appId === undefined || !Number.isInteger(parent.number) || author?.__typename !== "Bot" || author.databaseId !== parent.appId) {
     return null;
   }
-  const human = (actor) => actor?.__typename === "User" && humans.has(actor.databaseId);
+  const human = humanActor(humans);
   const edited = spec.lastEditedAt != null;
   if (!human(parent.spec?.author) || (edited && !human(spec.editor))) {
     return null;
@@ -2239,7 +2250,7 @@ export function splitScope(body) {
 // The targets a Scope line names, or null when one is no scopeTarget over
 // `texts` or repeats. Pure.
 function scopeTargets(line, texts) {
-  const names = line.slice(SCOPE_PREFIX.length).split(", ");
+  const names = splitScope(line);
   return new Set(names).size === names.length && names.every((name) => scopeTarget(name, texts)) ? names : null;
 }
 
@@ -2251,8 +2262,7 @@ const tickedForms = (line, taskList) => {
     return [];
   }
   const indent = line.slice(0, line.length - line.trimStart().length);
-  const text = line.trimStart().slice(taskList.length);
-  return ["[x]", "[X]"].map((box) => indent + taskList.replace("[ ]", box) + text);
+  return ["[x]", "[X]"].map((box) => indent + taskList.replace("[ ]", box) + taskText(line, taskList));
 };
 
 // The split record on the second line of the lanes App's SIZE_SPLIT_MARKER
@@ -2288,9 +2298,9 @@ export function splitRecord(body) {
   return {
     items: match[1],
     parts: match[2].split(";").map((part) => numbers(part, ",")),
-    order: numbers(match[3], ",").length === 0 ? [] : match[3].split(",").map((pair) => pair.split(">").map(Number)),
+    order: match[3] === "" ? [] : match[3].split(",").map((pair) => pair.split(">").map(Number)),
     filed: numbers(match[4], ","),
-    ...(match[5] === undefined ? {} : { groups: decodeGroups(match[5]) }),
+    ...(match[5] !== undefined && { groups: decodeGroups(match[5]) }),
   };
 }
 
@@ -2438,7 +2448,7 @@ export async function finishedParent({ github, repository, issue, trusted }) {
 // that still holds (isTrustedClose), or is a split parent the lanes App
 // closed (splitParentClosed), read fresh.
 export const closedByTrusted = ({ github, repository, humans, appId }) => {
-  const isApp = (actor) => appId !== undefined && actor?.id === appId;
+  const isApp = appActor(appId);
   const trusted = async (number) => {
     const issue = await github("GET", `/repos/${repository}/issues/${number}`);
     return (await isTrustedClose(github, repository, issue, humans, isApp)) || splitParentClosed({ github, repository, issue, isApp, humans, trusted });
@@ -2494,14 +2504,12 @@ export const ADMISSION_STATUS_READS = 2;
 export async function admissionFacts({ github, repository, number, issue, rules, humans, isTrusted, appId, doneBy, statusOf }) {
   const base = `/repos/${repository}/issues/${number}`;
   const blockers = await blockersOf(github, base);
+  const isApp = appActor(appId);
   // Anyone may close their own issue, so a blocking issue counts only with a
   // trusted close, read fresh from the issue; one closed as not planned or a
   // duplicate counts too, since nothing is left to wait for. `isTrusted`
   // answers for this repository's blockers only.
-  const trusted =
-    isTrusted ??
-    (async (blocker) =>
-      isTrustedClose(github, repository, await github("GET", `/repos/${repository}/issues/${blocker}`), humans, (actor) => appId !== undefined && actor?.id === appId));
+  const trusted = isTrusted ?? (async (blocker) => isTrustedClose(github, repository, await github("GET", `/repos/${repository}/issues/${blocker}`), humans, isApp));
   const trustedCloses = new Set();
   // A blocker here the lanes App closed report-delivered (decide's
   // `reported`); a close kind that does not read leaves it waiting as before.
@@ -2513,7 +2521,7 @@ export async function admissionFacts({ github, repository, number, issue, rules,
       if (ok) {
         trustedCloses.add(blockerKey(blocker, repository));
       } else if (local && appId !== undefined) {
-        const close = await currentAppClose(github, repository, blocker.number, (actor) => actor?.id === appId);
+        const close = await currentAppClose(github, repository, blocker.number, isApp);
         if (close?.stop === "report-delivered" && close.at) {
           reported.set(blockerKey(blocker, repository), { stop: close.stop, at: close.at, url: close.url, reason: close.reason });
         }
@@ -2522,7 +2530,7 @@ export async function admissionFacts({ github, repository, number, issue, rules,
   }
   // A throw here stops the caller before decide(), so nothing is written.
   const spec = await specOf(github, repository, number);
-  const child = appId !== undefined && issue.user?.id === appId && String(issue.body ?? "").startsWith(SPLIT_CHILD_MARKER);
+  const child = isApp(issue.user) && String(issue.body ?? "").startsWith(SPLIT_CHILD_MARKER);
   const typed = [...rules["types-under-parent"], ...rules["types-parent-if-present"]].includes(issue.type?.name);
   const parent = child || typed ? await parentOf(github, base) : null;
   // A size split's sub-issue counts as its parent's text (splitChildBody).
@@ -2534,10 +2542,10 @@ export async function admissionFacts({ github, repository, number, issue, rules,
   // After parentHolds, so its events reuse that field read.
   const parentEvents = parentHolds && (() => statusOf.events(parent.number));
   const decisionOpen =
-    typed && parent !== null && names(parent.labels).includes(NEEDS_DECISION) ? await parentDecisionOpen({ github, repository, parent, humans, appId, events: parentEvents }) : undefined;
+    typed && parent !== null && carried(names(parent.labels), DECISION_LABELS) ? await parentDecisionOpen({ github, repository, parent, humans, appId, events: parentEvents }) : undefined;
   // Only a visibility that reads public skips the cost_private charge words.
   // A failed read throws, like the reads above, so no verdict rests on a
-  // visibility it did not read (docs/outage-posture-audit.md, element 4).
+  // visibility it did not read (docs/conventions/pr-pipeline/README.md#outage-posture, element 4).
   const isPublic = (await github("GET", `/repos/${repository}`))?.visibility === "public";
   const subIssues = await openSubIssues(github, base, issue);
   return {
@@ -2590,7 +2598,13 @@ export async function deferredAhead(github, repository, issue, listing, pullsFor
     return true;
   }
   try {
-    const older = (await listing.issues(["deferred"]))
+    const deferred = await listing.issues(["deferred"]);
+    // An older issue the listing holds (`held`, Work status mid-write) could
+    // be deferred: it counts as one ahead, as an unreadable answer does.
+    if ((deferred.held ?? []).some((item) => Number(item.number) !== Number(issue.number) && !(Date.parse(item.created_at) >= created))) {
+      return true;
+    }
+    const older = deferred
       .filter((item) => Number(item.number) !== Number(issue.number) && Date.parse(item.created_at) < created)
       .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.number - b.number);
     for (const item of older.slice(0, DEFERRED_AHEAD_READS)) {
@@ -2621,16 +2635,21 @@ export const RACE_WINDOW_MS = 10 * 60_000;
 // reads as an admission-deferred add), the claim admit() makes, else its
 // first agent-ready add then (an admission that made no claim), or null when
 // its history shows no add of either at all yet; one whose adds all predate
-// `since` is left out. A failed read throws.
+// `since` is left out, and one the listing holds mid-write reads at null. A
+// failed read throws.
 export async function admissionsSince(github, repository, since, listing) {
   const stamp = new Date(since).toISOString().replace(/\.\d{3}Z$/, "Z");
   const listed = new Set();
-  for (const item of await listing.issues(["deferred", AGENT_READY], { since: stamp })) {
+  const found = await listing.issues(["deferred", AGENT_READY], { since: stamp });
+  for (const item of found) {
     if (!item?.pull_request && Number.isSafeInteger(item?.number)) {
       listed.add(item.number);
     }
   }
-  const entered = [];
+  // An issue the listing holds (`held`, Work status mid-write) may be a
+  // racing admission: it counts as entered with its add not read (at null),
+  // so it takes room rather than undercount.
+  const entered = (found.held ?? []).filter((item) => Number.isSafeInteger(item?.number) && !listed.has(item.number)).map((item) => ({ number: item.number, at: null }));
   for (const number of listed) {
     const adds = (await listing.events(number)).filter((event) => event?.event === "labeled" && [AGENT_READY, DEFERRED].includes(event.label?.name));
     const times = (name) => adds.filter((event) => event.label.name === name).map((event) => Date.parse(event.created_at)).filter((time) => Number.isFinite(time) && time >= since);
@@ -2666,34 +2685,16 @@ export function admissionsAhead(entered, number) {
 export async function admit({ github, repository, number, verdict, rules, humans, appId, status, webHosts, setStatus, statusOf, listing, log = console.log }) {
   const base = `/repos/${repository}/issues/${number}`;
   const issue = await github("GET", base);
-  const own = names(issue.labels);
-  const facts = await admissionFacts({
-    github,
-    repository,
-    number,
-    issue,
-    rules,
-    humans,
-    appId,
-    isTrusted: closedByTrusted({ github, repository, humans, appId }),
-    doneBy: mergedRefsReader({ github, repository, humans, appId, log }),
-    statusOf,
-  });
+  const isTrusted = closedByTrusted({ github, repository, humans, appId });
+  const doneBy = mergedRefsReader({ github, repository, humans, appId, log });
+  const facts = await admissionFacts({ github, repository, number, issue, rules, humans, appId, isTrusted, doneBy, statusOf });
   const { comments } = facts;
-  const decision = decide({
-    ...facts,
-    verdict,
-    rules,
-    humans,
-    appId,
-    repository,
-    webHosts,
-  });
+  const decision = decide({ ...facts, verdict, rules, humans, appId, repository, webHosts });
   const reasons = decision.reasons.join("; ");
   // A state the issue already reads is not written again: a second write
   // would name the lanes App as the setter of a person's hold, or read as a
   // fresh status: ready that lifts an agent-ready removal (admissionSettled).
-  const lower = names(facts.holdLabels ?? own);
+  const lower = names(facts.holdLabels ?? issue.labels);
   // A state that is no hold is written only over no hold a person set since
   // the read (write-status.mjs keepHold); `held` ends admission there.
   const move = (state) => setStatus(number, state, { keepHold: true });

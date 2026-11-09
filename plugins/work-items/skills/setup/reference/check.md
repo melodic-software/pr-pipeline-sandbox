@@ -12,21 +12,42 @@ check.
    [`reference/tracker-seam.md`](../../../reference/tracker-seam.md)
    "entry-point presence checks"; probe it (`command -v jq`), don't restate it. Absent is FAIL with that
    reference's install remediation, the schedule snippets parse with `jq` unconditionally.
-2. **Tracker provider binding**, resolve `BINDING` (above). Absent → INFO: the tracker seam is not
-   bound, so every seam verb hard-errors (exit 3) until `apply` seeds it, and the role remap has nothing
-   to configure; the remediation is `/work-items:setup apply`. Present → validate without mutating: it
-   parses as JSON, carries `schema_version` and a `provider`, and that provider resolves to a bundled
-   adapter (`github`, `local-markdown`, `jira`, `gitea`, `linear`) or a consumer-local one at
-   `${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/tools/work-item-tracker/adapters/<provider>/`; `config.lease_ttl_hours` is
+2. **Tracker provider binding**, resolve the convention home and `BINDING` (SKILL.md "Resolving the
+   paths"). A broken pointer (resolver exit `3`) is FAIL, naming the resolver's message. Where no home
+   applies (exit `4` or `5`) → INFO: the seam reads only the legacy JSON file there, and setup
+   writes no binding until the repository binds a convention home. Then branch on which files bind:
+   - **Neither** `BINDING` nor `LEGACY` → INFO: the tracker seam is not bound, so every seam verb
+     hard-errors (exit 3) until `apply` seeds it, and the role remap has nothing to configure; the
+     remediation is `/work-items:setup apply`.
+   - **`LEGACY` only** (`.work-item-tracker.json` exists and `<home>/work-items.yaml` has no
+     `tracker` key) → INFO: the binding exists only in the legacy JSON file, which the seam still
+     reads with a notice; `/work-items:setup apply` copies it into `<home>/work-items.yaml` and
+     keeps the JSON file. Validate the JSON file as below.
+   - **`BINDING`, with `LEGACY` too** → INFO: the JSON file is kept for the readers that still read
+     only it (SKILL.md "Provider binding" step 1); name any `provider` or `config` value that
+     differs between the two. When a `.work-item-tracker.local.json` exists and
+     `<home>/work-items.local.yaml` has no `tracker` key, say the seam no longer reads that
+     personal override, since it reads the one beside the YAML binding; `apply` copies it.
+
+   Validate the binding that binds without mutating: `<home>/work-items.yaml` parses with
+   `awk -f <plugin-root>/skills/triage/scripts/yaml-subset.awk` and its `tracker` mapping carries no
+   key outside `schema_version`, `provider`, `config` and `docs`, or the legacy file parses as JSON.
+   It carries `schema_version` and a `provider`, and that provider resolves to a bundled
+   adapter (`github`, `local-markdown`) or a consumer-local one at
+   `${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/tools/work-item-tracker/adapters/<provider>/`.
+   A seeded provider (`jira`, `gitea`, `linear`) resolves only through that consumer-local copy: with
+   none there it is FAIL, remediation `/work-items:setup apply`, which copies the seed. `config.lease_ttl_hours` is
    present, `local-markdown` additionally carries `config.storage_dir`, and `jira` additionally carries
    `config.jira` (`site`, non-empty `project_keys[]`, `auth_email`, `auth_env`). A malformed shape, an
    unknown/unresolvable provider, or a missing required config key is FAIL, naming what is wrong.
-   The ignore rule is required whether or not the overlay file exists. A present overlay
-   (`.work-item-tracker.local.json`) must parse as JSON, carry only allowlisted keys
+   The ignore rule for `OVERRIDE` (`<home>/work-items.local.yaml`) is required whether or not the
+   personal override file exists. A present personal override must parse (the YAML file with the same parser, its
+   `tracker` mapping; a legacy `.work-item-tracker.local.json`, still read beside a legacy-only
+   binding, as JSON), carry only allowlisted keys
    (CONTRACT.md "Setup (binding file)"), and be gitignored, never tracked. Otherwise FAIL.
    Ignored and untracked are **two independent probes**: run the same pair `apply` step 5 uses, per
-   [`reference/overlay-ignore-probes.md`](overlay-ignore-probes.md). A bare
-   `git check-ignore` is silent for an already-tracked overlay. Tracked is the more serious FAIL;
+   [`reference/personal-override-ignore-probes.md`](personal-override-ignore-probes.md). A bare
+   `git check-ignore` is silent for an already-tracked personal override. Tracked is the more serious FAIL;
    name it as such when both hold.
    A `github` binding must additionally be **addressable from this checkout**, because everything
    above is shape and owner/repo are never recorded in the binding, every repo-scoped verb derives
@@ -56,13 +77,14 @@ check.
    degrade to "no recurring schedule configured"; `apply` seeds it. Present → continue.
 4. **Schedule validity**, a present file parses as JSON with the root `{"items": [ ... ]}` shape
    (FAIL otherwise), and **both reconciliation keys are unique across the whole `items` array, every
-   `id` AND every `title`**. A duplicate `id` (the key `recheck <id>` resolves against) or duplicate
-   `title` (the key `due` / `work` match `[Maintenance] {title}` against) silently breaks
+   `id` AND every `title`**. A duplicate `id` (the key `recheck <id>` resolves against and an
+   item's recurring marker names) or duplicate `title` (the key `recheck <text match>` resolves
+   against) silently breaks
    reconciliation, FAIL, naming the collision. A valid file whose `items` array is empty is the
    skipped first-time bind's skeleton, INFO: the schedule carries no rows, so `due` / `recheck` /
    `work` have nothing to act on; `apply --seed-schedule` seeds it. (Report this only once the root
    shape validates, probe 3 establishes file presence alone and cannot tell empty from malformed.)
-5. **Tracked, not ignored**, a present schedule (and a present binding) must be committed to be
+5. **Tracked, not ignored**, a present schedule (and a present `<home>/work-items.yaml`) must be committed to be
    team-shared. Probe the pair per path: `git check-ignore -v` (match = FAIL with the pattern)
    AND `git ls-files --error-unmatch` (non-zero = FAIL: un-ignored but untracked; "commit it").
 6. **Recurring-maintenance role label**. Role-label resolution is an action-entry invariant per the
@@ -80,10 +102,10 @@ check.
    present-but-empty `{"items": []}` on disk, so a file-presence gate hard-FAILs the expected
    post-bind steady state over an item that can never be created:
    - **Schedule carries ≥1 item**. Verify the resolved label is present via the adapter's label
-     listing (GitHub adapter: `gh label list`): an absent label means a seeded `[Maintenance]` item
+     listing (GitHub adapter: `gh label list`): an absent label means a seeded recurring item
      lands unlabeled and goes invisible to the next `due` / `work` pass. FAIL, with the remediation
      being the repo's declared label provisioning process (never `gh label create` ad hoc).
-   - **Schedule absent, or present with an empty `items` array**, no `[Maintenance]` item can be
+   - **Schedule absent, or present with an empty `items` array**, no recurring item can be
      created from a schedule with no rows, so an absent label is INFO, not a gate: report it, and
      note it must exist before the schedule is ever seeded.
    - **Schedule present but not parseable as the `{"items": [ ... ]}` root**. It has no readable row
@@ -91,12 +113,12 @@ check.
      reason, so the table carries a row for every probe, and probe 4's FAIL is the gate. Never read
      an unparsable schedule as zero rows, and never raise the ≥1-row FAIL on a guess about what it
      holds, either would substitute this probe's own verdict for probe 4's.
-7. **Work-class label axis**, when probe 2 found a present, shape-valid binding whose provider
-   exposes label listing (the `github` adapter: `gh label list`), verify all five canonical
-   `work-class:` members from
-   [`reference/work-class-labels.md`](../../../reference/work-class-labels.md)
-   exist. Any missing member is FAIL. Triage cannot apply autonomous-eligible outcomes until the
-   axis is provisioned; remediation is `/work-items:setup apply` on repos without label-as-code,
+7. **Provenance label**, when probe 2 found a present, shape-valid binding whose provider
+   exposes label listing (the `github` adapter: `gh label list`), verify the canonical
+   `provenance: untrusted` member from
+   [`reference/label-taxonomy.md`](../../../reference/label-taxonomy.md)
+   exists. Absent is FAIL. Triage cannot mark an untrusted item until the
+   label is provisioned; remediation is `/work-items:setup apply` on repos without label-as-code,
    or the repo's declared label-as-code owner when one exists (never `gh label create` ad hoc there).
    Providers without a label listing (`local-markdown`, read-only `jira`) → INFO: verify at triage
    time via the item store. When probe 2 is INFO (no binding) or FAIL (malformed binding), skip this

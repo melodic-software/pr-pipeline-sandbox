@@ -853,7 +853,7 @@ test("intake-triage.yml: the model may apply duplicate, which admission refuses,
   const text = intake.with.instructions.replace(/\s+/g, " ");
   assert.match(text, /DUPLICATE\. When an open issue asks for the same thing, apply the `duplicate` label/);
   assert.match(text, /name the candidate by number/);
-  assert.match(text, /apply no `status: needs-decision`/);
+  assert.match(text, /apply no `needs-owner-decision`/);
 });
 
 test("pr-unblock.yml: report-stop-status runs when report-escalation does, or after an attempt that did not stop, with a gated head and never on a cancelled run", () => {
@@ -2062,6 +2062,18 @@ test("work-resolve-issue.yml: an unlisted sender's agent-ready field write is re
 
 const READ_RUNNER = "./.github/workflows/pr-run-activity-read.yml";
 const workflowFiles = () => readdirSync(new URL("../../workflows/", import.meta.url)).filter((file) => /\.ya?ml$/.test(file));
+
+// A workflow's `name:` is what a workflow_run filter matches, so one that drifts from this rule
+// silently stops a trigger. babysit_review_evidence.py's workflow_display_name holds the same rule.
+const { displayWords } = JSON.parse(readFileSync(new URL("../../standards/github-actions-conventions/vocabulary.json", import.meta.url), "utf8"));
+const displayName = (stem) => stem.split("-").map((word) => displayWords[word] ?? word[0].toUpperCase() + word.slice(1)).join(" ");
+test("every workflow and action name is its file or directory stem in Title Case", () => {
+  const actions = readdirSync(new URL("..", import.meta.url)).filter((dir) => existsSync(new URL(`../${dir}/action.yml`, import.meta.url)));
+  for (const [file, stem] of [...workflowFiles().map((name) => [new URL(`../../workflows/${name}`, import.meta.url), name.replace(/\.ya?ml$/, "")]), ...actions.map((dir) => [new URL(`../${dir}/action.yml`, import.meta.url), dir])]) {
+    assert.equal(parse(readFileSync(file, "utf8")).name, displayName(stem), String(file));
+  }
+});
+
 // The secret a read-runner input takes, by the suffix run-claude-cli names
 // it with: <ROLE>_CLAUDE_API_KEY or <ROLE>_CLAUDE_CODE_OAUTH_TOKEN.
 const CLAUDE_SECRETS = { "claude-api-key": "CLAUDE_API_KEY", "claude-code-oauth-token": "CLAUDE_CODE_OAUTH_TOKEN" };
@@ -2653,7 +2665,9 @@ test("no run-claude-cli plugin-dirs or add-dirs value names runner.temp, RUNNER_
 // ba7af78d291f10bd75651857a0db2357c23df0fe, 30b251532b2e9f7e0c4215e1dee5be0d3c688743, 81a603a6e2b0319428c981bf28f3fe923032afb2
 // 2476d5dde8979eab34374150b7e4b0a2b99f4e88, bc62beb95a989641f30552a932a132ebb8ecd801 and
 // b8bdd7fa2319b2457cbbef32c5348c394b9bc3f6: lane.cjs:404-405; 4aba9be6cc58c88c132308d417ebe136dd054296:
-// lane.cjs:425-426; in cliArgs. The org requires
+// lane.cjs:425-426; 8f2240359aff2febf49ff1ff838d1ffb27d6b14f: lane.cjs:467-468;
+// a5af46547856939969bee3c44d32d8ea6bc5dca4: lane.cjs:469-470;
+// fc442ad3e808adafe3b195e9d12fff901220db50: lane.cjs:473-474; in cliArgs. The org requires
 // actions pinned to a full SHA, so a pin bump fails here until its lane.cjs is read and its SHA added.
 const PERMISSION_PROMPTS_NONE_LAUNCHERS = new Set([
   "7b362428c76085a160e28656cd2c75c3147a69ff",
@@ -2667,6 +2681,9 @@ const PERMISSION_PROMPTS_NONE_LAUNCHERS = new Set([
   "bc62beb95a989641f30552a932a132ebb8ecd801",
   "b8bdd7fa2319b2457cbbef32c5348c394b9bc3f6",
   "4aba9be6cc58c88c132308d417ebe136dd054296",
+  "8f2240359aff2febf49ff1ff838d1ffb27d6b14f",
+  "a5af46547856939969bee3c44d32d8ea6bc5dca4",
+  "fc442ad3e808adafe3b195e9d12fff901220db50",
 ]);
 
 test("every run-claude-cli step pin in this repo's workflows is a launcher checked to pass --permission-prompts none", () => {
@@ -9134,7 +9151,7 @@ test("pr-run-activity-read.yml: issue-fields logs the API budget only when it ch
 // repository only, whatever it concluded, unless it ran no job.
 test("work-unblock.yml: a finished work-resolve-issue run in this repository sweeps, a skipped or fork run does not", () => {
   const doc = workflow("work-unblock.yml");
-  assert.deepEqual(doc.on.workflow_run, { workflows: ["work-resolve-issue"], types: ["completed"] });
+  assert.deepEqual(doc.on.workflow_run, { workflows: ["Work Resolve Issue"], types: ["completed"] });
   const job = doc.jobs["label-unblocked"];
   const runs = ({ event = "workflow_run", ref = "refs/heads/main", head = "melodic-software/claude-code-plugins", conclusion = "success", sender = "Bot", action = "closed" } = {}) =>
     evaluate(job.if, {
@@ -9343,7 +9360,7 @@ test("the tip step outputs the exact ref's SHA from this repository and fails on
   assert.match(missing.stdout, /^::error::the tip of main did not resolve$/m);
 });
 
-// Element 1 of docs/outage-posture-audit.md: at most 3 tries, with full-jitter
+// Element 1 of docs/conventions/pr-pipeline/README.md#outage-posture: at most 3 tries, with full-jitter
 // waits of 0-2 s and then 0-4 s, and red when no try yields a SHA. Each case
 // runs under both shells a step gets: bash -e, and bash -eo pipefail under
 // shell: bash.
@@ -9474,7 +9491,7 @@ const EVAL_LEG_CREDENTIALS = {
   subscription: ["CLAUDE_CODE_OAUTH_TOKEN", "${{ secrets.MAINTENANCE_CLAUDE_CODE_OAUTH_TOKEN }}"],
   fallback: ["CLAUDE_CODE_OAUTH_TOKEN", "${{ secrets.FALLBACK_CLAUDE_CODE_OAUTH_TOKEN }}"],
 };
-const CLASSIFIER_PIN = "b8bdd7fa2319b2457cbbef32c5348c394b9bc3f6";
+const CLASSIFIER_PIN = "fc442ad3e808adafe3b195e9d12fff901220db50";
 for (const [file, gateId, [keyId, subId, fbId], marker] of [
   ["eval-hill-climb-pass.yml", "gate", ["pass", "pass-subscription", "pass-fallback"], "key-credit-stop-maintenance-measure-skill-edit.yml-pass"],
   ["eval-browser-dispatch.yml", "eval-key-credit", ["eval", "eval-subscription", "eval-fallback"], "key-credit-stop-eval-browser-dispatch.yml-eval"],
@@ -10231,4 +10248,10 @@ test("a credential passed outside the launcher step is caught", () => {
   assert.deepEqual(stray(doc(job([{ name: "Call claude", env: { ANTHROPIC_API_KEY: "${{ secrets.R_CLAUDE_API_KEY }}" }, run: "claude -p hi" }]))), ["step Call claude"]);
   assert.deepEqual(stray(doc(job([through], { CLAUDE_CODE_OAUTH_TOKEN: "${{ secrets.R_CLAUDE_CODE_OAUTH_TOKEN }}" }))), ["job env"]);
   assert.deepEqual(stray({ env: { K: "${{ secrets.R_CLAUDE_API_KEY }}" }, jobs: { j: job([through]) } }), ["workflow env"]);
+});
+
+test("report-outcome keeps the base checkout its run-time .base imports need", () => {
+  const config = parse(read("../../../docs/conventions/pr-pipeline.yaml"));
+  assert.equal(config.activities["report-outcome"].checkout, "base");
+  assert.match(read("../../scripts/work-resolve-issue/report-outcome.mjs"), /env\.BASE_PATH \|\| "\.base", "\.github", "actions"/);
 });

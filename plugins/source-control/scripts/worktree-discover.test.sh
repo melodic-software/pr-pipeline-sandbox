@@ -151,6 +151,25 @@ assert_eq "an owner found by the scan contributes its root" $'root\t'"$ROOT3"$'\
 assert_eq "that root is scanned" $'worktree\t'"$ROOT3/d-wt3"$'\t'"$D" "$(rows worktree "$ROOT3/d-wt3")"
 git -C "$D" worktree remove --force "$ROOT/d-wt" >/dev/null 2>&1
 
+# A worktree below a root but not its direct child (inside another worktree's
+# .work/, or under a plain directory) is listed from its repository's registration.
+git -C "$A" worktree add -q -b wnest "$ROOT/a-wt/.work/nested" >/dev/null 2>&1
+mkdir -p "$ROOT/group"
+git -C "$B" worktree add -q -b wdeep "$ROOT/group/b-deep" >/dev/null 2>&1
+run_disc "$GLOBAL" "$T/bin/no-ghq" --repo-dir "$A"
+assert_exit "nested worktrees: exits 0" 0 "$RC"
+assert_eq "a worktree nested in another worktree is listed with its repository" \
+  $'worktree\t'"$ROOT/a-wt/.work/nested"$'\t'"$A" "$(rows worktree "$ROOT/a-wt/.work/nested")"
+assert_eq "a worktree under a plain directory below the root is listed" \
+  $'worktree\t'"$ROOT/group/b-deep"$'\t'"$B" "$(rows worktree "$ROOT/group/b-deep")"
+assert_eq "a direct child the scan found is not listed twice" \
+  $'worktree\t'"$ROOT/a-wt"$'\t'"$A" "$(rows worktree "$ROOT/a-wt")"
+assert_eq "the plain directory itself is no worktree row" "" "$(rows worktree "$ROOT/group")"
+assert_eq "the nested worktree counts toward its repository" $'repo\t'"$A"$'\t2' "$(rows repo "$A")"
+git -C "$A" worktree remove --force "$ROOT/a-wt/.work/nested" >/dev/null 2>&1
+git -C "$B" worktree remove --force "$ROOT/group/b-deep" >/dev/null 2>&1
+rmdir "$ROOT/group" "$ROOT/a-wt/.work"
+
 # A path holding a tab cannot be a TSV field: skipped, with a warning.
 TABBED="$ROOT/tab"$'\t'"wt"
 if git -C "$A" worktree add -q -b wtab "$TABBED" >/dev/null 2>&1; then
@@ -194,5 +213,114 @@ run_disc /dev/null "$T/bin/no-ghq" --repo-dir
 assert_exit "--repo-dir without a value is a usage error" 2 "$RC"
 run_disc /dev/null "$T/bin/no-ghq" --data-root-file "$T/missing"
 assert_exit "a missing root file is a usage error" 2 "$RC"
+
+# A git older than 2.36 rejects `worktree list -z`: fail closed, naming the
+# floor and the installed version, rather than reporting 0 linked worktrees.
+OLD_GIT_BIN="$T/old-git-bin"
+mkdir -p "$OLD_GIT_BIN"
+{
+  printf '#!/usr/bin/env bash\n'
+  # shellcheck disable=SC2016  # the $@ belongs to the generated stub, not here.
+  printf 'case " $* " in *" worktree list "*" -z "*) echo "error: unknown switch z" >&2; exit 129 ;; esac\n'
+  # shellcheck disable=SC2016
+  printf 'if [[ "${1:-}" == --version ]]; then echo "git version 2.35.0"; exit 0; fi\n'
+  printf 'exec %q "$@"\n' "$(command -v git)"
+} >"$OLD_GIT_BIN/git"
+chmod +x "$OLD_GIT_BIN/git"
+PATH_SAVED="$PATH"
+PATH="$OLD_GIT_BIN:$PATH_SAVED"
+run_disc "$GLOBAL" "$T/bin/no-ghq" --repo-dir "$A"
+PATH="$PATH_SAVED"
+assert_exit "git without worktree list -z fails closed (exit 5)" 5 "$RC"
+assert_contains "the old-git failure names the floor" "$ERR" "git >= 2.36.0"
+assert_contains "the old-git failure names the installed version" "$ERR" "git version 2.35.0"
+assert_eq "the old-git failure prints no inventory" "" "$OUT"
+
+# --- --remove-input-files deletes the handed files and their dir (#8212) ---
+# The status block writes its two input files into a mktemp dir; the helper owns
+# their removal so the block needs no rm and no exit-status variable.
+# mkinputs <dir> <data root>: the two files the skill writes, the plugin option
+# left unconfigured.
+mkinputs() {
+  mkdir -p "$1"
+  # shellcheck disable=SC2016 # the literal unexpanded token is the point
+  printf '%s' '${user_config.worktree_root}' >"$1/worktree-root"
+  printf '%s' "$2" >"$1/data-root"
+}
+dir_state() { [[ -e "$1" ]] && echo present || echo absent; }
+
+inputs="$T/inputs-ok"
+mkinputs "$inputs" "$T/data"
+run_disc /dev/null "$T/bin/no-ghq" --repo-dir "$B" --fallback-root-file "$inputs/worktree-root" \
+  --data-root-file "$inputs/data-root" --remove-input-files
+assert_exit "--remove-input-files: exits 0" 0 "$RC"
+assert_eq "--remove-input-files: the files were read first" \
+  $'root\t'"$T/data/worktrees"$'\tplugin-data' "$(rows root "$T/data/worktrees")"
+assert_eq "--remove-input-files: input dir removed after success" absent "$(dir_state "$inputs")"
+
+inputs="$T/inputs-no-root"
+# shellcheck disable=SC2016 # the literal unexpanded token is the point
+mkinputs "$inputs" '${CLAUDE_PLUGIN_DATA}'
+run_disc /dev/null "$T/bin/no-ghq" --repo-dir "$B" --fallback-root-file "$inputs/worktree-root" \
+  --data-root-file "$inputs/data-root" --remove-input-files
+assert_exit "--remove-input-files: no root still exits 3" 3 "$RC"
+assert_eq "--remove-input-files: input dir removed after a non-zero exit" absent "$(dir_state "$inputs")"
+
+# The trap is armed when the flag is parsed, so a later usage error cleans up.
+inputs="$T/inputs-usage"
+mkinputs "$inputs" "$T/data"
+run_disc /dev/null "$T/bin/no-ghq" --fallback-root-file "$inputs/worktree-root" \
+  --data-root-file "$inputs/data-root" --remove-input-files --bogus
+assert_exit "--remove-input-files: unknown flag still exits 2" 2 "$RC"
+assert_eq "--remove-input-files: input dir removed after a later usage error" absent "$(dir_state "$inputs")"
+
+# The files are read after parsing, so an unreadable one before the flag is removed too.
+inputs="$T/inputs-newline"
+mkinputs "$inputs" "$T/data"$'\n'
+run_disc /dev/null "$T/bin/no-ghq" --data-root-file "$inputs/data-root" \
+  --fallback-root-file "$inputs/worktree-root" --remove-input-files
+assert_exit "--remove-input-files: a root file holding a newline still exits 2" 2 "$RC"
+assert_eq "--remove-input-files: input dir removed after an unreadable file" absent "$(dir_state "$inputs")"
+
+inputs="$T/inputs-shared"
+mkinputs "$inputs" "$T/data"
+printf 'x\n' >"$inputs/unrelated"
+run_disc /dev/null "$T/bin/no-ghq" --repo-dir "$B" --fallback-root-file "$inputs/worktree-root" \
+  --data-root-file "$inputs/data-root" --remove-input-files
+assert_file_absent "--remove-input-files: handed file removed from a shared dir" "$inputs/data-root"
+assert_file_absent "--remove-input-files: the other handed file removed too" "$inputs/worktree-root"
+assert_file_exists "--remove-input-files: an unrelated file is kept" "$inputs/unrelated"
+
+inputs="$T/inputs-kept"
+mkinputs "$inputs" "$T/data"
+run_disc /dev/null "$T/bin/no-ghq" --repo-dir "$B" --fallback-root-file "$inputs/worktree-root" \
+  --data-root-file "$inputs/data-root"
+assert_file_exists "without --remove-input-files the input files stay" "$inputs/data-root"
+
+# The status.md block end to end under zsh, where `status=$?` aborts: the bare
+# helper call exits with the helper's code and leaves no temp directory.
+# run_zsh_block <inputs dir>: the block, run by zsh from a non-repository cwd.
+run_zsh_block() {
+  # shellcheck disable=SC2016 # zsh expands the positional parameters
+  (cd "$UNRELATED" && HOME="$T/home" GIT_CONFIG_GLOBAL=/dev/null REPO_FLEET_GHQ_BIN="$T/bin/no-ghq" \
+    zsh -fc 'bash "$1" --repo-dir "$2" --fallback-root-file "$3/worktree-root" \
+      --data-root-file "$3/data-root" --project-dir "$4" --remove-input-files' \
+    zsh "$DISCOVER" "$B" "$1" "$T/no-such-project" >/dev/null 2>&1)
+}
+if command -v zsh >/dev/null 2>&1; then
+  inputs="$T/inputs-zsh-ok"
+  mkinputs "$inputs" "$T/data"
+  run_zsh_block "$inputs"
+  assert_exit "zsh: the block exits with the helper's code on success" 0 "$?"
+  assert_eq "zsh: no temp directory left after success" absent "$(dir_state "$inputs")"
+  inputs="$T/inputs-zsh-no-root"
+  # shellcheck disable=SC2016 # the literal unexpanded token is the point
+  mkinputs "$inputs" '${CLAUDE_PLUGIN_DATA}'
+  run_zsh_block "$inputs"
+  assert_exit "zsh: the block exits with the helper's code on a refusal" 3 "$?"
+  assert_eq "zsh: no temp directory left after a refusal" absent "$(dir_state "$inputs")"
+else
+  skip_case "zsh not available: the status block's zsh run is not exercised"
+fi
 
 [[ $FAILED -eq 0 ]] || exit 1

@@ -10,7 +10,8 @@
 //   written to an attribute, a URL, a selector, or a form control's value.
 // - Every id the runtime assigns is built from a template key and a list
 //   position, never from data, so a copied payload carries no data text.
-// - Payloads hold the reader's own input and those ids, nothing else.
+// - Payloads hold the reader's own input and those ids, nothing else (a
+//   page-input block adds the time it was copied).
 // - No storage. The one URL it makes is a blob: URL for a download.
 // - Network only on a page built with --connect: its policy names one
 //   session-bridge origin (http://127.0.0.1:<port>), and the runtime talks to
@@ -153,6 +154,19 @@
     return lines.join("\n");
   };
 
+  // A copy button that also names its record (data-rv-record) copies the reader's choices as a
+  // fenced page-input block, one PageInput JSON object per line: a lock per choice, a comment per
+  // note. Each line opens with a brace, so no text the reader typed can close the fence.
+  const inputBlock = (recordId) => {
+    const at = new Date().toISOString();
+    const { choices, notes } = collect();
+    const lines = [
+      ...Object.entries(choices).map(([choiceId, optionId]) => ({ kind: "lock", recordId, choiceId, optionId, at })),
+      ...Object.values(notes).map((text) => ({ kind: "comment", recordId, text, at })),
+    ].map((entry) => JSON.stringify(entry));
+    return ["```page-input", ...lines, "```"].join("\n");
+  };
+
   const status = (text) => {
     for (const el of document.querySelectorAll("[data-rv-status]")) {
       el.textContent = text;
@@ -167,7 +181,8 @@
   };
 
   const copy = (button) => {
-    const text = payload(button.getAttribute("data-rv-copy"));
+    const record = button.getAttribute("data-rv-record");
+    const text = record !== null && KEY.test(record) ? inputBlock(record) : payload(button.getAttribute("data-rv-copy"));
     showPayload(text);
     try {
       navigator.clipboard.writeText(text).then(
@@ -194,6 +209,50 @@
       status("If no file was saved, select the text below and copy it.");
     } catch {
       status("Saving is not available here. Select the text below and copy it.");
+    }
+  };
+
+  // ------------------------------------------------ theme toggle
+  // The chrome's toggle (html-chrome.html): system, the default, follows the reader's
+  // color-scheme preference; light and dark pin the page. No storage, so a reload is system again.
+  const THEMES = new Set(["system", "light", "dark"]);
+
+  const setTheme = (choice) => {
+    if (!THEMES.has(choice)) {
+      return;
+    }
+    if (choice === "system") {
+      document.documentElement.removeAttribute("data-theme");
+    } else {
+      document.documentElement.setAttribute("data-theme", choice);
+    }
+    for (const button of document.querySelectorAll("button[data-rv-theme]")) {
+      button.setAttribute("aria-pressed", String(button.getAttribute("data-rv-theme") === choice));
+    }
+  };
+
+  // ------------------------------------------------ redraw binding
+  // A choice names the example blocks it selects: each option of a select[data-rv-choice] may
+  // carry data-rv-shows="<key>", and the blocks marked data-rv-example="<key>" are its example.
+  // Picking an option shows its blocks and hides the ones the select's other options name.
+  // Client-only: no network, no storage.
+  const redraw = (select) => {
+    const named = new Set();
+    const shown = new Set();
+    for (const option of select.querySelectorAll("option[data-rv-shows]")) {
+      const key = option.getAttribute("data-rv-shows");
+      if (KEY.test(key)) {
+        named.add(key);
+        if (option.selected) {
+          shown.add(key);
+        }
+      }
+    }
+    for (const block of document.querySelectorAll("[data-rv-example]")) {
+      const key = block.getAttribute("data-rv-example");
+      if (named.has(key)) {
+        block.hidden = !shown.has(key);
+      }
     }
   };
 
@@ -308,14 +367,24 @@
     if (document.querySelector("[data-rv-session]")) {
       connect();
     }
+    for (const select of document.querySelectorAll("select[data-rv-choice]")) {
+      redraw(select);
+    }
     document.addEventListener("input", (event) => {
       if (event.target.matches?.("input[data-rv-filter]")) {
         filter(event.target);
       }
     });
+    document.addEventListener("change", (event) => {
+      if (event.target.matches?.("select[data-rv-choice]")) {
+        redraw(event.target);
+      }
+    });
     document.addEventListener("click", (event) => {
       const button = event.target.closest?.("button");
-      if (button?.hasAttribute("data-rv-copy")) {
+      if (button?.hasAttribute("data-rv-theme")) {
+        setTheme(button.getAttribute("data-rv-theme"));
+      } else if (button?.hasAttribute("data-rv-copy")) {
         copy(button);
       } else if (button?.hasAttribute("data-rv-download")) {
         download(button);

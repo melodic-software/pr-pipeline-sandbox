@@ -117,8 +117,8 @@
     {
       "id": 9,
       "name": "pr-body-attribution-default-present",
-      "prompt": "/pull-request create from branch feat/512-add-widget — no source-control.md config file exists in this repo. Assemble and create the PR.",
-      "expected_output": "With no source-control.md config declaring pr_body_attribution, the skill resolves the key as absent across all three layers and keeps the current default behavior: the assembled PR body ends with the `🤖 Generated with [Claude Code](https://claude.com/claude-code)` attribution line (§2.4.1). Existing consumers see no change. The line is appended to the body file as literal text after the §2.4.2 gates pass, never written into the body before them.",
+      "prompt": "/pull-request create from branch feat/512-add-widget — no source-control config file exists in this repo. Assemble and create the PR.",
+      "expected_output": "With no source-control config declaring pr_body_attribution, the skill resolves the key as absent across all three layers and keeps the current default behavior: the assembled PR body ends with the `🤖 Generated with [Claude Code](https://claude.com/claude-code)` attribution line (§2.4.1). Existing consumers see no change. The line is appended to the body file as literal text after the §2.4.2 gates pass, never written into the body before them.",
       "files": [],
       "expectations": [
         "The assembled PR body includes the default `🤖 Generated with [Claude Code](https://claude.com/claude-code)` attribution line when no pr_body_attribution key is configured",
@@ -130,11 +130,11 @@
       "id": 11,
       "name": "pr-body-attribution-opt-out-suppressed",
       "prompt": "/pull-request create from branch feat/512-add-widget. Assemble and create the PR.",
-      "expected_output": "With .claude/source-control.md declaring `pr_body_attribution: none`, the skill resolves that key across the three source-control.md layers (per reference/config-resolution.md, the same seam /commit's trailer_policy uses) and omits the `🤖 Generated with [Claude Code]…` attribution line from the assembled PR body entirely — the ATTRIBUTION value resolves to empty and the post-gate append to the body file is skipped. The section scaffold (the `briefing` default, since this fixture sets no pr_body_required_sections) and the `${CLOSES_LINE}` closing keyword are unaffected. trailer_policy is a separate key: this opt-out governs only the PR body, not the commit trailer.",
-      "files": [".claude/source-control.md"],
+      "expected_output": "With docs/conventions/source-control.yaml declaring `pr_body_attribution: none`, the skill resolves that key across the source-control layers (per reference/config-resolution.md, the same seam /commit's trailer_policy uses) and omits the `🤖 Generated with [Claude Code]…` attribution line from the assembled PR body entirely — the ATTRIBUTION value resolves to empty and the post-gate append to the body file is skipped. The section scaffold (the `briefing` default, since this fixture sets no pr_body_required_sections) and the `${CLOSES_LINE}` closing keyword are unaffected. trailer_policy is a separate key: this opt-out governs only the PR body, not the commit trailer.",
+      "files": ["docs/conventions/source-control.yaml"],
       "expectations": [
-        "pr_body_attribution: none from .claude/source-control.md is honored: the PR body carries no `🤖 Generated with [Claude Code]…` attribution line",
-        "The suppression is driven by resolving pr_body_attribution across the source-control.md layers, not by editing the plugin",
+        "pr_body_attribution: none from docs/conventions/source-control.yaml is honored: the PR body carries no `🤖 Generated with [Claude Code]…` attribution line",
+        "The suppression is driven by resolving pr_body_attribution across the source-control layers, not by editing the plugin",
         "The rest of the PR body (the section scaffold and the closing-keyword line) is assembled unchanged",
         "Suppressing the PR-body attribution is treated as independent of trailer_policy — the opt-out targets only the PR body"
       ]
@@ -142,11 +142,11 @@
     {
       "id": 12,
       "name": "pr-body-required-sections-portable-default",
-      "prompt": "/pull-request create from branch feat/512-add-widget — no source-control.md config file exists in this repo. Assemble and create the PR.",
-      "expected_output": "With no source-control.md layer setting pr_body_required_sections, the skill resolves the `briefing` default. The assembled body carries `## Why`, `## What changed`, `## Scope` and `## Verification` in that order, each with real content, and no `## Related` section (the default excludes it, see docs/conventions/pr-body-convention/README.md) unless the branch/prompt flow produced genuine Refs references, in which case an ad hoc `## Related` section carries them without being treated as required. The §2.4.2.2 gate requires those four sections and passes; it does not fail because `## Related`, `## Tradeoffs` or `## Risk` is absent. The report names the source as the plugin default (briefing).",
+      "prompt": "/pull-request create from branch feat/512-add-widget — no source-control config file exists in this repo. Assemble and create the PR.",
+      "expected_output": "With no source-control config layer setting pr_body_required_sections, the skill resolves the `briefing` default. The assembled body carries `## Why`, `## What changed`, `## Scope` and `## Verification` in that order, each with real content, and no `## Related` section (the default excludes it, see docs/contracts/pr-body-convention/README.md) unless the branch/prompt flow produced genuine Refs references, in which case an ad hoc `## Related` section carries them without being treated as required. The §2.4.2.2 gate requires those four sections and passes; it does not fail because `## Related`, `## Tradeoffs` or `## Risk` is absent. The report names the source as the plugin default (briefing).",
       "files": [],
       "expectations": [
-        "No source-control.md layer sets pr_body_required_sections, so the `briefing` preset governs and the reported source is the plugin default",
+        "No source-control config layer sets pr_body_required_sections, so the `briefing` preset governs and the reported source is the plugin default",
         "The body carries `## Why`, `## What changed`, `## Scope` and `## Verification`, in that order, with no `## Summary` or `## Test plan`",
         "The assembled body does not include a `## Related` section unless genuine Refs references exist to carry",
         "The §2.4.2.2 required-section gate passes without requiring `## Related`, `## Tradeoffs` or `## Risk`",
@@ -156,9 +156,9 @@
     {
       "id": 13,
       "name": "pr-body-required-sections-gate-blocks-missing-section",
-      "prompt": "/pull-request create from branch feat/900-add-endpoint. The team's source-control.md config is captured in evals/fixtures/source-control-required-related.md relative to the skill directory (declares pr_body_required_sections: Summary, Test plan, Related). Assemble the PR body but the drafted body is missing a `## Related` section.",
-      "expected_output": "The §2.4.2.2 pre-create gate blocks `gh pr create` because the resolved pr_body_required_sections list (team layer) includes Related and the assembled body has no `## Related` section. The failure message names `Related` as the exact missing section and cites the resolved config source (the team-layer source-control.md file and the pr_body_required_sections key) so the actor knows where to add the section or where the convention is declared. PR creation does not proceed until the section is added.",
-      "files": ["evals/fixtures/source-control-required-related.md"],
+      "prompt": "/pull-request create from branch feat/900-add-endpoint. The team's docs/conventions/source-control.yaml is captured in evals/fixtures/source-control-required-related.yaml relative to the skill directory (declares pr_body_required_sections: Summary, Test plan, Related). Assemble the PR body but the drafted body is missing a `## Related` section.",
+      "expected_output": "The §2.4.2.2 pre-create gate blocks `gh pr create` because the resolved pr_body_required_sections list (team layer) includes Related and the assembled body has no `## Related` section. The failure message names `Related` as the exact missing section and cites the resolved config source (the team-layer docs/conventions/source-control.yaml and the pr_body_required_sections key) so the actor knows where to add the section or where the convention is declared. PR creation does not proceed until the section is added.",
+      "files": ["evals/fixtures/source-control-required-related.yaml"],
       "expectations": [
         "The gate blocks PR creation rather than proceeding with a body missing a required section",
         "The failure message names Related as the exact missing section, not a generic 'PR body invalid' message",
@@ -169,7 +169,7 @@
     {
       "id": 14,
       "name": "pr-body-required-sections-gate-not-fooled-by-attribution-footer",
-      "prompt": "/pull-request create from branch feat/512-add-widget — no source-control.md config exists (the briefing default: Why, What changed, Scope and Verification required; pr_body_attribution unset, so the default attribution line applies). The drafted body has real content under `## Why`, `## What changed` and `## Scope` but leaves `## Verification` (the last required section) empty.",
+      "prompt": "/pull-request create from branch feat/512-add-widget — no source-control config exists (the briefing default: Why, What changed, Scope and Verification required; pr_body_attribution unset, so the default attribution line applies). The drafted body has real content under `## Why`, `## What changed` and `## Scope` but leaves `## Verification` (the last required section) empty.",
       "expected_output": "The §2.4.2.2 gate still blocks PR creation for the empty `## Verification` section even though the default attribution line follows it in the final PR body. The gate evaluates the required-section scan against the body BEFORE the attribution line is appended (§2.4.1/§2.4.3), so an empty last section is never masked by non-whitespace footer text that has no `## ` heading of its own. If the gate ran against the attribution-inclusive body instead, the empty Verification section would incorrectly read as non-empty and the gate would wrongly pass.",
       "files": [],
       "expectations": [
@@ -232,9 +232,9 @@
     {
       "id": 19,
       "name": "pr-body-required-sections-none-resolves-empty",
-      "prompt": "/pull-request create from branch feat/512-add-widget. The team's source-control.md config is captured in evals/fixtures/source-control-required-none.md relative to the skill directory (declares pr_body_required_sections: none). No other layer sets the key. Assemble and create the PR.",
+      "prompt": "/pull-request create from branch feat/512-add-widget. The team's docs/conventions/source-control.yaml is captured in evals/fixtures/source-control-required-none.yaml relative to the skill directory (declares pr_body_required_sections: none). No other layer sets the key. Assemble and create the PR.",
       "expected_output": "The skill resolves pr_body_required_sections to the literal keyword `none` from the team layer: zero required sections. The assembled body carries the `${CLOSES_LINE}` closing-keyword line and the attribution line but NO section scaffold (no `## Why`, `## Verification`, `## Summary` or `## Test plan`) — `none` is a resolved value, not an absence, so the `briefing` default does not apply. The §2.4.2.2 required-section gate passes with nothing to verify; the §2.4.2.1 closing-keyword check is independent and still runs and must still pass.",
-      "files": ["evals/fixtures/source-control-required-none.md"],
+      "files": ["evals/fixtures/source-control-required-none.yaml"],
       "expectations": [
         "pr_body_required_sections resolving to the literal keyword `none` yields zero required sections — the assembled body carries no section scaffold",
         "`none` is treated as a resolved value, not as an unset key — the `briefing` default is NOT applied",
@@ -245,12 +245,12 @@
     {
       "id": 20,
       "name": "pr-body-required-sections-none-overrides-lower-layer",
-      "prompt": "/pull-request create from branch feat/512-add-widget. The user-global ~/.claude/source-control.md declares pr_body_required_sections as the bullet list Summary, Test plan, Related. The repo's team-tracked .claude/source-control.md declares pr_body_required_sections as the literal keyword none. The gitignored local overlay .claude/source-control.local.md exists but does not set pr_body_required_sections. Resolve the effective section scaffold.",
-      "expected_output": "Per config-resolution.md's per-key override across the three layers, the team layer's `none` REPLACES the user-global list wholesale — the effective value is zero required sections, and the overlay's silence on the key changes nothing (an absent key in a later layer keeps the earlier winner; it never resets or re-imports a lower layer's list). The skill distinguishes `none` (a resolved value that wins the per-key override like any list would) from absence (which would have fallen through to the user-global list here). A local overlay declaring `none` over a team list would win the same way — the semantics are per-key precedence, identical to trailer_policy / pr_body_attribution.",
+      "prompt": "/pull-request create from branch feat/512-add-widget. The user-global ~/.claude/source-control.md declares pr_body_required_sections as the bullet list Summary, Test plan, Related. The repo's team-tracked docs/conventions/source-control.yaml declares pr_body_required_sections as the literal keyword none. The gitignored personal override .claude/source-control.local.md exists but does not set pr_body_required_sections. Resolve the effective section scaffold.",
+      "expected_output": "Per config-resolution.md's per-key override across the three layers, the team layer's `none` REPLACES the user-global list wholesale — the effective value is zero required sections, and the personal override's silence on the key changes nothing (an absent key in a later layer keeps the earlier winner; it never resets or re-imports a lower layer's list). The skill distinguishes `none` (a resolved value that wins the per-key override like any list would) from absence (which would have fallen through to the user-global list here). A personal override declaring `none` over a team list would win the same way — the semantics are per-key precedence, identical to trailer_policy / pr_body_attribution.",
       "files": [],
       "expectations": [
         "The team layer's `none` overrides the user-global layer's Summary/Test plan/Related list — the effective resolution is zero required sections",
-        "The local overlay omitting the key does not disturb the team layer's `none` — per-key fallthrough keeps the later layer's resolved value",
+        "The personal override omitting the key does not disturb the team layer's `none` — per-key fallthrough keeps the later layer's resolved value",
         "`none` wins the per-key override as a resolved value exactly like a list would, with the same precedence semantics as trailer_policy and pr_body_attribution",
         "Absence and `none` are distinguished: had the team layer omitted the key, the user-global list would have won instead"
       ]
@@ -259,10 +259,10 @@
       "id": 21,
       "name": "ready-flip-merges-base-and-reverifies",
       "prompt": "/pull-request ready. PR 512 is an open draft on this branch, main has moved ahead of it, and the last verification:confirm ran two commits ago. Flip it to ready for review.",
-      "expected_output": "The skill routes to Phase 2.5. It refreshes the base by MERGING it (gh pr update-branch or git merge origin/main) and never by rewriting the branch's history, because a rebase of an open pull request needs a force-push and rewrites commits reviewers have read. It then runs the security review over the PR diff, commits what that review changed, and runs the verify gate (verification:confirm) last on the merged head, and only then flips with gh pr ready (the GitHub MCP update_pull_request call with draft: false in a cloud session).",
+      "expected_output": "The skill routes to Phase 2.5. It reads the shared branch update decision (branch-update-signals.sh piped to branch-update-method.sh), and where a merge is chosen, as on a squash-landing repository, it updates the branch by MERGING the base (the forge's pinned update or git merge origin/main). It then runs the security review over the PR diff, commits what that review changed, and runs the verify gate (verification:confirm) last on the merged head, and only then flips with gh pr ready (the GitHub MCP update_pull_request call with draft: false in a cloud session).",
       "files": [],
       "expectations": [
-        "The base is refreshed with a merge and never with a rebase or any other history rewrite, with the force-push and the rewritten reviewed commits given as the reason",
+        "The method comes from the branch update decision, and on a squash landing the base is merged and the branch is not rebased, with the decision's rule named as the reason",
         "The security review runs over the pull request's diff before the flip",
         "The verify gate (verification:confirm) runs last, on the post-merge head, after any edits have been committed",
         "The flip happens only after the verify gate is clean, via gh pr ready locally or the MCP update_pull_request call with draft: false in a cloud session"
@@ -283,27 +283,28 @@
     },
     {
       "id": 23,
-      "name": "pr-open-state-userconfig-only-opens-ready",
+      "name": "pr-open-state-userconfig-ready-opens-draft-then-flips",
       "prompt": "/pull-request create from branch feat/618-export-csv. The repository has no source-control.yaml under docs/conventions. The source-control userConfig option pr_open_state is set to ready, so SKILL.md's PR open state line substitutes to ready. The user is driving this session and answering prompts. Resolve the open state and open the PR.",
-      "expected_output": "With no repository file, the per-user level supplies the value: pr_open_state resolves to ready from userConfig. gh pr create runs without --draft (a REST fallback sends draft=false), and the report names the open state and the userConfig level.",
+      "expected_output": "With no repository file, the per-user level supplies the value: pr_open_state resolves to ready from userConfig. gh pr create runs with --draft (a REST fallback sends draft=true), then create runs Phase 2.5 (/source-control:pull-request ready) on the new PR, which flips it after its gates. The report names the open state, the userConfig level, and whether the flip happened.",
       "files": [],
       "expectations": [
         "pr_open_state resolves to ready because the userConfig value is ready and no repository file sets the key",
-        "The PR is opened without --draft (or with draft=false on the REST form)",
+        "The PR is opened with --draft (or draft=true on the REST form), never opened ready for review directly",
+        "create then runs the ready phase on the new PR",
         "The report names the open state as ready and the supplying level as userConfig"
       ]
     },
     {
       "id": 24,
-      "name": "pr-open-state-repo-file-only-opens-ready",
-      "prompt": "/pull-request create from branch feat/618-export-csv. The repository's docs/conventions/source-control.yaml on the base branch, main, is captured in evals/fixtures/source-control-open-ready.yaml relative to the skill directory. The userConfig option pr_open_state is not set by the user, so it substitutes to its declared default, draft. The user is driving this session and answering prompts. Resolve the open state and open the PR.",
-      "expected_output": "The repository file sets pr_open_state: ready, which wins over the per-user default. The PR opens ready for review (no --draft), and the report names the repository level (docs/conventions/source-control.yaml).",
+      "name": "pr-open-state-repo-file-ready-opens-draft-then-flips",
+      "prompt": "/pull-request create from branch feat/618-export-csv. The repository's docs/conventions/source-control.yaml on the base branch, main, is captured in evals/fixtures/source-control-open-ready.yaml relative to the skill directory. The userConfig option pr_open_state is set to draft. The user is driving this session and answering prompts. Resolve the open state and open the PR.",
+      "expected_output": "The repository file sets pr_open_state: ready, which wins over the per-user draft. The PR opens with --draft and create then runs Phase 2.5 (/source-control:pull-request ready) on it, which flips it after its gates; the report names the repository level (docs/conventions/source-control.yaml).",
       "files": [
         "evals/fixtures/source-control-open-ready.yaml"
       ],
       "expectations": [
         "pr_open_state resolves to ready from the repository file docs/conventions/source-control.yaml",
-        "The PR is opened without --draft (or with draft=false on the REST form)",
+        "The PR is opened with --draft (or draft=true on the REST form), and create then runs the ready phase to flip it",
         "The report names the supplying level as the repository file, not userConfig or the default"
       ]
     },
@@ -318,44 +319,47 @@
       "expectations": [
         "The repository file's draft wins over the userConfig value ready",
         "The PR is opened with --draft (or draft=true on the REST form)",
+        "create does not run the ready phase or flip the PR",
         "The report names the supplying level as the repository file, not userConfig",
         "The report says /source-control:pull-request ready is what flips the draft"
       ]
     },
     {
       "id": 26,
-      "name": "pr-open-state-unset-defaults-to-draft",
-      "prompt": "/pull-request create from branch feat/618-export-csv. The repository has no source-control.yaml under docs/conventions, and the userConfig option pr_open_state is not set by the user, so SKILL.md's PR open state line substitutes to its declared default, draft. Resolve the open state and open the PR.",
-      "expected_output": "Neither level sets a value other than the default, so pr_open_state resolves to draft and the reported level is the default. The PR opens with --draft and the report says /source-control:pull-request ready is what flips it.",
+      "name": "pr-open-state-unset-defaults-to-ready",
+      "prompt": "/pull-request create from branch feat/618-export-csv. The repository has no source-control.yaml under docs/conventions, and the userConfig option pr_open_state is not set by the user, so SKILL.md's PR open state line substitutes to its declared default, ready. The user is driving this session, answering prompts, and has not asked for a draft. Resolve the open state and open the PR.",
+      "expected_output": "Neither level sets a value other than the default, so pr_open_state resolves to ready and the reported level is the default. gh pr create runs with --draft (a REST fallback sends draft=true), then create runs Phase 2.5 (/source-control:pull-request ready) on the new PR, which flips it after its gates; the report names the open state, the default level, and whether the flip happened.",
       "files": [],
       "expectations": [
-        "pr_open_state resolves to draft",
+        "pr_open_state resolves to ready",
         "The report names the supplying level as the default",
-        "The PR is opened with --draft (or draft=true on the REST form)"
+        "The PR is first opened with --draft (or draft=true on the REST form)",
+        "create runs the ready phase on the new PR"
       ]
     },
     {
       "id": 27,
       "name": "pr-open-state-invalid-repo-value-falls-back-to-draft",
       "prompt": "/pull-request create from branch feat/618-export-csv. The repository's docs/conventions/source-control.yaml on the base branch, main, is captured in evals/fixtures/source-control-open-invalid.yaml relative to the skill directory. The userConfig option pr_open_state is set to ready. Resolve the open state and open the PR.",
-      "expected_output": "The repository level supplies published, which is neither draft nor ready, so it is not used. The skill says the repository file holds an invalid value, opens the PR as a draft, and reports the level as the default with the invalid repository value named. It does not fall through to the userConfig ready value and never opens the PR ready for review because of an unknown value.",
+      "expected_output": "The repository level supplies published, which is neither draft nor ready, so it is not used. The skill says the repository file holds an invalid value, opens the PR as a draft without running the ready phase, and reports the level as an invalid value at the repository level that fell back to draft. It does not fall through to the userConfig ready value and never opens the PR ready for review because of an unknown value.",
       "files": [
         "evals/fixtures/source-control-open-invalid.yaml"
       ],
       "expectations": [
         "The value published from the repository file is reported as invalid, naming the repository level",
         "The PR is opened with --draft (or draft=true on the REST form)",
+        "create does not run the ready phase or flip the PR",
         "The skill does NOT fall through to the userConfig value ready after rejecting the repository value",
-        "The reported level is the default, with the invalid repository value named"
+        "The reported level names the invalid repository value and the fallback to draft, not the default"
       ]
     },
     {
       "id": 28,
       "name": "pr-body-required-sections-summary-test-plan-keyword",
-      "prompt": "/pull-request create from branch feat/733-retry-uploads. The team's source-control.md config is captured in evals/fixtures/source-control-required-summary-test-plan.md relative to the skill directory. No other layer sets pr_body_required_sections. Assemble and create the PR.",
+      "prompt": "/pull-request create from branch feat/733-retry-uploads. The team's docs/conventions/source-control.yaml is captured in evals/fixtures/source-control-required-summary-test-plan.yaml relative to the skill directory. No other layer sets pr_body_required_sections. Assemble and create the PR.",
       "expected_output": "The team layer's keyword summary-test-plan resolves to two required sections, Summary and Test plan. The assembled body carries `## Summary` and `## Test plan` with real content and none of the briefing headings (Why, What changed, Scope, Tradeoffs, Risk, Verification). The §2.4.2.2 gate requires exactly those two sections, and the source it reports is the team-layer file with the summary-test-plan keyword.",
       "files": [
-        "evals/fixtures/source-control-required-summary-test-plan.md"
+        "evals/fixtures/source-control-required-summary-test-plan.yaml"
       ],
       "expectations": [
         "summary-test-plan is read as a keyword, not as a one-heading list named 'summary-test-plan'",
@@ -367,7 +371,7 @@
     {
       "id": 29,
       "name": "pr-body-briefing-optional-sections-only-with-content",
-      "prompt": "/pull-request create from branch fix/481-clock-skew. No source-control.md layer sets pr_body_required_sections. The change swaps a hand-rolled time parser for the standard library's; no other approach was considered. It changes how three scheduled jobs read timestamps from the jobs table. Assemble and create the PR.",
+      "prompt": "/pull-request create from branch fix/481-clock-skew. No source-control config layer sets pr_body_required_sections. The change swaps a hand-rolled time parser for the standard library's; no other approach was considered. It changes how three scheduled jobs read timestamps from the jobs table. Assemble and create the PR.",
       "expected_output": "The briefing default applies. The body carries `## Why`, `## What changed`, `## Scope`, `## Risk` and `## Verification`, in that order. `## Risk` is present because the change reaches the three scheduled jobs and the timestamps they read, and says whether that reach is safe. `## Tradeoffs` is left out entirely, not filled with N/A or None, because no alternative was weighed. The §2.4.2.2 gate requires Why, What changed, Scope and Verification and passes; it neither requires nor blocks on Tradeoffs or Risk.",
       "files": [],
       "expectations": [
@@ -381,14 +385,14 @@
     {
       "id": 30,
       "name": "pr-body-briefing-keyword-overrides-lower-list",
-      "prompt": "/pull-request create from branch feat/733-retry-uploads. The repo's team-tracked .claude/source-control.md declares pr_body_required_sections as the bullet list Summary, Test plan. The gitignored local overlay .claude/source-control.local.md declares pr_body_required_sections as the keyword briefing. Resolve the effective section scaffold.",
-      "expected_output": "The local overlay wins the per-key override, and its keyword briefing replaces the team layer's list whole. The effective required sections are Why, What changed, Scope and Verification; Summary and Test plan are not required and are not merged in. The reported source is the local overlay with the briefing keyword.",
+      "prompt": "/pull-request create from branch feat/733-retry-uploads. The repo's team-tracked docs/conventions/source-control.yaml declares pr_body_required_sections as the bullet list Summary, Test plan. The gitignored personal override .claude/source-control.local.md declares pr_body_required_sections as the keyword briefing. Resolve the effective section scaffold.",
+      "expected_output": "The personal override wins the per-key override, and its keyword briefing replaces the team layer's list whole. The effective required sections are Why, What changed, Scope and Verification; Summary and Test plan are not required and are not merged in. The reported source is the personal override with the briefing keyword.",
       "files": [],
       "narration": true,
       "expectations": [
-        "The local overlay's briefing keyword replaces the team layer's Summary, Test plan list, with no union of the two",
+        "The personal override's briefing keyword replaces the team layer's Summary, Test plan list, with no union of the two",
         "The required sections are Why, What changed, Scope and Verification",
-        "The reported source names the local overlay and the briefing keyword, not the plugin default"
+        "The reported source names the personal override and the briefing keyword, not the plugin default"
       ]
     },
     {
@@ -529,27 +533,27 @@
       "id": 41,
       "name": "pr-open-state-head-branch-value-ignored",
       "narration": true,
-      "prompt": "/pull-request create from branch feat/702-cache-ttl. The user is driving this session and answering prompts. On the base branch, main, docs/conventions/source-control.yaml does not exist (the contents API returns 404). The branch being opened adds that file with pr_open_state: ready in one of its commits. The userConfig option pr_open_state is not set by the user, so it substitutes to its declared default, draft. Resolve the open state and open the PR.",
-      "expected_output": "The repository level is read at the base branch, main, where the file is absent, so it is unset; the copy the branch adds is never read, because the branch under review must not choose its own open state. With the per-user level at its default, pr_open_state resolves to draft. The PR opens with --draft and the report names the default level.",
+      "prompt": "/pull-request create from branch feat/702-cache-ttl. The user is driving this session and answering prompts. On the base branch, main, docs/conventions/source-control.yaml does not exist (the contents API returns 404). The branch being opened adds that file with pr_open_state: draft in one of its commits. The userConfig option pr_open_state is not set by the user, so it substitutes to its declared default, ready. Resolve the open state and open the PR.",
+      "expected_output": "The repository level is read at the base branch, main, where the file is absent, so it is unset; the copy the branch adds is never read, because the branch under review must not choose its own open state. With the per-user level at its default, pr_open_state resolves to ready. The PR opens with --draft, then create runs the ready phase on it, and the report names the default level.",
       "files": [],
       "expectations": [
         "Reads docs/conventions/source-control.yaml at the base branch (for example the contents API with ref=main), not from the working tree or the head branch",
-        "Does not use the pr_open_state: ready that the branch's own commit adds",
-        "The PR is opened with --draft (or draft=true on the REST form)",
+        "Does not use the pr_open_state: draft that the branch's own commit adds",
+        "pr_open_state resolves to ready and create runs the ready phase",
         "The report names the supplying level as the default"
       ]
     },
     {
       "id": 42,
-      "name": "pr-open-state-unattended-run-opens-draft",
+      "name": "pr-open-state-unattended-run-follows-resolved-value",
       "prompt": "/pull-request create --pushed --worktree /work/wt-618 for branch feat/618-export-csv. This is an unattended lane run in a dontAsk session; no person is answering. The repository's docs/conventions/source-control.yaml on the base branch, main, is captured in evals/fixtures/source-control-open-ready.yaml relative to the skill directory. Resolve the open state and open the PR.",
-      "expected_output": "The base branch's file sets pr_open_state: ready, but the run is unattended, so the value is not used: the PR opens as a draft, and the report says the repository level set ready and an unattended run opens a draft, leaving the flip to /source-control:pull-request ready.",
+      "expected_output": "The base branch's file sets pr_open_state: ready, and an unattended run follows the resolved value like an attended one: the PR opens with --draft, then create runs Phase 2.5 as ready --unattended on it, whose holds still apply. The report names the repository level and whether the flip happened or which hold stopped it.",
       "files": ["evals/fixtures/source-control-open-ready.yaml"],
       "expectations": [
         "Resolves the repository level to ready from the base branch's file",
-        "The PR is opened with --draft (or draft=true on the REST form) despite the ready value",
-        "The report names the unattended run as the reason the ready value was not used",
-        "The report says /source-control:pull-request ready is what flips the draft"
+        "pr_open_state resolves to ready even though the run is unattended",
+        "create runs the ready phase as ready --unattended on the new PR",
+        "The report names the repository level and the flip outcome (flipped, or the hold that stopped it)"
       ]
     },
     {
@@ -559,7 +563,7 @@
       "expected_output": "The ready step checks for a hold before it touches the branch, finds the do-not-merge label, and stops: the pull request stays a draft, the label is reported as the reason, and the base is not merged, no review runs and nothing is flipped. It does not remove the label.",
       "files": [],
       "expectations": [
-        "The hold check runs before the base merge, the reviews and the flip",
+        "The hold check runs before the branch update, the reviews and the flip",
         "The pull request is left in draft and never flipped",
         "The report names the do-not-merge label as the reason",
         "The label is not removed"
@@ -569,11 +573,11 @@
       "id": 44,
       "name": "ready-flips-past-a-merge-hold-line",
       "prompt": "/pull-request ready. PR 641 is an open draft on this branch. Its body ends with the line `Hold: a human merges this`. No one is around to answer questions. Flip it to ready.",
-      "expected_output": "A body line starting `Hold:` holds the merge, not the ready flip, so the hold check passes and the ready step goes on to merge the base, run the reviews and the verify gate, and flip the pull request. It does not merge the pull request or edit the body.",
+      "expected_output": "A body line starting `Hold:` holds the merge, not the ready flip, so the hold check passes and the ready step goes on to update the branch from its base, run the reviews and the verify gate, and flip the pull request. It does not merge the pull request or edit the body.",
       "files": [],
       "expectations": [
         "The `Hold:` line is not treated as a reason to stay in draft",
-        "The ready step goes on to the base merge, the reviews and the flip",
+        "The ready step goes on to the branch update, the reviews and the flip",
         "The pull request is not merged",
         "The body is not edited"
       ]
@@ -582,7 +586,7 @@
       "id": 45,
       "name": "ready-refuses-a-wip-title",
       "prompt": "/pull-request ready. PR 642 is an open draft on this branch titled `test(harness-config): WIP: pin permission suites`. No one is around to answer questions. Flip it to ready.",
-      "expected_output": "The WIP marker in the title is a hold, so the ready step leaves the pull request in draft, reports the title as the reason, and does not merge the base, run the reviews or flip it. It does not retitle the pull request.",
+      "expected_output": "The WIP marker in the title is a hold, so the ready step leaves the pull request in draft, reports the title as the reason, and does not update the branch from its base, run the reviews or flip it. It does not retitle the pull request.",
       "files": [],
       "expectations": [
         "The WIP marker in the title is treated as a hold",
@@ -595,13 +599,254 @@
       "id": 46,
       "name": "ready-refuses-a-superseded-draft",
       "prompt": "/pull-request ready. PR 643 is an open draft on this branch whose body says `Closes #600`. Issue #600 was closed yesterday when another pull request merged. No one is around to answer questions. Flip it to ready.",
-      "expected_output": "An issue the pull request closes is already closed, so it is superseded: the ready step leaves it in draft, reports that #600 is closed as the reason, and does not merge the base, run the reviews or flip it. It neither closes the pull request nor reopens the issue.",
+      "expected_output": "An issue the pull request closes is already closed, so it is superseded: the ready step leaves it in draft, reports that #600 is closed as the reason, and does not update the branch from its base, run the reviews or flip it. It neither closes the pull request nor reopens the issue.",
       "files": [],
       "expectations": [
         "The closed linked issue is treated as a reason to refuse the flip",
         "The pull request is left in draft and never flipped",
         "The report names #600 as already closed",
         "The pull request is not closed and the issue is not reopened"
+      ]
+    },
+    {
+      "id": 47,
+      "name": "create-carries-brief-acceptance-criteria",
+      "prompt": "Open a draft PR for this branch. The unit tests pass. Skip prep; there's no related issue.",
+      "expected_output": "The repository's feature branch is one commit ahead of main and its name does not match any topic slug. The gitignored memory directory holds one approved PLAN.md whose Brief lists three acceptance criteria for a CSV export: a UTF-8 byte order mark, RFC 4180 quoting of cells holding a comma, quote or line break, and a header row even with no rows, the last citing an absolute local fixture path. The prompt never mentions the plan. Body assembly finds the single PLAN.md and writes an Acceptance criteria section listing the three criteria as values, with no path into the memory directory and the local path generalized, then opens the PR as a draft.",
+      "files": [],
+      "expectations": [
+        "It reads the single PLAN.md in the memory directory without being told about it",
+        "The PR body written to a file has a section headed Acceptance criteria listing all three of the Brief's criteria",
+        "The body states the criteria as values and cites no path into the memory directory",
+        "The body does not copy the criterion's absolute local path"
+      ]
+    },
+    {
+      "id": 48,
+      "name": "pr-open-state-request-for-draft-wins",
+      "prompt": "/pull-request create from branch feat/618-export-csv. Open it as a draft: I want the team to see the export shape early, and I'll keep adding to it over the next few sessions. The repository's docs/conventions/source-control.yaml on the base branch, main, is captured in evals/fixtures/source-control-open-ready.yaml relative to the skill directory. The user is driving this session and answering prompts. Resolve the open state and open the PR.",
+      "expected_output": "The request for a draft wins over the repository's ready: pr_open_state resolves to draft at the request level. The PR opens with --draft, create does not run the ready phase, and the report names the request level and says /source-control:pull-request ready is what flips the draft later.",
+      "files": ["evals/fixtures/source-control-open-ready.yaml"],
+      "expectations": [
+        "pr_open_state resolves to draft because the user asked for a draft, even though the repository file sets ready",
+        "The PR is opened with --draft (or draft=true on the REST form)",
+        "create does not run the ready phase or flip the PR",
+        "The PR body carries a line starting `Draft:` naming the reason (an early look or a multi-session container)",
+        "The report names the supplying level as the request"
+      ]
+    },
+    {
+      "id": 49,
+      "name": "ready-skips-a-step-pre-ready-disables-at-base",
+      "prompt": "/pull-request ready. PR 702 is an open draft on branch fix/702-retry-backoff, a code change (not docs-only), with no hold. The repository's docs/conventions/source-control.yaml on the base branch, main, is captured in evals/fixtures/source-control-pre-ready-security-off.yaml relative to the skill directory. The PR's own head branch edits that file to also set code-review to enabled: false. Flip it to ready for review and report.",
+      "expected_output": "The skill reads pre_ready at the base branch, main, never from the head branch, so only security-review is disabled: the head's edit turning off code-review is not used. It updates the branch from its base, runs the code review and the verify gate, skips the security review, then runs the hold check again and flips. The report gives one line per step in order, with security-review reported as disabled by pre_ready at main, never as passed, and code-review and verify reported as ran with their results.",
+      "files": [
+        "evals/fixtures/source-control-pre-ready-security-off.yaml"
+      ],
+      "expectations": [
+        "pre_ready is read from the base branch (main), not from the working tree or the head branch, and the head's code-review: false is not applied",
+        "The security review does not run, and the code review and the verify gate do run",
+        "The hold checks, the push when one is needed, and the flip still run",
+        "The report has one line per step in run order, and the security-review line says disabled by pre_ready at main",
+        "The security review is never reported as passed or clean"
+      ]
+    },
+    {
+      "id": 50,
+      "name": "ready-runs-every-step-when-pre-ready-names-an-unknown-step",
+      "prompt": "/pull-request ready. PR 715 is an open draft on branch feat/715-csv-import, a code change, with no hold. The repository's docs/conventions/source-control.yaml on the base branch, main, is captured in evals/fixtures/source-control-pre-ready-unknown-step.yaml relative to the skill directory. Flip it to ready for review and report.",
+      "expected_output": "The list names an unknown step, lint, so the reader fails closed: every pre-flip step runs, the code review included, even though the list sets code-review to false. The report says the step list failed closed and why (unknown step lint), and reports every step as ran or skipped by a built-in condition, none as disabled.",
+      "files": [
+        "evals/fixtures/source-control-pre-ready-unknown-step.yaml"
+      ],
+      "expectations": [
+        "Every pre-flip step runs, including the code review the list tried to turn off",
+        "The report says pre_ready failed closed and names the unknown step lint as the reason",
+        "No step is reported as disabled by pre_ready"
+      ]
+    },
+    {
+      "id": 51,
+      "name": "ready-skips-code-review-for-one-run-with-a-reason",
+      "prompt": "/pull-request ready --skip code-review --reason \"review model is rate-limited until tomorrow\". I am here at the keyboard. PR 731 is an open draft on branch feat/731-export-retry, a code change (not docs-only), with no hold, and the base branch main has no pre_ready list. Flip it to ready for review and report.",
+      "expected_output": "A person is present, code-review is a known step and the reason is not empty, so the code review does not run. The hold check, the branch update, the security review and the verify gate run, then the hold check again and the flip. The code-review report line says skipped by the acting gh login for this run, with the reason, and the same line is posted in one PR conversation comment, after the hold re-check and right before the flip. The PR body is not edited. The code review is never reported as passed.",
+      "files": [],
+      "expectations": [
+        "The code review does not run, and the branch update, the security review and the verify gate do run",
+        "The hold checks, the push when one is needed, and the flip still run",
+        "The code-review report line says skipped by <login> for this run with the reason review model is rate-limited until tomorrow",
+        "The same skipped line is posted in one PR conversation comment, after the hold re-check and before the flip, and the PR body is not edited",
+        "The code review is never reported as passed or clean"
+      ]
+    },
+    {
+      "id": 52,
+      "name": "ready-refuses-skip-under-unattended",
+      "prompt": "/pull-request ready 744 --unattended --skip security-review,verify --reason \"usage exhausted\". This runs from the work loop lane with no person present. PR 744 is an open draft on branch fix/744-null-guard, a code change, with no hold. Flip it to ready for review and report.",
+      "expected_output": "--skip is a person's consent for one run and this run is unattended, so the override is refused before any step and nothing is skipped. The report says --skip was refused because no person is present, and marks no step as skipped by the override.",
+      "files": [],
+      "expectations": [
+        "The run refuses --skip because it is unattended",
+        "No step is reported as skipped by the override",
+        "The PR is not flipped to ready with the security review or the verify gate left out"
+      ]
+    },
+    {
+      "id": 53,
+      "name": "pr-open-state-pushed-hold-in-opening-body",
+      "prompt": "/pull-request create --pushed --worktree /work/wt-618 --hold 'Hold: a human merges this' for branch feat/618-export-csv. This is an unattended orchestrator run in a dontAsk session; no person is answering. The worker's branch is clean and pushed at HEAD. The repository's docs/conventions/source-control.yaml on the base branch, main, is captured in evals/fixtures/source-control-open-ready.yaml relative to the skill directory. Assemble the body, resolve the open state and open the PR.",
+      "expected_output": "Body composition places `Hold: a human merges this` on its own line directly below the closing-keyword line, before the first ## section, and the line is in the body file before the pre-create gates run, so the PR opens with it. The repository file sets pr_open_state: ready, so the PR opens with --draft and create then runs Phase 2.5 as ready with the new PR's number and --unattended, from the worktree as its working directory. The Hold line holds the merge only, so it does not stop the flip.",
+      "files": [
+        "evals/fixtures/source-control-open-ready.yaml"
+      ],
+      "expectations": [
+        "The body file has `Hold: a human merges this` on its own line directly below the closing-keyword line, before the first ## section",
+        "The Hold line is written before the pre-create gates run, and no body edit after create adds it",
+        "pr_open_state resolves to ready from the repository file, and create runs the ready phase as ready <PR number> --unattended on the PR it just opened",
+        "The ready phase's commands run with the worktree /work/wt-618 as their working directory",
+        "The Hold line is not treated as a reason to leave the PR a draft"
+      ]
+    },
+    {
+      "id": 54,
+      "name": "pr-open-state-pushed-draft-merge-hold-unread",
+      "prompt": "/pull-request create --pushed --worktree /work/wt-618 --draft 'merge hold unread' for branch feat/618-export-csv. This is an unattended orchestrator run in a dontAsk session; no person is answering. The worker's branch is clean and pushed at HEAD. The repository's docs/conventions/source-control.yaml on the base branch, main, is captured in evals/fixtures/source-control-open-ready.yaml relative to the skill directory. Resolve the open state and open the PR.",
+      "expected_output": "The --draft flag is the request level, which wins over the repository's ready: pr_open_state resolves to draft at the request level. The body carries `Draft: merge hold unread` as its own last line before the attribution, the PR opens with --draft, and create does not run the ready phase. The report names the request level.",
+      "files": [
+        "evals/fixtures/source-control-open-ready.yaml"
+      ],
+      "expectations": [
+        "pr_open_state resolves to draft at the request level even though the repository file sets ready",
+        "The PR body carries the line `Draft: merge hold unread`",
+        "The PR is opened with --draft (or draft=true on the REST form)",
+        "create does not run the ready phase or flip the PR",
+        "The report names the supplying level as the request"
+      ]
+    },
+    {
+      "id": 55,
+      "name": "pr-open-state-create-draft-flag-ready-flip-reserved",
+      "prompt": "/pull-request create --draft 'ready flip reserved for a person' from branch feat/618-export-csv. This is an unattended scheduled run; no person is answering. The repository's docs/conventions/source-control.yaml on the base branch, main, is captured in evals/fixtures/source-control-open-ready.yaml relative to the skill directory. The userConfig option pr_open_state is set to ready. Resolve the open state and open the PR.",
+      "expected_output": "The normal create path takes --draft as the request level, which wins over the repository and userConfig ready values: pr_open_state resolves to draft at the request level. The body carries `Draft: ready flip reserved for a person`, the PR opens with --draft, create does not run the ready phase, and the report names the request level.",
+      "files": [
+        "evals/fixtures/source-control-open-ready.yaml"
+      ],
+      "expectations": [
+        "pr_open_state resolves to draft at the request level even though the repository file and userConfig set ready",
+        "The PR body carries the line `Draft: ready flip reserved for a person`",
+        "The PR is opened with --draft (or draft=true on the REST form)",
+        "create does not run the ready phase or flip the PR",
+        "The report names the supplying level as the request"
+      ]
+    },
+    {
+      "id": 56,
+      "name": "prep-lists-pre-push-warnings-advisory",
+      "narration": true,
+      "prompt": "/pull-request prep. Branch fix/worktree-trim changes plugins/source-control/skills/worktree/SKILL.md (two lines removed) and .github/workflows/pr-require-checks.yml against origin/main; nothing under plugins/source-control/skills/worktree/evals/ changes. prep-warnings.sh prints `skill-cut plugins/source-control/skills/worktree/SKILL.md: 2 line(s) removed with no file added or changed under plugins/source-control/skills/worktree/evals/; a cut ships only with eval evidence of no loss` and `protected-path .github/workflows/pr-require-checks.yml: the guarded merge holds it for a person (high-path:.github/workflows/pr-require-checks.yml)`.",
+      "expected_output": "Prep runs prep-warnings.sh against origin/main and lists both lines in the prep report, each naming its file. It treats them as advisory: it does not block or delay pull request creation on them and does not restore the removed lines or revert the workflow edit on its own.",
+      "files": [],
+      "expectations": [
+        "Runs prep-warnings.sh with --base origin/main",
+        "The prep report names plugins/source-control/skills/worktree/SKILL.md as a skill cut with no eval change",
+        "The prep report names .github/workflows/pr-require-checks.yml as a path the merge holds for a person",
+        "Does not block pull request creation because of the warnings",
+        "Does not revert either change without the user"
+      ]
+    },
+    {
+      "id": 57,
+      "name": "create-refs-link-writes-remaining",
+      "prompt": "Open a PR for branch feat/csv-export-bom. It delivers only the UTF-8 byte order mark from issue #812; link it with Refs: #812, it must not close the issue.",
+      "expected_output": "Issue #812 is open. Its body lists three acceptance items: `- [x] header row even with no rows`, `- [ ] UTF-8 byte order mark`, and `- [ ] RFC 4180 quoting of cells holding a comma, quote or line break (Closes #813 when done)`; it has no sub-issues. The branch delivers the byte order mark. The body opens with `Refs: #812` and carries no closing keyword. Create reads the issue through the skill's issue read and writes a `## Remaining` section listing the RFC 4180 quoting item as a plain bullet, with the `Closes #813` text dropped. It leaves out the checked header-row item and the byte order mark this PR delivers. The Summary names the byte order mark as the part this PR delivers. Had the issue held no unchecked items, sub-issues or slice list, the section would be one line naming what this PR delivers and the condition that closes #812.",
+      "files": [],
+      "expectations": [
+        "The PR body opens with a `Refs: #812` line and has no closing keyword for #812",
+        "The body has a section headed Remaining that lists the RFC 4180 quoting item",
+        "The Remaining section omits the checked header-row item and the byte order mark this PR delivers",
+        "The Remaining items are plain bullets, not `- [ ]` checkboxes, and carry no `Closes #813` text",
+        "The Summary names the byte order mark as the part of #812 this PR delivers"
+      ]
+    },
+    {
+      "id": 58,
+      "name": "create-refs-remaining-fallback-line",
+      "prompt": "Open a PR for branch feat/csv-export-bom. It is only the first step on issue #820, the byte order mark; link it with Refs: #820, it must not close the issue.",
+      "expected_output": "Issue #820 is open. Its body is one paragraph with no checklist and no slice list, and it has no sub-issues. Create reads the issue through the skill's issue read, finds nothing to list, and writes a `## Remaining` section of one line naming what this PR delivers (the byte order mark) and the condition that closes #820. No closing keyword sits before #820 anywhere in the body.",
+      "files": [],
+      "expectations": [
+        "The PR body opens with a `Refs: #820` line",
+        "The body has a section headed Remaining holding one line that names the byte order mark as what this PR delivers and states the condition that closes #820",
+        "No closing keyword (close, closes, fix, fixes, resolve, resolves) sits directly before #820 anywhere in the body"
+      ]
+    },
+    {
+      "id": 59,
+      "name": "readiness-carries-review-across-empty-remerge-diff-merge",
+      "narration": true,
+      "prompt": "/pull-request monitor 512. Earlier in this session /pull-request ready flipped PR 512: its base-merge step merged origin/main into the branch as merge commit 9f3c2a1, which is now the head; the head before it, 4b7e0d2, was reviewed by both CI review lanes, whose summaries and inline comments are written against 4b7e0d2. On 9f3c2a1 both review-lane checks are green but neither lane posted a summary, review or inline comment for it. All other checks are terminal and green, and no comment is unaddressed. `git show --remerge-diff 9f3c2a1` prints nothing at all. Run the readiness gate.",
+      "expected_output": "B2 and readiness Gate 5 apply the remerge-diff test to the base merge 9f3c2a1. Its output is fully empty, so the push changed no reviewed content and needs no fresh round: the latest productive review on the pre-merge head 4b7e0d2 satisfies each lane. Neither lane is classified ABSENT, no local substitute review (/review:fanout or /code-review) runs, and the `Review lanes:` line names the carried reviews on 4b7e0d2. The terminal-state wait still applies to every check.",
+      "files": [],
+      "expectations": [
+        "It runs or reads `git show --remerge-diff 9f3c2a1` for the base merge, not a diff against either parent",
+        "It treats the fully empty output as no fresh round needed and counts the reviews on 4b7e0d2 for both lanes",
+        "It does not classify either lane ABSENT and runs no local substitute review",
+        "The `Review lanes:` line names the reviews carried from 4b7e0d2"
+      ]
+    },
+    {
+      "id": 60,
+      "name": "readiness-substitutes-review-after-non-empty-remerge-diff-merge",
+      "narration": true,
+      "prompt": "/pull-request monitor 512. Earlier in this session /pull-request ready flipped PR 512: its base-merge step merged origin/main into the branch as merge commit 9f3c2a1, which is now the head; the head before it, 4b7e0d2, was reviewed by both CI review lanes, whose summaries and inline comments are written against 4b7e0d2. On 9f3c2a1 both review-lane checks are green but neither lane posted a summary, review or inline comment for it. All other checks are terminal and green, and no comment is unaddressed. `git show --remerge-diff 9f3c2a1` prints a hunk in src/export/csv.ts, where the merge resolved a conflict. Run the readiness gate.",
+      "expected_output": "B2 and readiness Gate 5 apply the remerge-diff test to the base merge 9f3c2a1. It prints a conflict resolution, so the push changed reviewed content and needs a fresh round: the reviews on 4b7e0d2 do not carry. Each lane produced nothing for 9f3c2a1, so each is classified ABSENT, never PASS, and a local review over the pull request's diff stands in for it (/review:fanout, or /code-review against an explicit target for the correctness lane). The `Review lanes:` line names each absent lane and its substitute, and the gate does not clear before the substitutes ran.",
+      "files": [],
+      "expectations": [
+        "It runs or reads `git show --remerge-diff 9f3c2a1` and treats its non-empty output as a change to reviewed content",
+        "It does not count the reviews on 4b7e0d2 for the head 9f3c2a1",
+        "It classifies both lanes ABSENT and runs a local substitute review over the pull request's diff",
+        "The `Review lanes:` line names each absent lane and its substitute"
+      ]
+    },
+    {
+      "id": 61,
+      "name": "evidence-refuses-file-not-in-publishable-list",
+      "narration": true,
+      "prompt": "/pull-request evidence 640 --evidence /tmp/run/e2e-summary.json --attach /tmp/run/checkout-cart-01-screenshot.png --attach /tmp/run/account-profile-01-screenshot.png. PR 640's head is 3c1d9e0aa1b2c3d4e5f60718293a4b5c6d7e8f90 and confirm-verdict.sh show prints `confirm: CONFIRMED for head 3c1d9e0aa1b2c3d4e5f60718293a4b5c6d7e8f90`. The e2e-summary.json `publishable` list holds checkout-cart-01-screenshot.png and e2e-summary.json only; account-profile-01-screenshot.png is not in it.",
+      "expected_output": "The evidence step reads the publishable list, finds that account-profile-01-screenshot.png is not in it, and refuses: it names that file and posts nothing, no comment created or edited and no file uploaded, rather than posting the one publishable capture or attaching the refused one.",
+      "files": [],
+      "expectations": [
+        "It names account-profile-01-screenshot.png as not in the publishable list",
+        "It runs no `gh pr comment` call, so no comment is created or edited and no file is uploaded",
+        "It does not attach account-profile-01-screenshot.png in any form"
+      ]
+    },
+    {
+      "id": 62,
+      "name": "evidence-second-head-updates-existing-comment",
+      "narration": true,
+      "prompt": "/pull-request evidence 640 --evidence /tmp/run2/e2e-summary.json. PR 640 has a new head, 9a8b7c6d5e4f30211223344556677889900aabbc, and confirm-verdict.sh show prints `confirm: CONFIRMED for head 9a8b7c6d5e4f30211223344556677889900aabbc`. The publishable list holds checkout-cart-01-screenshot.png. The account gh is logged in as has one comment on PR 640, the evidence comment posted for the previous head, which starts with `<!-- evidence-verification -->`. The leak scan of the rendered body finds nothing, and `gh pr comment --help` lists `--attach`.",
+      "expected_output": "The step finds the account's only comment on the PR is the evidence comment, so it updates it in place with `gh pr comment 640 --edit-last --create-if-none --body-file <body> --attach <checkout-cart-01-screenshot.png>`, the body rendered from templates/evidence-comment.md and naming the new head. It does not post a second comment, and the read-back finds exactly one comment starting with the marker.",
+      "files": [],
+      "expectations": [
+        "It checks that every comment the logged-in account has on PR 640 starts with `<!-- evidence-verification -->` before editing",
+        "It posts with `gh pr comment 640 --edit-last --create-if-none` and `--attach` for the publishable capture",
+        "It renders the body from templates/evidence-comment.md, naming the new head 9a8b7c6d5e4f30211223344556677889900aabbc",
+        "It does not create a second evidence comment, and its read-back finds exactly one comment starting with the marker"
+      ]
+    },
+    {
+      "id": 63,
+      "name": "evidence-no-artifact-says-media-not-uploaded",
+      "narration": true,
+      "prompt": "/pull-request evidence 641 --evidence /tmp/run/e2e-summary.json --summary /tmp/run/summary.md. PR 641's head is 5f5e5d5c5b5a59585756555453525150504f4e4d and confirm-verdict.sh show prints `confirm: CONFIRMED for head 5f5e5d5c5b5a59585756555453525150504f4e4d`. The e2e-summary.json capture status is `not-applicable` and its `publishable` list holds only e2e-summary.json. No --artifact-url was given. The logged-in account has no comment on PR 641, and the leak scan of the rendered body finds nothing.",
+      "expected_output": "With no capture to attach and no artifact URL, the step renders the body from the template with the text summary from summary.md and an artifact line reading `Media not uploaded: <reason>`, such as no capture was publishable. It creates the one evidence comment with `gh pr comment 641 --edit-last --create-if-none --body-file <body>` and attaches no file.",
+      "files": [],
+      "expectations": [
+        "The comment body carries the text summary from summary.md",
+        "The comment body has a line starting `Media not uploaded:` that names the reason",
+        "It attaches no file: e2e-summary.json is not an image or video",
+        "It creates the comment through `gh pr comment 641 --edit-last --create-if-none`"
       ]
     }
   ]

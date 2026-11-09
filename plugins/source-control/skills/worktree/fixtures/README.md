@@ -2,7 +2,7 @@
 
 Every measured claim this plugin makes about how Claude Code treats worktrees is recorded here with
 the script that produced it, so a recheck is one command rather than a re-derivation. Stamps follow
-[the upstream-drift convention](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/conventions/upstream-drift/README.md): claim,
+[the upstream-drift convention](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/contracts/upstream-drift/README.md): claim,
 basis, as-of date, recheck trigger.
 
 A record whose script cannot be re-run is not a fixture. It is a memory. If you change a probe,
@@ -16,7 +16,7 @@ all of it, and is dropped on exit 0.
 
 **Basis.** Four arms of `claude -p "…" --worktree <name> [--settings <file>]` in throwaway git
 repositories, plus <https://code.claude.com/docs/en/hooks> read as raw markdown (`hooks.md`) per the
-convention's [rung 1 fetch route](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/conventions/upstream-drift/README.md#the-rungs).
+convention's [rung 1 fetch route](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/contracts/upstream-drift/README.md#the-rungs).
 
 **As-of.** 2026-08-11, Claude Code **2.1.228**, Windows (Git Bash).
 
@@ -165,8 +165,11 @@ arm A and vice versa.
 them from token deltas. Registered in **exec (`args`-array) form** per
 <https://code.claude.com/docs/en/hooks> (raw markdown, fetched 2026-08-11): "Set `args` whenever the
 hook references a path placeholder, since each element is passed as one argument with no quoting."
-Delivered with `claude -p --settings <file>`, because a project-scope hook in an unapproved
-`settings.json` does not run headlessly.
+Delivered with `claude -p --settings <file>`. Our reading today, not the run's record: the flag
+keeps the trace hook in the probe's own file rather than in anything the fixture commits, and
+[Workspace trust](https://code.claude.com/docs/en/hooks#workspace-trust) says which settings-file
+hooks a `-p` session runs (as of 2026-11-04; recheck when that section changes what a `-p` session
+runs).
 
 **A trap the script guards.** Zero trace events means *the hook did not fire*, a fixture failure,
 not evidence of absence. The script says so rather than printing a null. Mistaking one for the other
@@ -181,7 +184,7 @@ approval outside `.claude/worktrees/`, and what a worktree shares with the main 
 measurement is the only adjudicator and why an undisclosed fixture was fatal.
 
 **When you re-run it:** record the outcome here, *including a null, which is a finding*, and
-refresh the as-of stamp in `SKILL.md` with the verdict, per the upstream-drift convention's
+refresh the as-of stamp in `reference/nesting-invariant.md` with the verdict, per the upstream-drift convention's
 "When a trigger fires" procedure. Do not treat a zero-event fixture failure as a null.
 
 ## `project-scope-reap-probe.sh`: what `plugin uninstall -s project` acts on
@@ -248,17 +251,19 @@ be followed.
 no record", purely because the reader compared the 8.3 short form inherited from `%TEMP%`
 of the user directory (`ALICE~1`) against the long form the CLI writes (`AliceExample`). The record
 was there the whole time. Any consumer comparing these paths must resolve first (`pwd -W` on Git
-Bash yields the native long form), unify separators, and fold case on Windows. Two related shapes
-bite the same way: `jq` on Git Bash terminates lines with CRLF, and `@tsv` escapes each backslash to
-`\\`. Both leave a `projectPath` that silently matches nothing.
+Bash yields the native long form), unify separators, and fold case on Windows. Normalize the line
+endings and escaping of what `jq` prints before matching it too. For how jq ends lines and escapes a
+`@tsv` field, see jq's
+[Format strings and escaping](https://jqlang.org/manual/#format-strings-and-escaping) and the
+`--binary` option under [Invoking jq](https://jqlang.org/manual/#invoking-jq) (as of 2026-11-03;
+recheck when either changes how `@tsv` escapes or how jq ends lines on Windows).
 
 ### What this settles in the plugin
 
-- `scripts/reap-project-plugin-records.sh` requires `--worktree-path` to name the directory it is
-  already standing in, and refuses otherwise. That is arm 3 rendered in code: the CLI cannot reach
-  another path's record, so a helper that could only ever be a no-op or a mistake there declines to
-  run at all.
-- The reap runs **before** `git worktree remove`, from inside the worktree: arm 4, the shortest
+- `scripts/reap-project-plugin-records.sh` enters `--worktree-path` itself and refuses a main
+  working tree (its `.git` is a directory). That is arm 3 rendered in code: the CLI cannot reach
+  another path's record, so the helper acts on the one directory it entered and nothing else.
+- The reap runs **before** `git worktree remove`, inside the worktree: arm 4, the shortest
   route, needing no directory to be recreated.
 - Arm 5 is what makes pre-existing orphans reachable at all, and it is also the arm most capable of
   harm, because it works on any path a user can recreate. `audit` therefore **reports** such records

@@ -4,12 +4,14 @@
 # session-bridge's watcher (the loopback adapter's client). Run in a background Bash task; it exits
 # when the page has something new.
 #   bash watch.sh '<data_dir>'
+# Authenticates with WATCH_TOKEN from the session env file (TOKEN when an app has no separate one).
 # Reads NAME and CONTROL from session-bridge.conf beside this script: NAME names the session env
 # file (.<NAME>-session.env) and the token header (X-<Name>-Token); CONTROL is the app's control
 # script beside this one, named in messages and run by wake.sh.
 # Long-polls /api/wait (each poll is the heartbeat the page shows as "Claude is listening"),
 # prints the unhandled events as one JSON line carrying "dataDir" and "next" (the exact re-arm
-# command, wake.sh beside this script), stores the seq in .watch-seq, and exits 0. Events a dead
+# command, wake.sh beside this script), writes the same line alone to .watch-wake.json in the data
+# dir, stores the seq in .watch-seq, and exits 0. Events a dead
 # turn never handled come back at once on the next arm; after that re-delivery (recorded in
 # .watch-replay) an arm waits for a new event.
 # Exits 2 when curl is missing, when session-bridge.conf is missing or malformed, when the env
@@ -19,12 +21,17 @@
 # time), when this watcher's lease was released while it waited, or when a poll fails after
 # `CONTROL stop` removed the env file; it prints why to stderr and does not retry. Each poll sends
 # this process's pid (&pid=$$), which the lease records so `CONTROL stop` can end this watcher.
+# Exits 4 after WAIT_EMPTY consecutive waits with no event (default 40, 60 minutes at the default
+# 90 s wait), so a watcher orphaned by a crashed session ends and the server can expire; it prints
+# the re-arm command for a live session to stderr.
 # Each poll names this watcher: WATCH_ID, else CLAUDE_CODE_SESSION_ID (Claude Code exports it to
 # every shell a session runs, so every re-arm shares it), else <hostname>-<parent pid>. A parent
 # pid of 1 (a Claude Code Bash shell on Windows reports it, for every session) names no one, so
 # then it exits 2 asking for WATCH_ID. The id is never written to the data dir, which two sessions
 # share. WATCH_PPID stands in for $PPID in tests.
 # WAIT_TIMEOUT comes from the session env file (default 90); curl allows 10 s more.
+# Prints a `note:` line to stderr before polling when the env file's PLUGIN_VERSION differs from
+# the plugin manifest beside this script (a server started before a plugin update).
 curl_bin=${WATCH_CURL:-curl}
 command -v "$curl_bin" >/dev/null 2>&1 || { echo "missing prerequisite: curl (watch.sh needs it on PATH)" >&2; exit 2; }
 [[ -n "${1:-}" ]] || { echo "usage: watch.sh <data_dir>" >&2; exit 2; }
@@ -32,23 +39,38 @@ command -v "$curl_bin" >/dev/null 2>&1 || { echo "missing prerequisite: curl (wa
 # Python takes as is (Git Bash does not convert a POSIX path holding a quote or a backtick).
 # Elsewhere `pwd -W` fails and plain `pwd` applies.
 abs_dir() { (cd "$1" 2>/dev/null && { pwd -W 2>/dev/null || pwd; }); }
+# The value of a KEY=value line in a file, carriage returns removed.
+value() { sed -n "s/^$1=//p" "$2" | tr -d '\r'; }
 here=$(abs_dir "$(dirname "${BASH_SOURCE[0]}")")
 conf="$here/session-bridge.conf"
-NAME=$(sed -n 's/^NAME=//p' "$conf" 2>/dev/null | tr -d '\r')
-CONTROL=$(sed -n 's/^CONTROL=//p' "$conf" 2>/dev/null | tr -d '\r')
+NAME=$(value NAME "$conf" 2>/dev/null)
+CONTROL=$(value CONTROL "$conf" 2>/dev/null)
 [[ "$NAME" =~ ^[a-z][a-z0-9-]*$ && "$CONTROL" =~ ^[A-Za-z0-9._-]+$ ]] ||
   { echo "no valid NAME and CONTROL in $conf" >&2; exit 2; }
 header="X-$(printf '%s' "${NAME:0:1}" | tr '[:lower:]' '[:upper:]')${NAME:1}-Token"
 dir=$(abs_dir "$1") || { echo "no such data dir: $1" >&2; exit 2; }
 env_file="$dir/.$NAME-session.env"
 [[ -f "$env_file" ]] || { echo "no $env_file: run $CONTROL ensure-running first" >&2; exit 2; }
-PORT=$(sed -n 's/^PORT=//p' "$env_file" | tr -d '\r')
-TOKEN=$(sed -n 's/^TOKEN=//p' "$env_file" | tr -d '\r')
-WAIT_TIMEOUT=$(sed -n 's/^WAIT_TIMEOUT=//p' "$env_file" | tr -dc '0-9')
+PORT=$(value PORT "$env_file")
+TOKEN=$(value WATCH_TOKEN "$env_file")
+[[ -n "$TOKEN" ]] || TOKEN=$(value TOKEN "$env_file")
+WAIT_TIMEOUT=$(value WAIT_TIMEOUT "$env_file" | tr -dc '0-9')
 WAIT_TIMEOUT=${WAIT_TIMEOUT:-90}
 [[ -n "$PORT" && -n "$TOKEN" ]] || { echo "server not running (empty $env_file)" >&2; exit 2; }
 [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "PORT in $env_file is not a number: re-run ensure-running" >&2; exit 2; }
+# A server started before a plugin update runs the old code: compare the version its start recorded
+# (PLUGIN_VERSION) with the plugin manifest beside this script, and say so once before polling.
+manifest="$here/../.claude-plugin/plugin.json"
+if [[ -f "$manifest" ]]; then
+  installed=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -n 1)
+  recorded=$(value PLUGIN_VERSION "$env_file")
+  if [[ -n "$installed" && "$recorded" != "$installed" ]]; then
+    echo "note: the $NAME server runs ${recorded:-a version that records none}, not this plugin's $installed: run $CONTROL ensure-running to restart it, then re-arm" >&2
+  fi
+fi
 max_fails=${WAIT_FAILS:-12}
+max_empty=${WAIT_EMPTY:-40}
+[[ "$max_empty" =~ ^[0-9]+$ && "$max_empty" -gt 0 ]] || max_empty=40
 # after=handled returns every unhandled event; .watch-replay bounds re-delivery to one extra wake.
 replayed=$(tr -dc '0-9' 2>/dev/null <"$dir/.watch-replay")
 replayed=${replayed:-0}
@@ -94,10 +116,13 @@ watcher=$(url_encode "$watcher")
 field() { printf '%s' "$out" | sed -n "s/.*\"$1\": \"\\([^\"]*\\)\".*/\\1/p"; }
 
 fails=0
+empty=0
 while :; do
   # The body comes back on stdout (no file path reaches curl), with the status on a last line.
+  # The token header goes in on stdin (`-H @-`), so it never appears in curl's argv.
   resp=$("$curl_bin" -s -w '\n%{http_code}' --noproxy '*' --max-time $((WAIT_TIMEOUT + 10)) \
-    -H "$header: $TOKEN" "http://127.0.0.1:$PORT/api/wait?after=handled&replayed=$replayed&timeout=$WAIT_TIMEOUT&watcher=$watcher&pid=$$")
+    -H @- "http://127.0.0.1:$PORT/api/wait?after=handled&replayed=$replayed&timeout=$WAIT_TIMEOUT&watcher=$watcher&pid=$$" \
+    <<<"$header: $TOKEN")
   code=${resp##*$'\n'}
   out=${resp%$'\n'*}
   if [[ "$code" == 409 && "$out" == *'"lease held"'* ]]; then
@@ -105,7 +130,7 @@ while :; do
     exit 3
   fi
   if [[ "$code" == 409 && "$out" == *'"lease released"'* ]]; then
-    echo "this watcher's lease was released while it waited ($CONTROL lease --release); another session may hold it now; run $CONTROL lease to see, and re-arm only if this session should watch" >&2
+    echo "handed over, not a failure: this watcher's lease was released while it waited ($CONTROL lease --release or --takeover); another session holds or may hold it now; run $CONTROL lease to see, and re-arm only if this session should watch" >&2
     exit 3
   fi
   case "$code" in
@@ -134,16 +159,29 @@ while :; do
   case "$out" in
     *'"timedOut": false'*)
       next="bash $(shell_quote "$here/wake.sh") $(shell_quote "$dir")"
-      printf '%s, "dataDir": "%s", "next": "%s"}\n' "${out%\}}" "$(json_escape "$dir")" "$(json_escape "$next")"
+      printf -v payload '%s, "dataDir": "%s", "next": "%s"}' "${out%\}}" "$(json_escape "$dir")" "$(json_escape "$next")"
+      # The task's output file mixes stderr in and ends with an exit footer, so the line also goes
+      # to a file of its own (0600: it holds the events' text), written whole and then renamed into
+      # place. A failed write removes the file, so a reader never takes an earlier wake for this one.
+      { (umask 077 && rm -f "$dir/.watch-wake.json.tmp" && printf '%s\n' "$payload" >"$dir/.watch-wake.json.tmp") &&
+        mv -f "$dir/.watch-wake.json.tmp" "$dir/.watch-wake.json"; } 2>/dev/null ||
+        { rm -f "$dir/.watch-wake.json" "$dir/.watch-wake.json.tmp"
+          echo "could not write $dir/.watch-wake.json: take the JSON line from this task's output" >&2; }
+      printf '%s\n' "$payload"
       printf '%s' "$out" | sed -n 's/^{"seq": \([0-9]*\).*/\1/p' >"$dir/.watch-seq"
-      case "$out" in
-        '{"seq": '*', "timedOut": false, "replayed": '*)
-          printf '%s' "$out" | sed -n 's/^{"seq": [0-9]*, "timedOut": false, "replayed": \([0-9]*\).*/\1/p' >"$dir/.watch-replay"
-          ;;
-        *) ;;
-      esac
+      if [[ "$out" == '{"seq": '*', "timedOut": false, "replayed": '* ]]; then
+        printf '%s' "$out" | sed -n 's/^{"seq": [0-9]*, "timedOut": false, "replayed": \([0-9]*\).*/\1/p' >"$dir/.watch-replay"
+      fi
       exit 0
       ;;
-    *) ;;
+    *)
+      # An orphan (its session crashed) would otherwise poll forever and keep the server and its
+      # token alive. The parent pid cannot tell: it is 1 for a Claude Code Bash shell on Windows.
+      empty=$((empty + 1))
+      if [[ "$empty" -ge "$max_empty" ]]; then
+        echo "no events in $empty consecutive waits: this watcher is exiting so an orphan does not keep the $NAME server alive; a live session re-arms with: bash $(shell_quote "$here/wake.sh") $(shell_quote "$dir")" >&2
+        exit 4
+      fi
+      ;;
   esac
 done

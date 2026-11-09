@@ -8,7 +8,7 @@ import { test } from "node:test";
 
 import { collapseStatus, StatusDisagreement } from "./issue-status.mjs";
 import { HUMAN_ID, STATUS_CONFIG, STRANGER_ID, TRUSTED_ACTORS, withFields } from "./read-status.fixtures.mjs";
-import { DISAGREEMENT_WAIT_MS, fieldStatusSetter, readyWhileDeferred, StatusReadError, statusEvents, statusLabels, statusReader, syntheticFrom } from "./read-status.mjs";
+import { carried, DECISION_LABELS, DISAGREEMENT_WAIT_MS, fieldStatusSetter, INFO_LABELS, isStatusLabel, readyWhileDeferred, StatusReadError, statusEvents, statusLabels, statusReader, syntheticFrom } from "./read-status.mjs";
 
 const unexpected = async (method, path) => {
   throw new Error(`unexpected ${method} ${path}`);
@@ -42,9 +42,9 @@ test("a trusted queue state replaces a stale queue label with its own first labe
 test("a trusted state keeps every hold label, drops a stale agent-ready, and adds a hold's first label once", () => {
   assert.deepEqual(statusLabels("ready", ["needs-human", "agent-ready", "status: confirmed"], STATUS_CONFIG), ["needs-human", "status: ready"]);
   assert.deepEqual(statusLabels("confirmed", ["Agent-Ready"], STATUS_CONFIG), ["status: confirmed"]);
-  assert.deepEqual(statusLabels("needs-human", ["status: needs-decision"], STATUS_CONFIG), ["status: needs-decision", "needs-human"]);
+  assert.deepEqual(statusLabels("needs-human", ["needs-owner-decision"], STATUS_CONFIG), ["needs-owner-decision", "needs-human"]);
   assert.deepEqual(statusLabels("needs-human", ["Needs-Human"], STATUS_CONFIG), ["Needs-Human"]);
-  assert.deepEqual(statusLabels("needs-owner-decision", [], STATUS_CONFIG), ["status: needs-decision"]);
+  assert.deepEqual(statusLabels("needs-owner-decision", [], STATUS_CONFIG), ["needs-owner-decision"]);
 });
 
 test("a trusted agent-ready adds the agent-ready label once and drops stale queue labels", () => {
@@ -216,7 +216,7 @@ test("a field change is an unlabeled of the old state's first label, then a labe
     label("labeled", "needs-triage", personActor, "2026-11-08T10:00:00Z"),
   ]);
   assert.deepEqual(syntheticFrom(change("2026-11-08T10:00:00Z", null, "needs-owner-decision"), STATUS_CONFIG), [
-    label("labeled", "status: needs-decision", personActor, "2026-11-08T10:00:00Z"),
+    label("labeled", "needs-owner-decision", personActor, "2026-11-08T10:00:00Z"),
   ]);
 });
 
@@ -412,4 +412,18 @@ test("a reader's re-read of a disagreeing field is not counted against its limit
   const labels = statusReader({ github, repository: "o/r", config: STATUS_CONFIG, trustedActors: TRUSTED_ACTORS, log: () => {}, limit: 2, sleep: async () => {} });
   assert.deepEqual(await labels(7, []), ["status: ready"]);
   assert.deepEqual(await labels(8, []), ["status: ready"]);
+});
+
+test("DECISION_LABELS and INFO_LABELS name each hold, and carried and isStatusLabel read them", () => {
+  assert.deepEqual(DECISION_LABELS, ["needs-owner-decision"]);
+  assert.deepEqual(INFO_LABELS, ["needs-reporter-info"]);
+  assert.equal(carried(["bug", "needs-owner-decision"], DECISION_LABELS), "needs-owner-decision");
+  assert.equal(carried(["needs-reporter-info"], INFO_LABELS), "needs-reporter-info");
+  assert.equal(carried(["bug"], DECISION_LABELS), undefined);
+  for (const name of ["status: ready", "Status: Ready", "needs-owner-decision", "Needs-Owner-Decision", "needs-reporter-info"]) {
+    assert.equal(isStatusLabel(name), true, name);
+  }
+  for (const name of ["bug", "needs-human", undefined]) {
+    assert.equal(isStatusLabel(name), false, String(name));
+  }
 });

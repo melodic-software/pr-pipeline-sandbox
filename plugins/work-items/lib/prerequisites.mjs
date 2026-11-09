@@ -2,7 +2,7 @@
 // GENERATED from lib/prerequisites.mjs by scripts/sync-shared-copies.sh. Do not edit this copy:
 // edit the canonical source, then rerun the script.
 // Read a plugin's prerequisites.json and report which declared dependencies resolve.
-// The contract is docs/conventions/prerequisites/README.md; the schema sits beside it.
+// The contract is docs/contracts/prerequisites/README.md; the schema sits beside it.
 //
 //   prerequisites.mjs report --plugin-root <dir> [--plugin-root <dir>...]
 //   prerequisites.mjs check <plugin-root> [--for <scope>] [--data-dir <dir>]
@@ -13,10 +13,13 @@
 //         --for keeps the entries scoped to that skill, hook or MCP server, plus
 //         the plugin-wide ones. --data-dir is the plugin data directory, for a
 //         caller whose environment lacks it (see expandPluginPath).
-// probe   A SessionStart hook. Notifies the user (systemMessage) once per session
+// probe   Run at SessionStart by harness-ops' prerequisites-fleet.mjs for each plugin
+//         whose manifest declares session_probe. Notifies the user (systemMessage) once per session
 //         for each missing entry a hook needs; the model hears of it when the hook
 //         first skips. Always exits 0 on a valid manifest, for the reason the
-//         node-notice header in prerequisites.sh records.
+//         node-notice header in prerequisites.sh records. A plugin with
+//         git-hooks/entries.json also gets one user line per drifted git-hook
+//         entry, once per session (see gitHookDrift).
 //         --run-if-unset-or-true is the plugin option gate exec-bash.mjs offers: the
 //         probe stays silent when CLAUDE_PLUGIN_OPTION_<OPTION> is set to anything
 //         but true, so a plugin's kill switch silences its probe.
@@ -65,6 +68,9 @@ const OPTION_RE = /^[A-Z0-9_]+$/;
 const SERVER_RE = /^[A-Za-z0-9._-]+$/;
 const MANAGER_RE = /^[a-z][a-z0-9-]*$/;
 const PROBE_TIMEOUT_MS = 20000;
+// This file's directory: the working directory of every probe, so a same-named
+// executable in the caller's directory is never the one run.
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOCAL_BIN_DEPTH = 8;
 
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -113,13 +119,20 @@ function detectErrors(kind, detect, where) {
     if (!isObject(v)) {
       errors.push(`${vw} must be an object`);
     } else {
-      errors.push(...keysErrors(v, ["args", "pattern", "min"], vw));
+      errors.push(...keysErrors(v, ["args", "pattern", "min", "below"], vw));
       if (!Array.isArray(v.args) || !v.args.every((a) => typeof a === "string")) {
         errors.push(`${vw}.args must be a list of strings`);
       }
       errors.push(...patternErrors(v.pattern, vw, true));
       if (typeof v.min !== "string" || !MIN_RE.test(v.min))
         errors.push(`${vw}.min must be a dotted number such as 2.94.0`);
+      if ("below" in v) {
+        if (typeof v.below !== "string" || !MIN_RE.test(v.below)) {
+          errors.push(`${vw}.below must be a dotted number such as 3.0.0`);
+        } else if (typeof v.min === "string" && MIN_RE.test(v.min) && compareVersions(v.below, v.min) <= 0) {
+          errors.push(`${vw}.below must be greater than ${vw}.min`);
+        }
+      }
     }
   }
   if ("probe" in detect) {
@@ -159,7 +172,7 @@ function entryErrors(entry, where) {
   if (!isObject(entry)) return [`${where} must be an object`];
   const errors = keysErrors(entry, ENTRY_KEYS, where);
   for (const key of ENTRY_KEYS) {
-    if (!(key in entry)) errors.push(`${where}.${key} is required`);
+    if (!(key in entry) && key !== "check") errors.push(`${where}.${key} is required`);
   }
   if ("id" in entry && !(typeof entry.id === "string" && ID_RE.test(entry.id))) {
     errors.push(`${where}.id must match ${ID_RE.source}`);
@@ -202,8 +215,19 @@ function entryErrors(entry, where) {
 // validateManifest(value) -> list of schema errors; empty means valid.
 export function validateManifest(manifest) {
   if (!isObject(manifest)) return ["the manifest must be a JSON object"];
-  const errors = keysErrors(manifest, ["$schema", "requires"], "manifest");
+  const errors = keysErrors(manifest, ["$schema", "session_probe", "requires"], "manifest");
   if ("$schema" in manifest && typeof manifest.$schema !== "string") errors.push("manifest.$schema must be a string");
+  if ("session_probe" in manifest) {
+    const sp = manifest.session_probe;
+    if (!isObject(sp)) {
+      errors.push("manifest.session_probe must be an object");
+    } else {
+      errors.push(...keysErrors(sp, ["run_if_unset_or_true"], "session_probe"));
+      if ("run_if_unset_or_true" in sp && !(typeof sp.run_if_unset_or_true === "string" && OPTION_RE.test(sp.run_if_unset_or_true))) {
+        errors.push("session_probe.run_if_unset_or_true must be an option name in capitals, such as BIOME_FORMAT_ENABLED");
+      }
+    }
+  }
   if (!Array.isArray(manifest.requires) || manifest.requires.length === 0) {
     errors.push("manifest.requires must be a non-empty list");
     return errors;
@@ -219,15 +243,20 @@ export function validateManifest(manifest) {
   return errors;
 }
 
-// loadManifest(root) -> { plugin, manifest, errors, absent }
-export function loadManifest(root) {
-  let plugin = path.basename(path.resolve(root));
+// The plugin's name from plugin.json; the directory name stands in when it is absent or unreadable.
+function pluginName(root) {
   try {
     const name = JSON.parse(readFileSync(path.join(root, ".claude-plugin", "plugin.json"), "utf8")).name;
-    if (isText(name)) plugin = name;
+    if (isText(name)) return name;
   } catch {
-    // The directory name stands in when plugin.json is absent or unreadable.
+    // Falls through to the directory name.
   }
+  return path.basename(path.resolve(root));
+}
+
+// loadManifest(root) -> { plugin, manifest, errors, absent }
+export function loadManifest(root) {
+  const plugin = pluginName(root);
   const file = path.join(root, "prerequisites.json");
   if (!existsSync(file)) return { plugin, manifest: null, errors: [], absent: true };
   let manifest;
@@ -318,8 +347,11 @@ function findLocalBin(rels, cwd, platform, fs) {
   return null;
 }
 
+// file is resolved against the caller's directory first, where which() found it
+// (a relative PATH entry gives a relative match), since the probe runs from HERE.
 function run(file, args, env) {
-  const r = spawnSync(file, args, {
+  const r = spawnSync(path.resolve(file), args, {
+    cwd: HERE,
     encoding: "utf8",
     timeout: PROBE_TIMEOUT_MS,
     stdio: ["ignore", "pipe", "pipe"],
@@ -341,10 +373,24 @@ function firstOnPath(names, ctx, rejectStoreAlias = false) {
 // --data-dir "${CLAUDE_PLUGIN_DATA}", per which processes receive the variable:
 // https://code.claude.com/docs/en/plugins/manifest-reference#where-each-variable-resolves
 // (as of 2026-10-11; recheck when that section changes which processes get
-// CLAUDE_PLUGIN_DATA in their environment).
+// CLAUDE_PLUGIN_DATA in their environment). The rule is the plugins' own
+// launchers' (plugins/speech/scripts/pydeps.py data_dir): a literal "${...}"
+// value is unset, and the environment's value counts only when its last path
+// segment is the plugin's name or starts with "<plugin>-", so another plugin's
+// directory is unknown here, not read.
+function ownDataDir(ctx) {
+  const flag = ctx.dataDir;
+  if (flag && !flag.startsWith("${")) return flag;
+  const env = ctx.env.CLAUDE_PLUGIN_DATA;
+  if (!env || env.startsWith("${")) return null;
+  const plugin = pluginName(ctx.root);
+  const last = path.basename(env);
+  return last === plugin || last.startsWith(`${plugin}-`) ? env : null;
+}
+
 function expandPluginPath(p, ctx) {
   if (p.startsWith("${CLAUDE_PLUGIN_DATA}")) {
-    const data = ctx.dataDir ?? ctx.env.CLAUDE_PLUGIN_DATA;
+    const data = ownDataDir(ctx);
     if (!data) return null;
     return path.join(data, p.slice("${CLAUDE_PLUGIN_DATA}".length));
   }
@@ -353,7 +399,7 @@ function expandPluginPath(p, ctx) {
 
 // A plugin that commits requirements.txt installs its Python packages into the
 // plugin data directory, at <data>/python/<first 12 hex of the lock's sha256>-<the
-// interpreter's sys.implementation.cache_tag>/ (docs/conventions/on-demand-dependencies,
+// interpreter's sys.implementation.cache_tag>/ (docs/contracts/on-demand-dependencies,
 // Rule P3). pluginPythonSet -> null when the plugin has no lock or the interpreter's
 // cache tag cannot be read, { dir: null } when the data directory is unknown here,
 // else { dir } for that interpreter.
@@ -370,7 +416,7 @@ function pluginPythonSet(python, ctx) {
 }
 
 // detectEntry(entry, ctx) -> { status, detail }. status is present, missing,
-// outdated (below the version floor), unverified (the version could not be
+// outdated (below the version floor or at or above its exclusive ceiling), unverified (the version could not be
 // read) or agent-check (an MCP server only the agent can see).
 export function detectEntry(entry, ctx) {
   const d = entry.detect;
@@ -389,6 +435,12 @@ export function detectEntry(entry, ctx) {
       }
       if (compareVersions(match[1], d.version.min) < 0) {
         return { status: "outdated", detail: `${found} is ${match[1]}; ${d.version.min} or newer is needed` };
+      }
+      if (d.version.below !== undefined && compareVersions(match[1], d.version.below) >= 0) {
+        return {
+          status: "outdated",
+          detail: `${found} is ${match[1]}; the supported range is >= ${d.version.min}, < ${d.version.below}`,
+        };
       }
       return { status: "present", detail: `${found} ${match[1]}` };
     }
@@ -467,7 +519,7 @@ function installText(entry) {
 }
 
 function remediation(entry) {
-  return `${entry.degrade} Install (${installText(entry)}). Then run ${entry.check}.`;
+  return `${entry.degrade} Install (${installText(entry)}). Then run ${entry.check ?? "this check again"}.`;
 }
 
 function inScope(entry, scope) {
@@ -631,10 +683,30 @@ function cmdProbe(opts, ctx, out) {
   for (const entry of manifest.requires.filter((e) => e.for.some((s) => s.startsWith("hook:")))) {
     const { status, detail } = detectEntry(entry, { ...ctx, root });
     if (!isFailure(status) || !firstNoticeThisSession(plugin, entry.id, session, ctx.env)) continue;
-    notices.push(userNotice(plugin, entry, status, detail));
+    notices.push(userNotice(plugin, { ...entry, root }, status, detail));
   }
+  const drift = gitHookDrift(root, ctx);
+  if (drift.length && firstNoticeThisSession(plugin, "git-hooks", session, ctx.env)) notices.push(...drift);
   if (notices.length) out.stdout(JSON.stringify({ systemMessage: notices.join("\n") }));
   return 0;
+}
+
+// A plugin that ships git-hooks/entries.json reports drift in its git-hook
+// entries through the same row: the vendored installer's `verify --quiet`
+// prints one line per drifted entry and nothing for an ok or declined one. The
+// installer sits beside this file only in plugins that carry it, so it runs as
+// a child process rather than an import.
+function gitHookDrift(root, ctx) {
+  const installer = path.join(HERE, "git-hooks", "install.mjs");
+  if (!existsSync(path.join(root, "git-hooks", "entries.json")) || !existsSync(installer)) return [];
+  const repo = ctx.env.CLAUDE_PROJECT_DIR || ctx.cwd;
+  const r = spawnSync(process.execPath, [installer, "verify", "--quiet", "--repo", repo, "--plugin-root", root], {
+    encoding: "utf8",
+    env: ctx.env,
+    timeout: PROBE_TIMEOUT_MS,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return (r.stdout ?? "").split("\n").filter((line) => line.trim() !== "");
 }
 
 // The user line for a missing hook dependency. hook::prereq_notice_to in
@@ -646,7 +718,7 @@ function userNotice(plugin, entry, status, detail) {
   const what = onPath ? `${entry.id} not on the hook PATH${local}` : detail;
   return (
     `${plugin}: ${what}. ${entry.degrade} Install (${installText(entry)}). ` +
-    `Hooks read Claude Code's PATH, not your shell profile. No further notice this session; ${entry.check} diagnoses.`
+    `Hooks read Claude Code's PATH, not your shell profile. No further notice this session; diagnose with: node "${entry.root}/lib/prerequisites.mjs" check "${entry.root}"`
   );
 }
 

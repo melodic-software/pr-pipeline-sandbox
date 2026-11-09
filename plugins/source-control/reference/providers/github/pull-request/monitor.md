@@ -25,23 +25,48 @@ gh pr view <pr_number> --json state -q '.state'
 ## Poll checks over REST
 
 The Monitor watch's poll script, passed inline in the `command` parameter. `<scripts-dir>` is the
-placeholder the pull-request skill resolves.
+placeholder the pull-request skill resolves. `BASELINE_FILE` stays empty on the first arming; a
+re-arm sets it to the snapshot file this same script wrote in a snapshot run (`SNAPSHOT_FILE`
+set: one state check and checks read, the `cur_checks` lines written under a marker line, then
+exit 0, or exit 1 with nothing written when the read failed). A baseline file without that
+marker line is refused with `BASELINE-UNREADABLE`, so only this script's serializer produces a
+baseline.
 
 ```bash
 PR_NUMBER=<N>
+INTERVAL=60  # raise with several watchers (../README.md#api-budget)
 OWNER=$(gh repo view --json owner -q .owner.login)
 REPO=$(gh repo view --json name -q .name)
+BASELINE_FILE=  # re-arm only: the file a snapshot run of this script wrote
+SNAPSHOT_FILE=  # snapshot run only: write the checks here and exit
+SNAPSHOT_MARK='# monitor-poll checks snapshot'
 prev_checks=""
+baselined=0  # set by a snapshot BASELINE_FILE or the first successful check read
+if [ -n "$BASELINE_FILE" ] && [ "$(head -n 1 "$BASELINE_FILE" 2>/dev/null | tr -d '\r')" = "$SNAPSHOT_MARK" ]; then
+  prev_checks=$(tail -n +2 "$BASELINE_FILE" | tr -d '\r' | grep -v '^$' | sort || true)
+  baselined=1
+elif [ -n "$BASELINE_FILE" ]; then
+  echo "BASELINE-UNREADABLE $BASELINE_FILE — missing or not a snapshot this script wrote; first checks poll only records; run a full scan"
+fi
 last_comment_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 prev_threads=""
 poll=0
+err=$(mktemp)  # stderr of every later gh call, checked for a rate limit each poll
+trap 'rm -f "$err"' EXIT  # every exit removes it
+trap 'exit 143' INT TERM HUP  # a signal then ends the script through the EXIT trap, in bash and zsh alike
 
 while true; do
   # Terminal state check — exit watch if PR closed/merged. REST, like the
-  # CI read below (§3.1 "Polling CI from more than one worker").
-  read -r state head_sha < <(gh api "repos/$OWNER/$REPO/pulls/$PR_NUMBER" \
-    --jq '"\(if .merged then "MERGED" elif .state == "closed" then "CLOSED" else "OPEN" end) \(.head.sha)"' \
-    2>/dev/null | tr -d '\r')
+  # CI read below (§3.1 "Polling CI from more than one worker"). A rate
+  # limit stops the watch: polling on would probe for recovery
+  # (../README.md#api-budget).
+  if out=$(gh api "repos/$OWNER/$REPO/pulls/$PR_NUMBER" \
+    --jq '"\(if .merged then "MERGED" elif .state == "closed" then "CLOSED" else "OPEN" end) \(.head.sha)"' 2>&1); then
+    read -r state head_sha <<<"$(printf '%s' "$out" | tr -d '\r')"
+  elif grep -qiE 'rate limit|HTTP 429' <<<"$out"; then
+    echo "RATE-LIMITED — watch stopped: $out"
+    exit 2
+  fi
   if [ "$state" = "MERGED" ] || [ "$state" = "CLOSED" ]; then
     echo "PR #$PR_NUMBER $state — watch complete"
     exit 0
@@ -52,23 +77,49 @@ while true; do
   # deduplicated as gh does (latest start per name/workflow/event);
   # commit statuses are always read, since check-runs omit them.
   b='def b: ascii_upcase | if . == "SUCCESS" then "pass" elif . == "SKIPPED" or . == "NEUTRAL" then "skipping" elif . == "CANCELLED" then "cancel" elif . == "ERROR" or . == "FAILURE" or . == "TIMED_OUT" or . == "ACTION_REQUIRED" then "fail" else "pending" end;'
-  wf=$(gh api --paginate "repos/$OWNER/$REPO/actions/runs?head_sha=$head_sha&per_page=100" \
-    --jq '.workflow_runs[] | {(.check_suite_id | tostring): "\(.name)/\(.event)"}' 2>/dev/null | jq -s -c 'add // {}')
-  cur_checks=$({ gh api --paginate "repos/$OWNER/$REPO/commits/$head_sha/check-runs?per_page=100" \
-      | jq -s -r --argjson wf "$wf" "$b"' [.[].check_runs[] | {k: "\(.name)/\($wf[.check_suite.id | tostring] // "")", name, t: (.started_at // ""), s: (if .status == "completed" then .conclusion else .status end)}] | group_by(.k) | map(max_by(.t))[] | "\(.name): \(.s | b)"'
-    gh api --paginate "repos/$OWNER/$REPO/commits/$head_sha/status?per_page=100" \
-      --jq "$b"' .statuses[] | "\(.context): \(.state | b)"'
-  } 2>/dev/null | tr -d '\r' | grep -v ': pending$' | sort || true)
-  if [ "$cur_checks" != "$prev_checks" ]; then
+  # A failed read of any call below leaves the baseline alone and emits
+  # nothing: an empty list from a failed read would otherwise be stored as
+  # the baseline, and the next good poll would emit every finished check.
+  checks_ok=1
+  [ -n "${head_sha:-}" ] || checks_ok=0
+  if [ "$checks_ok" -eq 1 ]; then
+    if wf_raw=$(gh api --paginate "repos/$OWNER/$REPO/actions/runs?head_sha=$head_sha&per_page=100" \
+      --jq '.workflow_runs[] | {(.check_suite_id | tostring): "\(.name)/\(.event)"}' 2>>"$err"); then
+      wf=$(printf '%s\n' "$wf_raw" | jq -s -c 'add // {}') || checks_ok=0
+    else checks_ok=0; fi
+  fi
+  if [ "$checks_ok" -eq 1 ]; then
+    runs_raw=$(gh api --paginate "repos/$OWNER/$REPO/commits/$head_sha/check-runs?per_page=100" 2>>"$err") || checks_ok=0
+    stat_raw=$(gh api --paginate "repos/$OWNER/$REPO/commits/$head_sha/status?per_page=100" \
+      --jq "$b"' .statuses[] | "\(.context): \(.state | b)"' 2>>"$err") || checks_ok=0
+  fi
+  if [ "$checks_ok" -eq 1 ]; then
+    run_rows=$(printf '%s\n' "$runs_raw" | jq -s -r --argjson wf "$wf" "$b"' [.[].check_runs[] | {k: "\(.name)/\($wf[.check_suite.id | tostring] // "")", name, t: (.started_at // ""), s: (if .status == "completed" then .conclusion else .status end)}] | group_by(.k) | map(max_by(.t))[] | "\(.name): \(.s | b)"') || checks_ok=0
+    cur_checks=$({ printf '%s\n' "$run_rows"; printf '%s\n' "$stat_raw"; } \
+      | tr -d '\r' | grep -v -e '^$' -e ': pending$' | sort || true)
+  fi
+  if [ -n "$SNAPSHOT_FILE" ]; then
+    if [ "$checks_ok" -ne 1 ]; then
+      echo "SNAPSHOT-FAILED — checks read failed; no snapshot written"
+      exit 1
+    fi
+    printf '%s\n%s\n' "$SNAPSHOT_MARK" "$cur_checks" >"$SNAPSHOT_FILE.tmp" &&
+      mv "$SNAPSHOT_FILE.tmp" "$SNAPSHOT_FILE"
+    exit $?
+  fi
+  if [ "$checks_ok" -eq 1 ]; then
     # Bucket values mirror gh pr checks: pass|fail|pending|skipping|cancel.
-    # The first poll only records the checks, so a re-arm at the
-    # deadline does not re-emit every completed check.
-    if [ "$poll" -gt 0 ]; then
+    # With no baseline, the first poll whose check read succeeds only records
+    # the checks. A re-arm starts from the full iteration's snapshot instead,
+    # so a check that finished since that read is emitted and the rest are not
+    # re-emitted.
+    if [ "$baselined" -eq 1 ] && [ "$cur_checks" != "$prev_checks" ]; then
       comm -13 <(echo "$prev_checks") <(echo "$cur_checks") | \
         grep --line-buffered -E ': (pass|fail|skipping|cancel)$' \
         || true
     fi
     prev_checks="$cur_checks"
+    baselined=1
   fi
 
   # New comments — ALL THREE review surfaces (issue-level, inline
@@ -80,11 +131,11 @@ while true; do
   now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   fetch_ok=1
   if out=$(gh api --paginate "repos/$OWNER/$REPO/issues/$PR_NUMBER/comments?since=$last_comment_ts&per_page=100" \
-    --jq '.[] | "COMMENT \(.user.login): \(.body[:80])"' 2>/dev/null); then
+    --jq '.[] | "COMMENT \(.user.login): \(.body[:80])"' 2>>"$err"); then
     printf '%s\n' "$out" | tr -d '\r' | grep --line-buffered . || true
   else fetch_ok=0; fi
   if out=$(gh api --paginate "repos/$OWNER/$REPO/pulls/$PR_NUMBER/comments?since=$last_comment_ts&per_page=100" \
-    --jq '.[] | "INLINE-COMMENT \(.user.login): \(.body[:80])"' 2>/dev/null); then
+    --jq '.[] | "INLINE-COMMENT \(.user.login): \(.body[:80])"' 2>>"$err"); then
     printf '%s\n' "$out" | tr -d '\r' | grep --line-buffered . || true
   else fetch_ok=0; fi
   # Reviews API has no `since` param — filter client-side on submitted_at.
@@ -92,17 +143,17 @@ while true; do
   # returns the 30 OLDEST reviews, so on a PR past that count the new ones
   # this poll exists to catch are exactly the ones never fetched.
   if out=$(gh api --paginate "repos/$OWNER/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" \
-    --jq ".[] | select(.submitted_at > \"$last_comment_ts\") | \"REVIEW \(.user.login) [\(.state)]: \(.body[:80])\"" 2>/dev/null); then
+    --jq ".[] | select(.submitted_at > \"$last_comment_ts\") | \"REVIEW \(.user.login) [\(.state)]: \(.body[:80])\"" 2>>"$err"); then
     printf '%s\n' "$out" | tr -d '\r' | grep --line-buffered . || true
   else fetch_ok=0; fi
   [ "$fetch_ok" -eq 1 ] && last_comment_ts="$now"
 
   # Review threads: resolving one moves no check and posts no comment, so
   # the reads above never see it. The Gate 7 read (readiness.md) costs a
-  # GraphQL call, so it runs every 4th poll (about 2 minutes) and emits
+  # GraphQL call, so it runs every 4th poll (about 4 minutes) and emits
   # when the unresolved count, or THREADS_UNPROVEN, changes.
   if [ $((poll % 4)) -eq 0 ]; then
-    cur_threads=$(bash "<scripts-dir>/source-control-review-threads" "$OWNER/$REPO#$PR_NUMBER" 2>/dev/null \
+    cur_threads=$(bash "<scripts-dir>/source-control-review-threads" "$OWNER/$REPO#$PR_NUMBER" 2>>"$err" \
       | awk 'NR == 1 && /^THREADS_(OK|BLOCKED) unresolved=/ { sub(/.*unresolved=/, ""); sub(/[^0-9].*/, ""); print }')
     cur_threads=${cur_threads:-THREADS_UNPROVEN}
     if [ "$cur_threads" != "$prev_threads" ]; then
@@ -110,14 +161,19 @@ while true; do
       prev_threads="$cur_threads"
     fi
   fi
+  if grep -qiE 'rate limit|HTTP 429' "$err"; then
+    echo "RATE-LIMITED — watch stopped: $(grep -iE -m1 'rate limit|HTTP 429' "$err")"
+    exit 2
+  fi
+  : >"$err"
   poll=$((poll + 1))
 
-  sleep 30
+  sleep "$INTERVAL"
 done
 ```
 
 Its state check and CI block (the `head_sha` read through `cur_checks`) also run standalone, with
-`OWNER`, `REPO`, and `PR_NUMBER` set, as the REST read of a PR's checks. The bucket mapping and the
+`OWNER`, `REPO`, `PR_NUMBER`, and `err` set, as the REST read of a PR's checks; `cur_checks` is valid only when `checks_ok` is 1. The bucket mapping and the
 latest-per-name/workflow/event dedupe follow gh's `pkg/cmd/pr/checks/aggregate.go`.
 
 ## Why polling uses REST
@@ -186,9 +242,9 @@ interval, or when either runners endpoint changes its permission requirement.
 
 ## Fetch failed logs
 
-`gh run view --log-failed` is the LAST resort because it truncates at the CLI display layer (~4MB
-cap, cli/cli #11059, #10551, #7771, #7642). The REST API path the bundled scripts use returns
-complete logs every time. The last-resort eyeball:
+`gh run view --log-failed` is the LAST resort: it truncates at the CLI display layer (~4MB cap,
+cli/cli #11059, #10551, #7771, #7642), while the bundled scripts' REST path returns complete logs.
+The last-resort eyeball:
 
 ```bash
 gh run view <run-id> --log-failed 2>&1 | grep '##\[error\]'

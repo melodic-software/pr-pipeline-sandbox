@@ -4,12 +4,14 @@
 
 Usage: python view_bridge.py --dir DATA_DIR <command>
   ensure-running [--port P] [--idle-seconds S]
-                             start the server on the data dir (or reuse it); print its JSON
+                             start the server on the data dir (or reuse it, unless it started
+                             from another plugin build: then restart it); print its JSON
   serve --port P --nonce N [--idle-seconds S]
                              run the server in the foreground (ensure-running spawns this)
   apply --file F             merge the session's replies from F into replies.json, then remove F
   stop                       stop the server and its watcher
   lease [--release]          show (or clear) the watcher lease
+  status --record-id K       list the unhandled actions as PageInput; needs no server or watcher
 
 The page is `<data_dir>/page.html`, built by lib/view-builder.mjs with `--connect` naming the origin
 ensure-running prints. The server serves it at `/`, hands the page its token at `/api/token`, takes
@@ -19,6 +21,11 @@ on `/events`. `replies.json` is the session's file: the seqs it handled and its 
 A page action holds only builder keys, builder row ids and the reader's own notes. Anything else is
 refused. Nothing here acts on an action: the watcher prints it under session_bridge.DATA_NOTE and the
 session decides (rendered-views README, rule 9).
+
+`status` reads the same two files, so it finds what the reader sent while no watcher ran. It lists
+each unhandled action by seq with only PageInput fields: a `lock` or `unlock` action gives one entry
+per choice, and every note gives a `comment` entry. Ticked rows and the choices of any other action
+are not reader input to the record, so it leaves them out.
 
 The token lives only while the session listens: the server exits once no watcher has waited for
 IDLE_SECONDS, and the next ensure-running starts a server with a new token. A session that ends takes
@@ -61,6 +68,10 @@ def load_json(path, default):
         return json.loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError:
         return default
+
+
+def load_log(path):
+    return load_json(path, {"seq": 0, "events": []})
 
 
 def write_json(path, value):
@@ -126,6 +137,8 @@ class ViewHub(bridge.LoopbackWatcher):
         self.replies = self.dir / "replies.json"
         self.page = self.dir / "page.html"
         self.idle = idle
+        # The page gets only self.token (at /api/token); the watcher token stays in the 0600 env file.
+        self.watch_token = secrets.token_urlsafe(32)
         self.started = time.time()
 
     def expired(self):
@@ -135,7 +148,7 @@ class ViewHub(bridge.LoopbackWatcher):
             return self.waiters == 0 and quiet > self.idle
 
     def read_log(self):
-        return load_json(self.actions, {"seq": 0, "events": []})
+        return load_log(self.actions)
 
     def write_log(self, log):
         write_json(self.actions, log)
@@ -209,7 +222,10 @@ class ViewHandler(bridge.LoopbackHandler):
         if url.path == "/api/token":
             # Only the page's own script gets the token: a browser sets Sec-Fetch-Site and no page
             # can forge it, and do_GET already refused a foreign Host or Origin. The token never
-            # enters the page's markup, so a saved or published copy holds none.
+            # enters the page's markup, so a saved or published copy holds none. This stops a
+            # browser page from another origin, not a local process: curl can send the header. The
+            # token opens POST /api/action only; /api/wait and the lease release need the watcher
+            # token, which this route never serves.
             if self.headers.get("Sec-Fetch-Site") != "same-origin":
                 return self.send(403, {"error": "same-origin page script only"})
             return self.send(200, {"token": self.hub.token})
@@ -261,7 +277,7 @@ def cmd_apply(d, a):
     if not f.exists():
         print("nothing to apply")
         return
-    log = load_json(d / "actions.json", {"seq": 0, "events": []})
+    log = load_log(d / "actions.json")
     try:
         done, out = parse_ops(
             json.loads(f.read_text(encoding="utf-8")), {e["seq"] for e in log["events"]}
@@ -274,6 +290,39 @@ def cmd_apply(d, a):
     write_json(d / "replies.json", {"handled": sorted(handled), "replies": replies})
     f.unlink()
     print(f"applied {len(done)} action(s), {len(out)} reply(ies)")
+
+
+def page_input(event, record_id):
+    """The PageInput entries one logged action carries: locks or unlocks, then comments."""
+    at = event.get("at")
+    kind = event.get("action")
+    locks = event.get("choices", {}) if kind in ("lock", "unlock") else {}
+    return [
+        {
+            "kind": kind,
+            "recordId": record_id,
+            "choiceId": choice,
+            "optionId": option,
+            "at": at,
+        }
+        for choice, option in locks.items()
+    ] + [
+        {"kind": "comment", "recordId": record_id, "text": text, "at": at}
+        for text in event.get("notes", {}).values()
+    ]
+
+
+def cmd_status(d, a):
+    if not KEY.fullmatch(a.record_id):
+        sys.exit("status: --record-id must be a builder key")
+    log = load_log(d / "actions.json")
+    handled = set(load_json(d / "replies.json", {}).get("handled", []))
+    events = [
+        {"seq": e["seq"], "input": page_input(e, a.record_id)}
+        for e in log.get("events", [])
+        if e["seq"] not in handled
+    ]
+    print(bridge.dumps_line({"note": bridge.DATA_NOTE, "events": events}))
 
 
 def cmd_serve(d, a):
@@ -315,21 +364,34 @@ def cmd_ensure_running(d, a):
         sys.exit("missing prerequisite: curl (the watcher needs it on PATH)")
     private_dir(d)
     s = bridge.read_session(d, NAME)
-    if not (s and bridge.running(d, s)):
+    live = bool(s and bridge.running(d, s))
+    stale = live and bridge.stale_build(s)
+    if stale:
+        # A server started before a plugin update runs the old code: start this build in its place.
+        end_server(d, s)
+        print(f"restarted the {NAME} server: {stale}", file=sys.stderr)
+        live = False
+    if not live:
         ports = [a.port, bridge.kept_port(d, NAME)]
         port = next((p for p in ports if p and bridge.port_free(p)), 0)
         nonce = secrets.token_hex(8)
         cmd = [bridge.interpreter(), str(HERE / "view_bridge.py"), "--dir", str(d)]
-        idle = ["--idle-seconds", str(a.idle_seconds)]
-        proc = bridge.spawn(
-            [*cmd, "serve", "--port", str(port), "--nonce", nonce, *idle]
-        )
+        cmd += ["serve", "--port", str(port), "--nonce", nonce]
+        cmd += ["--idle-seconds", str(a.idle_seconds)]
+        with bridge.open_server_log(d, NAME) as log:
+            proc = bridge.spawn(cmd, stderr=log)
         s = bridge.wait_started(d, NAME, nonce, proc, START_SECONDS)
         if s is None:
-            if proc.poll() is None:
+            code = proc.poll()
+            if code is None:
                 proc.kill()
+                why = f"the server did not start within {START_SECONDS} s"
+            else:
+                why = f"the server exited with status {code}"
+            tail = bridge.log_tail(bridge.server_log(d, NAME))
             sys.exit(
-                f"the server did not start within {START_SECONDS} s (data dir {d})"
+                f"{why} (data dir {d})"
+                + (f"\nserver stderr (last lines):\n{tail}" if tail else "")
             )
     origin = f"http://127.0.0.1:{int(s['port'])}"
     print(
@@ -351,13 +413,18 @@ def cmd_stop(d, a):
             bridge.clear_session(d, NAME)
         print("not running")
         return
+    end_server(d, s)
+    print(f"stopped {s['pid']}")
+
+
+def end_server(d, s):
+    """End the running server `s` records and its watcher, then clear the session files."""
     bridge.end_watcher(d, (bridge.watcher_lease(d, NAME) or {}).get("pid"))
     os.kill(s["pid"], signal.SIGTERM)
     deadline = time.monotonic() + START_SECONDS
     while time.monotonic() < deadline and bridge.ping(s["port"], timeout=0.5):
         time.sleep(0.05)
     bridge.clear_session(d, NAME)
-    print(f"stopped {s['pid']}")
 
 
 def cmd_lease(d, a):
@@ -386,6 +453,8 @@ def main(argv=None):
     sub.add_parser("stop")
     s = sub.add_parser("lease")
     s.add_argument("--release", action="store_true")
+    s = sub.add_parser("status")
+    s.add_argument("--record-id", required=True)
     a = p.parse_args(argv)
     d = Path(a.dir).resolve()
     {
@@ -394,6 +463,7 @@ def main(argv=None):
         "apply": cmd_apply,
         "stop": cmd_stop,
         "lease": cmd_lease,
+        "status": cmd_status,
     }[a.cmd](d, a)
 
 

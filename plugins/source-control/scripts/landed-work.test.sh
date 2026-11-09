@@ -141,6 +141,18 @@ assert_eq "squash: still landed after the base advances" "yes" "$(col "$R" $C_LA
 assert_eq "squash: still by range patch-id after the base advances" \
   "range-patchid" "$(col "$R" $C_METHOD)"
 
+# An empty commit on the base (an empty squash merge) has no patch to hash. It is
+# excused from the base-side count, so the base set stays usable; a commit whose
+# diff fails to render still is not (base-patchid-incomplete).
+git -C "$W" commit -q --allow-empty -m "empty squash on the base" >/dev/null 2>&1
+git -C "$W" push -q origin main >/dev/null 2>&1
+
+OUT="$(bash "$ENGINE" --repo-dir "$W" --no-peers)"
+R="$(row "$OUT" "wt-squash")"
+assert_eq "squash: still landed past an empty base commit" "yes" "$(col "$R" $C_LANDED)"
+assert_not_contains "and the base set is not reported incomplete" \
+  "$(col "$R" $C_REASON)" "base-patchid-incomplete"
+
 # --------------------------------------------------------------------------
 # Negative control — a genuinely unmerged branch is NOT landed
 # --------------------------------------------------------------------------
@@ -611,8 +623,234 @@ assert_eq "fixture sanity: the unpushed commit is landed" "yes" "$(col "$R" $C_L
 assert_eq "fixture sanity: a merge is mid-flight" "merge" "$(col "$R" $C_INPROGRESS)"
 assert_eq "in-progress outranks landed" "in-progress" "$(col "$R" $C_RISK)"
 
+# --------------------------------------------------------------------------
+# Merged-PR proof (--merged-pr-proof), with a stubbed gh
+# --------------------------------------------------------------------------
+
+# The stub prints the file named by GH_STUB_OUT in the format the engine's --jq
+# produces (`pr <head-ref> <base-ref>` / `head <oid>` / `commit <oid>` lines), or
+# fails when GH_STUB_FAIL is set. With GH_STUB_LOG set it appends one line of
+# arguments per invocation, so a test counts the calls.
+PR_BIN="$TEST_TMPDIR/pr-bin"
+mkdir -p "$PR_BIN"
+cat >"$PR_BIN/gh" <<'STUB'
+#!/usr/bin/env bash
+[[ -n "${GH_STUB_LOG:-}" ]] && printf '%s\n' "$*" >>"$GH_STUB_LOG"
+[[ -n "${GH_STUB_FAIL:-}" ]] && { printf 'gh stub:\tforced; failure\nsecond line\n' >&2; exit 1; }
+cat "${GH_STUB_OUT:-/dev/null}"
+STUB
+chmod +x "$PR_BIN/gh"
+
+# A branch whose two commits were never squashed onto the base by content the
+# engine can see: the base holds an unrelated later commit and the PR is the only
+# record of the merge.
+W="$(mkfixture)"
+WT_PR="$TEST_TMPDIR/wt-pr"
+git -C "$W" worktree add -q -b feat-pr "$WT_PR" main >/dev/null 2>&1
+commit_in "$WT_PR" p1.txt "one" "pr commit one"
+commit_in "$WT_PR" p2.txt "two" "pr commit two"
+PR_C1="$(git -C "$WT_PR" rev-parse HEAD~1)"
+PR_C2="$(git -C "$WT_PR" rev-parse HEAD)"
+commit_in "$W" other.txt "other" "unrelated on main"
+git -C "$W" push -q origin main >/dev/null 2>&1
+
+OUT="$(bash "$ENGINE" --repo-dir "$W" --no-peers)"
+R="$(row "$OUT" "wt-pr")"
+assert_eq "pr proof: without the flag the row is not landed" "no" "$(col "$R" $C_LANDED)"
+
+run_pr() {
+  PATH="$PR_BIN:$PATH" GH_STUB_OUT="$1" GH_STUB_FAIL="${2:-}" \
+    bash "$ENGINE" --repo-dir "$W" --no-peers --merged-pr-proof
+}
+
+printf 'pr feat-pr main\nhead %s\ncommit %s\ncommit %s\n' "$PR_C2" "$PR_C1" "$PR_C2" >"$TEST_TMPDIR/pr-head-equal"
+printf 'pr feat-pr feat-stack-base\nhead %s\ncommit %s\ncommit %s\n' "$PR_C2" "$PR_C1" "$PR_C2" >"$TEST_TMPDIR/pr-stacked"
+# Another branch's PR in the same listing proves nothing for this one.
+printf 'pr feat-other main\nhead %s\ncommit %s\ncommit %s\n' "$PR_C2" "$PR_C1" "$PR_C2" >"$TEST_TMPDIR/pr-other-branch"
+R="$(row "$(run_pr "$TEST_TMPDIR/pr-head-equal")" "wt-pr")"
+assert_eq "pr proof: HEAD equal to the merged PR head is landed" "yes" "$(col "$R" $C_LANDED)"
+assert_eq "pr proof: method names the PR head" "merged-pr-head" "$(col "$R" $C_METHOD)"
+assert_eq "pr proof: risk is landed" "landed" "$(col "$R" $C_RISK)"
+assert_not_contains "pr proof: the reason carries no stale not-landed text" "$(col "$R" $C_REASON)" "head-differs"
+
+# A PR merged into another feature branch never reached the base.
+R="$(row "$(run_pr "$TEST_TMPDIR/pr-stacked")" "wt-pr")"
+assert_eq "pr proof: a PR merged into a non-base branch is not landed" "no" "$(col "$R" $C_LANDED)"
+
+R="$(row "$(run_pr "$TEST_TMPDIR/pr-other-branch")" "wt-pr")"
+assert_eq "pr proof: another branch's merged PR is not landed" "no" "$(col "$R" $C_LANDED)"
+assert_contains "pr proof: the reason names the missing PR" "$(col "$R" $C_REASON)" "no-merged-pr-into-main-for-branch"
+assert_not_contains "pr proof: a short listing is not called full" "$(col "$R" $C_REASON)" "in-newest-"
+
+# A listing that filled --merged-pr-limit may have cut off this branch's PR.
+R="$(row "$(PATH="$PR_BIN:$PATH" GH_STUB_OUT="$TEST_TMPDIR/pr-other-branch" \
+  bash "$ENGINE" --repo-dir "$W" --no-peers --merged-pr-proof --merged-pr-limit 1)" "wt-pr")"
+assert_contains "pr proof: a full listing says so" "$(col "$R" $C_REASON)" "no-merged-pr-into-main-for-branch-in-newest-1"
+
+printf 'pr feat-pr main\nhead %s\ncommit %s\ncommit %s\n' "0000000000000000000000000000000000000001" "$PR_C1" "$PR_C2" >"$TEST_TMPDIR/pr-commits-only"
+R="$(row "$(run_pr "$TEST_TMPDIR/pr-commits-only")" "wt-pr")"
+assert_eq "pr proof: every local commit in the PR commit list is landed" "yes" "$(col "$R" $C_LANDED)"
+assert_eq "pr proof: method names the commit list" "merged-pr-commits" "$(col "$R" $C_METHOD)"
+
+# A later local commit that is not in the PR stays unproven, so a reused branch
+# name does not read as landed.
+commit_in "$WT_PR" p3.txt "three" "later commit not in the PR"
+R="$(row "$(run_pr "$TEST_TMPDIR/pr-commits-only")" "wt-pr")"
+assert_eq "pr proof: a later commit not in the PR is not landed" "no" "$(col "$R" $C_LANDED)"
+assert_contains "pr proof: the reason says why" "$(col "$R" $C_REASON)" "local-commits-not-all-in-merged-pr"
+
+# A failed PR read keeps the prior verdict and names the failed read.
+R="$(row "$(run_pr "$TEST_TMPDIR/pr-commits-only" 1)" "wt-pr")"
+assert_eq "pr proof: a failed read keeps the prior verdict" "no" "$(col "$R" $C_LANDED)"
+assert_contains "pr proof: the failed read is named" "$(col "$R" $C_REASON)" "merged-pr-read-failed:gh-pr-list"
+# gh's first error line rides along, its tab and semicolon blanked so the row's
+# columns and the reason list keep their shape; later lines are dropped.
+assert_contains "pr proof: gh's own error is named" "$(col "$R" $C_REASON)" "gh-pr-list (gh stub: forced  failure)"
+assert_not_contains "pr proof: only gh's first error line is kept" "$(col "$R" $C_REASON)" "second line"
+assert_eq "pr proof: the error text adds no column" \
+  "$(head -n 1 <<<"$OUT" | awk -F'\t' '{print NF}')" "$(awk -F'\t' '{print NF}' <<<"$R")"
+OUT="$(bash "$ENGINE" --repo-dir "$W" --no-peers)"
+
 # Bare-name invocation from the scripts directory still loads the library.
 BARE_OUT="$(cd "${ENGINE%/*}" && bash "${ENGINE##*/}" --repo-dir "$W" --no-peers)"
 assert_eq "bare-name invocation emits the same rows" "$OUT" "$BARE_OUT"
+
+# --------------------------------------------------------------------------
+# Merged-PR proof lists merged PRs once per repository, not once per worktree
+# --------------------------------------------------------------------------
+
+W="$(mkfixture)"
+for n in 1 2 3; do
+  git -C "$W" worktree add -q -b "feat-many-$n" "$TEST_TMPDIR/wt-many-$n" main >/dev/null 2>&1
+  commit_in "$TEST_TMPDIR/wt-many-$n" "many$n.txt" "many $n" "many $n"
+done
+commit_in "$W" many-main.txt "main moves" "unrelated on main"
+git -C "$W" push -q origin main >/dev/null 2>&1
+MANY1="$(git -C "$TEST_TMPDIR/wt-many-1" rev-parse HEAD)"
+MANY2="$(git -C "$TEST_TMPDIR/wt-many-2" rev-parse HEAD)"
+printf 'pr feat-many-1 main\nhead %s\ncommit %s\npr feat-many-2 main\nhead %s\ncommit %s\n' \
+  "$MANY1" "$MANY1" "$MANY2" "$MANY2" >"$TEST_TMPDIR/pr-many"
+GH_LOG="$TEST_TMPDIR/gh-calls"
+MANY_ERR="$TEST_TMPDIR/many.err"
+
+: >"$GH_LOG"
+OUT="$(PATH="$PR_BIN:$PATH" GH_STUB_OUT="$TEST_TMPDIR/pr-many" GH_STUB_LOG="$GH_LOG" \
+  bash "$ENGINE" --repo-dir "$W" --no-peers --merged-pr-proof 2>"$MANY_ERR")"
+assert_eq "pr listing: three unlanded worktrees make one gh call" "1" "$(grep -c . "$GH_LOG")"
+assert_contains "pr listing: the call lists merged PRs into the base" "$(cat "$GH_LOG")" "pr list --state merged --base main"
+assert_not_contains "pr listing: the call is not scoped to one branch" "$(cat "$GH_LOG")" "--head"
+assert_contains "pr listing: the run reports its gh call count" "$(cat "$MANY_ERR")" "merged-pr-proof made 1 gh call(s)"
+assert_eq "pr listing: the first branch is proven from the shared listing" \
+  "yes" "$(col "$(row "$OUT" "wt-many-1")" $C_LANDED)"
+assert_eq "pr listing: the second branch is proven from the shared listing" \
+  "yes" "$(col "$(row "$OUT" "wt-many-2")" $C_LANDED)"
+assert_eq "pr listing: a branch with no PR in the listing is not landed" \
+  "no" "$(col "$(row "$OUT" "wt-many-3")" $C_LANDED)"
+
+# A failed listing is cached too: a rate-limited read is not retried per worktree.
+: >"$GH_LOG"
+OUT="$(PATH="$PR_BIN:$PATH" GH_STUB_OUT="$TEST_TMPDIR/pr-many" GH_STUB_LOG="$GH_LOG" GH_STUB_FAIL=1 \
+  bash "$ENGINE" --repo-dir "$W" --no-peers --merged-pr-proof 2>"$MANY_ERR")"
+assert_eq "pr listing: a failed listing is read once" "1" "$(grep -c . "$GH_LOG")"
+assert_contains "pr listing: a later row still names the failed read" \
+  "$(col "$(row "$OUT" "wt-many-3")" $C_REASON)" "merged-pr-read-failed:gh-pr-list"
+
+# Each repository gets its own listing: a worktree of a second repository never
+# reads the first one's PRs.
+W2="$(mkfixture)"
+git -C "$W2" worktree add -q -b feat-many-1 "$TEST_TMPDIR/wt-other-repo" main >/dev/null 2>&1
+commit_in "$TEST_TMPDIR/wt-other-repo" other1.txt "other repo" "other repo commit"
+: >"$GH_LOG"
+OUT="$(PATH="$PR_BIN:$PATH" GH_STUB_OUT="$TEST_TMPDIR/pr-many" GH_STUB_LOG="$GH_LOG" \
+  bash "$ENGINE" --no-peers --merged-pr-proof \
+  --worktree "$TEST_TMPDIR/wt-many-1" --worktree "$TEST_TMPDIR/wt-many-2" \
+  --worktree "$TEST_TMPDIR/wt-other-repo" 2>"$MANY_ERR")"
+assert_eq "pr listing: two repositories make two gh calls" "2" "$(grep -c . "$GH_LOG")"
+assert_contains "pr listing: the count covers both repositories" "$(cat "$MANY_ERR")" "merged-pr-proof made 2 gh call(s)"
+
+for BAD_LIMIT in 0 x; do
+  bash "$ENGINE" --repo-dir "$W" --merged-pr-limit "$BAD_LIMIT" >/dev/null 2>&1
+  rc=$?
+  assert_eq "pr listing: --merged-pr-limit $BAD_LIMIT is a usage error" "2" "$rc"
+done
+
+# --------------------------------------------------------------------------
+# Base-side window: several worktrees at different merge-bases share one
+# rendering of the base commits
+# --------------------------------------------------------------------------
+
+# wt-window-a branches at the seed and lands as a squash (range-patchid);
+# wt-window-b branches after that squash and lands as two twin commits
+# (per-commit-patchid); wt-window-c branches later still and never lands (no).
+W="$(mkfixture)"
+WT_WA="$TEST_TMPDIR/wt-window-a"
+WT_WB="$TEST_TMPDIR/wt-window-b"
+WT_WC="$TEST_TMPDIR/wt-window-c"
+SEED="$(git -C "$W" rev-parse HEAD)"
+git -C "$W" worktree add -q -b feat-window-a "$WT_WA" main >/dev/null 2>&1
+commit_in "$WT_WA" wa1.txt "window a one" "wa1"
+commit_in "$WT_WA" wa2.txt "window a two" "wa2"
+git -C "$W" merge --squash feat-window-a >/dev/null 2>&1
+git -C "$W" commit -qm "squash feat-window-a" >/dev/null 2>&1
+git -C "$W" push -q origin main >/dev/null 2>&1
+git -C "$W" worktree add -q -b feat-window-b "$WT_WB" main >/dev/null 2>&1
+commit_in "$WT_WB" wb1.txt "window b one" "wb1"
+commit_in "$WT_WB" wb2.txt "window b two" "wb2"
+commit_in "$W" wb1.txt "window b one" "wb1 on main"
+commit_in "$W" wb2.txt "window b two" "wb2 on main"
+git -C "$W" push -q origin main >/dev/null 2>&1
+git -C "$W" worktree add -q -b feat-window-c "$WT_WC" main >/dev/null 2>&1
+commit_in "$WT_WC" wc1.txt "window c one" "wc1"
+commit_in "$W" wmain.txt "main moves on" "main advances"
+git -C "$W" push -q origin main >/dev/null 2>&1
+
+# The shim logs the commit list each base-window render reads on stdin, so the
+# test counts how often each base commit was hashed.
+REAL_GIT="$(command -v git)"
+SHIM_BIN="$TEST_TMPDIR/git-shim"
+WINDOW_LOG="$TEST_TMPDIR/window-renders"
+mkdir -p "$SHIM_BIN"
+cat >"$SHIM_BIN/git" <<'SHIM'
+#!/usr/bin/env bash
+case " $* " in
+*" --no-walk "*) tee -a "$GIT_SHIM_LOG" | "$REAL_GIT" "$@" ;;
+*) exec "$REAL_GIT" "$@" ;;
+esac
+SHIM
+chmod +x "$SHIM_BIN/git"
+
+BASE_TOTAL="$(git -C "$W" rev-list --count --no-merges "$SEED..origin/main")"
+
+# Newest merge-base first grows the window one range at a time; oldest first
+# hashes every base commit in the first worktree's turn, so the later verdicts
+# rest only on ids another worktree hashed.
+for ORDER in newest-first oldest-first; do
+  : >"$WINDOW_LOG"
+  if [[ "$ORDER" == "newest-first" ]]; then
+    TARGETS=(--worktree "$WT_WC" --worktree "$WT_WB" --worktree "$WT_WA")
+  else
+    TARGETS=(--worktree "$WT_WA" --worktree "$WT_WB" --worktree "$WT_WC")
+  fi
+  OUT="$(PATH="$SHIM_BIN:$PATH" REAL_GIT="$REAL_GIT" GIT_SHIM_LOG="$WINDOW_LOG" \
+    bash "$ENGINE" "${TARGETS[@]}" --no-peers)"
+  assert_eq "window ($ORDER): the squash worktree is landed by range patch-id" \
+    "range-patchid" "$(col "$(row "$OUT" "wt-window-a")" $C_METHOD)"
+  assert_eq "window ($ORDER): the twin-commit worktree is landed per commit" \
+    "per-commit-patchid" "$(col "$(row "$OUT" "wt-window-b")" $C_METHOD)"
+  assert_eq "window ($ORDER): the unlanded worktree is not landed" \
+    "no" "$(col "$(row "$OUT" "wt-window-c")" $C_LANDED)"
+  assert_eq "window ($ORDER): every base commit back to the oldest merge-base is hashed" \
+    "$BASE_TOTAL" "$(sort -u "$WINDOW_LOG" | grep -c .)"
+  assert_eq "window ($ORDER): no base commit is hashed twice across the worktrees" \
+    "$BASE_TOTAL" "$(grep -c . "$WINDOW_LOG")"
+
+  # A run over one worktree renders only that worktree's own range, which is
+  # what every worktree got before the window, so each row must match it.
+  for WT in "$WT_WA" "$WT_WB" "$WT_WC"; do
+    ALONE="$(bash "$ENGINE" --worktree "$WT" --no-peers | sed -n 2p)"
+    assert_eq "window ($ORDER): ${WT##*/} classifies the same alone as beside the others" \
+      "$ALONE" "$(row "$OUT" "${WT##*/}")"
+  done
+done
 
 [[ $FAILED -eq 0 ]] || exit 1

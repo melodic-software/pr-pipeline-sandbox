@@ -36,8 +36,14 @@ absent, since a convention is a team artifact until someone says otherwise.
 | `layer=` | Target path | For |
 |---|---|---|
 | `user` | `~/.claude/source-control.md` | the operator's own preference across every repo |
-| `team` (default) | `REPO_ROOT/.claude/source-control.md` | the shared, tracked convention |
+| `team` (default) | `REPO_ROOT/docs/conventions/source-control.yaml` | the shared, tracked convention |
 | `local` | `REPO_ROOT/.claude/source-control.local.md` | a personal deviation from team policy here |
+
+The team layer is YAML, validated by `plugins/source-control/schemas/source-control.schema.json`
+([config-resolution.md](../../../reference/config-resolution.md), "The config files"). The user
+and local layers stay markdown, one `## <key>` section per key. The retired team file
+`REPO_ROOT/.claude/source-control.md` is not read by this plugin; `apply layer=team` never writes
+there, and its migration step (below) copies the keys it carries into the YAML.
 
 Infer the layer rather than asking when the request names one: "my personal convention" / "on this
 machine" is `local`, "for all my repos" is `user`, "our convention" is `team`. State which layer
@@ -45,9 +51,9 @@ you picked before writing, since writing to the wrong one either fails to reach 
 commits a personal preference to shared history.
 
 When `REPO_ROOT` is `$HOME` or an ancestor of it, or is not inside a git working tree, **refuse
-`layer=team` and `layer=local`**. At home those two paths collapse onto
-`~/.claude/source-control.md` (and a home-rooted overlay), so a team write would edit the
-operator's personal config under a team label; outside a repository the tracked/ignored probes
+`layer=team` and `layer=local`**. At home the team and personal override paths sit in the operator's home directory, beside the user-global
+`~/.claude/source-control.md`, so a team write would edit the operator's personal config under a
+team label; outside a repository the tracked/ignored probes
 have no repository to answer against. Name the reason, the same note `parse-branch-issue.sh`
 prints (`project root is the home directory (or an ancestor of it)` or `project root is not
 inside a git repository`), and offer `layer=user`. Compare paths physically (slash-fold, case-fold, resolve symlinks when the
@@ -75,13 +81,13 @@ vocabulary the pattern does not use. Moving the other way re-adds the bundled 11
 `pr_title_pattern` follows the same rule unless the user set it to a value independent of
 `subject_pattern`, which is carried through like any other independent key.
 
-**Writing an overlay layer, `user` or `local`, resolve the layers below first and omit any
+**Writing the `user` or `local` layer, resolve the layers below first and omit any
 *requested* key already equal to that merge.** A non-interactive argument is not evidence of a genuine
 deviation: `apply layer=local subject_pattern=X` against a team file that already declares `X` would
 otherwise pin `X` locally, so a later team change would be silently ignored on this machine, the
 exact failure per-key override exists to prevent. This applies to the requested keys only; it never
-licenses dropping an unrelated key the overlay already carries. When every requested key already holds
-and the overlay would otherwise be empty, write nothing and say so rather than materializing an empty
+licenses dropping an unrelated key the written layer already carries. When every requested key already holds
+and the written layer would otherwise be empty, write nothing and say so rather than materializing an empty
 file.
 
 **`branch_issue_pattern=<ERE>` writes the branch-to-issue grammar.** It is independent of
@@ -100,11 +106,13 @@ file.
   value on its first non-blank line: a near-miss heading, a section with no value, or a heading or
   HTML comment as that line also stops resolution
   ([config-resolution.md](../../../reference/config-resolution.md)).
-- **Alone** (no `subject_pattern=`): write or replace only the `## branch_issue_pattern` section of
-  the chosen layer, value in backticks on the first line under the heading (a value that itself
-  contains a backtick goes in a fenced code block instead). Every other section and the preamble stay
-  byte-for-byte as they are. When the target file does not exist yet, write the step 5 template's
-  preamble plus this one section, never placeholder sections for the other keys. The overlay rule
+- **Alone** (no `subject_pattern=`): write or replace only the `branch_issue_pattern` key of the
+  chosen layer. For `layer=team` that is a single-quoted scalar line in the YAML
+  (`branch_issue_pattern: '^[^/]+/([0-9]+)-'`), every other key and comment left byte-for-byte as it
+  is. For `user` and `local` it is the `## branch_issue_pattern` section, value in backticks on the
+  first line under the heading (a value that itself contains a backtick goes in a fenced code block
+  instead), every other section and the preamble untouched. When the target file does not exist yet, write the step 5 template's
+  preamble plus this one section, never placeholder sections for the other keys. The layered-write rule
   above applies: writing `user` or `local`, when the layers below already resolve the same value,
   write nothing and say so.
 - **Combined** with `subject_pattern=`: one pass writes both. The `subject_pattern=` rules above
@@ -128,8 +136,8 @@ With no argument in an interactive session, run the interview:
    every self-contained Bash call.
 1. **Read the current config first**, all three layers, not just the target. Present the effective
    merge and which layer supplies each key; the interview proposes changes against that baseline and
-   overwrites nothing without confirmation. Writing an overlay layer, carry only the keys that
-   genuinely differ from the merge below it: an overlay that restates every key silently pins values
+   overwrites nothing without confirmation. Writing the `user` or `local` layer, carry only the keys that
+   genuinely differ from the merge below it: a layer that restates every key silently pins values
    the base layer should still own, which is the failure mode per-key override exists to avoid.
 2. **Infer before asking.** Gate this on the resolved value, not on file presence: infer whenever the
    **effective merged `subject_pattern` is unresolved**, which includes the case where layers exist
@@ -217,7 +225,7 @@ With no argument in an interactive session, run the interview:
    - **`pr_body_required_sections`** (optional): the required `## <heading>` section scaffold
      `/source-control:pull-request create` drafts and pre-checks before opening a PR (one bullet per heading; see
      [config-resolution.md](../../../reference/config-resolution.md) and
-     [`docs/conventions/pr-body-convention/README.md`](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/conventions/pr-body-convention/README.md)).
+     [`docs/contracts/pr-body-convention/README.md`](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/contracts/pr-body-convention/README.md)).
      **RECOMMENDED: keep the plugin's own portable default**, the `briefing` preset. This interview
      must not suggest a `Related`/linked-issue section, or any other specific organization's list, as
      if it were a universal default; a linked-issue section presumes an issue-tracker convention this
@@ -234,12 +242,35 @@ With no argument in an interactive session, run the interview:
      *below* the one being written already resolve to the portable default (or the key is unset
      everywhere), since writing the explicit default there would just add redundant noise. When the intent
      is genuinely to reset back to the portable default *over* a lower layer that sets something else
-     (a team config requiring `Related`, and this write is a personal overlay or a team rewrite meant
+     (a team config requiring `Related`, and this write is a `user` or `local` layer or a team rewrite meant
      to drop it), the portable default must be written out explicitly as the keyword `briefing`. An
      omitted section would silently keep inheriting the lower layer's list instead.
      State the one-line reason when this applies ("written explicitly to override the team layer's
      list, not merely to restate the default").
-5. **Write the config.** Materialize the target layer's path with these sections:
+5. **Write the config.** For `layer=team`, update `REPO_ROOT/docs/conventions/source-control.yaml` in
+   place (create it with the `# yaml-language-server: $schema=../../plugins/source-control/schemas/source-control.schema.json`
+   header line when absent), carrying every key already there such as `pr_open_state` and `pre_ready`:
+
+   ```yaml
+   subject_pattern: Conventional Commits   # the keyword, or exactly one anchored regex; never a list
+   type_list: [feat, fix]                  # only when subject_pattern is Conventional-Commits-shaped
+   pr_title_pattern: "Same as `subject_pattern`."
+   trailer_policy: none                    # only when the repo has a trailer convention
+   pr_body_attribution: none               # only when the repo overrides the default line
+   pr_body_required_sections:              # a list of H2 headings, or one keyword: briefing | summary-test-plan | none
+     - Summary
+     - Test plan
+   branch_issue_pattern: '^[^/]+/([0-9]+)-'  # only when set
+   ```
+
+   Drop any key with no content. Quote a regex, and any value holding a colon or a hash sign that follows a space. Then, when the retired
+   `REPO_ROOT/.claude/source-control.md` still carries a key the schema declares (these keys or a
+   `babysit_*` key), carry its value into the YAML (when the YAML lacks it; a bullet list becomes a
+   YAML sequence) and remove that `## <key>` section from the retired file in the same apply. Validate the result with `scripts/check-convention-yaml.sh --check`
+   where the repository has it, and confirm the layer with
+   `bash "<plugin-root>/lib/convention-key.sh" layer "$REPO_ROOT" <key>`, which must print `yaml`.
+
+   For `layer=user` and `layer=local`, materialize the target layer's path with these sections:
 
    ```markdown
    # source-control configuration
@@ -307,7 +338,7 @@ With no argument in an interactive session, run the interview:
    drafting read is per-H2-key, so the preamble can never change a resolved value.
 
 6. **Verify the write, per layer.** The post-write check inverts between layers and there is no
-   shared shortcut: the team file must be tracked, the local overlay must be ignored, and the
+   shared shortcut: the team file must be tracked, the personal override must be ignored, and the
    user-global file is not in a repository at all. Run the wrong one and the skill reports success
    over exactly the failure it exists to catch.
 
@@ -321,8 +352,8 @@ With no argument in an interactive session, run the interview:
      and reports nothing for a file that is already tracked, because gitignore rules do not apply to
      tracked files, so "no rule exists" and "a rule exists but the file was committed anyway" are
      indistinguishable from its output alone, and they need opposite remediations. Never stage the
-     overlay in either case.
-   - **`layer=team`**: `REPO_ROOT/.claude/source-control.md` must be tracked and staged. Verify it
+     personal override in either case.
+   - **`layer=team`**: `REPO_ROOT/docs/conventions/source-control.yaml` must be tracked and staged. Verify it
      is actually staged before reporting success; neither `git check-ignore -v` nor
      `git ls-files --error-unmatch` proves this alone. `git check-ignore -v` only reports a matching
      `.gitignore` pattern, staying silent for both a properly tracked file and a plain untracked one.
@@ -331,13 +362,13 @@ With no argument in an interactive session, run the interview:
      already tracked, so that check exits 0 even though the new content is still an unstaged
      working-tree modification.
 
-   For `layer=team`, also ensure the personal-overlay ignore rule exists
-   **whether or not an overlay file has been written**. The rule belongs to
+   For `layer=team`, also ensure the personal-override ignore rule exists
+   **whether or not a personal override file has been written**. The rule belongs to
    bind time, not to `layer=local`. Probe a nested sentinel
-   (`.claude/nested/overlay.local.md`), not the flat overlay path: a leftover
+   (`.claude/nested/personal-override.local.md`), not the flat personal override path: a leftover
    `.claude/*.local.*` rule still matches `.claude/source-control.local.md` and
    would otherwise look like the recursive rule is present. If
-   `git check-ignore --no-index -v -- .claude/nested/overlay.local.md` reports
+   `git check-ignore --no-index -v -- .claude/nested/personal-override.local.md` reports
    no match **from a repository `.gitignore`** (ignore `$GIT_DIR/info/exclude`
    and `core.excludesFile`), append the recursive `.claude/**/*.local.*` line
    to the consumer `.gitignore`, announce the edit, and stage that line with
@@ -352,31 +383,33 @@ With no argument in an interactive session, run the interview:
    # NOT fall through to add/diff on a match: `git add` would silently refuse the ignored path, and
    # `git diff --quiet` on an ignored untracked file exits 0 trivially, so the sequence would report
    # false success with nothing actually staged for teammates.
-   if IGNORE_MATCH="$(git check-ignore -v "$REPO_ROOT/.claude/source-control.md")"; then
-     echo "STOP: .claude/source-control.md is excluded by .gitignore: $IGNORE_MATCH" >&2
+   TEAM_FILE="docs/conventions/source-control.yaml"
+   if IGNORE_MATCH="$(git check-ignore -v "$REPO_ROOT/$TEAM_FILE")"; then
+     echo "STOP: $TEAM_FILE is excluded by .gitignore: $IGNORE_MATCH" >&2
      exit 1
    fi
    # With no ignore match, read the two-character XY status: `??` (untracked) or a non-blank
    # worktree (Y) column — a letter such as `M` in the second position, as in `XM`, `MM`, etc. —
    # means the just-written content is not yet staged.
-   git -C "$REPO_ROOT" status --porcelain -- .claude/source-control.md
+   git -C "$REPO_ROOT" status --porcelain -- "$TEAM_FILE"
    # If unstaged (per the check above), stage it. This covers both the fresh-file case and the
    # reconfiguration case (an already-tracked file whose rewritten content hadn't been staged yet),
    # unlike an index-presence check alone.
-   git -C "$REPO_ROOT" add .claude/source-control.md
+   git -C "$REPO_ROOT" add "$TEAM_FILE"
    # Confirm nothing is left unstaged (exit 0 = worktree matches the index).
-   git -C "$REPO_ROOT" diff --quiet -- .claude/source-control.md
+   git -C "$REPO_ROOT" diff --quiet -- "$TEAM_FILE"
+   # A migration that removed sections from the retired .claude/source-control.md stages that file too.
    ```
 
    For `layer=local`, run both probes and branch on the pair:
 
    ```bash
    REPO_ROOT="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}"
-   OVERLAY=".claude/source-control.local.md"
+   PERSONAL_OVERRIDE=".claude/source-control.local.md"
    # --no-index answers "does a matching ignore rule exist?" on its own terms. Without it, git
    # consults the index first and reports nothing for an already-tracked file, conflating a missing
    # rule with a rule that exists but was overridden by a past commit.
-   IGNORE_MATCH="$(git -C "$REPO_ROOT" check-ignore --no-index -v -- "$OVERLAY")" && HAS_RULE=1 || HAS_RULE=0
+   IGNORE_MATCH="$(git -C "$REPO_ROOT" check-ignore --no-index -v -- "$PERSONAL_OVERRIDE")" && HAS_RULE=1 || HAS_RULE=0
    # --no-index still consults $GIT_DIR/info/exclude and core.excludesFile. Those
    # are operator-local; a teammate does not inherit them. Count only a
    # repository .gitignore as the team-wide rule.
@@ -388,30 +421,30 @@ With no argument in an interactive session, run the interview:
      esac
    fi
    # An ignore rule does not untrack an already-committed file, so ask the index separately.
-   TRACKED="$(git -C "$REPO_ROOT" ls-files -- "$OVERLAY")"
-   # Exit non-zero on either FAIL, exactly as the team guard does. The overlay was written at step 5,
+   TRACKED="$(git -C "$REPO_ROOT" ls-files -- "$PERSONAL_OVERRIDE")"
+   # Exit non-zero on either FAIL, exactly as the team guard does. The personal override was written at step 5,
    # so proceeding here would report an effective merge over a personal file that is still shareable —
    # visible to `git status` (no rule) or already in team history (tracked). Halt until it is fixed.
    if [ "$HAS_RULE" -eq 1 ] && [ -z "$TRACKED" ]; then
-     echo "OK: personal overlay is ignored and untracked: $IGNORE_MATCH"
+     echo "OK: personal override is ignored and untracked: $IGNORE_MATCH"
    elif [ -n "$TRACKED" ]; then
-     echo "FAIL: $OVERLAY is tracked; untrack it with: git rm --cached $OVERLAY" >&2
+     echo "FAIL: $PERSONAL_OVERRIDE is tracked; untrack it with: git rm --cached $PERSONAL_OVERRIDE" >&2
      exit 1
    else
-     echo "FAIL: no ignore rule matches $OVERLAY; add .claude/**/*.local.* to .gitignore" >&2
+     echo "FAIL: no ignore rule matches $PERSONAL_OVERRIDE; add .claude/**/*.local.* to .gitignore" >&2
      exit 1
    fi
    ```
 
    The tracked branch takes precedence in the report: adding the `.gitignore` line to an
-   already-committed overlay changes nothing, so recommending it there sends the user in a circle.
+   already-committed personal override changes nothing, so recommending it there sends the user in a circle.
 
    Either guard stopping the sequence (non-zero exit) halts the apply. Do not report success or
    proceed to step 7. For the team guard (`IGNORE_MATCH` reported), tell the user the matching
-   `.gitignore` pattern and ask them to either fix `.gitignore` so `.claude/source-control.md` is no
+   `.gitignore` pattern and ask them to either fix `.gitignore` so the team YAML is no
    longer excluded, or persist the convention to a different layer. For the `layer=local` guard,
    surface the failure's own remediation, the recursive `.claude/**/*.local.*` ignore line for a missing
-   rule or `git rm --cached` for an already-tracked overlay, so the personal overlay does not linger in a
+   rule or `git rm --cached` for an already-tracked personal override, so the personal override does not linger in a
    shareable state. Re-run this step once the state is fixed.
 
    This skill stages but does not commit, so `git status --porcelain` legitimately keeps printing an
@@ -423,7 +456,7 @@ With no argument in an interactive session, run the interview:
 
 7. **Report the new effective merge**, not just what was written. A `layer=user` write can be
    overridden by an existing team file, and a `layer=team` write can be overridden by an existing
-   local overlay. A user who is told only "wrote `subject_pattern`" and then sees `/source-control:commit` use a
+   personal override. A user who is told only "wrote `subject_pattern`" and then sees `/source-control:commit` use a
    different pattern has been misled by the success message.
 
    For a `team` write, the report also states plainly what the file is and is not: a drafting aid
@@ -437,38 +470,38 @@ With no argument in an interactive session, run the interview:
 For a `team` write, offer (never require) the neutral-file shape: one tool-agnostic flat-scalar
 YAML file other consumers (commit-msg hooks, CI, other agents) read alongside this plugin. Contract
 and value grammar are owned by the
-[commit-convention owner doc](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/conventions/commit-convention/README.md);
+[commit-convention owner doc](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/contracts/commit-convention/README.md);
 this skill's part:
 
 - **Recommend it as the default when a second enforcement consumer exists.** Inference (step 2)
   already resolves the commit-msg hooks dir via `git rev-parse --git-path hooks`; when a second
   consumer of the convention is present, a commit-msg hook, a CI title check, or a user-stated one,
   **recommend the neutral SSOT as the default**, because the tool-agnostic file is what that second
-  consumer reads without reimplementing this plugin's markdown-H2 grammar. Fall back to markdown-only
-  only when this plugin is demonstrably the sole consumer. A repo where nothing else reads the
-  convention loses nothing by staying markdown-only; say so rather than forcing the split.
-- **Default the path to the well-known location.** The neutral file's well-known default path is
+  consumer reads without reimplementing the convention grammar. Skip it only when this plugin is
+  demonstrably the sole consumer: `docs/conventions/source-control.yaml` already serves this
+  plugin, so say so rather than forcing a second file.
+- **Write it at the well-known path only.** The neutral file lives at
   `docs/conventions/source-control/commit-convention.yml` (the marketplace's own dogfooded
-  `docs/conventions/<concern>/` layout). Writing it **there** means the resolver finds it with **no
-  `## convention_source` pointer at all** (the resolver probes the well-known path at rung 2), so the
-  common case leaves nothing in agent-rewritable markdown to sever. Only when the repo insists on a
-  different location do you declare `## convention_source` with that repo-relative path (forward
-  slashes, no `..`) in `.claude/source-control.md`, the rung-1 relocation override. Write the YAML
+  `docs/conventions/<concern>/` layout), where the resolver finds it with no pointer (rung 2).
+  Setup offers no other location: the `## convention_source` relocation pointer lives in the
+  retired `.claude/source-control.md`, so writing one would recreate that file. A repository that
+  insists on another path keeps its own pointer by hand until the guardrails resolver drops that
+  read. Write the YAML
   with machine keys (`subject_pattern`, `pr_title_pattern`, optionally `pr_body_required_sections`,
   `dialect: posix-ere`) plus a **1–2 line** `#` header (what the file is, who reads it), not a
   multi-line preamble; the flat YAML is self-describing and the human document proper lives in
   CONTRIBUTING/AGENTS.md, not in ceremony comments.
-- **Migration retires duplicates.** When the team markdown file already carries a key the neutral
-  file now declares, REMOVE it from the markdown in the same apply. The resolver would prefer the
+- **Migration retires duplicates.** When `.claude/source-control.md` already carries a key the neutral
+  file now declares, REMOVE it from that file in the same apply. The resolver would prefer the
   neutral value anyway, but leaving both invites hand-edit drift, which is the disease this shape
-  cures. Plugin-only keys (`trailer_policy`, `pr_body_attribution`) stay in the markdown file.
+  cures. Plugin-only keys (`trailer_policy`, `pr_body_attribution`) stay in the team YAML.
 - **Verification adds two probes.** (1) The neutral file round-trips through the enforcement
   resolver (`lib/resolve-convention-pattern.sh <repo_root> subject_pattern` emits the expected
   pattern). This exercises the whole precedence chain, so it confirms resolution whether the file
   sits at the well-known default path (no pointer) or at a relocated `convention_source` target; a
   broken file or pointer fails closed to no-enforcement by contract, so surface it at write time, not
   at the team's first blocked commit. (2) The neutral file is **staged**, by explicit path, in the
-  same team-write verification (step 6's team guard covers only `.claude/source-control.md`). A
+  same team-write verification (step 6's team guard covers only the team YAML). A
   commit that resolves to a neutral file whose tracked target is absent (an unstaged well-known file,
   or a `convention_source` pointer without its YAML) would hand every fresh checkout the missing-file
   fail-closed path and silently disable enforcement repo-wide. Run the same ignore-check + stage +

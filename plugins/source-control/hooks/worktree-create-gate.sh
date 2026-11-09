@@ -8,7 +8,7 @@
 # the in-repo default — the nested placement the nesting invariant exists to
 # avoid; that claim is owned, measured and dated in exactly one place, and this
 # comment does not restate it: see
-# skills/worktree/SKILL.md § "The nesting invariant, dated measurement".
+# skills/worktree/reference/nesting-invariant.md § "The nesting invariant, dated measurement".
 # This hook is the seam that covers those three paths,
 # and it is a thin stdin adapter over the same helper so there is one placement
 # implementation rather than two.
@@ -68,7 +68,7 @@
 #   As-of: 2026-10-11.
 #   Recheck trigger: that section stops scoping the key to background sessions.
 #
-# ── Verification stamp (docs/conventions/upstream-drift) ────────────────────────
+# ── Verification stamp (docs/contracts/upstream-drift) ────────────────────────
 # Claim: the four harness behaviors above — last-non-empty-line path read, hook
 #   must create the directory, both failure shapes fail creation, and the
 #   exit-0-stderr/non-zero-stderr channel split.
@@ -297,9 +297,9 @@ if ((status != 0)); then
     ;;
   4)
     gate::refuse \
-      "if $repo_dir is not a git repository, there is nothing to isolate: for a background session, set worktree.bgIsolation to \"none\" in settings so it edits in place; --worktree and subagent isolation need a repository" \
-      "the helper hit an environment error (exit 4): either $repo_dir is not a git repository, or git worktree add itself failed" \
-      'the git error above this line, if any, is the authoritative detail'
+      "if the helper named a worktree or session holding the target or its branch, finish there or choose another name; if $repo_dir is not a git repository, there is nothing to isolate: for a background session, set worktree.bgIsolation to \"none\" in settings so it edits in place; --worktree and subagent isolation need a repository" \
+      "the helper refused with exit 4: $repo_dir is not a git repository, the target or its branch is held by another worktree or session, or git worktree add itself failed" \
+      'the helper or git message above this line is the authoritative detail'
     ;;
   *)
     gate::refuse \

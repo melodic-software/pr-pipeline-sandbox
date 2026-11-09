@@ -1,0 +1,46 @@
+{
+  "pass": [
+    {
+      "answer": [],
+      "why": "nothing written"
+    },
+    {
+      "answer": [
+        {
+          "tool": "Write",
+          "input": {
+            "file_path": "/tmp/notes.md",
+            "content": "unbound"
+          }
+        }
+      ],
+      "why": "unrelated scratch"
+    }
+  ],
+  "fail": [
+    {
+      "answer": [
+        {
+          "tool": "Write",
+          "input": {
+            "file_path": "/w/docs/conventions/work-items.yaml",
+            "content": "tracker:\n  provider: local-markdown\n"
+          }
+        }
+      ],
+      "why": "binding written"
+    },
+    {
+      "answer": [
+        {
+          "tool": "Write",
+          "input": {
+            "file_path": "/w/.work-items/1.md",
+            "content": "---"
+          }
+        }
+      ],
+      "why": "store seeded"
+    }
+  ]
+}

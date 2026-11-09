@@ -1761,7 +1761,7 @@ class LaneMode(Unattended):
         )
 
     def test_the_configured_hold_list_reaches_the_enqueue_recheck(self) -> None:
-        holds = ("needs-human", "status: needs-info")
+        holds = ("needs-human", "needs-reporter-info")
         self.config = dataclasses.replace(self.config, issue_holds=holds)
         self.lane()
         self.assertEqual(self.lane_recheck_kwargs[0], {"issue": 41, "holds": holds})
@@ -3143,6 +3143,77 @@ class CheckInputsChangedOnTheBase(Unattended):
         code, _ = self.run_main()
         self.assert_no_merge(code)
         self.assertFalse(any(e.startswith("update-branch") for e in self.log))
+
+    def run_decided(self, method: str) -> Any:
+        decision = {"method": method, "reason": "the decision's reason"}
+        with mock.patch.object(merge, "branch_update_decision", return_value=decision):
+            return self.run_main()
+
+    def assert_held(self, code: int, out: Any, reason: str) -> None:
+        self.assert_no_merge(code)
+        self.assertEqual(self.log, [], "no update, no pin and no enqueue")
+        (blocker,) = [b for b in out["blockers"] if "check-inputs-changed:" in b]
+        self.assertIn(reason, blocker)
+        step = out["unattended"]["enqueue"]
+        self.assertNotIn("disarmed", step)
+        self.assertNotIn("updated", step["checkInputs"])
+
+    def test_a_hold_neither_updates_nor_enqueues(self) -> None:
+        code, out = self.run_decided("hold")
+        self.assert_held(code, out, "held: the decision's reason")
+
+    def test_no_usable_answer_from_the_script_holds(self) -> None:
+        answers = (
+            (subprocess.CompletedProcess([], 2, "", "bad signal"), "exit 2"),
+            (
+                subprocess.CompletedProcess([], 0, '{"method":"rebase"}', ""),
+                "unexpected method 'rebase'",
+            ),
+        )
+        for answer, reason in answers:
+            with (
+                self.subTest(reason=reason),
+                mock.patch.object(merge, "pull_request_stack", return_value=None),
+                mock.patch.object(merge, "run_command", return_value=answer),
+            ):
+                self.log = []
+                code, out = self.run_main()
+                self.assert_held(code, out, reason)
+
+    def test_a_native_stack_member_is_held(self) -> None:
+        with mock.patch.object(merge, "pull_request_stack", return_value={"number": 9}):
+            code, out = self.run_main()
+        self.assert_held(code, out, "cannot be rewritten")
+
+    def test_an_unreadable_stack_is_held(self) -> None:
+        with mock.patch.object(
+            merge, "pull_request_stack", side_effect=RuntimeError("gh: HTTP 502")
+        ):
+            code, out = self.run_main()
+        self.assert_held(code, out, "could not be read")
+
+    def test_merge_and_none_keep_todays_update_call(self) -> None:
+        for method in ("merge", "none"):
+            with self.subTest(method=method):
+                self.log = []
+                code, out = self.run_decided(method)
+                self.assert_no_merge(code)
+                self.assertEqual(self.log, [f"update-branch:expected_head_sha={HEAD}"])
+                self.assertIs(
+                    out["unattended"]["enqueue"]["checkInputs"]["updated"], True
+                )
+
+    def test_delegate_asks_for_a_rebase_and_neither_updates_nor_enqueues(self) -> None:
+        self.pr_commits = [DEPENDABOT_COMMIT]
+        self.compare_answers = dict(STRAY_MERGE_COMPARES)
+        code, out = self.run_decided("delegate")
+        self.assert_no_merge(code)
+        self.assertEqual(
+            self.log, [f"{self.REBASE_COMMENT} -f body={self.REBASE_BODY}"]
+        )
+        self.assertTrue(
+            any("dependabot-rebase-requested:" in b for b in out["blockers"])
+        )
 
 
 class UpdateError(unittest.TestCase):
@@ -5779,7 +5850,7 @@ class DependabotMajorEscalation(unittest.TestCase):
         )
         self.role = stack.enter_context(
             mock.patch.object(
-                merge, "human_gated_label", return_value="status: needs-decision"
+                merge, "human_gated_label", return_value="needs-owner-decision"
             )
         )
 
@@ -5828,7 +5899,7 @@ class DependabotMajorEscalation(unittest.TestCase):
         self.assertEqual(
             label[-4:],
             ["POST", f"repos/{self.REPO}/issues/{self.PR}/labels"]
-            + ["-f", "labels[]=status: needs-decision"],
+            + ["-f", "labels[]=needs-owner-decision"],
         )
         self.assertNotIn("do-not-merge", " ".join(" ".join(c) for c in self.calls))
         self.assertEqual(
@@ -5839,13 +5910,13 @@ class DependabotMajorEscalation(unittest.TestCase):
         out = self.writes("ineligible:dependabot-major-held:x(unreadable)")
         comment, label = self.calls
         self.assertIn("`x(unreadable)`", comment[-1])
-        self.assertEqual(label[-1], "labels[]=status: needs-decision")
+        self.assertEqual(label[-1], "labels[]=needs-owner-decision")
         self.assertEqual(
             out["majorEscalation"], {"label": "added", "comment": "created"}
         )
 
     def test_a_rerun_writes_nothing(self) -> None:
-        self.pr_labels = [{"name": "Status: Needs-Decision"}]
+        self.pr_labels = [{"name": "Needs-Owner-Decision"}]
         self.comments = [
             {
                 "id": 90,
@@ -5884,7 +5955,7 @@ class DependabotMajorEscalation(unittest.TestCase):
     REMOVED = {
         "event": "unlabeled",
         "actor": {"login": "owner-person", "type": "User", "id": PERSON_ID},
-        "label": {"name": "status: needs-decision"},
+        "label": {"name": "needs-owner-decision"},
         "created_at": "2026-10-18T11:00:00Z",
     }
 
@@ -5930,7 +6001,7 @@ class DependabotMajorEscalation(unittest.TestCase):
                             self.REPO,
                             self.PR,
                             identity,
-                            "status: needs-decision",
+                            "needs-owner-decision",
                             merge.MAJOR_ESCALATION_MARKER,
                             comments,
                             {},
@@ -5941,7 +6012,7 @@ class DependabotMajorEscalation(unittest.TestCase):
     def test_a_held_major_whose_label_write_failed_is_labeled_again(self) -> None:
         out = self.lifted([])
         (label,) = self.calls
-        self.assertEqual(label[-1], "labels[]=status: needs-decision")
+        self.assertEqual(label[-1], "labels[]=needs-owner-decision")
         self.assertEqual(
             out["majorEscalation"], {"label": "added", "comment": "unchanged"}
         )
@@ -5968,7 +6039,7 @@ class DependabotMajorEscalation(unittest.TestCase):
         self.assertIn(match["kind"], ("escalated", "routed-advisory"))
 
     def test_an_old_format_comment_is_reposted_as_a_new_escalation(self) -> None:
-        self.pr_labels = [{"name": "status: needs-decision"}]
+        self.pr_labels = [{"name": "needs-owner-decision"}]
         old = merge.major_escalation_body("x", self.HEAD).removeprefix(
             merge.ATTEND_QUEUE_MARKER + "\n"
         )
@@ -5992,7 +6063,7 @@ class DependabotMajorEscalation(unittest.TestCase):
     def test_a_stored_body_differing_only_in_whitespace_is_not_reposted(
         self,
     ) -> None:
-        self.pr_labels = [{"name": "status: needs-decision"}]
+        self.pr_labels = [{"name": "needs-owner-decision"}]
         stored = merge.major_escalation_body("x", self.HEAD).replace("\n", " \r\n")
         self.comments = [
             {
@@ -6012,13 +6083,13 @@ class DependabotMajorEscalation(unittest.TestCase):
         out = self.writes("in-flight:queue-full", "dependabot-major-held:x")
         comment, label = self.calls
         self.assertIn("`x`", comment[-1])
-        self.assertEqual(label[-1], "labels[]=status: needs-decision")
+        self.assertEqual(label[-1], "labels[]=needs-owner-decision")
         self.assertEqual(
             out["majorEscalation"], {"label": "added", "comment": "created"}
         )
         # The next run finds both and writes nothing.
         self.calls.clear()
-        self.pr_labels = [{"name": "status: needs-decision"}]
+        self.pr_labels = [{"name": "needs-owner-decision"}]
         self.comments = [
             {
                 "id": 91,

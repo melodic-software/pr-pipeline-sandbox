@@ -8,7 +8,7 @@
 # silently unparsable.
 #
 # Usage:
-#   parse-branch-issue.sh [branch-name] [pattern] [--no-default]
+#   parse-branch-issue.sh [branch-name] [pattern] [--no-default] [--explain]
 #
 # With no branch arg, falls back to `git branch --show-current`.
 # `--no-default` is for a caller bound to a work-item tracker, whose adapter
@@ -19,21 +19,25 @@
 # number (`1234`) or a tracker key (`SW2-1234`, `ENG-12`); the caller turns it
 # into link text. A pattern with no capture group, or a capture of any other
 # shape, yields no output and exit 1. It resolves, first hit wins:
-#   1. The `## branch_issue_pattern` section of the layered
-#      `.claude/source-control.md` surface (reference/config-resolution.md):
-#      `<repo>/.claude/source-control.local.md` over
-#      `<repo>/.claude/source-control.md` over `$HOME/.claude/source-control.md`.
-#      The value is the section's first non-blank line, surrounding backticks
+#   1. The layered `branch_issue_pattern` key (reference/config-resolution.md):
+#      `<repo>/.claude/source-control.local.md` over the team layer over
+#      `$HOME/.claude/source-control.md`. The team layer is the
+#      `branch_issue_pattern` key of `<repo>/docs/conventions/source-control.yaml`,
+#      read only when git tracks it; an untracked one is skipped with a note.
+#      The retired `<repo>/.claude/source-control.md` is not read. A team YAML
+#      the shared reader rejects stops resolution. `--explain` prints the layer
+#      that supplied the pattern on stderr.
+#      In a markdown layer the value is the `## branch_issue_pattern` section's
+#      first non-blank line, surrounding backticks
 #      stripped, or, when that line opens a code fence, the first non-blank line
 #      inside the fence. Headings inside fenced blocks are ignored. A leading
 #      UTF-8 BOM, trailing whitespace, and a closing `#` sequence on the heading
 #      are accepted. Repo root: CLAUDE_PROJECT_DIR, else
 #      `git rev-parse --show-toplevel`. When that root is the home directory
-#      (or an ancestor of it), team and overlay layers are not applicable: the
-#      team path would be the same file as user-global. Overlay is skipped the
-#      same way. A root outside any git working tree skips both layers too. A
-#      team or overlay path that physically equals the user-global
-#      file is skipped even when the root is not home.
+#      (or an ancestor of it), team and personal override layers are not applicable. A
+#      root outside any git working tree skips both layers too. A personal override
+#      path that physically equals the user-global file is skipped even when
+#      the root is not home.
 #   2. The deprecated branch_issue_pattern userConfig: `pattern` (unless it is the
 #      literal `${user_config...}` placeholder), then
 #      CLAUDE_PLUGIN_OPTION_BRANCH_ISSUE_PATTERN. Using it prints a deprecation
@@ -56,6 +60,15 @@ set -uo pipefail
 
 KEY="branch_issue_pattern"
 
+# `--explain` prints the layer that supplied the pattern on stderr; it is not a
+# positional argument, so strip it wherever it appears.
+EXPLAIN=0
+ARGS=()
+for arg in "$@"; do
+  if [[ "$arg" == "--explain" ]]; then EXPLAIN=1; else ARGS+=("$arg"); fi
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
 BRANCH="${1:-}"
 if [[ -z "$BRANCH" ]]; then
   BRANCH="$(git branch --show-current 2>/dev/null || true)"
@@ -71,6 +84,8 @@ note() { echo "parse-branch-issue: $*" >&2; }
 
 # shellcheck source=../../../lib/config-root.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../../lib/config-root.sh" || exit 1
+# shellcheck source=../../../lib/convention-key.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../../lib/convention-key.sh" || exit 1
 
 STOP="resolution stopped, no issue id emitted"
 
@@ -258,24 +273,49 @@ LAYERS=()
 USER_LAYER="${HOME:-}/.claude/source-control.md"
 if [[ -n "$REPO_ROOT" ]]; then
   case "$(config_root_classify "$REPO_ROOT")" in
-    home) note "team and overlay not applicable: project root is the home directory (or an ancestor of it)" ;;
-    non-repo) note "team and overlay not applicable: project root is not inside a git repository" ;;
+    home) note "team and personal override not applicable: project root is the home directory (or an ancestor of it)" ;;
+    non-repo) note "team and personal override not applicable: project root is not inside a git repository" ;;
     *)
-      overlay="${REPO_ROOT}/.claude/source-control.local.md"
-      team="${REPO_ROOT}/.claude/source-control.md"
-      config_root_paths_same "$overlay" "$USER_LAYER" || LAYERS+=("$overlay")
-      config_root_paths_same "$team" "$USER_LAYER" || LAYERS+=("$team")
+      personal_override="${REPO_ROOT}/.claude/source-control.local.md"
+      TEAM_YAML="${REPO_ROOT}/${CONVENTION_KEY_YAML_REL}"
+      config_root_paths_same "$personal_override" "$USER_LAYER" || LAYERS+=("$personal_override")
+      # The team layer is the YAML, a layer only when git tracks it, as in the
+      # commit skill. The retired .claude/source-control.md is not read.
+      if convention_key_tracked "$REPO_ROOT" "$CONVENTION_KEY_YAML_REL"; then
+        LAYERS+=("$TEAM_YAML")
+      elif [[ -e "$TEAM_YAML" ]]; then
+        note "${CONVENTION_KEY_YAML_REL} is not tracked by git, so it is not a config layer"
+      fi
       ;;
   esac
 fi
 LAYERS+=("$USER_LAYER")
 
-PATTERN="" SOURCE=""
+# The layer a resolved pattern came from, as reported by --explain.
+layer_label() {
+  case "$1" in
+    "${TEAM_YAML:-}") echo "$CONVENTION_KEY_YAML_REL" ;;
+    "${personal_override:-}") echo ".claude/source-control.local.md" ;;
+    "$USER_LAYER") echo "user-global .claude/source-control.md in the home directory" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+PATTERN="" SOURCE="" LABEL=""
 for layer in "${LAYERS[@]}"; do
-  value="$(section_value "$layer")" || exit 1
+  if [[ -n "${TEAM_YAML:-}" && "$layer" == "$TEAM_YAML" ]]; then
+    value="$(convention_key_yaml_value "$REPO_ROOT" "$KEY")"
+    rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      note "${CONVENTION_KEY_YAML_REL} could not be parsed; ${STOP}"
+      exit 1
+    fi
+  else
+    value="$(section_value "$layer")" || exit 1
+  fi
   [[ -n "$value" ]] || continue
   usable_pattern "$layer" "$value" "$STOP" || exit 1
-  PATTERN="$value" SOURCE="$layer"
+  PATTERN="$value" SOURCE="$layer" LABEL="$(layer_label "$layer")"
   break
 done
 
@@ -287,14 +327,15 @@ if [[ -z "$PATTERN" ]]; then
   [[ "$LEGACY" == *'${user_config'* ]] && LEGACY=""
   [[ -n "$LEGACY" ]] || LEGACY="${CLAUDE_PLUGIN_OPTION_BRANCH_ISSUE_PATTERN:-}"
   if [[ -n "$LEGACY" ]] && usable_pattern userConfig "$LEGACY" "ignored, default applies"; then
-    PATTERN="$LEGACY" SOURCE="userConfig"
-    note "the ${KEY} userConfig is deprecated; set a \`## ${KEY}\` section in .claude/source-control.md instead."
+    PATTERN="$LEGACY" SOURCE="userConfig" LABEL="userConfig"
+    note "the ${KEY} userConfig is deprecated; set ${KEY} in ${CONVENTION_KEY_YAML_REL} instead."
   fi
 fi
 if [[ -z "$PATTERN" && "${3:-}" == "--no-default" ]]; then
   exit 3
 fi
-[[ -n "$PATTERN" ]] || PATTERN='^[a-z]+/(routine-issue-)?([0-9]+)-' SOURCE="default"
+[[ -n "$PATTERN" ]] || PATTERN='^[a-z]+/(routine-issue-)?([0-9]+)-' SOURCE="default" LABEL="default"
+[[ "$EXPLAIN" -eq 0 ]] || note "${KEY} layer: ${LABEL}"
 
 [[ "$BRANCH" =~ $PATTERN ]] || exit 1
 

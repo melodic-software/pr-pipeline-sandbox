@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# review-venue.sh — Say, per AI review lane, whether CI reviews this repository's
+# pull requests and is healthy, so a local review runs only where CI does not.
+#
+# A lane is a workflow whose pull_request runs call the org's reusable review
+# workflow: ci-workflows pr-review.yml (code-review) or pr-review-security.yml
+# (security-review), or pr-review-cli.yml: security-review from a caller whose
+# path names security, code-review from any other. It is healthy when its workflow is active and its newest
+# pull_request run that reached a verdict (completed, and neither skipped nor
+# cancelled) succeeded and was created within --max-age-days. A failed run whose
+# every failed job says failure-class=skipped-validation reached no verdict: the
+# pull request edits the caller workflow, so the review skipped itself by
+# design. A disabled workflow, any other failed run (a usage-limit stop
+# included), a timed-out one, or none in the window is not healthy.
+#
+# A run listing page is whole when its workflow_runs array holds every run its
+# total_count leaves for that page. A page still not whole after three reads
+# reads unreadable for each lane it leaves undecided, never absent or stale.
+#
+# With --head, a last `tests` line says whether CI's test lanes covered that
+# commit: the GitHub Actions check runs on it whose name is `test` or starts
+# `test-`, `test ` or `test(`, taking per name the newest run that did not
+# skip. It reads `ci` when every one finished as success, skipped or neutral
+# and at least one succeeded. None (a draft skips them), all skipped, any
+# unfinished, any other conclusion, or more than 500 check runs reads `local`.
+#
+# Usage:
+#   review-venue.sh [--repo <owner/repo>] [--max-age-days <n>] [--head <sha>]
+#
+# Output, one line per lane, code-review first, then tests with --head:
+#   <lane> ci healthy: <detail>
+#   <lane> local absent|failing|stale|unreadable: <detail>
+#   tests ci healthy: <detail>
+#   tests local absent|failing|pending: <detail>
+#
+# Exit codes:
+#   0  read; every lane has a line
+#   1  invalid argument
+#   2  a gh call failed or returned something unparsable: treat every lane as local
+#   5  prerequisite missing (gh, jq)
+
+# portability-scope: the GitHub implementation of the review-venue read; every read is a gh call.
+set -uo pipefail
+
+usage() {
+  sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+die() {
+  printf 'review-venue: %s\n' "$2" >&2
+  exit "$1"
+}
+
+REPO="{owner}/{repo}" MAX_AGE_DAYS=7 HEAD_SHA=""
+while (($# > 0)); do
+  case "$1" in
+  -h | --help) usage ;;
+  --repo)
+    (($# >= 2)) || die 1 "--repo needs a value"
+    [[ "$2" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || die 1 "--repo must be <owner>/<repo>"
+    REPO="$2"
+    shift 2
+    ;;
+  --max-age-days)
+    (($# >= 2)) || die 1 "--max-age-days needs a value"
+    [[ "$2" =~ ^[1-9][0-9]{0,2}$ ]] || die 1 "--max-age-days must be a whole number from 1 to 999"
+    MAX_AGE_DAYS="$2"
+    shift 2
+    ;;
+  --head)
+    (($# >= 2)) || die 1 "--head needs a value"
+    [[ "$2" =~ ^[0-9a-f]{40}$ ]] || die 1 "--head must be a full 40-character commit sha"
+    HEAD_SHA="$2"
+    shift 2
+    ;;
+  *) die 1 "unknown argument $(printf '%q' "$1") (use --help)" ;;
+  esac
+done
+
+command -v gh >/dev/null 2>&1 || die 5 "gh not found on PATH"
+command -v jq >/dev/null 2>&1 || die 5 "jq not found on PATH"
+
+# Each lane and the reusable workflow its caller references, in output order.
+# Fixed here: a pull request cannot widen them.
+LANES=(code-review security-review)
+REUSABLE=(
+  '^melodic-software/ci-workflows/\.github/workflows/pr-review\.yml@'
+  '^melodic-software/ci-workflows/\.github/workflows/pr-review-security\.yml@'
+)
+# pr-review-cli.yml serves either lane through an input the run listing does
+# not show, so its caller's path decides the lane: security-review when it
+# names security, code-review otherwise.
+CLI='^melodic-software/ci-workflows/\.github/workflows/pr-review-cli\.yml@'
+CLI_SECURITY=(false true)
+WORKFLOW_ID=("" "") WORKFLOW_PATH=("" "")
+PAGES=3
+# Skipped-validation reds passed over per lane before it reads stale.
+MAX_PASSED=10
+READ_ATTEMPTS=3
+
+# read_runs <endpoint> <offset>: print one page of a run listing that starts
+# <offset> runs in. Returns 0 when the page is whole, 1 when no read of
+# READ_ATTEMPTS was, and 2 when gh failed or returned something unparsable.
+read_runs() {
+  local out whole attempt
+  for ((attempt = 1; attempt <= READ_ATTEMPTS; attempt++)); do
+    ((attempt == 1)) || sleep "$attempt"
+    out=$(gh api "$1") || return 2
+    whole=$(jq --argjson off "$2" 'if type != "object" then error("not an object") else
+      (.workflow_runs | type) == "array" and (.total_count | type) == "number"
+      and (.workflow_runs | length) == ([.total_count - $off, 100] | min | [., 0] | max) end' <<<"$out") || return 2
+    [[ -n "$whole" ]] || return 2
+    if [[ "$whole" == true ]]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# skipped_validation <run-id>: true when the run failed only because the pull
+# request edits the caller workflow. A run with no failed job keeps its verdict.
+skipped_validation() {
+  local jobs ids id ann hit
+  jobs=$(gh api "repos/$REPO/actions/runs/$1/jobs?per_page=100") || die 2 "cannot read the jobs of run $1"
+  ids=$(jq -r '.jobs[]? | select(.conclusion | IN("failure", "timed_out")) | .id' <<<"$jobs") ||
+    die 2 "cannot parse the jobs of run $1"
+  [[ -n "$ids" ]] || return 1
+  for id in $ids; do
+    [[ "$id" =~ ^[0-9]+$ ]] || die 2 "unexpected job id in run $1"
+    ann=$(gh api "repos/$REPO/check-runs/$id/annotations?per_page=100") || die 2 "cannot read the annotations of job $id"
+    hit=$(jq 'any(.[]?; .annotation_level == "failure" and (.message | test("^([a-z-]+: )?failure-class=skipped-validation(:|$)")))' <<<"$ann") ||
+      die 2 "cannot parse the annotations of job $id"
+    [[ "$hit" == true ]] || return 1
+  done
+}
+
+# Find each lane's caller workflow among the newest pull_request runs. Every PR
+# event starts each lane, a draft's run included (it concludes skipped), so a
+# repository with lanes shows them in the first pages.
+UNREAD=""
+for ((page = 1; page <= PAGES; page++)); do
+  runs=$(read_runs "repos/$REPO/actions/runs?event=pull_request&per_page=100&page=$page" $(((page - 1) * 100)))
+  case $? in
+  0) ;;
+  1)
+    UNREAD="page $page of the pull_request run listing came back incomplete in $READ_ATTEMPTS reads"
+    break
+    ;;
+  *) die 2 "cannot list the workflow runs of $REPO" ;;
+  esac
+  for i in "${!LANES[@]}"; do
+    [[ -n "${WORKFLOW_ID[i]}" ]] && continue
+    hit=$(jq -r --arg re "${REUSABLE[i]}" --arg cli "$CLI" --argjson sec "${CLI_SECURITY[i]}" '
+      [.workflow_runs[]? | select(any(.referenced_workflows[]?; .path | test($re))
+        or ((.path // "" | test("security")) == $sec
+          and any(.referenced_workflows[]?; .path | test($cli))))][0]
+      | select(. != null) | "\(.workflow_id)\t\(.path)"' <<<"$runs") ||
+      die 2 "cannot parse the workflow runs of $REPO"
+    if [[ -n "$hit" ]]; then
+      WORKFLOW_ID[i]="${hit%%$'\t'*}"
+      WORKFLOW_PATH[i]="${hit#*$'\t'}"
+    fi
+  done
+  [[ -n "${WORKFLOW_ID[0]}" && -n "${WORKFLOW_ID[1]}" ]] && break
+  [[ "$(jq '.workflow_runs | length' <<<"$runs")" -lt 100 ]] && break
+done
+
+for i in "${!LANES[@]}"; do
+  lane="${LANES[i]}" id="${WORKFLOW_ID[i]}" path="${WORKFLOW_PATH[i]}"
+  if [[ -z "$id" && -n "$UNREAD" ]]; then
+    printf '%s local unreadable: %s\n' "$lane" "$UNREAD"
+    continue
+  elif [[ -z "$id" ]]; then
+    printf '%s local absent: no recent pull_request run calls the %s lane\n' "$lane" "$lane"
+    continue
+  fi
+  [[ "$id" =~ ^[0-9]+$ ]] || die 2 "unexpected workflow id for $lane"
+  # A disabled workflow keeps its run history but answers no trigger.
+  wf=$(gh api "repos/$REPO/actions/workflows/$id") || die 2 "cannot read the workflow $path"
+  state=$(jq -er '.state | strings' <<<"$wf") || die 2 "cannot parse the workflow $path"
+  if [[ "$state" != active ]]; then
+    printf '%s local absent: %s is %s\n' "$lane" "$path" "$state"
+    continue
+  fi
+  lane_runs=$(read_runs "repos/$REPO/actions/workflows/$id/runs?event=pull_request&per_page=100" 0)
+  case $? in
+  0) ;;
+  1)
+    printf '%s local unreadable: the pull_request runs of %s came back incomplete in %s reads\n' "$lane" "$path" "$READ_ATTEMPTS"
+    continue
+    ;;
+  *) die 2 "cannot list the runs of $path" ;;
+  esac
+  verdicts=$(jq -r '.workflow_runs[]? | select(.status == "completed" and (.conclusion | IN("skipped", "cancelled") | not))
+    | "\(.id)\t\(.conclusion)\t\(.created_at)"' <<<"$lane_runs") || die 2 "cannot parse the runs of $path"
+  rid="" passed=0
+  while IFS=$'\t' read -r rid conclusion created; do
+    [[ -n "$rid" ]] || continue
+    [[ "$rid" =~ ^[0-9]+$ ]] || die 2 "unexpected run id in $path"
+    if [[ "$conclusion" == success ]] || ! skipped_validation "$rid"; then break; fi
+    rid="" passed=$((passed + 1))
+    ((passed < MAX_PASSED)) || break
+  done <<<"$verdicts"
+  [[ -z "$rid" ]] || made=$(jq -nr --arg t "$created" '$t | fromdateiso8601') || die 2 "cannot parse the time of run $rid"
+  if [[ -z "$rid" ]]; then
+    printf '%s local stale: %s has no run with a verdict among its newest 100\n' "$lane" "$path"
+  elif ((made < $(date +%s) - MAX_AGE_DAYS * 86400)); then
+    printf '%s local stale: the newest run with a verdict, %s, is from %s, older than %s days (%s)\n' "$lane" "$rid" "$created" "$MAX_AGE_DAYS" "$path"
+  elif [[ "$conclusion" == success ]]; then
+    printf '%s ci healthy: newest run with a verdict, %s, succeeded at %s (%s)\n' "$lane" "$rid" "$created" "$path"
+  else
+    printf '%s local failing: newest run with a verdict, %s, concluded %s at %s (%s)\n' "$lane" "$rid" "$conclusion" "$created" "$path"
+  fi
+done
+
+[[ -n "$HEAD_SHA" ]] || exit 0
+# filter=all, because a label or body edit re-runs the workflow on the same
+# commit and posts each test lane skipped: per name, the newest run that did
+# not skip is the lane's result, so a skip never hides a failure and a re-run
+# that passed replaces its failed attempt.
+CHECK_PAGES=5
+tests="[]" complete=false
+for ((page = 1; page <= CHECK_PAGES; page++)); do
+  checks=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs?filter=all&per_page=100&page=$page") ||
+    die 2 "cannot list the check runs of $HEAD_SHA"
+  tests=$(jq -c --argjson acc "$tests" '$acc + [.check_runs[]
+    | select(.app.slug == "github-actions" and (.name | test("^test($|[- (])")))
+    | {id, name, status, conclusion}]' <<<"$checks") || die 2 "cannot parse the check runs of $HEAD_SHA"
+  if [[ "$(jq '.check_runs | length' <<<"$checks")" -lt 100 ]]; then
+    complete=true
+    break
+  fi
+done
+if [[ "$complete" != true ]]; then
+  printf 'tests local absent: %s has more than %s check runs, not all read\n' "$HEAD_SHA" "$((CHECK_PAGES * 100))"
+  exit 0
+fi
+verdict=$(jq -r --arg h "$HEAD_SHA" '
+  def names: map(.name | sub(" \\(.*\\)$"; "")) | unique | join(", ");
+  def finished: .conclusion | IN("success", "skipped", "neutral");
+  group_by(.name) | map((map(select(.conclusion != "skipped")) | max_by(.id)) // max_by(.id))
+  | if length == 0 then "local absent: no test-lane check run on \($h)"
+  elif any(.status != "completed") then map(select(.status != "completed")) as $open
+    | "local pending: \($open | length) of \(length) test-lane check runs on \($h) have not finished (\($open | names))"
+  elif any(finished | not) then map(select(finished | not)) as $bad
+    | "local failing: \($bad | names) concluded \($bad | map(.conclusion) | unique | join(", ")) on \($h)"
+  elif any(.conclusion == "success") | not then "local absent: every test-lane check run on \($h) skipped"
+  else map(select(.conclusion == "success")) as $ok
+    | "ci healthy: \($ok | length) test-lane check runs succeeded on \($h) (\($ok | names))"
+  end' <<<"$tests") || die 2 "cannot read the test lanes of $HEAD_SHA"
+printf 'tests %s\n' "$verdict"

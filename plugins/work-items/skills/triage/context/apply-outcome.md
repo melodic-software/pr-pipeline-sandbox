@@ -20,17 +20,21 @@ Every outcome is a **transition off raw**, not a layer on top of it. Applying an
 |---------|--------|
 | Briefed, delegable | Write the brief per [`reference/agent-brief.md`](../../../reference/agent-brief.md) and its field rules (name by contract, describe the end state): behavioral contracts and named interfaces, **no file paths or line numbers**, apply labels + the autonomous-eligible role label (default `agent-ready`) |
 | Briefed, decision-defaulted | Same brief structure and field rules; the brief states the RECOMMENDED answer and its maintainer-vetoable alternative. Apply labels + the autonomous-eligible role label (default `agent-ready`) + `status:ready`, and post a `Decision defaulted: X — veto before merge` comment whose next line is the answer's `Basis:` (the comment, not the brief, carries any `file:line`) |
-| Briefed, multi-surface mechanical stub | For mechanical-class (`work-class: mechanical`) work spanning 3+ surfaces: in place of a full brief, post a one-line `sites + fix pattern` comment and apply the autonomous-eligible role label (default `agent-ready`) + `status:ready`, the stub replaces the full brief but not the ready-to-work state, so the item is picked up like any other autonomous-eligible outcome. The brief's name-by-contract rule still holds, name sites by interface / symbol / domain concept, **not file paths or line numbers** (recommended default: symbol-level naming) |
-| Briefed, human-gated | Same brief structure, plus why a human must act: a genuinely open decision (open design space, product intent, cross-repo policy, or a withheld consequential answer, stated as the open question plus the evidence that would settle it) or a capability blocker (external access, manual QA); apply labels + the human-gated role label (default `needs-human`) |
-| Needs more info | `status:needs-info` + the needs-info comment below |
+| Briefed, multi-surface mechanical stub | For mechanical work (one deterministic fix pattern, C2 by the risk-property bundle) spanning 3+ surfaces: in place of a full brief, post a one-line `sites + fix pattern` comment and apply the autonomous-eligible role label (default `agent-ready`) + `status:ready`, the stub replaces the full brief but not the ready-to-work state, so the item is picked up like any other autonomous-eligible outcome. The brief's name-by-contract rule still holds, name sites by interface / symbol / domain concept, **not file paths or line numbers** (recommended default: symbol-level naming) |
+| Briefed, human-gated | Only for an item that meets the human-gated label test in [`../SKILL.md`](../SKILL.md) "Triage states". Same brief structure, plus which part of the test it meets and why (an undecided design choice is stated as the open question plus the evidence that would settle it); apply labels + the human-gated role label (default `needs-human`) |
+| Needs more info | `needs-reporter-info` + the needs-info comment below |
 | Already implemented | Close pointing to where the behavior lives; do NOT ledger it (`docs/out-of-scope/` records rejections, not built features) |
 | Won't fix (bug) | Close with rationale comment |
 | Won't fix (enhancement) | Close with rationale comment; when the repo keeps `docs/out-of-scope/`, record the rejection in the matching concept file (re-read + append to "Prior requests", or create the concept file for a first rejection) and link it from the closing comment. An enhancement PR gets the same record as an issue, so a later PR for the rejected idea meets the earlier decision |
 | Duplicate | Never `completed`. Close via the adapter's native duplicate mechanic when the provider has one (GitHub: `--duplicate-of`), else not-planned + a `## Duplicate of <ref>` body section (`#<M>` same-repo, qualified `<owner>/<repo>#<M>` or URL cross-repo) + link comment |
 
+**Every close outcome re-points dependents first.** Before the close, run "Dependents on close" in [`reference/issue-conventions.md`](../../../reference/issue-conventions.md): a duplicate's dependents move to the surviving item, a won't-fix keeps its edges and names its dependents in the closing comment, and already implemented closes as delivered.
+
 For a PR, the outcome addresses the attached code explicitly: adopt the diff (briefed for an agent or human to carry forward), rework it (brief describes the gap between the diff and the verified requirement), or decline it (close with rationale, and the ledger entry when it's a rejected enhancement).
 
 **Decision-carrier clusters.** When step 1's cluster detection found members sharing one decision, apply human-gated to the **carrier only** (its body lists the member numbers). Each other member instead gets a native `blocked-by` edge to the carrier plus a `blocked by #<carrier> decision` comment, **never a per-member human-gated label**. Resolving the carrier's decision unblocks the whole cluster in one human touch.
+
+**Signature clusters.** When step 1 found a signature cluster, the parent takes its outcome from the table above. Each other member takes the Duplicate row with the parent as the surviving item, never the autonomous-eligible role label. Before closing a member, record its sighting on the parent. When the member's URL is `http` or `https` (the GitHub adapter), run `add-recurrence <parent> --source-link <member URL> --note "seen again: #<member> <one-line symptom>"`, so a later pass over the same member writes nothing new. `add-recurrence` refuses any other link, so for a `file://` member (the local-markdown adapter) append `Seen again: <member path>: <one-line symptom>` to the parent's body instead, once per member path. A member is never linked to the parent by a `blocked-by` edge: the parent's close would then promote the member to `agent-ready`.
 
 **Umbrella-fold routing (atomic).** When routing folds a member into an umbrella, treat the fold as **one indivisible sequence** per the Title section of [`reference/issue-conventions.md`](../../../reference/issue-conventions.md). Do not advance to the next item until every step completes:
 
@@ -41,54 +45,91 @@ For a PR, the outcome addresses the attached code explicitly: adopt the diff (br
 
 The item-side comment alone is never sufficient; stopping after step 1 leaves the umbrella unaware and is the failure mode this checklist prevents (#633). Before moving to the next intake row, verify step 2 landed. Re-read the umbrella's comments or the command output if needed.
 
-**Work-class pairing (hard).** Every mutation that applies the autonomous-eligible role label (`agent-ready` by default) MUST also apply exactly one `work-class:` label in the same edit, and it must be one of the autonomously dispatchable classes (`work-class: read-only` / `mechanical` / `scoped`. Map C1–C3). Applying `agent-ready` without a work-class is a triage defect: the fail-closed admission gate then makes the item unreachable while it still looks frontier-available (medley#1677). **Never pair `agent-ready` with `work-class: structural` (C4) or `work-class: untrusted-provenance` (C5)**: those are human-gated regardless of any other signal, so the pair contradicts itself. `list-frontier --autonomous` drops such an item on the work-class floor and the role label buys nothing; before that floor existed, each lane instance in turn claimed it, hit the admission gate, and escalated, burning a worker every pass. A C4/C5 outcome takes the human-gated role label (default `needs-human`) instead, per [`reference/work-class-labels.md`](../../../reference/work-class-labels.md) "Human-floor classes exclude the autonomous-eligible role label". **Classify** from the risk-property bundle, when the `autonomy` plugin is installed, read [`work-classes.md`](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/plugins/autonomy/reference/guardrails/work-classes.md) (same reference the work-loop admission gate cites); otherwise use the label→class mapping in [`reference/work-class-labels.md`](../../../reference/work-class-labels.md). **Preflight:** before any autonomous-eligible outcome, verify all five canonical labels exist per that reference's "Migration" section; if any are missing, stop without mutating and report remediation. `/work-items:setup apply` provisions them on repos without label-as-code, or route to the repo's declared label-as-code owner. A lane that may not write `work-class:` labels cannot meet this pairing and never applies the role label: see "Lane barred from recording a class" below.
+**Work class does not gate the role label.** The autonomous-eligible role label (`agent-ready` by default) is applied with no class label; triage stamps none. Every session, interactive or a lane, applies the role label only to an item whose author passes the issue trust test: the tracker's author association for the issue author is `OWNER` or `MEMBER`, or the author is a structural bot listed in the repository's team-tracked, default-branch `babysit_loop_trusted_internal_bot_logins` (the issue test in the `autonomy` plugin's classification criteria, "Issue: the intake's provenance", linked from [`label-taxonomy.md`](../../../reference/label-taxonomy.md)). Read the association from the tracker's item metadata through the adapter, never from the item's title, body or comments. Any other item, including one whose association is absent or unreadable, would be an untrusted spec admitted under the session's own identity. It is C5 by the issue test in that file, so a session that may write `provenance: untrusted` applies that label in the outcome edit; a lane that may not write it (by default the work-loop intake sweep, below) applies none, and no later gate would catch the item. Either way its briefed exit is human-gated, so the outcome edit applies the human-gated role label (default `needs-human`) and no `status:ready`, and the brief names part 2 of the human-gated label test (admitting an untrusted-provenance item) with the association it read. **One pairing ban (hard): never pair `agent-ready` with `provenance: untrusted` (C5) or `provenance: signal`.** `list-frontier --autonomous` drops such an item on the human floor and the work-loop's provenance hold escalates it, so the role label buys nothing; the outcome takes the human-gated role label (default `needs-human`) instead, per [`reference/label-taxonomy.md`](../../../reference/label-taxonomy.md) "Provenance" row and the class-labels reference it links, section "The human-floor class excludes the autonomous-eligible role label".
 
-**Signal-marked items are C5 by rule.** An item whose body carries the autonomy signal marker, or that already carries `provenance: signal`, gets `work-class: untrusted-provenance` in the same edit that applies `provenance: signal`. It is never paired with `agent-ready`, and its briefed exit is human-gated: the outcome edit applies the human-gated role label (default `needs-human`). No judgment about the item's content, however small or well-scoped the fix looks, lowers the class. The preflight in "Status and provenance labels" below covers `work-class: untrusted-provenance` as well: when the repository lacks it, stop without mutating and report the provisioning gap. A lane barred from recording a class applies `needs-human` to a signal item with no `work-class:` label and leaves the class to a person. `list-frontier --autonomous` drops a `provenance: signal` item whatever its other labels, because the human floor in `labels.sh` holds that label as well as the C4/C5 classes.
+**Work-loop intake sweep: propose, never admit.** When triage runs as `/work-items:work-loop`'s intake sweep, its label writes carry the lane's own identity, and the work-loop's labeler precondition cannot tell those from a person's. So by default the sweep writes neither `provenance: untrusted` nor the autonomous-eligible role label, and a delegable, decision-defaulted or multi-surface stub outcome goes to the attended queue's escalated view instead. Two checks come first. An item whose author fails the issue trust test above takes that rule's human-gated exit, with no proposed swap. The "Issue dimensions" rule below runs as though the outcome applied the autonomous-eligible role label, and an item it holds (a `split` size, or an uncertainty mode other than `run`) takes that rule's route. Every other such outcome takes these steps:
 
-**Lane barred from recording a class: propose it, human-gate the item.** When the session may not record a class, because the autonomous lane's standing directive forbids writing `work-class:` labels (the conforming posture for an unattended lane: the autonomy contract's `admission-policy.md` bars any agent-writable surface from supplying "the work class used for admission"), the pairing rule above cannot be met, so the autonomous-eligible role label is never applied. A delegable, decision-defaulted, or multi-surface-stub outcome instead ends in the attended queue's `[escalated]` view:
+1. **Comment first.** Write the work-loop's step 5 escalation record, then post an escalation marker comment whose first line is `<!-- work-items:escalation lane=work-loop kind=escalated -->` ([`reference/escalation-marker.md`](../../../reference/escalation-marker.md)), with a one-line basis for admitting the item and a ready-to-paste label edit that swaps the human-gated role label for the autonomous-eligible one. Still post the brief, the stub comment or the `Decision defaulted` comment. Skip the marker when one from the seam's write identity already stands on the item.
+2. **Then the labels, in one edit:** the outcome's labels, `status:ready`, the human-gated role label (default `needs-human`), and removal of the raw marker. No autonomous-eligible role label.
 
-1. **Comment first.** Post an escalation marker comment per [`reference/escalation-marker.md`](../../../reference/escalation-marker.md), first line `<!-- work-items:escalation lane=<lane> kind=escalated -->`, whose body carries the `Proposed work class:` line that reference defines (one dispatchable member, C1–C3), a one-line basis, and the ready-to-paste label edit that stamps the class and flips the role in one edit (adapter: "Edit labels / assignees"). The brief, stub, or `Decision defaulted` comment the outcome already requires is still posted. Skip posting when a marker from the seam's configured write identity already stands on the item.
-2. **Then the labels, in one edit:** the outcome's labels plus `status:ready`, the human-gated role label (default `needs-human`), and removal of the raw marker. No `work-class:` label and no autonomous-eligible role label.
+When the comment cannot be posted, change no labels: the item keeps its raw marker and the next sweep retries it. Only a work-loop launch prompt that explicitly opts the sweep into writing `provenance: untrusted` or the autonomous-eligible role label lifts this default, and then the rules above apply. A launch prompt that grants triage mutations in general is not that opt-in.
 
-If the comment cannot be written, change no label: the item keeps its raw marker and the next sweep retries it. A human-gated item without the marker is a parked item no queue lists as escalated, and an item left at `status:ready` with neither role label is on no queue at all; this branch must end in neither. A C4/C5 outcome is unchanged (human-gated per the paragraph above), and the unconstrained path (interactive, or a lane permitted to stamp) keeps the pairing rule as written.
+**Issue dimensions (hard, when configured).** When the repository's
+`docs/conventions/pr-pipeline.yaml` (read at `--config-ref` when given, the way "Triage settings"
+reads) has `models.issue-dimensions`, every outcome that would apply the autonomous-eligible role
+label first assesses the item on each dimension that block's `fields` names, choosing one key of
+that dimension's table in the same block, never a name from this skill: for complexity, the key
+whose factor fits how hard the work is to get right; for size, the smallest key whose
+`base-turns` times that factor fits the brief's work in one run, or the key set to `split` when
+none does; for uncertainty, the key whose mode is `run` when the approach is known, else the key
+whose mode names the step that must come first. Then write all of them in one call, before the
+outcome's label edit:
 
-**Whose credential the label writes carry.** An unattended lane writes under the repository's `merge.agent-identity` when one is named, and its identity gate, run at the start of every cycle, refuses every write when the session does not act as it. With no identity named, its writes carry the session's credential, a named residual (the loop-lane convention's "Lane write identity", §1). Interactive triage keeps the operator's credential, so its label writes, a `work-class:` stamp included, count as human provenance to every check that asks who applied a label. That holds only while the user directs the session: a named residual.
+```bash
+bash "<plugin-root>/skills/triage/scripts/set-dimensions.sh" [--ref '<ref>'] <item-id> <dimension>=<key> ...
+```
 
-**Capability-tier stamp.** When triage assesses an item for the frontier capability tier, apply the provider-permissioned `capability-tier: frontier` label in the same mutation batch as other triage labels, never encode the tier only in briefing body prose. Body mentions of frontier tier are context for operators; `work-loop` reads the label only (#1716). Preflight per [`reference/capability-tier-labels.md`](../../../reference/capability-tier-labels.md) "Migration": if the label is missing from the repo, stop without inventing it and report provisioning (label-as-code owner or `/work-items:setup`). Security-surface work routes to the frontier dispatch tier via work-class rules without requiring this stamp.
+The script maps each key to its option id through the block and sets the fields through the
+tracker seam; never set a field any other way or type an id. Exit 3 means the repository maps no
+dimensions: skip this rule. Any other non-zero exit stops the outcome with no label change,
+reported with the script's message, since the issue lane refuses an item whose fields are empty.
+The lane counts a value only when its last setter is a listed human or the lanes App, so report
+when the seam writes as any other account.
+
+An item whose size is `split`, or whose uncertainty mode is not `run`, is not
+autonomous-eligible: in one edit, apply `status:ready` and the human-gated role label (default
+`needs-human`) and clear the raw marker, with a comment naming the next step: `/work-items:decompose`
+for a `split` size, planning or research for `research-first`, a probe or spike for `probe-first`.
+The fields stay set, so the item is not re-assessed. An interactive session may run that step once
+the operator agrees; a lane does not, since publishing items is outside triage's mandate. No
+`models.issue-dimensions` block: skip this rule.
+
+**Priority.** Every briefed outcome sets the priority step 2 assessed, by the rule in
+[`reference/tracker-seam.md`](../../../reference/tracker-seam.md) "Setting an item's priority". On
+the field, that is its own `set-fields` call right before the outcome's label edit; on labels, it
+rides in that edit. A failed field write stops the outcome with no label change, reported, and the
+item keeps its raw marker for the next pass.
+
+**Signal-marked items are C5 by rule.** An item whose body carries the autonomy signal marker, or that already carries `provenance: signal`, gets `provenance: untrusted` in the same edit that applies `provenance: signal`. It is never paired with `agent-ready`, and its briefed exit is human-gated: the outcome edit applies the human-gated role label (default `needs-human`). No judgment about the item's content, however small or well-scoped the fix looks, lowers the class. The preflight in "Status and provenance labels" below covers `provenance: untrusted` as well: when the repository lacks it, stop without mutating and report the provisioning gap. A lane that may not write `provenance: untrusted` applies `provenance: signal` and `needs-human` to a signal item and leaves `provenance: untrusted` to a person. `list-frontier --autonomous` drops a `provenance: signal` item whatever its other labels, because the human floor in `labels.sh` holds that label as well as `provenance: untrusted`.
+
+**Whose credential the label writes carry.** An unattended lane writes under the repository's `merge.agent-identity` when one is named, and its identity gate, run at the start of every cycle, refuses every write when the session does not act as it. With no identity named, its writes carry the session's credential, a named residual (the loop-lane convention's "Lane write identity", §1). Interactive triage keeps the operator's credential, so its label writes count as human provenance to every check that asks who applied a label. That holds only while the user directs the session: a named residual.
+
+**Capability-tier stamp.** When triage assesses an item for the frontier capability tier, apply the provider-permissioned `capability-tier: frontier` label in the same mutation batch as other triage labels, never encode the tier only in briefing body prose. Body mentions of frontier tier are context for operators; `work-loop` reads the label only (#1716). Preflight per [`reference/capability-tier-labels.md`](../../../reference/capability-tier-labels.md) "Migration": if the label is missing from the repo, stop without inventing it and report provisioning (label-as-code owner or `/work-items:setup`). Security-surface work routes to the frontier dispatch tier per the convention's tier rules, without requiring this stamp.
 
 The canonical-role labels applied by these outcomes (autonomous-eligible default `agent-ready`, human-gated default `needs-human`) are **resolved from the binding's `config.role_labels` at action entry**, never hardcoded. Absent entries fall back to documented defaults silently, and stop on a malformed/empty/non-string value ([`reference/label-taxonomy.md`](../../../reference/label-taxonomy.md) "Canonical roles").
 
-Label edits, comments, and closes route through the adapter's write mechanics (adapter: "Edit labels / assignees", "Comment on item / edit a comment", "Close item"); the gather + attention-view reads are bare. When triage spawns follow-up work, a fresh, orthogonal problem it surfaces but will not fix this pass, distinct from the item under evaluation and from work it has already scoped and routed, item creation goes through the seam `create-item` verb (`/work-items:track add` is the canonical path) and follows the shared self-observation contract ([`reference/dogfood-filing.md`](../../../reference/dogfood-filing.md): dedupe → categorize → fixed shape → `needs-triage`). That new item is genuinely raw intake, so `needs-triage` is correct for it; the item triage is *evaluating* is never sent back to raw intake, its raw marker is cleared by the closing invariant below, and follow-up whose scope triage has already decided is routed through the outcome labels above, not filed as a self-observation.
+Label edits, retitles from step 2, comments, and closes route through the adapter's write mechanics (adapter: "Edit labels / assignees", "Edit title / body", "Comment on item / edit a comment", "Close item"); the gather + attention-view reads are bare. When triage spawns follow-up work, a fresh, orthogonal problem it surfaces but will not fix this pass, distinct from the item under evaluation and from work it has already scoped and routed, item creation goes through the seam `create-item` verb (`/work-items:track add` is the canonical path) and follows the shared self-observation contract ([`reference/dogfood-filing.md`](../../../reference/dogfood-filing.md): dedupe → categorize → fixed shape → `needs-triage`). That new item is genuinely raw intake, so `needs-triage` is correct for it; the item triage is *evaluating* is never sent back to raw intake, its raw marker is cleared by the closing invariant below, and follow-up whose scope triage has already decided is routed through the outcome labels above, not filed as a self-observation.
 
 **Closing invariant, no outcome leaves a re-selectable raw item.** The attention view lists *open* items and re-selects anything still carrying the raw marker, so every outcome must leave the item unre-selectable:
 
-- **Every routing outcome that keeps the item open clears the raw-intake marker in the same edit that applies the outcome's labels, no exceptions across the routing space.** `status:ready` (briefed/ready and decision-defaulted), the autonomous-eligible role label, the human-gated role label (default `needs-human`), `status:needs-decision`, and `status:needs-info` each **remove the raw marker**; never leave both the raw marker and a routing label present. A raw marker alongside any routing label is a contradiction, the open-only attention view reads it as still-raw and re-triages it every cycle, so an already-decided item re-enters the needs-triage queue as if it were unrouted intake and wastes a read-and-confirm pass. If an item shows both, the routed state is the truth; clear the stale raw marker.
+- **Every routing outcome that keeps the item open clears the raw-intake marker in the same edit that applies the outcome's labels, no exceptions across the routing space.** `status:ready` (briefed/ready and decision-defaulted), the autonomous-eligible role label, the human-gated role label (default `needs-human`), `needs-owner-decision`, `needs-reporter-info`, and an idea issue's `needs-spec` each **remove the raw marker**; never leave both the raw marker and a routing label present. A raw marker alongside any routing label is a contradiction, the open-only attention view reads it as still-raw and re-triages it every cycle, so an already-decided item re-enters the needs-triage queue as if it were unrouted intake and wastes a read-and-confirm pass. If an item shows both, the routed state is the truth; clear the stale raw marker.
 - **Close** (already implemented / wontfix / duplicate) drops the item from the open-only attention frontier, so the raw marker is moot, a closed item never re-triages.
 - **`status: confirmed` is not a routing outcome.** Step 3 applies it beside the raw marker. The outcome edit here always clears the raw marker, and replaces `status: confirmed` when it applies another `status:` value; a human-gated outcome, which applies none, keeps `status: confirmed`.
 
 ## Status and provenance labels
 
-Two labels this skill writes come from the live label set and are never invented:
+These labels this skill writes come from the live label set and are never invented:
 
 - `status: confirmed`, applied by step 3 on a passed verification.
-- `provenance: signal`, applied by the outcome edit to an item whose body carries the autonomy
-  signal marker (step 1).
+- `provenance: signal` and `provenance: untrusted`, applied by the outcome edit to an
+  item whose body carries the autonomy signal marker (step 1).
+- `needs-spec`, applied to an idea issue (step 1).
 
-**Preflight.** Before the edit that would apply either one, check that it exists in the repository
-(adapter: the label listing step 2 uses for `priority:`). When it is absent, stop without mutating
+**Preflight.** Before the edit that would apply any of them, check that it exists in the repository
+(adapter: "List labels"). When it is absent, stop without mutating
 anything, not even the other labels of that edit, and report it as a provisioning gap for the
 repository's label-as-code owner, or for a person to create in the tracker. Never fall back to a
 different label.
 
 The `status:` axis is single-valued: the edit that applies `status: confirmed`, `status: ready` or
-`status:needs-info` removes every other `status:` label. `provenance: signal` is not removed by any
-outcome or lane edit.
+`needs-reporter-info` removes every other `status:` label. No triage outcome or lane edit removes
+`provenance: signal`; only a person with `write` does, under attend-queue's provenance-removal rule.
 
 ## Verification comment
 
 Step 3 posts it on a passed verification, before the label edit that applies `status: confirmed`.
 If the comment cannot be posted, apply no label. In an autonomous session it starts with the AI
-disclaimer.
+disclaimer when the setting resolves `true` ([`reference/ai-disclaimer.md`](../../../reference/ai-disclaimer.md)).
 
 ```markdown
 **Verified: <bug reproduced | request valid | PR behaves as described>**
@@ -109,7 +150,7 @@ checked and what it showed.
 Posted with the brief by every outcome that applies the autonomous-eligible role label, when
 `triage_objection_window_hours` resolved above 0. `<end>` is the post time plus that many hours, in
 UTC, written `YYYY-MM-DDTHH:MM:SSZ`. The marker line is first so the work-loop admission gate can
-find it; in an autonomous session the AI disclaimer follows it.
+find it; in an autonomous session the AI disclaimer, when the setting adds one, follows it.
 
 Post it before the label edit that applies the autonomous-eligible role label. If the comment
 cannot be posted, apply no label at all: the item keeps its raw marker and the next sweep retries
@@ -126,7 +167,7 @@ Triage posts this and moves on; nothing in triage waits for the window.
 
 ## Needs-info comment
 
-When an item parks at `status:needs-info`, post one comment in this shape:
+When an item parks at `needs-reporter-info`, post one comment in this shape:
 
 ```markdown
 **Triage paused: waiting on @<reporter>**

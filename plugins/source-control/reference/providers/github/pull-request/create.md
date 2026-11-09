@@ -30,17 +30,22 @@ CLOSES_LINE=""
 REFS_LINES=""  # newline-separated `Refs #Y — <why>` bullets for the ## Related section, populated
                 # by the multi-issue or orphan-PR prompts below; never a closing keyword and
                 # not a linkage line — see §2.4.1 for routing.
+ISSUE_BODY=""
 if [[ "$ISSUE_NUM" =~ ^[0-9]+$ ]]; then   # the GitHub default needs an issue number
   # Validate issue exists in current repo BEFORE shipping `Closes #N`.
   # GitHub auto-close only fires when the issue exists, lives in this repo,
   # and is open at merge time. A typo'd branch like
   # `feat/99999-foo` would otherwise ship a misleading `Closes #99999` line.
-  ISSUE_STATE=$(gh issue view "$ISSUE_NUM" --json state --jq '.state' 2>/dev/null || true)
+  # One read returns the body beside the state, for the Summary's Problem and intent fallback.
+  ISSUE_JSON=$(gh issue view "$ISSUE_NUM" --json state,body 2>/dev/null || true)
+  ISSUE_STATE=$(printf '%s' "$ISSUE_JSON" | jq -r '.state // empty' || true)
+  ISSUE_BODY=$(printf '%s' "$ISSUE_JSON" | jq -r '.body // empty' || true)
   if [[ "$ISSUE_STATE" == "OPEN" ]]; then
     CLOSES_LINE="Closes #${ISSUE_NUM}"
   else
     echo "⚠ Branch suggests Closes #${ISSUE_NUM}, but that issue is missing or not open in this repo. Falling back to interactive prompt." >&2
     ISSUE_NUM=""   # fall through to orphan-PR 2-option prompt below
+    ISSUE_BODY=""  # no Problem and intent fallback from an item the PR does not close
   fi
 fi
 # If still empty, the orphan-PR prompt populates CLOSES_LINE below.
@@ -54,12 +59,37 @@ set. Pointer:
 [Configure cloud environments § GitHub proxy](https://code.claude.com/docs/en/cloud-environments#github-proxy),
 which names the refusal and the REST fallback. As-of: 2026-10-11. Recheck trigger: that section
 changes its GraphQL entry, or a release note names the GitHub proxy. The `2>/dev/null || true` in the block above swallows that 403. Substitute the REST
-issues endpoint, which reports `state` in lower case:
+issues endpoint, which reports `state` in lower case and `body` as a string or null. Pointer:
+[Get an issue](https://docs.github.com/en/rest/issues/issues#get-an-issue), whose schema is
+[Create an issue](https://docs.github.com/en/rest/issues/issues#create-an-issue)'s. As-of:
+2026-10-26. Recheck trigger: either field's type changes there.
 
 ```bash
-ISSUE_STATE=$(gh api "repos/{owner}/{repo}/issues/${ISSUE_NUM}" --jq '.state' 2>/dev/null || true)
+ISSUE_JSON=$(gh api "repos/{owner}/{repo}/issues/${ISSUE_NUM}" 2>/dev/null || true)
+ISSUE_STATE=$(printf '%s' "$ISSUE_JSON" | jq -r '.state // empty' || true)
+ISSUE_BODY=$(printf '%s' "$ISSUE_JSON" | jq -r '.body // empty' || true)
 if [[ "$ISSUE_STATE" == "open" ]]; then   # REST returns `open`/`closed`, not `OPEN`/`CLOSED`
 ```
+
+## Refs issue read
+
+When the orphan-PR prompt yields `Refs: #<N>`, one read returns what the `## Remaining` section
+lists: the issue body and its open sub-issues. A missing or closed issue leaves both empty, and
+the section falls back to its one-line form.
+
+```bash
+REFS_JSON=$(gh issue view "$REFS_NUM" --json state,body,subIssues 2>/dev/null || true)
+if [[ "$(printf '%s' "$REFS_JSON" | jq -r '.state // empty')" == "OPEN" ]]; then
+  REFS_BODY=$(printf '%s' "$REFS_JSON" | jq -r '.body // empty')
+  REFS_OPEN_SUBS=$(printf '%s' "$REFS_JSON" | jq -r '.subIssues.nodes[]? | select(.state == "OPEN") | "#\(.number) \(.title)"')
+fi
+```
+
+Under the GraphQL restriction in [Issue state over REST](#issue-state-over-rest), read the body
+from `gh api "repos/{owner}/{repo}/issues/${REFS_NUM}"` (state `open`) and the sub-issues from
+`gh api "repos/{owner}/{repo}/issues/${REFS_NUM}/sub_issues"`. Pointer:
+[List sub-issues](https://docs.github.com/en/rest/issues/sub-issues#list-sub-issues). As-of:
+2026-10-28. Recheck trigger: that endpoint moves or its `state` field changes.
 
 ## Placeholder anchoring
 
@@ -70,8 +100,8 @@ directory**, or from `GH_REPO`. Out of tree, run the call from the worktree
 ## Body overrides the template
 
 A body passed with `gh pr create --body-file` (or `--body`) fully overrides
-`.github/PULL_REQUEST_TEMPLATE.md` (cli/cli #10751). `gh pr create` has no option that uploads a
-file.
+`.github/PULL_REQUEST_TEMPLATE.md` (cli/cli #10751). Create passes no `--attach` (gh 2.99.0 and
+later): captures go to the PR through the pull-request skill's `evidence` action.
 
 ## Open the draft PR
 
@@ -79,9 +109,8 @@ file.
 # Identity: plain `gh` (the human PR author) by default.
 # No reviewers are auto-requested by default — `gh pr create` runs without
 # `--reviewer`.
-# DRAFT_FLAG comes from the phase's resolved pr_open_state: (--draft) by
-# default, empty only when the state is `ready` and a person drives the run.
-PR_URL=$(gh pr create "${DRAFT_FLAG[@]}" --head "$BRANCH" --title "<type>: <description>" --body-file "$BODY_FILE")
+# Always a draft: a `ready` open state is reached by Phase 2.5's flip.
+PR_URL=$(gh pr create --draft --head "$BRANCH" --title "<type>: <description>" --body-file "$BODY_FILE")
 
 # Extract PR number from URL (gh pr create outputs the URL on success).
 # This number is the source of truth for the rest of this phase — pass it
@@ -91,13 +120,13 @@ PR_NUMBER=$(basename "$PR_URL")
 
 ## Open the PR over REST
 
-`gh pr create` sends a `RepositoryInfo` GraphQL query as its repo-info preamble, before it touches
-the pull-request API at all, so under the GraphQL restriction it returns `HTTP 403` having
-created nothing. `POST /repos/{owner}/{repo}/pulls` is REST and works. It requires `head` and
-`base`, and `title` unless an existing `issue` is being converted; `body`, `draft`, and
+`gh pr create` sends a `RepositoryInfo` GraphQL query as its repo-info preamble, before touching
+the pull-request API, so under the GraphQL restriction it returns `HTTP 403` having created
+nothing. `POST /repos/{owner}/{repo}/pulls` is REST and works. It requires `head` and `base`, and
+`title` unless an existing `issue` is being converted; `body`, `draft`, and
 `maintainer_can_modify` are optional. Five differences from `gh pr create` matter:
 
-- **`base` is required.** `gh pr create` defaults it to the repository's default branch; REST does not. Resolve it over REST as well, since §2.2's `gh repo view --json defaultBranchRef` reads the same GraphQL surface and 403s alongside the rest.
+- **`base` is required.** `gh pr create` defaults it to the repository's default branch; REST does not. Resolve it over REST too, since §2.2's `gh repo view --json defaultBranchRef` reads the same GraphQL surface and 403s with the rest.
 - **`head` is bare `<branch>` only for a same-repo PR.** From a fork (the triangular flow §2.7's remote resolver allows), it must be namespaced `<fork-owner>:<branch>`, and when both repositories belong to the same organization, REST additionally requires `head_repo=<fork-repo-name>`.
 - **Send the body from its file with `-F body=@"$BODY_FILE"`.** `-F`/`--field` reads a value that starts with `@` from the named file. `-f`/`--raw-field` would send the path itself as the body.
 - **The response carries the PR identity.** Read `.number` and `.html_url` from it rather than parsing the number back out of the URL.
@@ -110,7 +139,7 @@ PR_JSON=$(gh api --method POST "repos/{owner}/{repo}/pulls" \
   -f head="$BRANCH" \
   -f base="$BASE" \
   -F body=@"$BODY_FILE" \
-  -F draft="$DRAFT_JSON")
+  -F draft=true)
 PR_URL=$(printf '%s' "$PR_JSON" | jq -r '.html_url')
 PR_NUMBER=$(printf '%s' "$PR_JSON" | jq -r '.number')
 ```
@@ -135,14 +164,14 @@ In a sandboxed session, take identity from the create response, or re-read it wi
 `gh pr create` MUST pass `--head "$BRANCH"` explicitly, since the invoker is not on the branch:
 
 ```bash
-PR_URL=$(gh pr create "${DRAFT_FLAG[@]}" --head "$BRANCH" --title "<type>: <description>" --body-file "$BODY_FILE")
+PR_URL=$(gh pr create --draft --head "$BRANCH" --title "<type>: <description>" --body-file "$BODY_FILE")
 ```
 
 In a sandboxed session that 403s, the REST form, run from the worktree:
 
 ```bash
 PR_JSON=$( cd "$WT" && gh api --method POST "repos/{owner}/{repo}/pulls" \
-  -f title="<type>: <description>" -f head="$BRANCH" -f base="$BASE" -F body=@"$BODY_FILE" -F draft="$DRAFT_JSON" )
+  -f title="<type>: <description>" -f head="$BRANCH" -f base="$BASE" -F body=@"$BODY_FILE" -F draft=true )
 ```
 
 Resolve the base branch the same anchored way:
@@ -154,10 +183,10 @@ On a triangular flow, name the base repository explicitly and namespace `head`:
 BASE_REPO="<base-owner>/<repo>"                # the PR's target, not the push destination
 PR_JSON=$(GH_REPO="$BASE_REPO" gh api --method POST "repos/{owner}/{repo}/pulls" \
   -f title="<type>: <description>" -f head="<fork-owner>:$BRANCH" \
-  -f base="$BASE" -F body=@"$BODY_FILE" -F draft="$DRAFT_JSON")
+  -f base="$BASE" -F body=@"$BODY_FILE" -F draft=true)
 ```
 
-`GH_REPO` overrides the cwd-derived placeholders outright, so this form needs no `cd` at all. On a
-triangular flow resolve `$BASE` through `GH_REPO` too, as
+`GH_REPO` overrides the cwd-derived placeholders, so this form needs no `cd`. On a triangular flow
+resolve `$BASE` through `GH_REPO` too, as
 `BASE=$(GH_REPO="$BASE_REPO" gh api "repos/{owner}/{repo}" --jq '.default_branch')`, not through the
 `cd "$WT"` form above, which would read the fork's default branch.

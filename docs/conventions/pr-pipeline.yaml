@@ -340,7 +340,7 @@ activities:
       # trigger gate checks that a listed human or the lanes App added it.
       # No `work-class:` label admits or refuses it. A person decides an
       # issue carrying one of these labels, so it starts nothing.
-      labels-absent: [needs-human, needs-owner-decision, "status: needs-decision", "status: needs-info"]
+      labels-absent: [needs-human, needs-owner-decision, needs-reporter-info]
       # Read now, so removing agent-ready while a run waits stops it.
       labels: [agent-ready]
   apply-issue-patch:
@@ -364,8 +364,7 @@ activities:
       labels-absent:
         - needs-human
         - needs-owner-decision
-        - "status: needs-decision"
-        - "status: needs-info"
+        - needs-reporter-info
       labels:
         - agent-ready
   report-outcome:
@@ -375,6 +374,9 @@ activities:
     # marker. A script, no model.
     script: .github/scripts/work-resolve-issue/report-outcome.mjs
     effect: publish-artifact
+    # The hand-back routes import .base/.github/actions at run time, so the
+    # PR head checkout must not replace the workspace.
+    checkout: base
     gating: advisory
     reads-untrusted: false
     inputs: [issue]
@@ -762,9 +764,8 @@ models:
       needs-triage:
         - needs-triage
       needs-reporter-info:
-        - "status: needs-info"
+        - needs-reporter-info
       needs-owner-decision:
-        - "status: needs-decision"
         - needs-owner-decision
       needs-spec:
         - needs-spec
@@ -826,10 +827,8 @@ branch-cleanup:
   max-deletes-per-run: 25
 
 merge:
-  # The lane auto-merges only PRs labeled `work-class: mechanical` (C2):
-  # dependency bumps, lint and format fixes, syncs. The classes C1-C5 (read-only,
-  # mechanical, scoped, structural, untrusted-provenance) are defined in
-  # plugins/autonomy/reference/guardrails/work-classes.md.
+  # The rung is a pacing cap; C2 is the accepted alias for merge. The lane reads
+  # no `work-class:` label: its merge criterion is the verifier verdict below.
   rung: C2
   authority: pr-merge
   agent-identity: melodic-automation-lanes[bot]

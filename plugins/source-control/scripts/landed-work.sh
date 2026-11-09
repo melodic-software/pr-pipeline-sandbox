@@ -6,8 +6,9 @@
 # its content is not already on the base. Everything else is recoverable, and the
 # distinction is the only thing standing between a cleanup sweep and data loss.
 #
-# Read-only by construction: no fetch, no ref write, no checkout, no removal, no
-# network. Every verdict is computed from refs already on disk, so a stale remote
+# Read-only by construction: no fetch, no ref write, no checkout, no removal, and
+# no network unless --merged-pr-proof is passed (one read-only `gh pr list` of
+# merged PRs per repository and base). Every verdict is computed from refs already on disk, so a stale remote
 # ref yields a conservative answer (see the fail-closed rule below), never a wrong
 # destructive one.
 #
@@ -65,7 +66,8 @@ $PROG — read-only landed-vs-stranded classification for git worktrees.
 
 Usage:
   $PROG [--repo-dir <dir>] [--worktree <path>]... [--base <ref>]
-        [--merged-refs-file <path>] [--no-peers]
+        [--merged-refs-file <path>] [--no-peers] [--merged-pr-proof]
+        [--merged-pr-limit <n>]
   $PROG --path-key <value>
   $PROG --help
 
@@ -90,6 +92,20 @@ Options:
                       offline.
   --no-peers          Skip peer detection (another worktree holding the same
                       commits). Peer detection is O(n^2) ancestry probes.
+  --merged-pr-proof   For a row that is not landed, find the branch's merged pull
+                      request and report landed when local HEAD equals or is an
+                      ancestor of the PR head commit, or every unpushed local
+                      commit is in the PR's commit list. The PRs come from one
+                      \`gh pr list --state merged --base <base>\` per repository
+                      and base, read once and reused for every worktree (the
+                      only network use). The number of gh calls the run made is
+                      printed on stderr. A failed read keeps the prior verdict
+                      and names the read in the reason. Off by default, so the
+                      script stays offline.
+  --merged-pr-limit <n>
+                      Most merged PRs that listing reads, newest first.
+                      Default: 1000. A branch whose PR is older than that window
+                      stays unproven, and its reason says the listing was full.
   --path-key <value>  Print the path comparison key for <value> and exit. A
                       debug seam the test suite asserts the normalizer through.
 
@@ -153,6 +169,8 @@ REPO_DIR="."
 BASE_REF=""
 MERGED_REFS_FILE=""
 DO_PEERS=true
+USE_PR_PROOF=false
+MERGED_PR_LIMIT=1000
 EXPLICIT_TARGETS=()
 
 while [[ $# -gt 0 ]]; do
@@ -190,6 +208,16 @@ while [[ $# -gt 0 ]]; do
   --no-peers)
     DO_PEERS=false
     shift
+    ;;
+  --merged-pr-proof)
+    USE_PR_PROOF=true
+    shift
+    ;;
+  --merged-pr-limit)
+    [[ $# -ge 2 ]] || die "--merged-pr-limit requires a value"
+    [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "--merged-pr-limit must be a positive integer: $2"
+    MERGED_PR_LIMIT="$2"
+    shift 2
     ;;
   *) die "unknown argument: $1" ;;
   esac
@@ -351,15 +379,74 @@ resolve_base() {
 # equals the squash commit's, and still matches after the base advances. Both
 # verified in a fixture rather than assumed.
 patch_ids() {
-  local p="$1" range="$2" out="$3" patches="$WORKDIR/patches.$$" rc=0
+  local p="$1" range="$2" out="$3" patches="$WORKDIR/patches.$$" pairs="$WORKDIR/pairs.$$" rc=0
   : >"$out"
   git -C "$p" log -p --no-merges --no-color "$range" >"$patches" 2>/dev/null || rc=1
   # An empty stream is a legitimate empty range, so only a non-empty one is fed
   # to patch-id; $out stays truncated either way.
   if ((rc == 0)) && [[ -s "$patches" ]]; then
-    git patch-id --verbatim <"$patches" | cut -d' ' -f1 | sort >"$out" || rc=1
+    git patch-id --verbatim <"$patches" >"$pairs" || rc=1
+    cut -d' ' -f1 "$pairs" | sort >"$out"
   fi
-  rm -f "$patches"
+  rm -f "$patches" "$pairs"
+  return "$rc"
+}
+
+# extend_base_window <path> <sorted-commits>: make sure every commit listed in
+# <sorted-commits> has been through `git log -p | git patch-id --verbatim` once
+# in this run. Every worktree's base range ends at the same base tip, so the
+# ranges overlap almost entirely, and hashing each range separately would
+# recompute the same commits once per worktree.
+#
+# The window is two files: base-window.pairs holds `<patch-id> <commit>` lines,
+# and base-window.seen holds every commit already rendered, sorted, including the
+# ones that produced no patch (an empty commit), so those are not rendered again
+# for each worktree either. Keyed by commit alone: a commit SHA fixes its
+# parent and tree, so it fixes the diff, and the id holds for every worktree
+# that renders diffs alike. The rendered text also follows the rendering
+# worktree's attributes and diff config (a `-diff` or textconv attribute,
+# `diff.algorithm`), so a worktree that renders differently can miss a base
+# match it would otherwise find. A missed match only falls through to the
+# two-dot check, the fail-closed direction; it never adds a match.
+#
+# Only a fully successful render is added. A failed `log` or `patch-id` adds
+# nothing, so the commits stay unseen and the caller reports the failure.
+extend_base_window() {
+  local p="$1" needed="$2" seen="$WORKDIR/base-window.seen" pairs="$WORKDIR/base-window.pairs"
+  local missing="$WORKDIR/base-window.missing" patches="$WORKDIR/base-window.patches"
+  local new="$WORKDIR/base-window.new" rc=0
+  [[ -f "$seen" ]] || : >"$seen"
+  [[ -f "$pairs" ]] || : >"$pairs"
+  : >"$new"
+  comm -23 "$needed" "$seen" >"$missing" 2>/dev/null || rc=1
+  if ((rc == 0)) && [[ -s "$missing" ]]; then
+    git -C "$p" log -p --no-merges --no-color --no-walk --stdin <"$missing" >"$patches" 2>/dev/null || rc=1
+    if ((rc == 0)) && [[ -s "$patches" ]]; then
+      git patch-id --verbatim <"$patches" >"$new" || rc=1
+    fi
+    # A commit marked seen whose pair failed to append is a short base set,
+    # which the caller's count check names; the reverse order could hash a
+    # commit twice.
+    if ((rc == 0)); then
+      { sort -m "$seen" "$missing" >"$seen.next" && mv "$seen.next" "$seen" && cat "$new" >>"$pairs"; } || rc=1
+    fi
+  fi
+  rm -f "$missing" "$patches" "$new" "$seen.next"
+  return "$rc"
+}
+
+# only_empty_commits_unhashed <path> <range> <hashed-commits>: succeed when every
+# non-merge commit in <range> that patch-id did not hash has an empty diff. Such a
+# commit has no patch to hash, so it cannot be a rendering failure.
+only_empty_commits_unhashed() {
+  local p="$1" range="$2" hashed="$3" all="$WORKDIR/range-commits.$$" c rc=0
+  git -C "$p" rev-list --no-merges "$range" 2>/dev/null | sort >"$all" || rc=1
+  if ((rc == 0)); then
+    while read -r c; do
+      git -C "$p" diff-tree --quiet --root --no-commit-id -r "$c" 2>/dev/null || { rc=1; break; }
+    done < <(comm -23 "$all" "$hashed")
+  fi
+  rm -f "$all"
   return "$rc"
 }
 
@@ -411,35 +498,38 @@ classify_landed() {
     return 0
   fi
 
-  # Base side. Memoized per (merge-base, base-tip): every sibling worktree of the
-  # same repository sharing that pair reuses the set, and it is the step that
-  # dominates the run.
-  base_ids="$WORKDIR/base.$mb.$base_sha"
-  if [[ ! -f "$base_ids" ]]; then
-    local base_expected
-    base_expected=$(git -C "$p" rev-list --count --no-merges "$mb..$base_sha" 2>/dev/null) || base_expected=""
-    if [[ -z "$base_expected" ]]; then
-      L_REASON="base-range-unreadable"
-      return 0
-    fi
-    if ! patch_ids "$p" "$mb..$base_sha" "$base_ids"; then
-      rm -f "$base_ids"
-      L_REASON="base-patchid-failed"
-      return 0
-    fi
-    # Count parity, the same check the branch side makes. An under-complete base
-    # set can only make a match LESS likely, so this cannot be the difference
-    # between `yes` and `no` today — it is here so the two sides cannot silently
-    # diverge if either is ever refactored, and so a base range that failed to
-    # render is named rather than quietly narrowing the id set it is compared
-    # against.
-    local base_count
-    base_count=$(wc -l <"$base_ids" | tr -d '[:space:]')
-    if [[ "$base_count" -ne "$base_expected" ]]; then
-      rm -f "$base_ids"
-      L_REASON="base-patchid-incomplete-$base_count-of-$base_expected-commits"
-      return 0
-    fi
+  # Base side, the step that dominates the run: a worktree far behind the base
+  # has thousands of commits in mb..base. Each commit is hashed once per run into
+  # the shared window (extend_base_window), and this worktree's set is the
+  # window's entries whose commit is in its own mb..base.
+  local base_commits="$WORKDIR/base.range" base_pairs="$WORKDIR/base.pairs" base_expected base_count
+  base_ids="$WORKDIR/base.ids"
+  if ! git -C "$p" rev-list --no-merges "$mb..$base_sha" >"$base_commits.raw" 2>/dev/null ||
+    ! sort "$base_commits.raw" >"$base_commits"; then
+    L_REASON="base-range-unreadable"
+    return 0
+  fi
+  base_expected=$(wc -l <"$base_commits" | tr -d '[:space:]')
+  if ! extend_base_window "$p" "$base_commits" ||
+    ! awk 'FILENAME == ARGV[1] { want[$1] = 1; next } ($2 in want)' \
+      "$base_commits" "$WORKDIR/base-window.pairs" >"$base_pairs"; then
+    L_REASON="base-patchid-failed"
+    return 0
+  fi
+  cut -d' ' -f1 "$base_pairs" | sort >"$base_ids"
+  cut -d' ' -f2 "$base_pairs" | sort >"$base_ids.commits"
+  # Count parity, the same check the branch side makes. An under-complete base
+  # set can only make a match LESS likely, so this cannot be the difference
+  # between `yes` and `no` today — it is here so the two sides cannot silently
+  # diverge if either is ever refactored, and so a base range that failed to
+  # render is named rather than quietly narrowing the id set it is compared
+  # against. An empty commit on the base (an empty squash merge) has no patch,
+  # so it is excused only after diff-tree shows its diff really is empty.
+  base_count=$(wc -l <"$base_ids" | tr -d '[:space:]')
+  if [[ "$base_count" -ne "$base_expected" ]] &&
+    ! only_empty_commits_unhashed "$p" "$mb..$base_sha" "$base_ids.commits"; then
+    L_REASON="base-patchid-incomplete-$base_count-of-$base_expected-commits"
+    return 0
   fi
 
   # Branch side. The COMPLETENESS check runs before any verdict, because both
@@ -568,6 +658,143 @@ classify_landed() {
   L_STATE="no"
   L_METHOD="two-dot"
   L_REASON="head-differs-from-base-on-${#specs[@]}-touched-path(s)"
+}
+
+GH_CALLS=0
+MP_KEYS=()
+MP_ERRS=()
+MP_FILE=""
+MP_ERR=""
+
+# merged_pr_listing <path> <base-name>: point MP_FILE at the merged PRs into
+# <base-name> for <path>'s repository, as `pr <head-ref> <base-ref>`, `head <oid>`
+# and `commit <oid>` lines. The first call for a repository and base runs one
+# `gh pr list`; later calls reuse its file, so N worktrees cost one listing, not
+# N reads. The repository is keyed by its common git dir, which every linked
+# worktree shares. A failed read is cached as well, so a rate-limited listing is
+# not retried once per worktree. Returns 1 with MP_ERR naming the failure.
+merged_pr_listing() {
+  local p="$1" base_name="$2" repo key i err
+  MP_FILE=""
+  MP_ERR=""
+  # `CDPATH=` keeps a relative `.git` from resolving through the caller's CDPATH.
+  repo=$(cd "$p" 2>/dev/null && common=$(git rev-parse --git-common-dir 2>/dev/null) &&
+    CDPATH='' cd -- "$common" 2>/dev/null && pwd -P) || repo=""
+  key="${repo:-$p}|$base_name"
+  for ((i = 0; i < ${#MP_KEYS[@]}; i++)); do
+    if [[ "${MP_KEYS[$i]}" == "$key" ]]; then
+      MP_FILE="$WORKDIR/merged-prs.$i"
+      MP_ERR="${MP_ERRS[$i]}"
+      [[ -z "$MP_ERR" ]]
+      return
+    fi
+  done
+  i=${#MP_KEYS[@]}
+  MP_FILE="$WORKDIR/merged-prs.$i"
+  GH_CALLS=$((GH_CALLS + 1))
+  if ! (cd "$p" && gh pr list --state merged --base "$base_name" --limit "$MERGED_PR_LIMIT" \
+    --json headRefName,headRefOid,baseRefName,commits \
+    --jq '.[] | "pr " + .headRefName + " " + .baseRefName, "head " + .headRefOid, (.commits[] | "commit " + .oid)') >"$MP_FILE" 2>"$MP_FILE.err"; then
+    # Name gh's own error so a failed run states its cause; tabs and semicolons
+    # would break the record's columns and reason list.
+    err=$(head -n 1 "$MP_FILE.err" | tr '\t;' '  ' | cut -c1-120)
+    MP_ERR="gh-pr-list${err:+ ($err)}"
+  fi
+  MP_KEYS+=("$key")
+  MP_ERRS+=("$MP_ERR")
+  [[ -z "$MP_ERR" ]]
+}
+
+# merged_pr_proof <path> <branch>: affirmative proof from the branch's MERGED pull
+# request, for a row the content probes left `no` or `?`. Sets L_STATE, L_METHOD
+# and L_REASON; returns 0 only when it proved the branch landed.
+#
+# Range patch-id cannot match a multi-commit branch to its squash commit, and
+# `git cherry` calls each part `+`; the merged PR is the one record that names
+# what was merged. Landed when local HEAD equals or is an ancestor of the PR's
+# head commit, or every unpushed local commit is in the PR's commit list. A later
+# local commit that is in neither stays unproven, which is what keeps a reused
+# branch name from reading as landed.
+#
+# Any failed read leaves the prior verdict and appends a reason naming the read:
+# an unreadable PR is `unproven`, never `landed`.
+merged_pr_proof() {
+  local p="$1" branch="$2" out="$WORKDIR/merged-pr.out" head_oid unpushed_list sha
+  local -a pr_heads=()
+  local commits_file="$WORKDIR/merged-pr.commits" kind val
+  : >"$commits_file"
+  if ! command -v gh >/dev/null 2>&1; then
+    L_REASON="${L_REASON:+$L_REASON; }merged-pr-read-failed:gh-not-found"
+    return 1
+  fi
+  # Only a PR merged INTO the resolved base proves anything: a stacked PR merged
+  # into another feature branch never reached the base.
+  local base_name="${L_BASE%@*}"
+  base_name="${base_name#*/}"
+  if [[ -z "$L_BASE" || -z "$base_name" ]]; then
+    L_REASON="${L_REASON:+$L_REASON; }merged-pr-read-failed:no-resolved-base"
+    return 1
+  fi
+  if ! merged_pr_listing "$p" "$base_name"; then
+    L_REASON="${L_REASON:+$L_REASON; }merged-pr-read-failed:$MP_ERR"
+    return 1
+  fi
+  # This branch's PRs, as `pr <base-ref>` / `head` / `commit` lines. A ref name
+  # holds no whitespace, so the default field split reads it whole. The `""`
+  # forces a string compare, so branch `1.0` never matches a PR from branch `1`.
+  if ! awk -v b="$branch" '$1 == "pr" { keep = ($2 "" == b ""); if (keep) print "pr " $3; next } keep' \
+    "$MP_FILE" >"$out"; then
+    L_REASON="${L_REASON:+$L_REASON; }merged-pr-read-failed:branch-filter"
+    return 1
+  fi
+  local in_base=false
+  while read -r kind val; do
+    case "$kind" in
+    pr)
+      in_base=false
+      if [[ "$val" == "$base_name" ]]; then in_base=true; fi
+      ;;
+    head) [[ "$in_base" == "true" ]] && pr_heads+=("$val") ;;
+    commit) [[ "$in_base" == "true" ]] && printf '%s\n' "$val" >>"$commits_file" ;;
+    *) ;;
+    esac
+  done <"$out"
+  if [[ ${#pr_heads[@]} -eq 0 ]]; then
+    # A full listing may have cut off an older PR for this branch, so say so.
+    local window=""
+    if [[ "$(grep -c '^pr ' "$MP_FILE")" -ge "$MERGED_PR_LIMIT" ]]; then
+      window="-in-newest-$MERGED_PR_LIMIT"
+    fi
+    L_REASON="${L_REASON:+$L_REASON; }no-merged-pr-into-$base_name-for-branch$window"
+    return 1
+  fi
+
+  for head_oid in "${pr_heads[@]}"; do
+    # Exit 1 is "not an ancestor"; any other status (the PR head was never
+    # fetched, so the object is absent) proves nothing and is not an error.
+    if git -C "$p" merge-base --is-ancestor HEAD "$head_oid" 2>/dev/null; then
+      L_STATE="yes"
+      L_METHOD="merged-pr-head"
+      L_REASON="head-is-ancestor-of-merged-pr-head"
+      return 0
+    fi
+  done
+
+  if ! unpushed_list=$(git -C "$p" rev-list HEAD --not --remotes 2>/dev/null) || [[ -z "$unpushed_list" ]]; then
+    L_REASON="${L_REASON:+$L_REASON; }merged-pr-read-failed:local-commit-list"
+    return 1
+  fi
+  while read -r sha; do
+    [[ -z "$sha" ]] && continue
+    if ! grep -Fxq "$sha" "$commits_file"; then
+      L_REASON="${L_REASON:+$L_REASON; }local-commits-not-all-in-merged-pr"
+      return 1
+    fi
+  done <<<"$unpushed_list"
+  L_STATE="yes"
+  L_METHOD="merged-pr-commits"
+  L_REASON="every-unpushed-commit-in-merged-pr"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -740,6 +967,9 @@ for ((idx = 0; idx < ${#T_PATH[@]}; idx++)); do
     reason="nothing-unpushed"
   else
     classify_landed "$p"
+    if [[ "$USE_PR_PROOF" == "true" && "$L_STATE" != "yes" && "${T_BRANCH[$idx]}" != "(detached)" ]]; then
+      merged_pr_proof "$p" "${T_BRANCH[$idx]}" || true
+    fi
     R_LANDED+=("$L_STATE")
     R_METHOD+=("$L_METHOD")
     R_BASE+=("$L_BASE")
@@ -765,6 +995,10 @@ for ((idx = 0; idx < ${#T_PATH[@]}; idx++)); do
   fi
   R_REASON+=("$reason")
 done
+
+if [[ "$USE_PR_PROOF" == "true" ]]; then
+  printf '%s: merged-pr-proof made %s gh call(s)\n' "$PROG" "$GH_CALLS" >&2
+fi
 
 assert_row_count "${#T_PATH[@]}" "${#R_LANDED[@]}" || exit 5
 

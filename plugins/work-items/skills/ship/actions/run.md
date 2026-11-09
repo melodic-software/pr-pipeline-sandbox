@@ -21,6 +21,11 @@ One container per run. A topic slug resolves the container the way SKILL.md Step
 landing on the default branch. Invoked from a loop, a lane, a scheduled or background session, or
 any run with no human to answer, STOP before any claim and report that `run` is attended only.
 
+## Requires the implementation plugin
+
+`run` hands every item to `/implementation:implement-dispatch`. When the `implementation` plugin
+is not installed, STOP before any claim and tell the user to install it; `run` has no other route.
+
 ## Workflow
 
 1. **Resolve and read.** SKILL.md Steps 1 to 3: the container, its rollup and container-scoped
@@ -78,24 +83,27 @@ any run with no human to answer, STOP before any claim and report that `run` is 
    next starts, renewing the remaining leases before each:
    - **`integration branch → single PR`.** In a worktree checked out on the integration branch,
      never the main checkout: pull, merge the item branch, run the project's build and test gate,
-     and push. A merge conflict goes to `/source-control:resolve-conflicts`. Then close the item
+     and push. Resolve a merge conflict the way `/source-control:pull-request ready` resolves its
+     base merge: both sides' intent first, both changes composed. Then close the item
      through `/work-items:track done` with a summary naming the branch: the checkpoint. No
      per-item PR.
    - **`per-item PRs`.** Each accepted item has a pull request against the default branch; open a
-     missing one with `/source-control:pull-request create --pushed --worktree <path>`. Before
-     `ready`, carry the item's human-merge hold into the PR body exactly as `/work-items:work`'s
-     open-the-PR step does with `${CLAUDE_PLUGIN_ROOT}/scripts/merge-hold.sh`. **Then ready
-     it:** right after `create --pushed`, unless the consuming project's instructions reserve the
-     ready flip for a person, dispatch `/source-control:pull-request ready` into the item's worktree,
-     at the strong tier's current alias resolved per the loop-lane convention's capability tiers,
-     never this session's inherited model. `ready` resolves the PR from the branch checked out there,
-     so the brief names the PR number `create --pushed` returned and the dispatched agent stops when
-     `ready` resolves a different one. The strong tier fits because `ready` merges the base, runs the
-     code and security reviews, verifies the merged head, and only then flips the draft. When `ready`
-     refuses (a hold, a superseded item, a failed gate), the PR stays a draft: carry the reason it
-     reported into the report, and never lift the hold or flip the PR another way. When the user says
+     missing one with `/source-control:pull-request create --pushed --worktree <path>`, reading
+     the item's human-merge hold with `${CLAUDE_PLUGIN_ROOT}/scripts/merge-hold.sh` before it, as
+     `/work-items:work`'s open-the-PR step does: exit `0` passes the printed line as `--hold`, so
+     the PR opens with it before any flip; any exit other than `0` or `1` passes
+     `--draft 'merge hold unread'`. Pass `--draft 'ready flip reserved for a person'` when the
+     consuming project's instructions reserve the ready flip for a person. When the open state
+     resolves `ready`, `create --pushed` runs
+     `ready --unattended` itself (it updates the branch from its base, runs the code and security reviews,
+     verifies the updated head, then flips), so the run dispatches no `ready` of its own; run
+     `create --pushed` at the strong tier's current alias, dispatching it at that tier when this
+     session runs below it. When
+     `create --pushed` reports the PR left a draft (a `draft` open state, a requested draft, or a
+     `ready` refusal: a hold, a superseded item, a failed gate), carry the reason it reported
+     into the report, and never lift the hold or flip the PR another way. When the user says
      to land it, take it through `ready` again (on a PR already out of draft it refreshes the base
-     and re-runs the reviews and the verify gate on the merged head, without flipping again) and then
+     and re-runs the reviews and the verify gate on the updated head, without flipping again) and then
      `merge`; both keep their own gates and holds. The PR's closing keyword closes the item. Only
      then start the next PR, which landing the previous one may have made stale.
 

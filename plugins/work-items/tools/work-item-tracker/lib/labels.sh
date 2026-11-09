@@ -17,7 +17,7 @@ readonly WIT_DEFAULT_RECURRING_MAINTENANCE_LABEL="recurring"
 # config.role_labels["owner-decision"]; a remap replaces this entry in the hold
 # label defaults below (lib/binding.sh).
 # shellcheck disable=SC2034
-readonly WIT_DEFAULT_OWNER_DECISION_LABEL="status: needs-decision"
+readonly WIT_DEFAULT_OWNER_DECISION_LABEL="needs-owner-decision"
 # Container marker (CONTRACT.md "Containers and state"): not a canonical role, but
 # remapped the same way through binding config.container_label.
 # shellcheck disable=SC2034
@@ -29,20 +29,8 @@ readonly WIT_DEFAULT_CONTAINER_LABEL="work-map"
 # shellcheck disable=SC2034
 readonly WIT_WAYFIND_LABEL_PREFIX="wayfind:"
 
-# Human-floor work class: human-gated even beside the autonomous-eligible label
-# (reference/work-class-labels.md). Fixed string; the work-class axis has no binding key.
-# No work class floors an item now; the one entry is the legacy name of the
-# untrusted-provenance marker, held until the label source drops it. Skills name
-# it as WIT_LEGACY_UNTRUSTED_LABEL rather than restating the string.
-# shellcheck disable=SC2034
-readonly WIT_LEGACY_UNTRUSTED_LABEL="work-class: untrusted-provenance" # legacy name of provenance: untrusted
-# shellcheck disable=SC2034
-readonly WIT_HUMAN_FLOOR_WORK_CLASS_LABELS=(
-  "$WIT_LEGACY_UNTRUSTED_LABEL"
-)
-
-# The human floor holds provenance labels as well as work classes: an item marked
-# untrusted, or filed from a signal, is C5 whatever its work-class label says.
+# The human floor holds provenance labels (reference/work-class-labels.md): an item
+# marked untrusted, or filed from a signal, is C5 whatever its work-class label says.
 # shellcheck disable=SC2034
 readonly WIT_HUMAN_FLOOR_PROVENANCE_LABELS=(
   "provenance: untrusted"
@@ -55,7 +43,7 @@ readonly WIT_HUMAN_FLOOR_PROVENANCE_LABELS=(
 # shellcheck disable=SC2034
 readonly WIT_HUMAN_FLOOR_STATUS_LABELS=(
   "$WIT_DEFAULT_OWNER_DECISION_LABEL"
-  "status: needs-info"
+  "needs-reporter-info"
   "needs-spec"
 )
 
@@ -71,15 +59,13 @@ readonly WIT_HUMAN_FLOOR_STATUS_STATES=(
 )
 
 # The labels of those states. An item carrying one already has its hold decided by
-# its labels, so the field adds none (needs-owner-decision floors only through the
-# field's hold, never through its bare label, as before the field was read).
+# its labels, so the field adds none.
 # Defaults of binding config.hold_state_labels.
 # shellcheck disable=SC2034
 readonly WIT_HOLD_STATE_LABELS=(
   "needs-human"
   "$WIT_DEFAULT_OWNER_DECISION_LABEL"
-  "needs-owner-decision"
-  "status: needs-info"
+  "needs-reporter-info"
   "needs-spec"
 )
 

@@ -10,8 +10,9 @@ Detect stale claims, orphaned recurring entries, and label hygiene issues.
 
 ## Checks
 
-Before any tracker read, resolve `recurring-maintenance` from `.work-item-tracker.json`
-`config.role_labels`, using `recurring` when the file or entry is absent (the documented default,
+Before any tracker read, resolve `recurring-maintenance` from `config.role_labels` of the binding
+the seam resolves (the `tracker` mapping of `<home>/work-items.yaml`, else the legacy repo-root
+JSON binding), using `recurring` when the file or entry is absent (the documented default,
 no warning). Stop on a malformed, empty, or non-string configured value. Keep the resolved string
 for every recurring-item query and comparison in this audit.
 
@@ -39,13 +40,16 @@ Entries in `.github/recurring-schedule.json` with no corresponding open or recen
 SCHEDULE="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/.github/recurring-schedule.json"
 if [[ -f "$SCHEDULE" ]]; then
   jq -r --arg today "$(date +%Y-%m-%d)" \
-    '.items[] | select(.next_due != null and .next_due <= $today) | .title' "$SCHEDULE"
+    '.items[] | select(.next_due != null and .next_due <= $today) | .id' "$SCHEDULE"
 fi
 ```
 
-List open recurring items (adapter: "List items", `--label <resolved recurring-maintenance label>`,
-`--state all`, bare read) and cross-reference: schedule items without a matching item are orphaned.
-The recurring workflow titles items `[Maintenance] {title}`, so strip the prefix when comparing.
+List recurring items (adapter: "List items", `--label <resolved recurring-maintenance label>`,
+`--state all`, with bodies, bare read) and cross-reference by each body's
+`<!-- recurring-schedule id=<id> -->` line, never by title
+([`reference/issue-conventions.md`](../../../reference/issue-conventions.md)
+"Recurring marker"): schedule ids no item's marker names are orphaned. Report a labeled item with
+no marker as unlinked.
 
 ### 3. Unlabeled items + label conflicts
 

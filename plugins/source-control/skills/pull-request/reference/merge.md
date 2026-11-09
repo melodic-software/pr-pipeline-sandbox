@@ -4,7 +4,7 @@
 
 Resolve `<pr_number>` from the checked-out branch ([GitHub](../../../reference/providers/github/README.md#resolve-a-pull-request)). Pass it explicitly to every forge call in this phase.
 
-**Re-run full [readiness checklist](readiness.md) before merge execution.** This is the second run (first was in monitor 3.4). Catches late-arriving comments, status changes between monitor completion and merge, and race condition where a comment-only actor posts after readiness was declared.
+**Re-run full [readiness checklist](readiness.md) before merge execution.** This second run (the first was in monitor 3.4) catches late comments, status changes since monitor completed, and a comment-only actor posting after readiness was declared.
 
 Re-check all check runs for any state changes, then re-check for new comments since monitoring completed, reading the authors on all 3 comment surfaces, paginated ([GitHub](../../../reference/providers/github/pull-request/merge.md#re-check-checks-and-comments-before-merge)).
 
@@ -27,8 +27,14 @@ Re-check all check runs for any state changes, then re-check for new comments si
    ([GitHub](../../../reference/providers/github/pull-request/merge.md#stale-base-guard)). Capture
    that `headRefOid` as `HEAD_SHA` here: it is the head every later step in this phase pins to, so
    a push after this point holds the merge instead of riding along. If
-   `behind_by > 0`, update the branch (merge-forward, or the forge's update-branch) and re-run
-   readiness; do **not** squash-merge a behind head. Under a non-strict ruleset, GitHub can
+   `behind_by > 0`, run [Decide and carry out the update](ready-for-review.md#decide-and-carry-out-the-update)
+   without its step 1: a local commit the PR lacks is a `hold` at this gate, not a push. On `none`
+   go on with `HEAD_SHA` as pinned when the decision's `head_sha` equals it; when they differ the
+   head moved, so re-run readiness. After an update or a request to the manager, re-run readiness
+   on the new head. On `hold`, do **not** squash-merge a behind head.
+   When the base uses a merge queue
+   ([GitHub](../../../reference/providers/github/pull-request/merge.md#behind-branch-exceptions)),
+   skip the decision and enqueue. Under a non-strict ruleset, GitHub can
    still report `CLEAN` while the head is behind, and a stale-base squash can silently revert
    recently-landed fixes (the tests travel with the reverted code, so CI stays green). `CLEAN` also
    says nothing about which base CI tested: GitHub regenerates the test merge commit only on a
@@ -39,17 +45,26 @@ Re-check all check runs for any state changes, then re-check for new comments si
    consuming repo runs an overlapping-path CI gate, treat it as the tripwire; it covers the
    stale-**base** class only, and only a post-merge silent-revert detector catches a head that is
    current in history but stale in content. A consuming repo may have neither.
-3. **Comprehension quiz (default-on, self-enforced).** When the PR carries substantial work the user didn't author line-by-line (multi-file feature/refactor, or a long agent session outran the user's reading), generate a self-contained HTML change report + quiz before asking for merge approval: the report explains the change with context and intuition (what was done, why, which existing code paths it leans on); the quiz at the bottom tests exactly that. The user merges after passing, self-enforced with no tooling gate; "skip quiz" skips it explicitly. Exemption is calibrated by size and blast radius, NOT by file type: exempt only diffs the user can genuinely review at a glance (single-file, mechanical, or a handful of small localized edits). A large multi-file instruction-only change (skills, rules, agent instructions from a long session) gets the quiz even though it is docs-only: instruction surfaces steer future agent behavior, so unread changes there carry real blast radius
-4. Wait for user approval, since merge is an irreversible action, unless the PR qualifies for
+3. **Comprehension quiz (default-on, self-enforced).** When the PR carries substantial work the user didn't author line-by-line (multi-file feature/refactor, or a long agent session outran the user's reading), generate a self-contained HTML change report + quiz before asking for merge approval: the report explains the change with context and intuition (what was done, why, which existing code paths it leans on); the quiz at the bottom tests exactly that. The user merges after passing, self-enforced with no tooling gate; "skip quiz" skips it explicitly. Exempt by size and blast radius, NOT file type: only diffs the user can review at a glance (single-file, mechanical, or a handful of small localized edits). A large multi-file instruction-only change (skills, rules, agent instructions from a long session) still gets the quiz: instruction surfaces steer future agent behavior, so unread changes there carry real blast radius
+4. Wait for user approval (merge is irreversible) unless the PR qualifies for
    the merge after AI review under §4.2.1
 
 ## 4.2 Squash merge
 
 Default merge mode is squash: one squashed commit per PR onto the default branch. Follow the consuming project's convention when it differs (merge commit / rebase-merge).
 
-Every merge call in 4.2 pins to the `HEAD_SHA` captured in 4.1 step 2, so a push after approval
-fails the merge instead of landing unreviewed. Before any merge call, poll the PR's merge state at
-the pinned head while it reads `UNKNOWN`, and merge or enqueue only once it reads `CLEAN`; any
+Merge with the forge's plain merge command, with the PR number and repository written literally
+and the flags the repository needs ([GitHub](../../../reference/providers/github/pull-request/merge.md#merge-command)).
+Pinning it to the `HEAD_SHA` captured in 4.1 step 2 (`--match-head-commit`) is optional for an
+immediate merge and required with `--auto`; an armed auto-merge is always reported. Before pushing
+to a PR with auto-merge armed, disarm it, and re-arm it only after the reviews pass on the new head
+([GitHub](../../../reference/providers/github/pull-request/merge.md#merge-command)). What the pin
+covers, and what it does not after arming:
+[GitHub](../../../reference/providers/github/pull-request/merge.md#merge-command). The repository's rules, required checks and the merge guard hook are the
+gate: a merge the forge or the permission layer refuses is reported with its error text and the
+session moves on to other work, never handed to the user as a command to run and never retried in
+another shape. Before any merge call, poll the PR's merge state at
+the pinned head over REST every 60 seconds while it reads `UNKNOWN`, and merge or enqueue only once it reads `CLEAN`; any
 other state, or a moved head, is a hold to report
 ([GitHub](../../../reference/providers/github/pull-request/merge.md#wait-for-a-known-merge-state)).
 
@@ -73,13 +88,12 @@ poll until it reads `merged`, `enqueued`, or `failed`. `enqueued` means queued, 
 the head branch only once the PR reads `MERGED`. GitHub checks only basic PR state when it accepts
 the request and applies the base's rules when the merge runs, so 4.1 still comes first.
 
-**Always use the explicit `<pr_number>` resolved at phase entry.** The PR title becomes the squash commit message. It is shaped to satisfy the resolved subject/title convention, per pull-request SKILL.md's "PR title format" ladder (Conventional Commits by default).
+**Always use the explicit `<pr_number>` resolved at phase entry.** The PR title becomes the squash commit message, shaped to the resolved subject/title convention per pull-request SKILL.md's "PR title format" ladder (Conventional Commits by default).
 
 ### 4.2.1 Merge after AI review
 
 Merge or enqueue without asking only when every condition below holds; otherwise 4.1 step 4 waits
-for the user. Never arm auto-merge (`--auto`): the AI review checks are not required checks, so
-after arming, a push by anyone with write access would merge the new head on `ci-status` alone.
+for the user.
 
 - The repository is in the melodic-software organization and the live ruleset for the base branch
   requires the `ci-status` status check (both asserted in the merge script below).
@@ -89,7 +103,8 @@ after arming, a push by anyone with write access would merge the new head on `ci
   configuration (settings, autoMode, hooks, `CLAUDE.md`, `AGENTS.md`, `.claude/`) and no
   deployment path, unless the user named it in this session.
 - On the head commit you pin, the PR reads `CLEAN` and both AI review lanes have completed with
-  success, matched by exact check name: `pr-review / claude-review-status`, and for security
+  success, matched by exact check name: `pr-review / review-status` or
+  `pr-review / claude-review-status`, and for security `pr-review-security / review-status`,
   `pr-review-security / security-review`, its legacy caller `security-review / security-review`, or
   `claude-security-review-status` (the names `babysit_merge.py` accepts). A missing, running,
   skipped or failed review check holds. The Codex review posts review threads, not a check run,
@@ -105,13 +120,16 @@ melodic-software, the base branch's live rules require `ci-status`, every check 
 head was read (the count matches the reported total) and both AI review lanes, matched by the exact
 names above, completed with success, and the PR reads `CLEAN` at the pinned head (it polls while
 the merge state reads `UNKNOWN`, as in 4.2). Only then does it
-merge, pinned to that head with `--match-head-commit`.
+print the pinned head and the merge mode. Then run the merge command per 4.2 as its own command; a
+refusal is reported and the session moves on, as in 4.2.
 
 Behind a merge queue (claude-code-plugins) the queue sets the strategy, so pass no strategy flag.
-Never pass `--auto`,
-`--admin`, `--merge`/`-m` or `--rebase`/`-r`. Confirm queue entry per
-[4.2.2](#422-confirm-queue-entry), then poll the PR's state and merge-queue membership every 30
-seconds until it reads `MERGED` or leaves the queue unmerged (run the loop in the background or under
+Pass `--auto` only on a merge-queue or auto-merge base, always pinned to `HEAD_SHA`, and `--admin` only where a code-owner
+review or merge queue blocks an otherwise ready merge and the consumer's policy allows an admin
+merge for the repository. Confirm queue entry per
+[4.2.2](#422-confirm-queue-entry), then poll the PR's state over REST every 60
+seconds, reading queue membership once when that read changes, until it reads `MERGED` or leaves
+the queue unmerged (run the loop in the background or under
 a monitor; [GitHub](../../../reference/providers/github/pull-request/merge.md#poll-the-merge-queue)).
 
 A PR that leaves the queue unmerged is reported to the user, not re-enqueued, and 4.3 does not run.
@@ -133,7 +151,7 @@ Run the confirm read
 the PR's state, queue membership, merge state, head and auto-merge request, polling while the merge
 state reads `UNKNOWN`. Merged or queued is reported as such. Open, not queued and `CLEAN` at
 `HEAD_SHA`: it prints the PR's node id to enqueue. Any other state, or a moved head, is a hold that
-prints the state. An armed auto-merge is reported, since 4.2.1 never arms it.
+prints the state. An armed auto-merge is reported; 4.2 arms one only pinned to `HEAD_SHA`.
 
 To enqueue, run the enqueue call once as its own command, with the printed node id and `HEAD_SHA`
 written in as literal values rather than a variable or command substitution, pinned to that head,
@@ -144,8 +162,7 @@ A non-zero exit from the read or the enqueue call is a hold: report the printed 
 "A conversation must be resolved" names the blocker), do not retry the enqueue, and 4.3 does not
 run. One exception: when the error says the PR is already queued, the merge call won the race;
 re-run the script once, and a `queued` read is the result. A hold with auto-merge armed also tells
-the user that a later push could merge on `ci-status` alone (4.2.1's reason for never arming it)
-and offers disarming auto-merge as their option; this phase does not disarm it. Never jump the
+the user that a later push could merge on `ci-status` alone and offers disarming auto-merge as their option; this phase does not disarm it. Never jump the
 queue. Only `queued` moves on to the poll in 4.2.1; `merged` moves on to 4.3.
 
 ## 4.3 Worktree transition and next-task setup
@@ -156,7 +173,7 @@ Detect if currently in a worktree (`git worktree list`).
 
 **If in a worktree (primary pattern, worktree reuse):**
 
-Reuse the worktree for next task by creating a new branch from the latest default branch. Faster than remove+recreate and preserves gitignored files.
+Reuse the worktree for the next task by creating a new branch from the latest default branch: faster than remove+recreate, and it preserves gitignored files.
 
 First set `DEFAULT_BRANCH` to the repository's default branch; not every repo uses main ([GitHub](../../../reference/providers/github/README.md#identity-and-repository)).
 
@@ -180,7 +197,7 @@ git branch -D <old-branch>
 
 If a stash was created, report it and tell the user to inspect it with `git stash list` and restore it on an appropriate branch with `git stash pop`. Then report the transition and suggest `/clear` for fresh conversation context (`/clear` fires any SessionStart hooks the project registers). Use `-D` not `-d` because squash merge changes the commit SHA.
 
-Worktree reuse (new branch from latest default branch in the same directory) is faster than leave+recreate and preserves gitignored files; the alternative is `ExitWorktree` with `action: "keep"` (never `"remove"`) + a fresh `EnterWorktree` for a clean slate.
+The alternative to worktree reuse is `ExitWorktree` with `action: "keep"` (never `"remove"`) + a fresh `EnterWorktree` for a clean slate.
 
 The worktree's lock stays while it is reused for the next task. When the worktree is not reused (leaving it with `ExitWorktree`), release the lock after the merge succeeds, so later cleanup does not find a lock nobody holds:
 
@@ -192,7 +209,7 @@ bash "<scripts-dir>/worktree-claim.sh" release <worktree-path> --session-id "${C
 
 **If on a regular branch (not in worktree):**
 
-1. **Check for uncommitted changes BEFORE checkout** with `git status --porcelain`. If uncommitted changes exist, they will be lost on the default-branch checkout (conflicting changes fail, non-conflicting changes silently carry over, neither desirable). Stash first: `git stash push -u -m "pre-merge-cleanup: <branch-name>"` (`-u` includes untracked files, since without it new files are silently skipped). Stashes survive branch deletion (stored in `.git/refs/stash`, not tied to branches)
+1. **Check for uncommitted changes BEFORE checkout** with `git status --porcelain`. If any exist, they do not survive the default-branch checkout intact (conflicting changes fail, non-conflicting ones silently carry over). Stash first: `git stash push -u -m "pre-merge-cleanup: <branch-name>"` (`-u` includes untracked files, which would otherwise be skipped). Stashes survive branch deletion (stored in `.git/refs/stash`, not tied to branches)
 2. `git checkout "$DEFAULT_BRANCH"` (the repository's default branch, resolved as in the worktree case above)
 3. `git pull --ff-only`
 4. `git branch -D <merged-branch>`
@@ -200,7 +217,7 @@ bash "<scripts-dir>/worktree-claim.sh" release <worktree-path> --session-id "${C
 
 ## 4.4 Run a session retrospective (optional)
 
-If your environment provides a retrospective skill (e.g. `/session-flow:retro`), invoke it via the Skill tool **after the worktree transition (worktree reuse) or after merge (non-worktree)**. With worktree reuse, `CLAUDE_PROJECT_DIR` stays valid because the worktree directory persists, so skills remain fully discoverable. If no such capability exists, skip this step.
+If your environment provides a retrospective skill (e.g. `/session-flow:retro`), invoke it via the Skill tool **after the worktree transition (worktree reuse) or after merge (non-worktree)**. With worktree reuse the directory persists, so `CLAUDE_PROJECT_DIR` and skill discovery stay valid. If no such capability exists, skip this step.
 
 If the user declines or says "skip", proceed to step 4.5. In `full` mode, run automatically without pausing.
 
@@ -216,7 +233,7 @@ git branch              # merged branch should be gone, new branch active
 
 **Post-merge CI health check.** Verify CI on main is green after the merge commit lands: read the conclusion and title of the latest CI run on `$DEFAULT_BRANCH` ([GitHub](../../../reference/providers/github/pull-request/merge.md#latest-run-on-the-default-branch)).
 
-If latest run shows `failure`, flag it immediately: the merge may have introduced a regression on main. If run is still `in_progress`, note it and suggest checking back.
+If the latest run shows `failure`, flag it immediately as a possible regression on main. If it is still `in_progress`, note it and suggest checking back.
 
 Report: merge complete, transition successful, state verified.
 

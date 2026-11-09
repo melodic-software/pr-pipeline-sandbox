@@ -1,15 +1,14 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { managedSettingsFiles, OptionsError, readOperatorOptions, resolveInstall } from "./operator-options.mjs";
-import { demotionIssue, FULL, GATE, github, issueItem, LANE, MECHANICAL, pr, REPO, shaOf, wfRun } from "./fixtures/publish-promotion-evidence/github-fake.mjs";
-import { collect } from "./publish-promotion-evidence.mjs";
-import { laneWritable } from "./resolve-promotion-evidence.mjs";
+import { laneWritable, OPTION_KEYS } from "./resolve-promotion-evidence.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CELLS = ["C2-auto-merge", "C3-auto-merge", "C3-ai-review-blocking"];
@@ -29,7 +28,7 @@ writeFileSync(surfaces.evidence, "[]");
 const config = join(base, "config");
 const installScripts = join(config, "plugins", "cache", "mkt", "source-control", "9.9.9", "skills", "babysit-loop", "scripts");
 mkdirSync(installScripts, { recursive: true });
-for (const name of ["resolve-promotion-evidence.mjs", "operator-options.mjs", "publish-promotion-evidence.mjs"]) copyFileSync(join(HERE, name), join(installScripts, name));
+for (const name of ["resolve-promotion-evidence.mjs", "operator-options.mjs"]) copyFileSync(join(HERE, name), join(installScripts, name));
 const HELPER = join(installScripts, "resolve-promotion-evidence.mjs");
 const userSettings = join(config, "settings.json");
 
@@ -232,12 +231,24 @@ process.stdout.write(${JSON.stringify(stdout)});
   return path;
 }
 
+// The publisher's sidecar for the evidence file as it reads now, generated `ageHours` ago.
+const sidecar = join(ops, "evidence.meta.json");
+function writeSidecar(ageHours = 0, overrides = {}) {
+  const sha256 = createHash("sha256").update(readFileSync(surfaces.evidence, "utf8")).digest("hex");
+  const generated_at = new Date(Date.now() - ageHours * 3_600_000).toISOString();
+  writeFileSync(sidecar, JSON.stringify({ generated_at, through: generated_at, sha256, prev_sha256: null, ...overrides }));
+  return generated_at;
+}
+const BOUND = { promotion_evidence_max_age_hours: "24" };
+const RESTART = { args: { "window-start": "2026-10-11T07:00:00Z" } };
+
 test("--window-start hands the checker a copy with one gate-failure per cell at that instant", cli, () => {
   const record = join(ops, "record.json");
   const prior = { cell: "C2-auto-merge", event: "reverted-merge", at: "2026-10-01T00:00:00Z" };
   writeFileSync(surfaces.evidence, JSON.stringify([prior]));
+  writeSidecar();
   try {
-    const result = runWith(recordingStub(GOOD_OUTPUT, record), {}, { args: { "window-start": "2026-10-11T07:00:00Z" } });
+    const result = runWith(recordingStub(GOOD_OUTPUT, record), BOUND, RESTART);
     assert.equal(result.failClosedReason, null);
     const seen = JSON.parse(readFileSync(record, "utf8"));
     assert.notEqual(seen.evidence, surfaces.evidence);
@@ -260,165 +271,6 @@ test("a missing, empty or malformed --window-start fails closed", cli, () => {
   assertFailClosed(JSON.parse(run.stdout), /usage: /);
 });
 
-// --- Inline mode: the publisher's GitHub reads fed straight to the checker ---
-
-const FAKE = join(HERE, "fixtures", "publish-promotion-evidence", "github-fake.mjs");
-const NOW = "2026-10-05T00:00:00Z";
-const daysBefore = (at, days) => new Date(Date.parse(at) - days * 86_400_000).toISOString();
-
-// A checker that demotes each cell some event in its --evidence names, so the verdict shows which
-// events reached it, whether read from a file or from stdin.
-const ECHO = join(ops, "echo-checker.mjs");
-writeFileSync(
-  ECHO,
-  `import { readFileSync } from "node:fs";
-const args = process.argv.slice(2);
-const source = args[args.indexOf("--evidence") + 1];
-const events = JSON.parse(readFileSync(source === "-" ? 0 : source, "utf8"));
-const lines = ["Security binding OK", "Effective promotion state (evaluation mode):"];
-for (const cell of ${JSON.stringify(CELLS)}) {
-  const hits = events.filter((e) => e.cell === cell).map((e) => e.event + " at " + e.at);
-  lines.push("- " + cell + ": bound promoted -> effective " + (hits.length ? "unpromoted (" + hits.join("; ") + ")" : "promoted"));
-}
-process.stdout.write(lines.join("\\n") + "\\n");
-`,
-);
-
-function bindingFile(ratifiedAt, name = `binding-${++stubCount}.json`) {
-  const path = join(ops, name);
-  const promotion_state = Object.fromEntries(CELLS.map((cell) => [cell, ratifiedAt === undefined ? { state: "promoted" } : { state: "promoted", ratified_at: ratifiedAt }]));
-  writeFileSync(path, JSON.stringify({ promotion_state }));
-  return path;
-}
-
-// Runs inline mode from the install copy through a wrapper that injects the clock and
-// the `gh` seam: the recorded GitHub over `fixture`, or a `gh api` that fails with `failWith`.
-function runInline({ binding, fixture = {}, failWith = null, now = NOW, extra = [], ghRepo = REPO }) {
-  seamCount += 1;
-  const wrapper = join(installScripts, `inline-seam-${seamCount}.mjs`);
-  writeFileSync(
-    wrapper,
-    `import { inline } from "./resolve-promotion-evidence.mjs";
-import { github } from ${JSON.stringify(FAKE)};
-import { ghFailure } from ${JSON.stringify(join(HERE, "publish-promotion-evidence.mjs"))};
-const failWith = ${JSON.stringify(failWith)};
-const gh = failWith === null ? github(${JSON.stringify(fixture)}) : (path, graphql) => ghFailure(path, graphql, "", failWith);
-await inline({ argv: process.argv.slice(2), gh, now: Date.parse(${JSON.stringify(now)}) });
-`,
-  );
-  const argv = ["--repo", REPO, "--binding", binding, "--checker", ECHO, "--probe-evidence-root", surfaces.root, "--lane-login", LANE, ...GATE.flatMap((g) => ["--gate-check", g]), ...extra];
-  const run = spawnSync(process.execPath, [wrapper, ...argv], { encoding: "utf8", cwd: checkout, env: { ...process.env, GITHUB_REPOSITORY: ghRepo } });
-  assert.equal(run.status, 0, run.stderr);
-  return JSON.parse(run.stdout);
-}
-
-// One autonomous C2 merge, then a red scheduled full run on a later commit containing it: the
-// publisher's post-merge gate counts that as a gate-failure on C2-auto-merge only.
-const TIP = shaOf(0xa001);
-const RED_C2 = {
-  pulls: [pr(1301, "2026-09-01T00:00:00Z", { labels: [MECHANICAL] })],
-  history: [shaOf(1301), TIP],
-  workflowRuns: { [FULL]: [wfRun(1, "schedule", TIP, "2026-09-03T00:00:00Z", { conclusion: "failure" })] },
-};
-
-test("inline mode prints the verdict file mode prints for the publisher's events over the same recorded GitHub", cli, () => {
-  const binding = bindingFile("2026-08-01T00:00:00Z");
-  const evidenceFile = join(ops, "published.json");
-  const published = collect({ repo: REPO, since: "2026-08-01T00:00:00Z", through: NOW, laneLogins: [LANE], gateChecks: GATE, gh: github(RED_C2) });
-  writeFileSync(evidenceFile, JSON.stringify(published.events));
-  const fileMode = runWith(ECHO, { promotion_evidence_binding: binding, promotion_evidence_source: evidenceFile });
-  const inlineMode = runInline({ binding, fixture: RED_C2 });
-  assert.equal(fileMode.failClosedReason, null);
-  assert.equal(inlineMode.failClosedReason, null);
-  assert.deepEqual(inlineMode.cells, fileMode.cells);
-  assert.deepEqual(Object.fromEntries(CELLS.map((cell) => [cell, inlineMode.cells[cell].effective])), {
-    "C2-auto-merge": "unpromoted",
-    "C3-auto-merge": "promoted",
-    "C3-ai-review-blocking": "promoted",
-  });
-  assert.equal(inlineMode.source, `github:${REPO}`);
-});
-
-test("inline mode reads GitHub when the promotion epoch started 84 days ago and refuses at 86", () => {
-  const fresh = runInline({ binding: bindingFile(daysBefore(NOW, 84)) });
-  assert.equal(fresh.failClosedReason, null);
-  assert.equal(fresh.cells["C2-auto-merge"].effective, "promoted");
-  // A GitHub that fails every read shows the guard refuses before any read.
-  const stale = runInline({ binding: bindingFile(daysBefore(NOW, 86)), failWith: "HTTP 401: Bad credentials" });
-  assertFailClosed(stale, /^epoch-start-expired: /);
-});
-
-test("inline mode refuses a binding with no promotion epoch start", () => {
-  assertFailClosed(runInline({ binding: bindingFile(undefined), failWith: "HTTP 401: Bad credentials" }), /^epoch-start-missing: /);
-  const none = join(ops, "binding-none.json");
-  writeFileSync(none, JSON.stringify({ promotion_state: { "C2-auto-merge": { state: "unpromoted", ratified_at: NOW } } }));
-  assertFailClosed(runInline({ binding: none, failWith: "HTTP 401: Bad credentials" }), /^epoch-start-missing: /);
-});
-
-test("inline mode refuses when a GitHub read fails", () => {
-  const result = runInline({ binding: bindingFile(daysBefore(NOW, 10)), failWith: "HTTP 502: Bad Gateway" });
-  assertFailClosed(result, /^github-read-failed: .*HTTP 502/);
-});
-
-test("inline mode from the CLI refuses when gh cannot run, and on a usage error", () => {
-  const binding = bindingFile(new Date(Date.now() - 86_400_000).toISOString());
-  const argv = ["--inline", "--repo", REPO, "--binding", binding, "--checker", ECHO, "--probe-evidence-root", surfaces.root, "--lane-login", LANE, "--gate-check", GATE[0]];
-  const empty = mkdtempSync(join(base, "no-gh-"));
-  const noGh = spawnSync(process.execPath, [HELPER, ...argv], { encoding: "utf8", cwd: checkout, env: { PATH: empty } });
-  assert.equal(noGh.status, 0, noGh.stderr);
-  assertFailClosed(JSON.parse(noGh.stdout), /^github-read-failed: /);
-  const usage = spawnSync(process.execPath, [HELPER, "--inline", "--repo", REPO], { encoding: "utf8", cwd: checkout });
-  assertFailClosed(JSON.parse(usage.stdout), /^usage: /);
-});
-
-test("inline mode refuses a --repo other than GITHUB_REPOSITORY", () => {
-  const result = runInline({ binding: bindingFile(daysBefore(NOW, 10)), ghRepo: "melodic-software/other" });
-  assertFailClosed(result, /^repo-mismatch: /);
-});
-
-test("inline mode fails closed with JSON when the publisher cannot be imported", () => {
-  const lone = mkdtempSync(join(base, "no-publisher-"));
-  for (const name of ["resolve-promotion-evidence.mjs", "operator-options.mjs"]) copyFileSync(join(HERE, name), join(lone, name));
-  const binding = bindingFile(new Date(Date.now() - 86_400_000).toISOString());
-  const argv = ["--inline", "--repo", REPO, "--binding", binding, "--checker", ECHO, "--probe-evidence-root", surfaces.root, "--lane-login", LANE, "--gate-check", GATE[0]];
-  const run = spawnSync(process.execPath, [join(lone, "resolve-promotion-evidence.mjs"), ...argv], { encoding: "utf8", cwd: checkout, env: { PATH: process.env.PATH } });
-  assert.equal(run.status, 0, run.stderr);
-  assertFailClosed(JSON.parse(run.stdout), /^publisher-unavailable: /);
-});
-
-test("inline mode counts an in-epoch gate failure of a merge made just before the epoch", () => {
-  // Merged an hour before ratification; the red full run containing it lands after.
-  const epoch = "2026-09-01T00:00:00Z";
-  const fixture = {
-    pulls: [pr(1302, "2026-08-31T23:00:00Z", { labels: [MECHANICAL] })],
-    history: [shaOf(1302), TIP],
-    workflowRuns: { [FULL]: [wfRun(2, "schedule", TIP, "2026-09-01T01:00:00Z", { conclusion: "failure" })] },
-  };
-  const result = runInline({ binding: bindingFile(epoch), fixture });
-  assert.equal(result.failClosedReason, null);
-  assert.equal(result.cells["C2-auto-merge"].effective, "unpromoted");
-  assert.match(result.cells["C2-auto-merge"].line, /gate-failure at 2026-09-01T01:08:00Z/);
-});
-
-test("inline mode fails closed when a run or demotion issue inside the window was deleted, and demotes on a demotion issue", () => {
-  const binding = bindingFile("2026-09-01T00:00:00Z");
-  const runs = [1, 2, 3].map((id) => wfRun(id, "schedule", TIP, `2026-09-0${id + 1}T00:00:00Z`));
-  const history = [shaOf(1301), TIP];
-  assertFailClosed(runInline({ binding, fixture: { history, workflowRuns: { [FULL]: runs }, deletedRuns: [2] } }), new RegExp(`^run-deleted: ${FULL} `));
-  const issueList = [issueItem(7101, "2026-09-02T00:00:00Z"), issueItem(7103, "2026-09-03T00:00:00Z")];
-  assertFailClosed(runInline({ binding, fixture: { issueList, goneIssues: [7102] } }), /^issue-deleted: #7102 /);
-  const demoted = runInline({ binding, fixture: { demotionIssues: [demotionIssue(7104, "2026-09-04T00:00:00Z")] } });
-  assert.equal(demoted.failClosedReason, null);
-  for (const cell of CELLS) assert.match(demoted.cells[cell].line, /unpromoted \(gate-failure at 2026-09-04T00:00:00Z\)/);
-});
-
-test("inline --window-start demotes every cell at that instant", () => {
-  const binding = bindingFile(daysBefore(NOW, 10));
-  const restarted = runInline({ binding, extra: ["--window-start", daysBefore(NOW, 1).replace(".000Z", "Z")] });
-  assert.equal(restarted.failClosedReason, null);
-  for (const cell of CELLS) assert.equal(restarted.cells[cell].effective, "unpromoted");
-});
-
 test("--window-start over an unreadable or non-array source fails closed", cli, () => {
   const checker = recordingStub(GOOD_OUTPUT, join(ops, "unused.json"));
   const args = { args: { "window-start": "2026-10-11T07:00:00Z" } };
@@ -429,6 +281,77 @@ test("--window-start over an unreadable or non-array source fails closed", cli, 
     assertFailClosed(runWith(checker, {}, args), /promotion_evidence_source .* is not a JSON array/);
   } finally {
     writeFileSync(surfaces.evidence, "[]");
+  }
+});
+
+test("a re-earn read from a stale events file fails closed naming the file, its generated_at and the bound", cli, () => {
+  // The checker prints C2 promoted after the restart: a cell re-ratified after the demotion.
+  const checker = recordingStub(GOOD_OUTPUT, join(ops, "unused.json"));
+  writeFileSync(surfaces.evidence, JSON.stringify([{ cell: "C2-auto-merge", event: "gate-failure", at: "2026-10-01T00:00:00Z" }]));
+  try {
+    const stale = writeSidecar(25);
+    const result = runWith(checker, BOUND, RESTART);
+    assertFailClosed(result, new RegExp(`^promotion_evidence_source ${escapeRe(surfaces.evidence)} is stale: generated_at ${escapeRe(stale)} is older than promotion_evidence_max_age_hours 24$`));
+    writeSidecar(23);
+    const fresh = runWith(checker, BOUND, RESTART);
+    assert.equal(fresh.failClosedReason, null);
+    assert.equal(fresh.cells["C2-auto-merge"].effective, "promoted");
+  } finally {
+    writeFileSync(surfaces.evidence, "[]");
+  }
+});
+
+test("a re-earn without a usable age bound or sidecar fails closed", cli, () => {
+  const checker = recordingStub(GOOD_OUTPUT, join(ops, "unused.json"));
+  writeSidecar();
+  assertFailClosed(runWith(checker, {}, RESTART), /^promotion_evidence_max_age_hours not set in managed or user settings/);
+  for (const bad of ["", "0", "-1", "1.5", "24h"]) {
+    assertFailClosed(runWith(checker, { promotion_evidence_max_age_hours: bad }, RESTART), /promotion_evidence_max_age_hours/);
+  }
+  writeSidecar(0, { sha256: "0".repeat(64) });
+  assertFailClosed(runWith(checker, BOUND, RESTART), /does not hold the sha256 of promotion_evidence_source/);
+  for (const generated of [undefined, "2026-10-11", "not a date"]) {
+    writeSidecar(0, { generated_at: generated });
+    assertFailClosed(runWith(checker, BOUND, RESTART), /has no ISO 8601 generated_at/);
+  }
+  writeSidecar(-1);
+  assertFailClosed(runWith(checker, BOUND, RESTART), /has a generated_at .* in the future$/);
+  writeSidecar();
+  writeSettings(operatorOptions(checker, BOUND));
+  assertFailClosed(runHelper({ ...RESTART, helper: seam({ owned: [sidecar] }) }), new RegExp(`^lane-writable:${escapeRe(sidecar)}$`));
+  rmSync(sidecar);
+  assertFailClosed(runWith(checker, BOUND, RESTART), /has no readable sidecar .*evidence\.meta\.json/);
+});
+
+test("without --window-start or a re-earned event the age bound is not read", cli, () => {
+  writeSidecar(1000);
+  const result = runWith(stub(GOOD_OUTPUT));
+  assert.equal(result.failClosedReason, null);
+  assert.equal(result.cells["C2-auto-merge"].effective, "promoted");
+  rmSync(sidecar);
+});
+
+test("without --window-start a re-earned event read from a stale events file fails closed", cli, () => {
+  // A contrary event lifted by a re-earn in the same file, with no demotion record to restart at.
+  const reearned = [
+    { cell: "C2-auto-merge", event: "gate-failure", at: "2026-10-01T00:00:00Z", discovered: "2026-10-01T00:00:00Z" },
+    { cell: "C2-auto-merge", event: "re-earned", at: "2026-10-20T00:00:00Z", since: "2026-10-01T00:00:00Z" },
+  ];
+  writeFileSync(surfaces.evidence, JSON.stringify(reearned));
+  try {
+    const checker = stub(GOOD_OUTPUT);
+    const stale = writeSidecar(1000);
+    assertFailClosed(runWith(checker, BOUND), new RegExp(`^promotion_evidence_source ${escapeRe(surfaces.evidence)} is stale: generated_at ${escapeRe(stale)} is older than promotion_evidence_max_age_hours 24$`));
+    assertFailClosed(runWith(checker), /^promotion_evidence_max_age_hours not set in managed or user settings/);
+    writeSidecar(23);
+    const fresh = runWith(checker, BOUND);
+    assert.equal(fresh.failClosedReason, null);
+    assert.equal(fresh.cells["C2-auto-merge"].effective, "promoted");
+    rmSync(sidecar);
+    assertFailClosed(runWith(checker, BOUND), /has no readable sidecar .*evidence\.meta\.json/);
+  } finally {
+    writeFileSync(surfaces.evidence, "[]");
+    rmSync(sidecar, { force: true });
   }
 });
 
@@ -608,7 +531,7 @@ test("managed settings win over user settings, later managed files over earlier 
   writeSettings({ promotion_evidence_checker: "/managed/checker", promotion_evidence_binding: "/managed/binding" }, primary);
   writeSettings({ promotion_evidence_binding: "/dropin/binding" }, dropin);
   const install = { pluginId: "source-control@mkt", name: "source-control", userSettings: user };
-  const resolved = readOperatorOptions(install, [primary, dropin, join(dir, "absent.json")]);
+  const resolved = readOperatorOptions(install, [primary, dropin, join(dir, "absent.json")], OPTION_KEYS);
   assert.deepEqual(resolved.promotion_evidence_checker, { value: "/managed/checker", scope: "managed", file: primary });
   assert.deepEqual(resolved.promotion_evidence_binding, { value: "/dropin/binding", scope: "managed", file: dropin });
   assert.deepEqual(resolved.promotion_evidence_root, { value: "/user/root", scope: "user", file: user });
@@ -623,25 +546,25 @@ test("a malformed managed entry or a null managed value fails closed instead of 
   const install = { pluginId: "source-control@mkt", name: "source-control", userSettings: user };
   for (const entry of [{ options: "oops" }, { options: [] }, "oops", { options: { promotion_evidence_checker: null } }]) {
     writeFileSync(managed, JSON.stringify({ pluginConfigs: { "source-control@mkt": entry } }));
-    assert.throws(() => readOperatorOptions(install, [managed]), OptionsError, JSON.stringify(entry));
+    assert.throws(() => readOperatorOptions(install, [managed], OPTION_KEYS), OptionsError, JSON.stringify(entry));
   }
   for (const pluginConfigs of ["oops", [], null]) {
     writeFileSync(managed, JSON.stringify({ pluginConfigs }));
-    assert.throws(() => readOperatorOptions(install, [managed]), OptionsError, JSON.stringify(pluginConfigs));
+    assert.throws(() => readOperatorOptions(install, [managed], OPTION_KEYS), OptionsError, JSON.stringify(pluginConfigs));
   }
   writeFileSync(managed, JSON.stringify({ pluginConfigs: { "source-control@mkt": {} } }));
-  assert.equal(readOperatorOptions(install, [managed]).promotion_evidence_checker.value, "/user/checker");
+  assert.equal(readOperatorOptions(install, [managed], OPTION_KEYS).promotion_evidence_checker.value, "/user/checker");
   writeFileSync(managed, JSON.stringify({}));
-  assert.equal(readOperatorOptions(install, [managed]).promotion_evidence_checker.value, "/user/checker");
+  assert.equal(readOperatorOptions(install, [managed], OPTION_KEYS).promotion_evidence_checker.value, "/user/checker");
 });
 
 test("an unanchored install reads managed settings by manifest name and no user settings", () => {
   const dir = mkdtempSync(join(base, "unanchored-"));
   const managed = join(dir, "managed-settings.json");
   writeSettings({ promotion_evidence_checker: "/managed/checker" }, managed, "source-control@any-mkt");
-  const resolved = readOperatorOptions({ pluginId: null, name: "source-control", userSettings: null }, [managed]);
+  const resolved = readOperatorOptions({ pluginId: null, name: "source-control", userSettings: null }, [managed], OPTION_KEYS);
   assert.equal(resolved.promotion_evidence_checker.value, "/managed/checker");
-  assert.throws(() => readOperatorOptions({ pluginId: null, name: "source-control", userSettings: null }, [dir]), OptionsError);
+  assert.throws(() => readOperatorOptions({ pluginId: null, name: "source-control", userSettings: null }, [dir], OPTION_KEYS), OptionsError);
 });
 
 test("managedSettingsFiles names the fixed system path and nothing on an unknown platform", () => {

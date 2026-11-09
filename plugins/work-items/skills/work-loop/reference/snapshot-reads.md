@@ -1,8 +1,7 @@
 # Cycle-start snapshot reads
 
 `SKILL.md` step 1 takes the cycle-start snapshot this file governs; both stop modes test their exit
-condition against it, and the first-drain completion proposal
-([first-drain-ratification.md](first-drain-ratification.md)) is raised from it. An empty id set passes the drain exit test vacuously, so the snapshot is trusted only
+condition against it. An empty id set passes the drain exit test vacuously, so the snapshot is trusted only
 when the reads behind it were complete.
 
 ## The reads
@@ -13,6 +12,16 @@ when the reads behind it were complete.
   way; each adapter decides it exactly, by reading one item past `limits.list_items_max` where the
   provider allows, so a backlog of exactly the ceiling is complete. Never pass a
   provider-specific flag such as `--limit` here.
+- **Cordoned milestones**: the forge's contents read of the admission rules file
+  ([mode-drain.md](mode-drain.md), "Cordoned items"), in drain mode and only when a retained row
+  carries a `milestone`. An absent file is a complete read with no names.
+- **Status**, in drain mode: `status-storage`, then on `field` `get-statuses` over the retained
+  open ids, per the tracker seam's "Reading an item's status"
+  ([`tracker-seam.md`](../../../reference/tracker-seam.md)). The drain-terminal test reads holds
+  from it ([mode-drain.md](mode-drain.md)). It has no `truncated` field and is complete on exit `0`.
+- **Priority**, when more than one item was admitted: `get-statuses --field Priority` over the
+  admitted ids, for the sort in `SKILL.md` step 4. A failed or unsupported read does not abort the
+  cycle; the sort falls back to the `priority:` labels.
 
 With `--scope <label>`, both reads take `--label <label>`. Where the bound adapter filters by label
 in its provider query, the ceiling counts only scoped items, so a small scope on a large tracker
@@ -20,8 +29,8 @@ reads complete; where it does not, the seam filters after the read and a listing
 stays truncated (`CONTRACT.md`, "Verbs"). `--shard` has no provider filter and partitions the
 retained ids after the reads.
 
-An envelope with no `truncated` field falls under "Completeness unknown" below, whichever read
-returned it.
+An open-items or frontier envelope with no `truncated` field falls under "Completeness unknown"
+below, whichever of the two returned it.
 
 ## A read that is not complete aborts the cycle
 
@@ -30,7 +39,7 @@ truncation, the cycle aborts with **no state change**:
 
 - no intake sweep, admission, execution, escalation (except the truncation escalation below), or
   exit evaluation;
-- every durable counter, `first_drain_proposed` included, is written back as it was read. Only
+- every durable counter is written back as it was read. Only
   `heartbeat_at` moves, so the lane is not mistaken for a dead one;
 - the cycle report leads with `snapshot unusable: <read>: <reason>`, and the next cycle is scheduled
   as usual.
@@ -59,6 +68,6 @@ backlog; an empty one from a failed or skipped read is not.
 
 A frontier or open-items envelope with no `truncated` field comes from a consumer adapter written
 before the contract added it. Its completeness is **unknown**, not complete: the cycle runs, but its snapshot
-never satisfies the drain exit test or proposes first-drain completion, and the report says
+never satisfies the drain exit test, and the report says
 `snapshot completeness unknown`. The drain-terminal stop still applies, because stopping lifts no
 gate. Regenerating the adapter with `/work-items:onboard-adapter` restores the flag.

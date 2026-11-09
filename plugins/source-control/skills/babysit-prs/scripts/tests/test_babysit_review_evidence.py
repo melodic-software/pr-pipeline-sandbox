@@ -593,7 +593,7 @@ NEEDS_YAML = unittest.skipUnless(
 WORKFLOW = ".github/workflows/lint-docs.yml"
 # A workflow whose token cannot write and that reaches no secret.
 READ_ONLY = """\
-name: lint-docs
+name: Lint Docs
 on:
   pull_request:
     paths: ['docs/**']
@@ -744,6 +744,12 @@ class ReadOnlyWorkflowTests(Base):
         )
 
     @NEEDS_YAML
+    def test_a_workflow_named_by_its_stem_still_binds(self) -> None:
+        # A repository on the name-equals-stem convention still clears.
+        text = READ_ONLY.replace("name: Lint Docs", "name: lint-docs", 1)
+        self.assertBinds(self.bound({WORKFLOW: text}))
+
+    @NEEDS_YAML
     def test_read_all_and_empty_permissions_bind(self) -> None:
         for perms in ("permissions: read-all", "permissions: {}"):
             with self.subTest(perms):
@@ -774,9 +780,20 @@ class ReadOnlyWorkflowTests(Base):
         self.assertIn(".github/workflows/pr-require-checks.yml", floored)
         for path in floored:
             stem = ev.WORKFLOW_PATH_RE.match(path)[1]
-            text = READ_ONLY.replace("name: lint-docs", f"name: {stem}", 1)
+            text = READ_ONLY.replace(
+                "name: Lint Docs", f"name: {ev.workflow_display_name(stem)}", 1
+            )
             with self.subTest(path):
                 self.assertHeld(self.bound({path: text}))
+
+    def test_workflow_name_words_equal_the_standards_display_words(self) -> None:
+        vocabulary = json.loads(
+            (
+                pathlib.Path(__file__).resolve().parents[6]
+                / ".github/standards/github-actions-conventions/vocabulary.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(ev.WORKFLOW_NAME_WORDS, vocabulary["displayWords"])
 
     @NEEDS_YAML
     def test_each_unsafe_workflow_stays_a_lane_source(self) -> None:
@@ -823,9 +840,9 @@ class ReadOnlyWorkflowTests(Base):
                 top, "jobs:"
             ),
             "a name that is not the stem": READ_ONLY.replace(
-                "name: lint-docs", "name: pr-require-checks"
+                "name: Lint Docs", "name: PR Require Checks"
             ),
-            "no name": READ_ONLY.replace("name: lint-docs\n", ""),
+            "no name": READ_ONLY.replace("name: Lint Docs\n", ""),
             "a repeated key": READ_ONLY.replace(
                 top, "permissions:\n  contents: read\npermissions: write-all\njobs:"
             ),
@@ -849,7 +866,7 @@ class ReadOnlyWorkflowTests(Base):
             "an expression for a scope": READ_ONLY.replace(
                 "pull-requests: read", "pull-requests: ${{ 'write' }}"
             ),
-            "no jobs": "name: lint-docs\non: push\npermissions: {}\njobs: {}\n",
+            "no jobs": "name: Lint Docs\non: push\npermissions: {}\njobs: {}\n",
             "no trigger": READ_ONLY.replace("on:", "run-name:", 1),
         }
         # Each case holds through the parsed reading alone too, with the
@@ -866,7 +883,9 @@ class ReadOnlyWorkflowTests(Base):
         for lane in LANES:
             path = FILES[lane]
             stem = path.rsplit("/", 1)[1][: -len(".yml")]
-            text = READ_ONLY.replace("lint-docs", stem)
+            text = READ_ONLY.replace(
+                "name: Lint Docs", f"name: {ev.workflow_display_name(stem)}"
+            )
             with self.subTest(path):
                 self.assertHeld(self.bound({path: text}))
                 self.assertHeld(self.bound({path: None}))
@@ -876,6 +895,8 @@ class ReadOnlyWorkflowTests(Base):
             ".github/workflows/lint-docs.yaml",
             ".github/workflows/sub/lint-docs.yml",
             ".github/workflows/Lint-Docs.yml",
+            # A stem that is itself the Title Case name is not a readonly candidate.
+            ".github/workflows/Lint Docs.yml",
             ".github/workflows",
         ):
             with self.subTest(path):

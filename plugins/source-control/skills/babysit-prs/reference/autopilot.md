@@ -37,13 +37,16 @@ coordinator judges lower-priority still gets its cycle; it is sequenced, never s
 from the fan-out.
 
 **Draft PRs** are in scope, not exempt. Its worker assesses whether the draft's work is
-actually complete: if so, mark it ready for review (`/source-control:pull-request ready`, which
-merges the base branch, runs the security review over the PR diff and the verify gate on the
-merged head before it flips) and continue through the normal fix/resolve/merge steps in the same cycle; if it is genuinely still in progress, leave
-it draft and report why. That is a real escalation with a reason, not a silent skip.
+actually complete: if so, mark it ready for review (`/source-control:pull-request ready --unattended`, which
+updates the branch from its base, runs the security review over the PR diff and the verify gate on the
+updated head before it flips) and continue through the normal fix/resolve/merge steps in the same cycle; if it is genuinely still in progress, leave
+it draft and report why. That is a real escalation with a reason, not a silent skip. A draft
+whose body has a line starting `Draft:` (a requested draft or a multi-session container) is never
+flipped, however complete: report it as held by that line. The worker always invokes the flip as
+`ready --unattended`, so `ready`'s own hold check refuses such a draft too.
 
 Autopilot keeps every cross-tier invariant in `SKILL.md`, including dependency hold-merge. It
 widens *author* scope (all authors under the watched owners) and *thread* scope
 (`--include-human`); it does **not** widen the owner allowlist, and it does not gain force-push,
 `--admin`, or settings powers. Those still escalate. Run it looped:
-`/loop 15m /source-control:babysit-prs autopilot`.
+`/loop 15m /source-control:babysit-prs autopilot --unattended`.

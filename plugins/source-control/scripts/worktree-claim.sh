@@ -12,10 +12,11 @@
 # (git-worktree(1) "lock" / "LIST OUTPUT FORMAT" porcelain `locked [reason]`).
 #
 # Verbs:
-#   report [--repo-dir DIR]
+#   report [--repo-dir DIR] [--root DIR]
 #     List each linked worktree as CLAIMED <path> <reason> or UNCLAIMED <path>.
 #     Exit 1 when any linked worktree lacks a lock reason; 0 when every linked
-#     worktree carries one (or none exist).
+#     worktree carries one (or none exist). With --root, a further summary line
+#     counts the UNCLAIMED worktrees that lie outside that worktree root.
 #   claim <path> [--repo-dir DIR] [--session-id ID]
 #     Lock this unlocked linked worktree with a session-distinct reason.
 #     Refuses to rewrite an existing reason (helper-created trees keep theirs).
@@ -30,12 +31,32 @@
 #     Inverse of claim: unlock a linked worktree whose reason names this
 #     session. An unlocked tree is a no-op; a foreign or reasonless lock is
 #     never removed (reason printed).
+#   handover <path> --session-id OLD --to NEW [--repo-dir DIR]
+#     Move this session's claim to the session that resumes the work (a
+#     handoff then /clear starts a new session id). Re-locks only when the
+#     reason names OLD, the proof release uses, and writes NEW's reason through
+#     worktree_lock_reason, keeping the creator script it named. Both ids are
+#     explicit: the environment is never read for OLD.
 #   stale <path> [--repo-dir DIR] [--idle-minutes N]
 #     Read-only. Exit 0 only when the lock is provably stale: a linked worktree
 #     whose reason reads `lane active on <host> session <sid> since`, <host> is
-#     this host, and no ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/*/<sid>.jsonl
-#     changed within N minutes (default 120; a missing transcript is idle). It
-#     does not look at PR or landed state; the caller requires that separately.
+#     this host, no running Claude Code process holds <sid>, and no
+#     ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/*/<sid>.jsonl changed within N
+#     minutes (default 120; a missing transcript is idle). A process holds <sid>
+#     when a ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions/*.json entry names it
+#     and that entry's pid is running with the entry's procStart. Dead and
+#     pid-reused entries do not count. A missing, unreadable or malformed
+#     registry, or a host where an entry's start time cannot be read, is not
+#     provable. It does not look at PR or landed state; the caller requires that
+#     separately.
+#   stale --batch --repo-dir DIR [--idle-minutes N]
+#     The same verdict for each NUL-delimited path on stdin, from one worktree
+#     list parse, one registry read and one transcript scan. Prints one
+#     `exit<TAB>path<TAB>note` row per path, in input order, where exit and note
+#     are what single-path
+#     `stale` would return and print for it (a tab or newline in the note reads
+#     as a space). A path holding a tab or newline is usage (exit 2) and no row
+#     is printed. --repo-dir is required: no single path locates the repository.
 #
 # Requires git >= 2.36.0 (`git worktree list --porcelain -z`); older git fails
 # closed with exit 5 and a message naming the floor and the installed version.
@@ -43,27 +64,37 @@
 # Exit codes:
 #   0  report: no unclaimed linked worktrees
 #      stale: provably stale (one evidence line printed)
+#      stale --batch: every path evaluated (each row carries its own exit)
 #      claim: locked, or already claimed by this session
 #      check-enter: our claim, or path is not a linked worktree
 #      release: unlocked this session's lock, or the tree was already unlocked
+#      handover: the lock now names NEW (or already did)
 #   1  report: one or more linked worktrees have no lock reason
 #      stale: not provably stale (unlocked, reasonless, no session, another
-#      host, or a transcript changed within the idle window)
-#   2  usage (release: main worktree, or no session id to prove ownership)
+#      host, a running process holds the session, the session registry is
+#      missing or malformed, or a transcript changed within the idle window)
+#   2  usage (release: main worktree, or no session id to prove ownership;
+#      handover: main worktree, or --session-id / --to missing)
 #   3  check-enter: the worktree is unclaimed (no lock reason)
+#      handover: the worktree is unlocked, so there is no claim to hand over
 #   4  check-enter: foreign live claim (reason printed)
 #      claim: path already has a reason that is not this session's
 #      release: the lock is foreign or carries no session (reason printed)
+#      handover: the lock names a session other than OLD (reason printed), or
+#      carries no reason at all
 #   5  environment: not a git repository, or path is not a registered worktree
+#      handover: git could not re-lock (the old reason is restored when it can be)
 #
 # Session identity (claim / check-enter / release):
 #   1. --session-id
-#   2. CLAUDE_SESSION_ID when set and not the unexpanded `${CLAUDE_SESSION_ID}`
-#      token
-#   3. claim only: a generated host+pid+random token so two concurrent
+#   2. CLAUDE_CODE_SESSION_ID, the id Claude Code exports to Bash, when set and
+#      not the unexpanded `${CLAUDE_CODE_SESSION_ID}` token
+#   3. CLAUDE_SESSION_ID, under the same rule
+#   4. claim only: a generated host+pid+random token so two concurrent
 #      invocations on one host still produce different reasons
 #   check-enter without a session id cannot prove ownership: any lock reason
-#   is treated as foreign. release without one exits 2.
+#   is treated as foreign. release without one exits 2. handover reads only
+#   --session-id and --to, never the environment.
 set -uo pipefail
 
 PROG=${0##*/}
@@ -86,12 +117,14 @@ EX_ENV=5
 usage() {
   cat >&2 <<EOF
 Usage:
-  $PROG report [--repo-dir DIR]
+  $PROG report [--repo-dir DIR] [--root DIR]
   $PROG claim <path> [--repo-dir DIR] [--session-id ID]
   $PROG claim --all-unclaimed [--repo-dir DIR] [--session-id ID]
   $PROG check-enter <path> [--repo-dir DIR] [--session-id ID]
   $PROG release <path> [--repo-dir DIR] [--session-id ID]
+  $PROG handover <path> --session-id OLD --to NEW [--repo-dir DIR]
   $PROG stale <path> [--repo-dir DIR] [--idle-minutes N]
+  $PROG stale --batch --repo-dir DIR [--idle-minutes N] < NUL-delimited paths
 EOF
   exit "$EX_USAGE"
 }
@@ -125,7 +158,19 @@ normalize_path() {
 # `check-enter .` or a `/tmp` vs `/private/tmp` spelling still matches
 # porcelain (git-worktree(1) accepts relative or absolute).
 canonicalize_path() {
-  local p="$1" base="${2:-$PWD}" phys
+  local out
+  canonicalize_path_to out "$@"
+  printf '%s' "$out"
+}
+
+# canonicalize_path_to <var> <path> [base]: canonicalize_path into <var>
+# without forking in the common case (an already-clean path to an existing
+# directory), which parse_worktrees hits once per registered worktree. Siblings
+# under one non-symlink parent share a single `cd -P` through CANON_PARENT.
+CANON_PARENT=""
+CANON_PARENT_PHYS=""
+canonicalize_path_to() {
+  local __var="$1" p="$2" base="${3:-$PWD}" here="$PWD" phys
   p="${p%$'\r'}"
   # shellcheck disable=SC2088
   if [[ "$p" == "~/"* && -n "${HOME:-}" ]]; then
@@ -134,8 +179,22 @@ canonicalize_path() {
   if [[ "$p" != /* && ! "$p" =~ ^[A-Za-z]:/ ]]; then
     p="${base%/}/$p"
   fi
-  p="$(normalize_path "$p")"
-  if [[ -d "$p" ]]; then
+  if [[ "$p" == *//* || "$p" == */./* || "$p" == */../* || "$p" == */. || "$p" == */.. || "$p" == ?*/ ]]; then
+    p="$(normalize_path "$p")"
+  fi
+  local parent="${p%/*}"
+  if [[ -d "$p" && ! -L "$p" && -n "$parent" && "$parent" == "$CANON_PARENT" ]]; then
+    # Sibling of the last directory resolved: reuse its parent's physical path.
+    p="${CANON_PARENT_PHYS}/${p##*/}"
+  elif [[ -d "$p" && -d "$here" ]] && CDPATH='' builtin cd -P -- "$p" 2>/dev/null; then
+    phys="$PWD"
+    builtin cd -- "$here" || exit "$EX_ENV"
+    if [[ ! -L "$p" && -n "$parent" ]]; then
+      CANON_PARENT="$parent"
+      CANON_PARENT_PHYS="${phys%/*}"
+    fi
+    p="$phys"
+  elif [[ -d "$p" ]]; then
     phys="$(cd "$p" && pwd -P 2>/dev/null)" || phys=""
     [[ -n "$phys" ]] && p="$phys"
   elif [[ -e "$p" ]]; then
@@ -145,23 +204,25 @@ canonicalize_path() {
       p="${dir}/$(basename -- "$p")"
     fi
   fi
-  printf '%s' "$p"
+  printf -v "$__var" '%s' "$p"
 }
 
-# Resolve --session-id / CLAUDE_SESSION_ID. Echoes empty when neither is usable.
+# Resolve --session-id, else CLAUDE_CODE_SESSION_ID, else CLAUDE_SESSION_ID.
+# Echoes empty when none is usable.
 resolve_session_id() {
-  local sid="${1:-}"
+  local sid="${1:-}" name
   if [[ -n "$sid" ]]; then
     printf '%s' "$sid"
     return 0
   fi
-  sid="${CLAUDE_SESSION_ID:-}"
-  # SC2016: the unexpanded token is what we must reject.
-  # shellcheck disable=SC2016
-  if [[ -z "$sid" || "$sid" == '${CLAUDE_SESSION_ID}' ]]; then
-    return 0
-  fi
-  printf '%s' "$sid"
+  for name in CLAUDE_CODE_SESSION_ID CLAUDE_SESSION_ID; do
+    sid="${!name:-}"
+    # The unexpanded `${NAME}` token is not an id.
+    if [[ -n "$sid" && "$sid" != "\${$name}" ]]; then
+      printf '%s' "$sid"
+      return 0
+    fi
+  done
 }
 
 # Reject a session id that would break the reason-string match or the lock
@@ -174,9 +235,10 @@ valid_session_id() {
 # Fills WT_PATHS / WT_REASONS / WT_IS_LINKED from the shared fact record.
 # Linked means "not the main worktree and not bare".
 parse_worktrees() {
-  local repo="$1" porcelain i
+  local repo="$1" porcelain i canon
   WT_PATHS=()
   WT_REASONS=()
+  WT_IS_LOCKED=()
   WT_IS_LINKED=()
   porcelain="$(mktemp)" || return 1
   if ! git_unlocated -C "$repo" worktree list --porcelain -z >"$porcelain"; then
@@ -188,8 +250,10 @@ parse_worktrees() {
   [[ ${#WT_FACT_PATH[@]} -gt 0 ]] || return 0
   for i in "${!WT_FACT_PATH[@]}"; do
     [[ "${WT_FACT_BARE[$i]}" == "yes" ]] && continue
-    WT_PATHS+=("$(canonicalize_path "${WT_FACT_PATH[$i]}")")
+    canonicalize_path_to canon "${WT_FACT_PATH[$i]}"
+    WT_PATHS+=("$canon")
     WT_REASONS+=("${WT_FACT_LOCKED[$i]}")
+    WT_IS_LOCKED+=("${WT_FACT_IS_LOCKED[$i]}")
     if [[ "${WT_FACT_LINKED[$i]}" == "yes" ]]; then
       WT_IS_LINKED+=(1)
     else
@@ -198,8 +262,9 @@ parse_worktrees() {
   done
 }
 
-# Longest worktree-path prefix of <target>, or empty. <target> must already
-# be canonicalized (absolute, `.`/`..` collapsed, symlinks resolved).
+# Index of the longest worktree-path prefix of <target> into WT_INDEX; fails
+# when none matches. <target> must already be canonicalized (absolute, `.`/`..`
+# collapsed, symlinks resolved). Set, not printed, so a caller needs no subshell.
 find_worktree_index() {
   local target="$1" i best=-1 best_len=0
   for i in "${!WT_PATHS[@]}"; do
@@ -211,11 +276,8 @@ find_worktree_index() {
       fi
     fi
   done
-  if ((best >= 0)); then
-    printf '%s' "$best"
-    return 0
-  fi
-  return 1
+  WT_INDEX="$best"
+  ((best >= 0))
 }
 
 resolve_repo_dir() {
@@ -240,9 +302,13 @@ shift
 
 repo_dir=""
 session_id=""
+session_id_given=0
+to_session=""
 path=""
 all_unclaimed=0
+batch=0
 idle_minutes=120
+root_dir=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -254,6 +320,17 @@ while [[ $# -gt 0 ]]; do
   --session-id)
     [[ $# -ge 2 ]] || usage
     session_id="$2"
+    [[ -z "$2" ]] || session_id_given=1
+    shift 2
+    ;;
+  --to)
+    [[ $# -ge 2 ]] || usage
+    to_session="$2"
+    shift 2
+    ;;
+  --root)
+    [[ $# -ge 2 ]] || usage
+    root_dir="$2"
     shift 2
     ;;
   --idle-minutes)
@@ -263,6 +340,10 @@ while [[ $# -gt 0 ]]; do
     ;;
   --all-unclaimed)
     all_unclaimed=1
+    shift
+    ;;
+  --batch)
+    batch=1
     shift
     ;;
   -h | --help)
@@ -294,7 +375,7 @@ if [[ -n "$session_id" ]] && ! valid_session_id "$session_id"; then
 fi
 
 case "$cmd" in
-report | claim | check-enter | release | stale) ;;
+report | claim | check-enter | release | handover | stale) ;;
 *)
   printf '%s: unknown verb: %s\n' "$PROG" "$cmd" >&2
   usage
@@ -320,15 +401,48 @@ if [[ "$cmd" == "release" && -z "$path" ]]; then
   exit "$EX_USAGE"
 fi
 if [[ "$cmd" == "release" && -z "$session_id" ]]; then
-  printf '%s: release needs --session-id or CLAUDE_SESSION_ID to prove ownership\n' "$PROG" >&2
+  printf '%s: release needs --session-id or CLAUDE_CODE_SESSION_ID to prove ownership\n' "$PROG" >&2
   exit "$EX_USAGE"
 fi
-if [[ "$cmd" == "stale" && -z "$path" ]]; then
+if [[ "$cmd" == "handover" ]]; then
+  if [[ -z "$path" ]]; then
+    printf '%s: handover requires a path\n' "$PROG" >&2
+    exit "$EX_USAGE"
+  fi
+  if ((session_id_given == 0)) || [[ -z "$to_session" ]]; then
+    printf '%s: handover needs --session-id OLD and --to NEW\n' "$PROG" >&2
+    exit "$EX_USAGE"
+  fi
+  if ! valid_session_id "$to_session"; then
+    printf '%s: --to must match ^[A-Za-z0-9._:-]{1,128}$\n' "$PROG" >&2
+    exit "$EX_USAGE"
+  fi
+elif [[ -n "$to_session" ]]; then
+  printf '%s: --to applies to handover only\n' "$PROG" >&2
+  exit "$EX_USAGE"
+fi
+if ((batch)) && [[ "$cmd" != "stale" ]]; then
+  printf '%s: --batch applies to stale only\n' "$PROG" >&2
+  exit "$EX_USAGE"
+fi
+if ((batch)) && [[ -n "$path" ]]; then
+  printf '%s: stale --batch reads its paths from stdin, not arguments\n' "$PROG" >&2
+  exit "$EX_USAGE"
+fi
+if ((batch)) && [[ -z "$repo_dir" ]]; then
+  printf '%s: stale --batch needs --repo-dir\n' "$PROG" >&2
+  exit "$EX_USAGE"
+fi
+if [[ "$cmd" == "stale" ]] && ((batch == 0)) && [[ -z "$path" ]]; then
   printf '%s: stale requires a path\n' "$PROG" >&2
   exit "$EX_USAGE"
 fi
 if [[ ! "$idle_minutes" =~ ^[0-9]{1,9}$ ]]; then
   printf '%s: --idle-minutes must be a non-negative integer\n' "$PROG" >&2
+  exit "$EX_USAGE"
+fi
+if [[ -n "$root_dir" && "$cmd" != "report" ]]; then
+  printf '%s: --root applies to report only\n' "$PROG" >&2
   exit "$EX_USAGE"
 fi
 if [[ "$cmd" == "report" && -n "$path" ]]; then
@@ -361,7 +475,8 @@ if ! parse_worktrees "$repo_dir"; then
 fi
 
 do_report() {
-  local i unclaimed=0 linked=0
+  local i unclaimed=0 linked=0 outside=0 root=""
+  [[ -z "$root_dir" ]] || root="$(canonicalize_path "$root_dir")"
   for i in "${!WT_PATHS[@]}"; do
     ((WT_IS_LINKED[i])) || continue
     linked=$((linked + 1))
@@ -370,10 +485,16 @@ do_report() {
     else
       printf 'UNCLAIMED\t%s\n' "${WT_PATHS[i]}"
       unclaimed=$((unclaimed + 1))
+      if [[ -n "$root" && "${WT_PATHS[i]}" != "$root"/* ]]; then
+        outside=$((outside + 1))
+      fi
     fi
   done
   printf '%s: %d linked, %d unclaimed, %d claimed\n' \
     "$PROG" "$linked" "$unclaimed" "$((linked - unclaimed))" >&2
+  if [[ -n "$root" ]]; then
+    printf '%s: %d unclaimed outside the worktree root %s\n' "$PROG" "$outside" "$root" >&2
+  fi
   if ((unclaimed > 0)); then
     return "$EX_UNCLAIMED_REPORT"
   fi
@@ -417,10 +538,11 @@ lock_one() {
 
 do_claim_one() {
   local idx
-  if ! idx="$(find_worktree_index "$path")"; then
+  if ! find_worktree_index "$path"; then
     printf '%s: not a registered worktree: %s\n' "$PROG" "$path" >&2
     exit "$EX_ENV"
   fi
+  idx="$WT_INDEX"
   if ((WT_IS_LINKED[idx] == 0)); then
     printf '%s: refusing to claim the main worktree: %s\n' "$PROG" "${WT_PATHS[idx]}" >&2
     exit "$EX_USAGE"
@@ -453,10 +575,11 @@ do_claim_all() {
 
 do_check_enter() {
   local idx
-  if ! idx="$(find_worktree_index "$path")"; then
+  if ! find_worktree_index "$path"; then
     # Not a linked (or main) worktree path — nothing to consult.
     return "$EX_OK"
   fi
+  idx="$WT_INDEX"
   if ((WT_IS_LINKED[idx] == 0)); then
     return "$EX_OK"
   fi
@@ -479,10 +602,11 @@ do_check_enter() {
 
 do_release() {
   local idx wt reason
-  if ! idx="$(find_worktree_index "$path")"; then
+  if ! find_worktree_index "$path"; then
     printf '%s: not a registered worktree: %s\n' "$PROG" "$path" >&2
     return "$EX_ENV"
   fi
+  idx="$WT_INDEX"
   wt="${WT_PATHS[idx]}"
   if ((WT_IS_LINKED[idx] == 0)); then
     printf '%s: refusing to release the main worktree: %s\n' "$PROG" "$wt" >&2
@@ -504,47 +628,270 @@ do_release() {
   printf 'released %s\n' "$wt"
 }
 
-# ponytail: liveness is provable only from this host's transcripts; a lock from
-# another host, or without a session id, stays "not provable".
-do_stale() {
-  local idx wt reason lane host sid projects hit
-  if ! idx="$(find_worktree_index "$path")"; then
+do_handover() {
+  local idx wt reason creator=worktree-claim.sh new_reason
+  if ! find_worktree_index "$path"; then
     printf '%s: not a registered worktree: %s\n' "$PROG" "$path" >&2
     return "$EX_ENV"
   fi
+  idx="$WT_INDEX"
   wt="${WT_PATHS[idx]}"
+  if ((WT_IS_LINKED[idx] == 0)); then
+    printf '%s: refusing to hand over the main worktree: %s\n' "$PROG" "$wt" >&2
+    return "$EX_USAGE"
+  fi
+  reason="${WT_REASONS[idx]}"
+  if [[ -z "$reason" && "${WT_IS_LOCKED[idx]}" == "yes" ]]; then
+    printf '%s: not handed over, the lock carries no reason, so it names no session: %s\n' "$PROG" "$wt" >&2
+    return "$EX_FOREIGN"
+  fi
+  if [[ -z "$reason" ]]; then
+    printf '%s: not locked, no claim to hand over: %s\n' "$PROG" "$wt" >&2
+    printf '  claim it instead: %s claim %s --session-id %s\n' "$PROG" "$wt" "$to_session" >&2
+    return "$EX_UNCLAIMED"
+  fi
+  if worktree_reason_is_ours "$reason" "$to_session"; then
+    printf '%s\n' "$reason"
+    return "$EX_OK"
+  fi
+  if ! worktree_reason_is_ours "$reason" "$session_id"; then
+    printf '%s: not handed over, the lock does not name session %s: %s\n' "$PROG" "$session_id" "$reason" >&2
+    return "$EX_FOREIGN"
+  fi
+  [[ "$reason" == worktree-create.sh:* ]] && creator=worktree-create.sh
+  new_reason="$(worktree_lock_reason "$creator" "$to_session")"
+  if ! git_unlocated -C "$repo_dir" worktree unlock "$wt" >&2; then
+    printf '%s: git worktree unlock failed for %s\n' "$PROG" "$wt" >&2
+    return "$EX_ENV"
+  fi
+  if ! git_unlocated -C "$repo_dir" worktree lock --reason "$new_reason" "$wt" >&2; then
+    printf '%s: git worktree lock failed for %s\n' "$PROG" "$wt" >&2
+    git_unlocated -C "$repo_dir" worktree lock --reason "$reason" "$wt" >&2 ||
+      printf '%s: the old lock could not be restored on %s; read git worktree list --porcelain for its state\n' "$PROG" "$wt" >&2
+    return "$EX_ENV"
+  fi
+  printf '%s\n' "$new_reason"
+}
+
+# scan_transcripts <name> [-quit]: on its first call only, list each
+# <projects>/*/<name> changed within the idle window into TRANSCRIPTS, one per
+# line with a newline on each side, so a session's lookup is one string match.
+# A batch passes `*.jsonl` to cover every session at once; a single path passes
+# its own <sid>.jsonl and -quit. TRANSCRIPT_SCAN records ok, unreadable or failed.
+TRANSCRIPT_SCAN=""
+TRANSCRIPTS=""
+scan_transcripts() {
+  [[ -z "$TRANSCRIPT_SCAN" ]] || return 0
+  local found
+  TRANSCRIPT_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+  if [[ ! -d "$TRANSCRIPT_DIR" || ! -r "$TRANSCRIPT_DIR" ]]; then
+    TRANSCRIPT_SCAN=unreadable
+  elif found="$(find "$TRANSCRIPT_DIR" -mindepth 2 -maxdepth 2 -name "$1" -mmin "-$idle_minutes" -print ${2:+"$2"} 2>/dev/null)"; then
+    TRANSCRIPT_SCAN=ok
+    TRANSCRIPTS=$'\n'"$found"$'\n'
+  else
+    TRANSCRIPT_SCAN=failed
+  fi
+}
+
+# load_session_registry: on its first call only, read every <config>/sessions/*.json
+# into REGISTRY_ROWS as sessionId<TAB>pid<TAB>procStart lines. REGISTRY_SCAN records
+# ok, unreadable or malformed. One malformed entry spoils the whole read, because
+# it might be the one holding the session asked about. The <pid>.key files beside
+# the entries hold credentials and never match this glob.
+REGISTRY_SCAN=""
+REGISTRY_ROWS=""
+load_session_registry() {
+  [[ -z "$REGISTRY_SCAN" ]] || return 0
+  REGISTRY_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions"
+  if [[ ! -d "$REGISTRY_DIR" || ! -r "$REGISTRY_DIR" || ! -x "$REGISTRY_DIR" ]]; then
+    REGISTRY_SCAN=unreadable
+    return 0
+  fi
+  local -a entries=("$REGISTRY_DIR"/*.json)
+  if [[ ! -e "${entries[0]}" ]]; then
+    REGISTRY_SCAN=ok
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    REGISTRY_SCAN=nojq
+    return 0
+  fi
+  local rows row count=0
+  # shellcheck disable=SC2016  # jq program, not a shell expansion.
+  if ! rows="$(jq -r '
+    if (.pid | type) == "number" and .pid > 0 and .pid == (.pid | floor)
+      and (.sessionId | type) == "string" and (.sessionId | length) > 0
+      and (.procStart | type) == "string" and (.procStart | test("^[0-9]+$"))
+    then [.sessionId, .pid, .procStart] | @tsv
+    else error("unknown shape")
+    end' "${entries[@]}" 2>/dev/null)"; then
+    REGISTRY_SCAN=malformed
+    return 0
+  fi
+  while IFS= read -r row; do
+    [[ -z "$row" ]] || count=$((count + 1))
+  done <<<"$rows"
+  # jq emits nothing for a zero-byte file and exits 0.
+  if ((count != ${#entries[@]})); then
+    REGISTRY_SCAN=malformed
+    return 0
+  fi
+  REGISTRY_SCAN=ok
+  REGISTRY_ROWS="$rows"
+}
+
+# proc_start_time <pid>: field 22 of /proc/<pid>/stat into PROC_START, the clock
+# ticks since boot that a registry procStart records. Returns 1 when the process
+# is gone, 2 when this host cannot tell: macOS has no /proc, and Git Bash's /proc
+# lists only its own pids, not the Windows pids a registry entry holds.
+HOST_KERNEL=""
+proc_start_time() {
+  local stat
+  local -a fields
+  [[ -n "$HOST_KERNEL" ]] || HOST_KERNEL="$(uname -s 2>/dev/null)"
+  [[ "$HOST_KERNEL" == Linux && -r /proc/self/stat ]] || return 2
+  [[ -d "/proc/$1" ]] || return 1
+  IFS= read -r stat 2>/dev/null <"/proc/$1/stat" || return 2
+  # The command name (field 2) may itself hold spaces and parentheses.
+  read -r -a fields <<<"${stat##*) }"
+  PROC_START="${fields[19]:-}"
+  [[ "$PROC_START" =~ ^[0-9]+$ ]] || return 2
+}
+
+# session_is_free <sid>: 0 when no running Claude Code process holds <sid>,
+# including an entry that is dead or whose pid now belongs to another process.
+# Otherwise 1, with the reason in STALE_NOTE.
+session_is_free() {
+  local entry_sid entry_pid entry_start rc
+  load_session_registry
+  case "$REGISTRY_SCAN" in
+  unreadable)
+    STALE_NOTE="not provable: session registry $REGISTRY_DIR is missing or unreadable"
+    return 1
+    ;;
+  nojq)
+    STALE_NOTE="not provable: jq is not on PATH, so session registry $REGISTRY_DIR cannot be read"
+    return 1
+    ;;
+  malformed)
+    STALE_NOTE="not provable: session registry $REGISTRY_DIR could not be read or holds an entry in an unknown shape"
+    return 1
+    ;;
+  *) ;;
+  esac
+  while IFS=$'\t' read -r entry_sid entry_pid entry_start; do
+    [[ "$entry_sid" == "$1" ]] || continue
+    proc_start_time "$entry_pid"
+    rc=$?
+    if ((rc == 2)); then
+      STALE_NOTE="not provable: cannot read the start time of process $entry_pid on this host"
+      return 1
+    fi
+    if ((rc == 0)) && [[ "$PROC_START" == "$entry_start" ]]; then
+      STALE_NOTE="not provable: session $1 is held by running process $entry_pid"
+      return 1
+    fi
+  done <<<"$REGISTRY_ROWS"
+  return 0
+}
+
+# stale_verdict <canonical-path>: the stale verdict into STALE_NOTE, returned as
+# the exit code `stale` documents. Forks only for the host name, the kernel name,
+# the registry read and the transcript scan, each once per run, so --batch pays
+# nothing more per path.
+# ponytail: liveness is provable only from this host's registry and transcripts;
+# a lock from another host, or without a session id, stays "not provable".
+THIS_HOST=""
+stale_verdict() {
+  local idx reason host sid hit
+  if ! find_worktree_index "$1"; then
+    STALE_NOTE="not a registered worktree: $1"
+    return "$EX_ENV"
+  fi
+  idx="$WT_INDEX"
   reason="${WT_REASONS[idx]}"
   if ((WT_IS_LINKED[idx] == 0)) || [[ -z "$reason" ]]; then
-    printf 'not provable: %s is not a linked worktree with a lock reason\n' "$wt"
+    STALE_NOTE="not provable: ${WT_PATHS[idx]} is not a linked worktree with a lock reason"
     return "$EX_UNCLAIMED_REPORT"
   fi
-  if ! lane="$(worktree_reason_lane "$reason")"; then
-    printf 'not provable: the lock reason names no session: %s\n' "$reason"
+  # Called for the BASH_REMATCH it sets, not its output, so no subshell runs.
+  if ! worktree_reason_lane "$reason" >/dev/null; then
+    STALE_NOTE="not provable: the lock reason names no session: $reason"
     return "$EX_UNCLAIMED_REPORT"
   fi
-  read -r host sid <<<"$lane"
-  if [[ "$host" != "$(worktree_host_name)" ]]; then
-    printf 'not provable: the lock is from host %s, not this host\n' "$host"
+  host="${BASH_REMATCH[1]}"
+  sid="${BASH_REMATCH[2]}"
+  [[ -n "$THIS_HOST" ]] || THIS_HOST="$(worktree_host_name)"
+  if [[ "$host" != "$THIS_HOST" ]]; then
+    STALE_NOTE="not provable: the lock is from host $host, not this host"
     return "$EX_UNCLAIMED_REPORT"
   fi
-  projects="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
-  if [[ ! -d "$projects" || ! -r "$projects" ]]; then
-    printf 'not provable: transcript directory %s is unreadable\n' "$projects"
+  session_is_free "$sid" || return "$EX_UNCLAIMED_REPORT"
+  if ((batch)); then
+    scan_transcripts '*.jsonl'
+  else
+    scan_transcripts "$sid.jsonl" -quit
+  fi
+  case "$TRANSCRIPT_SCAN" in
+  unreadable)
+    STALE_NOTE="not provable: transcript directory $TRANSCRIPT_DIR is unreadable"
+    return "$EX_UNCLAIMED_REPORT"
+    ;;
+  failed)
+    STALE_NOTE="not provable: scanning $TRANSCRIPT_DIR failed"
+    return "$EX_UNCLAIMED_REPORT"
+    ;;
+  *) ;;
+  esac
+  if [[ "$TRANSCRIPTS" == *"/$sid.jsonl"$'\n'* ]]; then
+    hit="${TRANSCRIPTS%%"/$sid.jsonl"$'\n'*}"
+    STALE_NOTE="not provable: transcript ${hit##*$'\n'}/$sid.jsonl changed within $idle_minutes minutes"
     return "$EX_UNCLAIMED_REPORT"
   fi
-  if ! hit="$(find "$projects" -mindepth 2 -maxdepth 2 -name "$sid.jsonl" -mmin "-$idle_minutes" -print -quit 2>/dev/null)"; then
-    printf 'not provable: scanning %s failed\n' "$projects"
-    return "$EX_UNCLAIMED_REPORT"
+  STALE_NOTE="stale: session $sid on $host has no transcript change in $idle_minutes minutes"
+  return "$EX_OK"
+}
+
+do_stale() {
+  local rc
+  stale_verdict "$path"
+  rc=$?
+  if ((rc == EX_ENV)); then
+    printf '%s: %s\n' "$PROG" "$STALE_NOTE" >&2
+  else
+    printf '%s\n' "$STALE_NOTE"
   fi
-  if [[ -n "$hit" ]]; then
-    printf 'not provable: transcript %s changed within %s minutes\n' "$hit" "$idle_minutes"
-    return "$EX_UNCLAIMED_REPORT"
-  fi
-  printf 'stale: session %s on %s has no transcript change in %s minutes\n' "$sid" "$host" "$idle_minutes"
+  return "$rc"
+}
+
+do_stale_batch() {
+  local input canon rc i
+  local -a inputs=()
+  while IFS= read -r -d '' input || [[ -n "$input" ]]; do
+    [[ -n "$input" ]] || continue
+    if [[ "$input" == *$'\t'* || "$input" == *$'\n'* ]]; then
+      printf '%s: stale --batch: a path holds a tab or newline: %q\n' "$PROG" "$input" >&2
+      return "$EX_USAGE"
+    fi
+    inputs+=("$input")
+  done
+  [[ ${#inputs[@]} -gt 0 ]] || return "$EX_OK"
+  for i in "${!inputs[@]}"; do
+    canonicalize_path_to canon "${inputs[i]}"
+    stale_verdict "$canon"
+    rc=$?
+    printf '%s\t%s\t%s\n' "$rc" "${inputs[i]}" "${STALE_NOTE//[$'\t\n']/ }"
+  done
+  return "$EX_OK"
 }
 
 case "$cmd" in
 stale)
+  if ((batch)); then
+    do_stale_batch
+    exit $?
+  fi
   do_stale
   exit $?
   ;;
@@ -566,6 +913,10 @@ check-enter)
   ;;
 release)
   do_release
+  exit $?
+  ;;
+handover)
+  do_handover
   exit $?
   ;;
 # Unknown verbs already exited above, where the verb was validated.

@@ -97,7 +97,7 @@ name: PR Feedback Dispatch
 on:
   # workflow_run runs this file from the default branch, never a PR's copy.
   workflow_run: # zizmor: ignore[dangerous-triggers]
-    workflows: [PR Review Hosted, PR Review Security Hosted, PR Verify, PR Unblock Dispatch, PR Merge, pr-review-approved, pr-review-comment-relay]
+    workflows: [PR Review Hosted, PR Review Security Hosted, PR Verify, PR Unblock Dispatch, PR Merge, PR Review Approved, PR Review Comment Relay]
     types: [completed]
 
 permissions: {}

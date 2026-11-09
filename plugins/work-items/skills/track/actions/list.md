@@ -27,7 +27,7 @@ List work items with optional filtering.
 ```markdown
 | # | Item | Type | Labels | Assignee | Updated |
 |---|------|------|--------|----------|---------|
-| 1 | #42 Fix <thing> | Bug | area: <your-area>, priority: high | @user | 2d ago |
+| 1 | #42 Fix <thing> | Bug | area: <your-area> | @user | 2d ago |
 | 2 | #38 Review <config> | Task | area: <your-area> | -- | 5d ago |
 ```
 
@@ -35,4 +35,4 @@ The `#` column is a sequential index for this listing. When the user references 
 
 ## Search syntax
 
-Provider search qualifiers (label/exclude/assignee/sort/date) and the pass-through behavior of `--search` are documented in the bound adapter's operations reference. GitHub: `${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/adapters/github/README.md` "Search items".
+Provider search qualifiers (label/exclude/assignee/sort/date) are linked from, and the pass-through behavior of `--search` is documented in, the bound adapter's operations reference. GitHub: `${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/adapters/github/README.md` "Search items".

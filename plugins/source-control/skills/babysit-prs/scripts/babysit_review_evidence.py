@@ -725,6 +725,35 @@ def readonly_workflow(
     return isinstance(text, str) and _readonly_workflow_text(text, stem)
 
 
+# The standards vocabulary's displayWords: this script runs outside the
+# repository that holds it, so a test asserts the two stay equal.
+WORKFLOW_NAME_WORDS = {
+    "acl": "ACL",
+    "api": "API",
+    "ci": "CI",
+    "cli": "CLI",
+    "dotnet": ".NET",
+    "editorconfig": "EditorConfig",
+    "markdownlint": "markdownlint",
+    "nuget": "NuGet",
+    "oidc": "OIDC",
+    "pr": "PR",
+    "psscriptanalyzer": "PSScriptAnalyzer",
+    "wip": "WIP",
+    "yq": "yq",
+}
+
+
+def workflow_display_name(stem: str) -> str:
+    """A lowercase file stem's workflow `name:`: hyphens to spaces, Title
+    Case, listed words as `WORKFLOW_NAME_WORDS` spells them.
+    `.github/actions/resolve-config/callers.test.mjs` holds the same rule over
+    this repository's workflow files."""
+    return " ".join(
+        WORKFLOW_NAME_WORDS.get(word, word.capitalize()) for word in stem.split("-")
+    )
+
+
 def _readonly_workflow_text(text: str, stem: str) -> bool:
     """Whether workflow text, read as GitHub would, grants its token no write
     scope and reaches no secret:
@@ -732,9 +761,10 @@ def _readonly_workflow_text(text: str, stem: str) -> bool:
     - one plain YAML document: no anchor, alias, explicit tag, directive,
       `<<` merge key or repeated key (PyYAML and GitHub's parser could read
       those differently), and only known top-level and job keys;
-    - `name:` equal to the file stem, so no `workflow_run` listener that
-      names another workflow fires on it (its `workflows` filter matches
-      names, and an omitted name is the file path);
+    - `name:` equal to the file stem or `workflow_display_name` of it, two
+      forms per stem and neither another stem's, so no `workflow_run`
+      listener that names another workflow fires on it (its `workflows`
+      filter matches names, and an omitted name is the file path);
     - no `pull_request_target`, `workflow_run` or `workflow_call` trigger;
     - every job's token set by a `permissions:` of its own or the top level,
       each scope `read` or `none` (`read-all` or `{}` too): a scope set
@@ -769,7 +799,10 @@ def _readonly_workflow_text(text: str, stem: str) -> bool:
     if top is None or not set(top) <= WORKFLOW_KEYS:
         return False
     name, on, jobs = top.get("name"), top.get("on"), top.get("jobs")
-    if not isinstance(name, yaml.ScalarNode) or name.value != stem:
+    if not isinstance(name, yaml.ScalarNode) or name.value not in (
+        stem,
+        workflow_display_name(stem),
+    ):
         return False
     triggers = _yaml_names(on, yaml)
     if not triggers or {t.casefold() for t in triggers} & DENIED_TRIGGERS:

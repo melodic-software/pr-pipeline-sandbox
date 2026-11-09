@@ -33,15 +33,15 @@ third, the provider **binding**, is discharged differently: a missing binding bl
 routes rather than halting unconditionally.
 
 - **`jq`** (`command -v jq`). The actions' snippets parse with it unconditionally. Missing: stop
-  and surface the install remediation (<https://jqlang.org/download/>; a separate install under Git
-  Bash on native Windows). Never improvise a parse.
+  and surface the install remediation, the per-platform install at <https://jqlang.org/download/>
+  (as of 2026-11-03; recheck when that page moves). Never improvise a parse.
 - **The seam script**, `"$TRACKER"` above. The plugin bundles it, so it resolves at the plugin-dir
   path by default; if it resolves at **neither** the plugin path nor the project-root fallback, the
   plugin install is incomplete: stop and surface that the plugin must be reinstalled or repaired,
   rather than improvising provider commands. `/work-items:setup` binds the provider and configures the
   recurring schedule and label remaps but does NOT create the seam.
-- **The provider binding** (`.work-item-tracker.json` at the project root, seeded by
-  `/work-items:setup`). Unlike the two above, a missing binding has a legitimate recovery path, so it is
+- **The provider binding** (the `tracker` key of `<home>/work-items.yaml`, else the legacy
+  repo-root JSON binding `/work-items:setup` writes). Unlike the two above, a missing binding has a legitimate recovery path, so it is
   **loud and actionable, never a silent default and never a raw mid-flow `exit 3`**, but it does not halt the
   invocation unconditionally:
   - **Seam coordination verbs** (`create-item`, `get-item`, `claim`, `renew-lease`, `release`, `reclaim`,
@@ -89,15 +89,15 @@ ways:
 
 **Single-item fetch does not return a body.** `get-item` yields the normalized item object,
 `schema_version, id, title, state, assignees, labels, type, blocked_by_count,
-blocked_by_wont_do_count, parent_id, url, created_at`
+blocked_by_wont_do_count, parent_id, url, created_at, milestone`
 (`${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/CONTRACT.md` "JSON output contract"), and there is
 **no `body` field** in it; `--body` exists only as a *write* parameter on `create-item`. `get-item`
 is nonetheless authoritative for `parent_id`, which is how an item reaches its container. Reading
 the text of an item, such as a container's Brief or an item's acceptance criteria, is therefore a
 **provider-mechanic** read (`gh issue view <n> --repo <owner>/<repo> --json body,title` on GitHub;
 the provider's REST equivalent otherwise), and a surface that shows a body read must label it as
-such rather than folding it into a seam snippet. That GitHub form is GraphQL-backed, so a sandboxed
-session (Claude Code on the web, remote execution) reads over REST instead; the adapter's
+such rather than folding it into a seam snippet. A sandboxed session (Claude Code on the web,
+remote execution) reads that body over REST instead; the adapter's
 operations reference carries the REST substitute and the pointer record under "View item"
 (`${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/adapters/github/README.md`).
 Provider mechanics run unbound, so the read still
@@ -151,20 +151,21 @@ from the tracker binding's `config.role_labels` (defaults `agent-ready` / `needs
 | Axis | Mechanism | Scope | What it encodes |
 |------|-----------|-------|-----------------|
 | Type | native Issue Type (org) · `type:` label (personal) | universal | `Bug` / `Feature` / `Task`, the kind of issue; commit-type granularity stays at the commit layer |
-| Priority | `priority:` | universal | urgency, members from the live set |
+| Priority | `Priority` issue field (org) · `priority:` label (no such field) | universal | urgency, members from the live set; written per "Setting an item's priority" below |
 | Status | `status:` | universal | exception + gate flags only (`needs-info`, `needs-decision`, `ready`); claim = assignee + lease, blocked = native edge (neither is a label). the triage floor is the bare label `needs-triage`, not a status or priority value; see [`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md) |
 | Meta | (none) | universal | `automated`, `good-first-issue`, `migrated`, `stale`, plus the canonical-role labels (defaults `agent-ready`, `needs-human`, `recurring`) |
 | Area | `area:` | repo-specific | the consuming repo's architecture surface, see [`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md) |
 | Category | `category:` | repo-specific | the consuming repo's domain categorization, see [`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md) |
 | Ecosystem | `ecosystem:` | repo-specific | the consuming repo's language/toolchain mix, see [`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md) |
 | Cadence | `cadence:` | repo-specific | e.g. `cadence:weekly`, `cadence:monthly`, members from the live set |
-| Work class | `work-class:` | universal | C1–C5 semantic risk class, canonical members and migration in [`${CLAUDE_PLUGIN_ROOT}/reference/work-class-labels.md`](${CLAUDE_PLUGIN_ROOT}/reference/work-class-labels.md) |
+| Work class | `work-class:` | universal | C1–C4 risk-class record no work-items skill stamps or reads; C5 is `provenance: untrusted`; members in [`${CLAUDE_PLUGIN_ROOT}/reference/work-class-labels.md`](${CLAUDE_PLUGIN_ROOT}/reference/work-class-labels.md) |
 | Capability tier | `capability-tier:` | universal | frontier quota-guard tier, canonical members and migration in [`${CLAUDE_PLUGIN_ROOT}/reference/capability-tier-labels.md`](${CLAUDE_PLUGIN_ROOT}/reference/capability-tier-labels.md); absent = general tier |
 
 ## Role-label resolution is an action-entry invariant
 
 At the start of every action that queries, creates, or filters items by a canonical role, read
-`.work-item-tracker.json` and resolve each role the action uses from `config.role_labels`; an absent
+the binding the seam resolves (the `tracker` mapping of `<home>/work-items.yaml`, else the legacy
+repo-root JSON binding) and resolve each role the action uses from `config.role_labels`; an absent
 file or absent entry falls back to the documented default silently (setup omits default entries on
 purpose). Keep
 those resolved strings for that invocation and
@@ -173,11 +174,70 @@ use them in every adapter query and core-side label comparison. Never put a defa
 JSON, a non-string role value, or an empty role value is a configuration error: stop and report it
 rather than silently querying the default.
 
+## Reading an item's status
+
+Skills that place an item in a queue, or hold it for a person, by its status cite this rule and
+never restate it. Verb forms are in `${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/CONTRACT.md`
+"Verbs".
+
+1. **Where status lives.** Run `"$TRACKER" status-storage` once per pass. `labels` means the
+   labels decide and the field steps below are skipped, as they are in a session with no tracker
+   binding, which reads labels alone. Otherwise a non-zero exit stops the pass, which
+   reports that status was unread; it never presents a label-only view as complete.
+2. **The field read.** On `field`, run `"$TRACKER" get-statuses --field "Work status" <id>...`
+   over the open items the pass listed, at most 100 ids per call. A non-zero exit stops the pass
+   the same way.
+3. **An item's status** is its Work status value when set, else its labels. A queue-state label
+   that disagrees with a set value no longer places the item: a `needs-triage` label on an item
+   whose value is `confirmed` lists as `confirmed`. Holds are decided by step 4 alone.
+4. **Held for a person.** An item is held when it carries the human-gated role label (resolved as
+   in "Role-label resolution is an action-entry invariant" above), carries a
+   `WIT_HOLD_STATE_LABELS` label, or its status is in `WIT_HUMAN_FLOOR_STATUS_STATES` (both in
+   [`${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/lib/labels.sh`](${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/lib/labels.sh)).
+   Either source holds it, whatever the other says. Those states are Work status option names and
+   take no `config.role_labels` remap.
+5. **Who set the value.** Decision readers (the autonomous frontier, the work-loop's drain-terminal
+   test) take setter trust from `get-statuses`, which counts only trusted setters when the binding
+   configures it (GitHub: `${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/adapters/github/README.md`
+   "Work status trust"). Display readers such as
+   `/work-items:morning-brief` may read the plain field; they decide nothing.
+6. **Lifting a hold.** When storage is `field` and the item's status is a hold state, the pass
+   that removes the hold label also writes the field, while it holds the item's claim. Run
+   `"$TRACKER" get-field-options --field "Work status"` for `field_id` and the id of the option the
+   skill names, then `"$TRACKER" set-fields <id> --field <field_id>=<option_id>`, before the label
+   edit. A `null` `field_id`, a missing option, or a failed write leaves the item as it was, labels
+   included, and is reported.
+
+## Setting an item's priority
+
+Skills that write an item's priority cite this rule and never restate it. Verb forms are in
+`${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/CONTRACT.md` "Verbs".
+
+1. **Where priority lives.** Once per invocation, before the first write, run
+   `"$TRACKER" capabilities`. When the adapter declares `get-field-options` and `set-fields`, run
+   `"$TRACKER" get-field-options --field Priority`. Priority lives in the field when that lists at
+   least one option. It lives in labels when the adapter does not declare both verbs, when
+   `field_id` is `null` or `options` is empty, and when the read is refused (`status-storage` in
+   `CONTRACT.md` says which exits are a refusal). Any other failure stops the pass, which reports it:
+   a provider that did not answer has not said priority lives in labels. Report which one is in
+   use.
+2. **The live set.** On the field, the priorities are its option names. On labels, they are the
+   repository's live `priority:` labels (adapter: "List labels"). Match a name case-insensitively,
+   ignoring a leading `priority:` and the space after it, so `high` and `priority: high` name one
+   priority. A value with no match is not a priority.
+3. **Writing the field.** `"$TRACKER" set-fields <id> --field <field_id>=<option_id>`, both ids
+   from step 1's read. No `priority:` label is applied.
+4. **Writing labels.** The axis is single-valued: the edit that applies the matched label removes
+   every other `priority:` label on the item.
+
 ## Recurring schedule
 
 Recurring items are defined in `.github/recurring-schedule.json` and created as items by the
-consuming repo's recurring-issues automation when they come due. The `/work-items:track recheck`
-action updates this schedule after completing a periodic check.
+consuming repo's recurring-issues automation when they come due. That automation writes each item
+in the recurring shape, the `<!-- recurring-schedule id=<id> -->` body line included
+([`issue-conventions.md`](issue-conventions.md) "Recurring marker"): an item without it is matched
+to no row. The `/work-items:track recheck` action updates this schedule after completing a
+periodic check.
 
 ## Memory-tier writes
 
@@ -203,8 +263,8 @@ step sequence.
 ### With `/session-flow:retro`
 
 The retrospective skill's Phase 3 surfaces "Issue candidates": deferred research, discovered gaps,
-recurring recheck updates. Approved items use `/work-items:track add`. Mid-session learnings can be
-captured with `/session-flow:retro codify`.
+recurring recheck updates. Approved items use `/work-items:track add`. A recurring mid-session
+correction goes to `/corrections:codify`, which picks the rung that encodes it.
 
 ### With `/source-control:pull-request`
 
@@ -235,10 +295,15 @@ need attention.
 ## Gotchas
 
 Skill-behavior failure patterns. Add to this section when new gotchas are discovered.
-Provider-mechanic gotchas (Windows `\r`, search-qualifier syntax, the `gh` 30-row default limit,
-`--add-label` vs `--label`, `--reason` values, rate limits, Issue-Forms auto-labeling) live in the
-bound adapter's operations reference. For GitHub, that is
+Provider-mechanic gotchas (Windows `\r`, search syntax, `gh` list limits, label and assignee edit
+flags, close reasons, rate limits, labels on programmatic creation) live in the bound adapter's
+operations reference. For GitHub, that is
 `${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/adapters/github/README.md` "Gotchas".
+
+- **Unattended loops hold to the provider's API budget.** Every lane, worker and session under one
+  user draws on one provider budget. Waits run in the background at the adapter's cadence, writes go
+  one at a time, and a rate-limit error (seam exit 8) stops the run's provider calls until the reset,
+  never a retry loop. For GitHub, the cadence is the adapter reference's "API budget".
 
 - **Claim concurrency is the seam's job.** Claiming is race-safe at the seam (assignee + lease
   comment, same-identity aware), per `${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/CONTRACT.md` "Lease protocol". Reclaim
@@ -265,5 +330,6 @@ bound adapter's operations reference. For GitHub, that is
 - Own the label taxonomy content. That is
   [`${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md`](${CLAUDE_PLUGIN_ROOT}/reference/label-taxonomy.md)
   (universal + repo-specific groups).
-- Bind the provider. The active provider lives in `.work-item-tracker.json` at the project root,
-  seeded once by `/work-items:setup`; these skills read the binding but never write it.
+- Bind the provider. The active provider lives under the `tracker` key of `<home>/work-items.yaml`,
+  else in the legacy repo-root JSON binding `/work-items:setup` writes; these skills read the
+  binding but never write it.
