@@ -20,7 +20,7 @@ on:
         type: string
       activity:
         description: >-
-          refine runs fix-marker and applies its patch; fix-ci-fallback runs only
+          refine runs nothing (fix-marker runs on pull_request only); fix-ci-fallback runs only
           the Phase 5b fallback probe below; fix-docs runs main's fix-docs, and
           fix-docs-no-key runs it with an empty key (Phase 7.1 probes).
         required: false
@@ -38,14 +38,13 @@ permissions: {}
 jobs:
   # fix-marker is a read skill: the read runner runs it with no write token
   # and uploads its uncommitted edit as a patch, and apply-marker-patch pushes
-  # it under patch-rules.json's default row. On pull_request the head is the
-  # event's, which no head code wrote.
+  # it under patch-rules.json's default row. It runs on pull_request only,
+  # whose event names the head the patch is made on, which no head code wrote.
   fix-marker:
     # The lanes App's own pull_request events never start a lane.
     if: >-
-      !(github.event_name == 'pull_request'
-      && format('{0}', github.event.sender.id) == vars.AUTOMATION_LANES_APP_SENDER_ID)
-      && (inputs.activity == '' || inputs.activity == 'refine')
+      github.event_name == 'pull_request'
+      && format('{0}', github.event.sender.id) != vars.AUTOMATION_LANES_APP_SENDER_ID
     permissions:
       contents: read
       pull-requests: read
@@ -70,13 +69,10 @@ jobs:
       scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
 
   # fix-marker's push job, on a written patch only; every input is the scan
-  # job's, never the run job's, since the run job runs head code. Only on
-  # pull_request, whose event names the head the patch was made on.
+  # job's, never the run job's, since the run job runs head code.
   apply-marker-patch:
     needs: fix-marker
-    if: >-
-      ${{ !cancelled() && github.event_name == 'pull_request'
-      && needs.fix-marker.outputs.scan-patch-state == 'written' }}
+    if: ${{ !cancelled() && needs.fix-marker.outputs.scan-patch-state == 'written' }}
     permissions:
       contents: read
       pull-requests: read
