@@ -108,7 +108,7 @@ ADAPTED=(
   # main's, unchanged; resolve-issue takes main's labels and holds but keeps
   # no checks.
   docs/conventions/pr-pipeline.yaml
-  # Sandbox activities fix-marker and audit-env-write, with the role input,
+  # Sandbox activity fix-marker and its patch job, with the role input,
   # and the fix-ci fallback probe (pr-unblock.yml's fix-ci jobs on this lane).
   # Its run-name, dispatcher-run-id input and fix-docs jobs are main's on the
   # automations role: sync them with the dispatcher, which sends that input.
