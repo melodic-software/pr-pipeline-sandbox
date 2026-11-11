@@ -276,7 +276,7 @@ jobs:
           # .github/standards/trusted-actors/trusted-actors.json lists them.
           exempt_author_ids='49699333 337859524 300666570'
           lanes='pr-review-hosted.yml pr-review / review-status
-          pr-review-security-hosted.yml pr-review-security / security-review'
+          pr-review-security-hosted.yml pr-review-security / review-status'
           if [[ ! $HEAD_SHA =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::the head '$HEAD_SHA' is not a commit SHA."
             exit 1
