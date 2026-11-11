@@ -46,7 +46,11 @@ activities:
   # their fixtures.
   fix-marker:
     skill: sandbox-marker:fix-marker
-    effect: mutate-branch
+    # A skill runs with no write token: its edit leaves as a patch that
+    # apply-patch pushes under patch-rules.json's default row.
+    effect: read
+    applied-by:
+      patch: apply-patch
     gating: advisory
     reads-untrusted: false
     applies-when:
@@ -98,28 +102,6 @@ activities:
     effect: read
     gating: advisory
     reads-untrusted: false
-  # Case 7a: a write activity that applies to every PR, sent to
-  # pr-run-activity-read.yml, must stop with effect-not-read before the head
-  # checkout. Its script never runs.
-  check-write-effect:
-    script: scripts/lanes/check-sandbox.sh
-    effect: mutate-branch
-    gating: advisory
-    reads-untrusted: false
-
-  # P7: the audit-env skill at a write effect, so it runs in
-  # pr-run-activity-write.yml, whose job holds id-token: write.
-  audit-env-write:
-    # A write skill's Bash runs only base wrappers, so the scan is one.
-    skill: sandbox-marker:scan-environ
-    verify-scripts:
-      - scripts/scan-environ.sh
-    effect: mutate-tracker
-    gating: advisory
-    reads-untrusted: false
-    applies-when:
-      paths: ["sandbox/env/**"]
-
   # Phase 9: the pr-unblock lane, copied from claude-code-plugins' live config.
   resolve-conflicts:
     # Resolves the conflicts of merging the default branch's tip into a pull
@@ -580,8 +562,6 @@ lanes:
     stage: refine
     slots:
       - activity: fix-marker
-      - activity: check-write-effect
-      - activity: audit-env-write
       # Sandbox-only probe of fix-ci's subscription fallback (claude-code-
       # plugins Phase 5b, probe P2): pr-refine.yml's fix-ci-fallback dispatch
       # passes an unset key. A new lane would need a lane-rules.json row, which
@@ -593,7 +573,7 @@ lanes:
       # main's fix-docs (Phase 7.1 probes P1-P3), on pr-refine as on main.
       - activity: fix-docs
       - activity: apply-patch
-        needs: [fix-ci, fix-docs]
+        needs: [fix-ci, fix-docs, fix-marker]
   pr-explain:
     stage: verify
     slots:
@@ -663,7 +643,6 @@ models:
     explain-marker: turns-5
     review-gate: turns-5
     audit-env: turns-6
-    audit-env-write: turns-6
     resolve-conflicts: code-fix
     address-feedback: code-fix
     review-dependency: review

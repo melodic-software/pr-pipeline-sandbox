@@ -20,7 +20,7 @@ on:
         type: string
       activity:
         description: >-
-          refine runs fix-marker and audit-env-write; fix-ci-fallback runs only
+          refine runs nothing (fix-marker runs on pull_request only); fix-ci-fallback runs only
           the Phase 5b fallback probe below; fix-docs runs main's fix-docs, and
           fix-docs-no-key runs it with an empty key (Phase 7.1 probes).
         required: false
@@ -36,13 +36,15 @@ on:
 permissions: {}
 
 jobs:
+  # fix-marker is a read skill: the read runner runs it with no write token
+  # and uploads its uncommitted edit as a patch, and apply-marker-patch pushes
+  # it under patch-rules.json's default row. It runs on pull_request only,
+  # whose event names the head the patch is made on, which no head code wrote.
   fix-marker:
-    # The lanes App's own pull_request events never start a lane, so a lane
-    # push never waits in the per-PR write queue.
+    # The lanes App's own pull_request events never start a lane.
     if: >-
-      !(github.event_name == 'pull_request'
-      && format('{0}', github.event.sender.id) == vars.AUTOMATION_LANES_APP_SENDER_ID)
-      && (inputs.activity == '' || inputs.activity == 'refine')
+      github.event_name == 'pull_request'
+      && format('{0}', github.event.sender.id) != vars.AUTOMATION_LANES_APP_SENDER_ID
     permissions:
       contents: read
       pull-requests: read
@@ -53,22 +55,24 @@ jobs:
       # One per-PR queue shared by every write lane: it queues, never cancels.
       group: pr-pipeline-write-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity-write.yml
+    uses: ./.github/workflows/pr-run-activity-read.yml # zizmor: ignore[self-repository]
     with:
       role: automations
       lane: pr-refine
       activity: fix-marker
+      # No API key is passed, so the run takes the OAuth-token leg.
+      fallback: no-key
       pr-number: ${{ inputs.pr-number }}
+      head-sha: ${{ github.event.pull_request.head.sha }}
     secrets:
       claude-code-oauth-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
+      scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
 
-  audit-env-write:
-    # The lanes App's own pull_request events never start a lane, so a lane
-    # push never waits in the per-PR write queue.
-    if: >-
-      !(github.event_name == 'pull_request'
-      && format('{0}', github.event.sender.id) == vars.AUTOMATION_LANES_APP_SENDER_ID)
-      && (inputs.activity == '' || inputs.activity == 'refine')
+  # fix-marker's push job, on a written patch only; every input is the scan
+  # job's, never the run job's, since the run job runs head code.
+  apply-marker-patch:
+    needs: fix-marker
+    if: ${{ !cancelled() && needs.fix-marker.outputs.scan-patch-state == 'written' }}
     permissions:
       contents: read
       pull-requests: read
@@ -76,17 +80,20 @@ jobs:
       issues: write
       id-token: write
     concurrency:
-      # One per-PR queue shared by every write lane: it queues, never cancels.
       group: pr-pipeline-write-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity-write.yml
+    uses: ./.github/workflows/pr-run-activity-write.yml # zizmor: ignore[self-repository]
     with:
       role: automations
       lane: pr-refine
-      activity: audit-env-write
+      activity: apply-patch
       pr-number: ${{ inputs.pr-number }}
-    secrets:
-      claude-code-oauth-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
+      patch-state: ${{ needs.fix-marker.outputs.scan-patch-state }}
+      patch-sha256: ${{ needs.fix-marker.outputs.scan-patch-sha256 }}
+      patch-attempt: ${{ needs.fix-marker.outputs.scan-patch-attempt }}
+      patch-activity: fix-marker
+      patch-head-sha: ${{ github.event.pull_request.head.sha }}
+      reply-attempt: ${{ needs.fix-marker.outputs.scan-reply-attempt }}
 
   # Sandbox-only probe of fix-ci's subscription fallback (claude-code-plugins
   # Phase 5b, probe P2): pr-unblock.yml's fix-ci jobs on lane pr-refine,
