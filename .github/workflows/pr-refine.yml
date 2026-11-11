@@ -61,6 +61,8 @@ jobs:
       role: automations
       lane: pr-refine
       activity: fix-marker
+      # No API key is passed, so the run takes the OAuth-token leg.
+      fallback: no-key
       pr-number: ${{ inputs.pr-number }}
       head-sha: ${{ github.event.pull_request.head.sha }}
     secrets:
