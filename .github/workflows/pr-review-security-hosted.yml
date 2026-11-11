@@ -1,7 +1,7 @@
 name: PR Review Security Hosted
 
-# Sandbox caller of the org pr-review-cli reusable, lane `security`, at the
-# pin claude-code-plugins#9910 uses and its hold inputs. The job id
+# Sandbox caller of the org pr-review-cli reusable, lane `security`, at @main
+# as claude-code-plugins calls it, with its hold inputs. The job id
 # `pr-review-security` keeps the check `pr-review-security / security-review`,
 # which ci-status's `Require both review lanes on this head` step reads. No
 # resolve-model job: the review runs on the reusable's default model.
@@ -69,7 +69,7 @@ jobs:
       checks: read # the reusable's status job reads its earlier runs' cost notices
       contents: read
       pull-requests: write # the review, its comments, the marker and the hold label
-    uses: melodic-software/ci-workflows/.github/workflows/pr-review-cli.yml@4fbceb4b75ffd568dfa5db31de0d0e753c0c64e6 # v0.65.9
+    uses: melodic-software/ci-workflows/.github/workflows/pr-review-cli.yml@main
     with:
       lane: security
       publish: comments
