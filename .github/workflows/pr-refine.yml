@@ -46,6 +46,7 @@ jobs:
       github.event_name == 'pull_request'
       && format('{0}', github.event.sender.id) != vars.AUTOMATION_LANES_APP_SENDER_ID
     permissions:
+      actions: read # the read runner's key-credit gate lists the credit-stop markers
       contents: read
       pull-requests: read
       checks: write
@@ -74,6 +75,7 @@ jobs:
     needs: fix-marker
     if: ${{ !cancelled() && needs.fix-marker.outputs.scan-patch-state == 'written' }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
@@ -171,6 +173,7 @@ jobs:
     needs: fix-ci-context
     if: ${{ !cancelled() && needs.fix-ci-context.outputs.proceed == 'true' }}
     permissions:
+      actions: read # the read runner's key-credit gate lists the credit-stop markers
       contents: read
       pull-requests: read
       checks: write
@@ -202,6 +205,7 @@ jobs:
       && (needs.fix-ci.outputs.lane-class == 'credit-stop'
       || needs.fix-ci.outputs.credential-present == 'false') }}
     permissions:
+      actions: read # the read runner's key-credit gate lists the credit-stop markers
       contents: read
       pull-requests: read
       checks: write
@@ -232,6 +236,7 @@ jobs:
       ${{ !cancelled() && ((needs.fix-ci-subscription.outputs.patch-state || needs.fix-ci.outputs.patch-state) == 'written'
       || (needs.fix-ci-subscription.outputs.patch-state || needs.fix-ci.outputs.patch-state) == 'empty') }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
@@ -327,6 +332,7 @@ jobs:
       && format('{0}', github.event.sender.id) != vars.AUTOMATION_LANES_APP_SENDER_ID
       && needs.fix-docs-head.outputs.held == 'false'
     permissions:
+      actions: read # the read runner's key-credit gate lists the credit-stop markers
       contents: read
       pull-requests: read
       checks: write
@@ -401,6 +407,7 @@ jobs:
       && needs.fix-docs-handoff.outputs.posted != 'true'
       && needs.fix-docs-handoff.outputs.allowed == 'true' }}
     permissions:
+      actions: read # the read runner's key-credit gate lists the credit-stop markers
       contents: read
       pull-requests: read
       checks: write
@@ -440,6 +447,7 @@ jobs:
       ${{ !cancelled()
       && (needs.fix-docs-subscription.result != 'skipped' && needs.fix-docs-subscription.outputs.scan-patch-state || needs.fix-docs-subscription.result == 'skipped' && needs.fix-docs.outputs.scan-patch-state || '') == 'written' }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
