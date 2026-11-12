@@ -18,5 +18,5 @@ Admin-merge such a PR only when all three of these hold:
    and still fail here, for example a copied reusable workflow that requests a permission this
    repository's callers do not grant.
 
-Before merging, comment on the PR stating which of the three conditions hold, with a link to the
-run behind each one.
+Before merging, comment on the PR showing that all three hold: link the runs for conditions 1 and
+3, and paste the `check-sync.sh` output for condition 2, which runs only locally.
