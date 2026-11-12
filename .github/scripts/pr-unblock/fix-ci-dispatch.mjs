@@ -54,9 +54,10 @@ import {
   timeLimitNoted,
 } from "../maintenance-reconcile-lost-runs/infra-failure.mjs";
 import { postingAttempt } from "../../actions/report-check-run/posting-run.mjs";
-import { emptyRecord, isHandled, markHandled } from "./dispatch-record.mjs";
+import { emptyRecord, isHandled, markHandled, sendDispatch } from "./dispatch-record.mjs";
 import { STOP_RESOLVED } from "./escalation-routes.mjs";
 import { HOLD_LINE, runTitle } from "./feedback-dispatch.mjs";
+import { DEFAULTS as DOCS_FIX_DEFAULTS } from "./fix-docs-dispatch.mjs";
 import { failingChecks } from "./fix-ci-context.mjs";
 import { prHold, reviewReader } from "./gate-source.mjs";
 import { HEAD_LAG_STOP, KILL_SWITCH_STOP, killSwitchStop, laneStop, releasesHead } from "./limit-stop.mjs";
@@ -93,8 +94,16 @@ const NOTHING_TO_FIX = new Set(["Skipped: not-applicable", STOP_RESOLVED]);
 // The neutral check a run skipped on a held PR posts.
 const HELD_SKIP = "Skipped: awaiting-human";
 
-const RUN_ID = /^[1-9][0-9]{0,14}$/;
 const MAX_PAGES = 20;
+
+// The trusted accounts whose idle PRs fix-ci adopts: every one but the authors
+// fix-docs also leaves alone (Dependabot, whose red PRs review-dependency owns;
+// the release and standards-sync Apps, whose PRs carry generated or synced
+// files that a lane commit breaks: check-managed-files refuses a sync PR
+// commit by any other author).
+export function adoptableOwnerIds(trustedIds, excludedAuthorIds = DOCS_FIX_DEFAULTS.excludedAuthorIds) {
+  return [...trustedIds].filter((id) => !excludedAuthorIds.includes(id));
+}
 
 // The tracker's human-gated label from the binding's JSON text, as
 // pr-merge.yml resolves it: config.role_labels["human-gated"] trimmed, or
@@ -256,7 +265,7 @@ export function staleStop(node, { base, appSenderId, holdLabels, gateLabel }) {
   ) {
     return null;
   }
-  const checks = (contexts.nodes ?? []).filter((context) => context?.__typename === "CheckRun" && context.name !== "ci-status");
+  const checks = (contexts.nodes ?? []).filter((context) => context?.__typename === "CheckRun" && !AGGREGATE_JOBS.has(context.name));
   if (checks.some((run) => run.status !== "COMPLETED" || !PASSING.has(run.conclusion))) {
     return null;
   }
@@ -277,7 +286,7 @@ const cancelled = (required) => required?.run?.status === "completed" && require
 // The lanes passed and another check failed: an advisory lane's, if any.
 const advisoryFailed = (node, checks, checkName) =>
   lanesState(node) === "SUCCESS" &&
-  checks.some((run) => run.name !== checkName && run.name !== "ci-status" && run.status === "COMPLETED" && run.conclusion === "FAILURE");
+  checks.some((run) => run.name !== checkName && !AGGREGATE_JOBS.has(run.name) && run.status === "COMPLETED" && run.conclusion === "FAILURE");
 
 // A job or step name comes from the PR head's workflow file: control characters
 // are dropped and the length capped, so it cannot start a workflow command in
@@ -528,23 +537,18 @@ export async function dispatchCiFixes({
   let sent = 0;
   const send = async (node, cause) => {
     sent += 1;
-    try {
-      const { workflowRunId } = await api.dispatchWorkflow({
-        workflow,
-        ref: `refs/heads/${base}`,
-        inputs: { "pr-number": String(node.number), activity, "dispatcher-run-id": String(runId) },
-      });
-      const id = String(workflowRunId);
-      if (!RUN_ID.test(id)) {
-        failed += 1;
-        log(`::error::#${node.number}: dispatch returned no valid workflow_run_id`);
-        return;
-      }
-      dispatched.push({ number: node.number, workflowRunId: id });
-      log(`dispatched fix-ci #${node.number} head ${node.headRefOid} workflow_run_id=${id} (cause: ${cause()})`);
-    } catch (error) {
+    const id = await sendDispatch(api, log, {
+      workflow,
+      base,
+      node,
+      label: "fix-ci ",
+      note: () => ` (cause: ${cause()})`,
+      inputs: { "pr-number": String(node.number), activity, "dispatcher-run-id": String(runId) },
+    });
+    if (id === null) {
       failed += 1;
-      log(`::error::#${node.number}: dispatch failed: ${error.message}`);
+    } else {
+      dispatched.push({ number: node.number, workflowRunId: id });
     }
   };
   for (const node of candidates) {

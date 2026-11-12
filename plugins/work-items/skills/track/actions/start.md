@@ -16,22 +16,24 @@ Claim a work item through the seam (assignee + lease record).
 
    ```bash
    TRACKER="${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/work-item-tracker.sh"
-   [[ -f "$TRACKER" ]] || TRACKER="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/tools/work-item-tracker/work-item-tracker.sh"
+   [[ -f "$TRACKER" ]] || TRACKER="<project root>/tools/work-item-tracker/work-item-tracker.sh"
    "$TRACKER" get-item "<id>"
    "$TRACKER" reclaim "<id>"
    ```
+
+   `<project root>` is the literal path [`tracker-seam.md`](../../../reference/tracker-seam.md) "Project root" resolves, in its own Bash call before this snippet and each later one in this file.
 
    If the item is still assigned to another user after reclaim, its lease is live. Warn: "Item `<id>` held by {assignee} (live lease). Proceed anyway? (yes / pick different)". Without the reclaim, `claim` would back off (exit 7) on the stale assignee before evaluating lease expiry.
 
    Exit `6` (capability-unsupported, CONTRACT.md "Exit codes") means the bound provider declares `reclaim: false` (e.g. `local-markdown`, whose `claim` already race-checks the lease pre-write, CONTRACT.md "Adapter contract"). That is not an error. Skip the stale-lease check and proceed straight to Claim.
 
-   A **harness denial of the `reclaim` call itself** takes the same posture. Under auto mode a classifier denial lands on the Bash tool call itself, so no exit code is produced (CONTRACT.md "Exit codes"). Report it once, skip the stale-lease check, and proceed straight to Claim. Never retry the denied call, and never self-widen permissions to work around it (`${CLAUDE_PLUGIN_ROOT}/reference/permission-preflight.md` "Why a preflight, not a fixer", whose "The dated record for both claims" carries the dated basis for this refusal). A live foreign lease is still caught: `claim` backs off with exit `7`.
+   A **harness denial of the `reclaim` call itself** takes the same posture. Treat it apart from every script exit code (CONTRACT.md "Exit codes"; [How auto mode evaluates actions](https://code.claude.com/docs/en/permission-modes#how-auto-mode-evaluates-actions), as of 2026-11-10; recheck when that section changes how a denied call reaches Claude). Report it once, skip the stale-lease check, and proceed straight to Claim. Never retry the denied call, and never self-widen permissions to work around it (`${CLAUDE_PLUGIN_ROOT}/reference/permission-preflight.md` "Why a preflight, not a fixer", whose "The dated record for both claims" carries the dated basis for this refusal). A live foreign lease is still caught: `claim` backs off with exit `7`.
 
 1. **Claim via the seam.** The `claim` verb runs the full race-safe, same-identity-aware protocol (assign `@me` → re-read → post lease comment → re-read leases → back off on a foreign earlier lease) and emits the claim object, or exits `7` on a lost race:
 
    ```bash
    TRACKER="${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/work-item-tracker.sh"
-   [[ -f "$TRACKER" ]] || TRACKER="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/tools/work-item-tracker/work-item-tracker.sh"
+   [[ -f "$TRACKER" ]] || TRACKER="<project root>/tools/work-item-tracker/work-item-tracker.sh"
    "$TRACKER" claim "<id>"
    ```
 

@@ -194,7 +194,6 @@ FAILED_CONCLUSIONS = (
     "startup_failure",
     "action_required",
 )
-LANE_AGGREGATE_JOB = "ci-status"
 HYGIENE_AGGREGATE_STEP = "Aggregate hygiene results"
 UNATTRIBUTABLE_GATES = frozenset({"gitleaks failed"})
 # A newly failing check demotes only when one of its failing suites is in the
@@ -274,6 +273,9 @@ EXIT_FAILURE, EXIT_UNREADABLE, EXIT_WRITE_FAILED, EXIT_UNVERIFIED = 1, 3, 4, 5
 # `--lane-alerted`'s "not recorded": a code no crash (1), argparse refusal (2),
 # failed read (3) or rate limit (75) produces, so only it lets pr-merge.yml send.
 EXIT_NOT_ALERTED = 4
+# `--stop-uncovered`'s stop: a code no crash, refusal, failed read, verdict or
+# rate limit produces, so only it reads as "this report would need a dispatch".
+EXIT_UNCOVERED = 6
 
 IsHuman = Callable[[Any], bool]
 
@@ -304,6 +306,17 @@ class UnlistedRecordHold(PostMergeReadError):
 
 class PostMergeWriteError(RuntimeError):
     """A remediation write failed."""
+
+
+class UncoveredMergeStop(Exception):
+    """`check(stop_uncovered=True)` found a judged merge that no listed
+    dispatch run created at or after its merge can cover, so the verdict is
+    unreadable or `needs_dispatch`. Not a `PostMergeReadError`: it ends the
+    check rather than making the verdict unreadable."""
+
+    def __init__(self, number: int) -> None:
+        super().__init__(f"#{number}: no dispatch run created since its merge")
+        self.number = number
 
 
 # One type and one derivation with `babysit_merge_policy.in_flight`, so both
@@ -764,15 +777,22 @@ def _immediate_enqueue(
     return lane_prs_at(parent if isinstance(parent, str) else "") == "native"
 
 
+# Each repository's default branch this process read; a failed read is not kept.
+_default_branches: dict[tuple[str, str], str] = {}
+
+
 def _default_branch(owner: str, name: str) -> str:
-    """The repository's default branch; an unreadable one fails the read, so
-    the check never judges a branch the repository does not merge into."""
-    branch = json_object(_read(["api", f"repos/{owner}/{name}"], "repository")).get(
-        "default_branch"
-    )
-    if not isinstance(branch, str) or not branch.strip():
-        raise PostMergeReadError("repository: no default branch")
-    return branch
+    """The repository's default branch, read once per process; an unreadable
+    one fails the read, so the check never judges a branch the repository
+    does not merge into."""
+    if (owner, name) not in _default_branches:
+        branch = json_object(
+            _read(["api", f"repos/{owner}/{name}"], "repository")
+        ).get("default_branch")
+        if not isinstance(branch, str) or not branch.strip():
+            raise PostMergeReadError("repository: no default branch")
+        _default_branches[owner, name] = branch
+    return _default_branches[owner, name]
 
 
 def _merged_since(
@@ -1116,10 +1136,11 @@ def suite_failures(log: str, kind: str) -> frozenset[str] | None:
                 started.add(m[1])
             elif m := _BASH_PASS.fullmatch(line):
                 passed.add(m[1])
-            elif m := _BASH_FAIL.fullmatch(line) or _BASH_NO_RESULT.fullmatch(line):
+            elif m := _BASH_FAIL.fullmatch(line):
                 failed.add(m[1])
-                if _BASH_NO_RESULT.fullmatch(line):
-                    started.add(m[1])
+            elif m := _BASH_NO_RESULT.fullmatch(line):
+                failed.add(m[1])
+                started.add(m[1])
             elif (m := _BASH_ADVISORY.match(line)) and m[2] == nonce:
                 advisory.add(m[1])
         if started - passed - failed:
@@ -1226,8 +1247,10 @@ def _sender_fields(record: dict[str, Any]) -> dict[str, Any]:
     """The fields of an uploading run `_Context._lane_sender` reads, and its
     status."""
     return {
-        **{k: record.get(k) for k in ("id", "path", "event", "status")},
-        **{k: record.get(k) for k in ("head_branch", "head_sha")},
+        **{
+            k: record.get(k)
+            for k in ("id", "path", "event", "status", "head_branch", "head_sha")
+        },
         **{
             k: {"full_name": json_object(record.get(k)).get("full_name")}
             for k in ("repository", "head_repository")
@@ -1265,8 +1288,7 @@ def load_lane_records(
             raise ValueError(f"{name!r}: {exc}") from exc
         if not (
             _LANE_RECORD_NAME.fullmatch(name)
-            and isinstance(artifact, int)
-            and not isinstance(artifact, bool)
+            and type(artifact) is int
             and artifact > 0
             and isinstance(sender.get("id"), int)
             and sender.get("status") == "completed"
@@ -1301,6 +1323,9 @@ class _Context:
     outcome_cache: dict[tuple[int, str], tuple[str, str]] = field(default_factory=dict)
     # Full runs whose red verdict came from the wrapper's re-run (attempt 2).
     red_on_rerun: set[int] = field(default_factory=set)
+    # Full runs whose flake verdict came from that re-run passing, not from a
+    # newer run superseding them (`flake_final`).
+    flaked_on_rerun: set[int] = field(default_factory=set)
     branch: str = ""
     branch_tip: str | None = None
     lane_cache: dict[str, bool] = field(default_factory=dict)
@@ -1337,6 +1362,10 @@ class _Context:
     # The verdict's first run listing's completed runs, by id, at the
     # `updated_at` read (`_listed_runs` with `record`); None until listed.
     judged_runs: dict[int, str] | None = None
+    # That listing's dispatch runs as `_runs` returned them, with the time
+    # they were listed from, which `_lane_reruns` reads when it covers its
+    # lookback and every run in it had completed; None until listed.
+    dispatch_listing: tuple[datetime, list[Run]] | None = None
     settle_compares_left: int = SETTLE_COMPARE_BUDGET
     compare_reads: int = 0
     # `red-main.confirm-wait-minutes` plus FULL_RUN_ALLOWANCE (None: read at
@@ -1353,6 +1382,8 @@ class _Context:
     )
     # Each suite's newest open quarantine issue by a filer; None until read.
     quarantine_issues: dict[str, dict[str, Any]] | None = None
+    # The filers' open issues (`_open_records`); None until read.
+    open_records: list[dict[str, Any]] | None = None
     # Excused failing suites, by (suite, sighting).
     quarantines: dict[tuple[str, str], Quarantine] = field(default_factory=dict)
     # The earliest time a quarantine that excused a failing suite expires,
@@ -1393,7 +1424,7 @@ class _Context:
         `contains` answers from it without an API call for every commit the
         checkout already has."""
         window = "&".join(
-            f"{key}={quote(t.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%SZ'), safe='')}"
+            f"{key}={quote(_stamp(t), safe='')}"
             for key, t in (("since", merged_at), ("until", deadline))
         )
         listed = _paginated(
@@ -1419,19 +1450,28 @@ class _Context:
         SHA with no created filter: a check independent of the dated
         listing. A failed or short read raises."""
         if commit not in self.dispatch_at_cache:
-            rows = _paginated(
-                f"repos/{self.owner}/{self.name}/actions/workflows/{FULL_RUN_WORKFLOW}"
-                f"/runs?event=workflow_dispatch&branch={quote(self.branch, safe='')}"
-                f"&head_sha={commit}&per_page=100",
-                f"{FULL_RUN_WORKFLOW} dispatch runs at {commit[:12]}",
-                "workflow_runs",
-            )
             self.dispatch_at_cache[commit] = {
                 r.id: r
-                for r in _run_rows(rows, "workflow_dispatch", self.owner, self.name)
-                if r.head_branch == self.branch and self.on_branch(r)
+                for r in self._full_run_rows_at("workflow_dispatch", "dispatch", commit)
+                if self.on_branch(r)
             }
         return self.dispatch_at_cache[commit]
+
+    def _full_run_rows_at(self, event: str, label: str, commit: str) -> list[Run]:
+        """The branch's full runs of `event` at `commit`, read by head SHA
+        with no created filter. A failed or short read raises."""
+        rows = _paginated(
+            f"repos/{self.owner}/{self.name}/actions/workflows/{FULL_RUN_WORKFLOW}"
+            f"/runs?event={event}&branch={quote(self.branch, safe='')}"
+            f"&head_sha={commit}&per_page=100",
+            f"{FULL_RUN_WORKFLOW} {label} runs at {commit[:12]}",
+            "workflow_runs",
+        )
+        return [
+            r
+            for r in _run_rows(rows, event, self.owner, self.name)
+            if r.head_branch == self.branch
+        ]
 
     def regressions(self, signal: str, run: Run, merged_at: datetime) -> frozenset[str]:
         """The checks failing on red full run `run` that were not failing on
@@ -1454,8 +1494,11 @@ class _Context:
         issue older than `merge.quarantine-days`. A gate suite has no
         quarantine, and a check whose suites cannot be named stays excused as
         a pre-existing failure."""
-        named = {c: self.failing_suites(run.id, attempt, c) for c in checks}
-        named = {c: suites for c, suites in named.items() if suites}
+        named = {
+            c: suites
+            for c in checks
+            if (suites := self.failing_suites(run.id, attempt, c))
+        }
         if not named:
             return frozenset()
         issues = self._quarantine_issues()
@@ -1548,19 +1591,7 @@ class _Context:
             self.full_runs_cache[commit] = [
                 r
                 for event in FULL_RUN_EVENTS.values()
-                for r in _run_rows(
-                    _paginated(
-                        f"repos/{self.owner}/{self.name}/actions/workflows/{FULL_RUN_WORKFLOW}"
-                        f"/runs?event={event}&branch={quote(self.branch, safe='')}"
-                        f"&head_sha={commit}&per_page=100",
-                        f"{FULL_RUN_WORKFLOW} {event} runs at {commit[:12]}",
-                        "workflow_runs",
-                    ),
-                    event,
-                    self.owner,
-                    self.name,
-                )
-                if r.head_branch == self.branch
+                for r in self._full_run_rows_at(event, event, commit)
             ]
         return self.full_runs_cache[commit]
 
@@ -1631,10 +1662,7 @@ class _Context:
     def _last_green(self, run: Run) -> Run | None:
         """The branch's newest green full run before `run`, on another commit."""
         if run.id not in self.green_cache:
-            created = quote(
-                f"<{run.created_at.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')}",
-                safe="",
-            )
+            created = quote(f"<{_stamp(run.created_at)}", safe="")
             greens: list[Run] = []
             for event in FULL_RUN_EVENTS.values():
                 listing = _read(
@@ -1817,9 +1845,7 @@ class _Context:
         over, so an edit cannot extend or move a quarantine."""
         if self.quarantine_issues is None:
             found: dict[str, dict[str, Any]] = {}
-            for issue in _demotion_issues(
-                self.owner, self.name, (self.identity, *DEMOTION_FILERS), state="open"
-            ):
+            for issue in self._open_records():
                 suite = _quarantined_suite(issue.get("body"))
                 if suite is None or issue.get("state") != "open":
                     continue
@@ -1843,6 +1869,35 @@ class _Context:
                 for suite, issue in found.items()
             }
         return self.quarantine_issues
+
+    def _open_records(self) -> list[dict[str, Any]]:
+        """The open issues a filer (the agent identity or github-actions[bot])
+        opened, demotion and quarantine records alike, read once per check."""
+        if self.open_records is None:
+            self.open_records = _demotion_issues(
+                self.owner, self.name, (self.identity, *DEMOTION_FILERS), state="open"
+            )
+        return self.open_records
+
+    def flake_final(self, run: Run) -> bool:
+        """Whether flake `run` can no longer change the merge's verdict: its
+        re-run passed (not a newer run superseding it, which holds only within
+        the compare budget), `merge.quarantine-days` (`_quarantine_days`) have
+        passed since it was created, so any quarantine its attempt 1 started
+        has expired, and no open demotion record names it. A failed read
+        leaves it not final, so it holds the merge as it did before any of
+        these reads ran, rather than making the whole verdict unreadable."""
+        if run.id not in self.flaked_on_rerun:
+            return False
+        try:
+            return self.now >= run.created_at + timedelta(
+                days=self._quarantine_days(run)
+            ) and not any(
+                _demotes_run(run.url, issue.get("body"))
+                for issue in self._open_records()
+            )
+        except (PostMergeReadError, policy.PolicyReadError):
+            return False
 
     def _edited_issues(self, numbers: list[int]) -> frozenset[int]:
         """The issues among `numbers` whose body was edited after filing, which
@@ -1868,9 +1923,7 @@ class _Context:
     def _baseline(self, signal: str, before: datetime) -> frozenset[str] | None:
         key = (signal, before)
         if key not in self.baseline_cache:
-            created = quote(
-                f"<{before.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')}", safe=""
-            )
+            created = quote(f"<{_stamp(before)}", safe="")
             listing = _read(
                 [
                     "api",
@@ -1912,6 +1965,10 @@ class _Context:
                 "jobs",
             )
             jobs = [j for j in listed if j.get("conclusion") in FAILED_CONCLUSIONS]
+            # The ci-status alias repeats CI Status's conclusion: the two are
+            # one check, CI Status.
+            if any(j.get("name") == policy.GATE_CHECK for j in jobs):
+                jobs = [j for j in jobs if j.get("name") != policy.GATE_ALIAS]
             self.passed_jobs[key] = frozenset(
                 str(j.get("name") or "")
                 for j in listed
@@ -1926,7 +1983,7 @@ class _Context:
             unknown: set[str] = set()
             for job in jobs:
                 name = str(job.get("name") or "")
-                if name == LANE_AGGREGATE_JOB and len(jobs) > 1:
+                if name in policy.GATE_NAMES and len(jobs) > 1:
                     continue
                 by_name[name] = job
                 gates = self._failed_gates(job.get("id"))
@@ -2157,15 +2214,7 @@ class _Context:
             "floor": low.isoformat(),
             "records": records,
         }
-        target = Path(path)
-        tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-        try:
-            tmp.write_text(json.dumps(payload), encoding="utf-8")
-            os.replace(tmp, target)
-        except OSError as exc:
-            print(f"lane records not written to {path}: {exc}", file=sys.stderr)
-            with contextlib.suppress(OSError):
-                tmp.unlink(missing_ok=True)
+        _write_carried(path, payload, "lane records")
 
     def _lane_sender(self, record: dict[str, Any], events: frozenset[str]) -> bool:
         """Whether workflow run `record` ran this repository's own pr-merge.yml
@@ -2273,19 +2322,24 @@ class _Context:
             self.bridge_cache[tip] = bridge
         return self.bridge_cache[tip]
 
+    def _clones(self) -> list[Path]:
+        """The full-history clones `contains` asks, resolved once."""
+        if self.local_clones is None:
+            self.local_clones = _full_history_clones()
+        return self.local_clones
+
     def _local_branch(self) -> tuple[Path, str] | None:
         """The first full-history clone holding a copy of the branch, from
         `refs/remotes/origin/<branch>` or else `refs/heads/<branch>`, and that
         copy's commit; None when no clone holds one."""
-        if self.local_clones is None:
-            self.local_clones = _full_history_clones()
+        clones = self._clones()
         if not self.branch:
             return None
         refs = (f"refs/remotes/origin/{self.branch}", f"refs/heads/{self.branch}")
         return next(
             (
                 (root, out.strip())
-                for root in self.local_clones
+                for root in clones
                 for ref in refs
                 if (
                     out := policy._git(
@@ -2329,9 +2383,7 @@ class _Context:
             return None
         if (chained := self._chain_contains(ancestor, sha)) is not None:
             return chained
-        if self.local_clones is None:
-            self.local_clones = _full_history_clones()
-        for root in self.local_clones:
+        for root in self._clones():
             try:
                 proc = run_command(
                     [
@@ -2409,15 +2461,7 @@ class _Context:
             "repo": f"{self.owner}/{self.name}",
             "attempts": self.attempts_used,
         }
-        target = Path(path)
-        tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-        try:
-            tmp.write_text(json.dumps(payload), encoding="utf-8")
-            os.replace(tmp, target)
-        except OSError as exc:
-            print(f"attempts not written to {path}: {exc}", file=sys.stderr)
-            with contextlib.suppress(OSError):
-                tmp.unlink(missing_ok=True)
+        _write_carried(path, payload, "attempts")
 
     def _outcome(self, run: Run, attributable: bool) -> tuple[str, str]:
         first = self._attempt(run, 1)
@@ -2469,6 +2513,7 @@ class _Context:
         if second.status != "completed":
             return PENDING, "re-run-in-progress"
         if second.conclusion == "success":
+            self.flaked_on_rerun.add(run.id)
             return FLAKE, "attempt 1 failed, the one re-run passed"
         self.red_on_rerun.add(run.id)
         return RED, f"attempt 1 {first.conclusion}; re-run {second.conclusion}"
@@ -2477,6 +2522,20 @@ class _Context:
         """The failing attempt's URL, in the demotion workflow's form: a run's
         URL names no attempt, and a later failing attempt is a new sighting."""
         return f"{run.url}/attempts/{2 if run.id in self.red_on_rerun else 1}"
+
+
+def _write_carried(path: str, payload: dict[str, Any], label: str) -> None:
+    """Replace the file at `path` with `payload` through a temporary file.
+    Best effort: a failure is logged, and the file is left as it was."""
+    target = Path(path)
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as exc:
+        print(f"{label} not written to {path}: {exc}", file=sys.stderr)
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
 
 
 @dataclass
@@ -2512,6 +2571,7 @@ def _judge(
         # No dispatch can ever cover it, so it would hold the lane forever.
         raise PostMergeReadError(f"#{merge.number}: merge commit unknown")
     merged_at = _time(merge.merged_at)
+    deadline = merged_at + DISPATCH_DEADLINE
     commit = merge.merge_commit
 
     def relevant(run: Run) -> bool:
@@ -2541,7 +2601,7 @@ def _judge(
         # A missing or edited pin is pending until the dispatch deadline, then
         # a failure, so a demotion record is filed and a human close restarts
         # the floor instead of the lane holding forever.
-        if now > merged_at + DISPATCH_DEADLINE:
+        if now > deadline:
             failures.append(
                 Failure(
                     SIGNAL_READ_BACK,
@@ -2586,9 +2646,10 @@ def _judge(
         if not in_window(run):
             continue
         state, detail = ctx.outcome(run, attributable=True)
-        if state in (RED, SETTLED, FLAKE):
+        if state in (RED, SETTLED) or (state == FLAKE and not ctx.flake_final(run)):
             # A superseded red run reads settled or flake only within the
-            # compare budget (`_Context.superseded`), so neither is final.
+            # compare budget (`_Context.superseded`), so neither is final; a
+            # flake on the re-run is final once `_Context.flake_final` holds.
             final = False
         if state == RED:
             new = ctx.regressions(signal, run, merged_at)
@@ -2626,7 +2687,6 @@ def _judge(
             final = False
             tally.outstanding.append(run.created_at)
 
-    deadline = merged_at + DISPATCH_DEADLINE
     if not any(r.created_at <= deadline for r in own) and now > deadline:
         # A listing can answer without runs it holds, so the absence is read
         # again by the merge commit and each descendant committed in time: a
@@ -2728,6 +2788,7 @@ def _lane_reruns(
     green one still settles a red run (`_Context.superseded`)."""
     excused = dict(ctx.quarantines)
     try:
+        start = now - ctx.lane_rerun_lookback()
         if list_schedule:
             ctx.held_full_runs.update(
                 (r.id, (SIGNAL_SCHEDULE, r))
@@ -2737,19 +2798,23 @@ def _lane_reruns(
                     FULL_RUN_WORKFLOW,
                     "schedule",
                     ctx.branch,
-                    now - ctx.lane_rerun_lookback(),
+                    start,
                     now,
                 )
                 if ctx.on_branch(r) and not ctx.replaced(r)
             )
-        runs = _runs(
-            ctx.owner,
-            ctx.name,
-            FULL_RUN_WORKFLOW,
-            "workflow_dispatch",
-            ctx.branch,
-            now - ctx.lane_rerun_lookback(),
-            now,
+        listing = ctx.dispatch_listing
+        listed = (
+            [r for r in listing[1] if r.created_at >= start]
+            if listing is not None and listing[0] <= start
+            else None
+        )
+        # A run still going when listed may have finished red since, so any
+        # such run in the lookback means the runs are listed again.
+        runs = (
+            listed
+            if listed is not None and all(r.status == "completed" for r in listed)
+            else _dispatch_runs(ctx, start, now)
         )
         ctx.held_full_runs.update((r.id, (SIGNAL_DISPATCH, r)) for r in runs)
         for run in sorted(runs, key=lambda r: r.created_at, reverse=True):
@@ -2774,23 +2839,35 @@ def _lane_reruns(
     return []
 
 
+def _dispatch_runs(ctx: _Context, floor: datetime, now: datetime) -> list[Run]:
+    """The full workflow's dispatch runs on the branch since `floor`, as listed."""
+    return _runs(
+        ctx.owner, ctx.name, FULL_RUN_WORKFLOW, "workflow_dispatch", ctx.branch, floor, now
+    )
+
+
 def _listed_runs(
-    ctx: _Context, floor: datetime, now: datetime, *, record: bool = False
+    ctx: _Context,
+    floor: datetime,
+    now: datetime,
+    *,
+    record: bool = False,
+    dispatched: list[Run] | None = None,
 ) -> tuple[list[tuple[str, Run]], list[Run] | None]:
     """The full runs (by signal) and canary runs on the branch since `floor`,
     oldest first, the canary runs None when the repository has no canary
     (`_canary_absent`); the full runs are held for `_Context.superseded`. With
     `record`, each listed run that had completed is kept in
-    `_Context.judged_runs` at the `updated_at` read."""
+    `_Context.judged_runs` at the `updated_at` read. `dispatched` is
+    `_dispatch_runs` from `floor` when the caller already listed it."""
     owner, name, branch = ctx.owner, ctx.name, ctx.branch
-    listed = [
-        (SIGNAL_SCHEDULE, r)
-        for r in _runs(owner, name, FULL_RUN_WORKFLOW, "schedule", branch, floor, now)
-    ] + [
-        (SIGNAL_DISPATCH, r)
-        for r in _runs(
-            owner, name, FULL_RUN_WORKFLOW, "workflow_dispatch", branch, floor, now
-        )
+    schedule = _runs(owner, name, FULL_RUN_WORKFLOW, "schedule", branch, floor, now)
+    if dispatched is None:
+        dispatched = _dispatch_runs(ctx, floor, now)
+    if record:
+        ctx.dispatch_listing = (floor, dispatched)
+    listed = [(SIGNAL_SCHEDULE, r) for r in schedule] + [
+        (SIGNAL_DISPATCH, r) for r in dispatched
     ]
     # A listing filtered by branch name also returns runs on a tag named
     # like the branch, whose red would be charged to the merge. A run the
@@ -2881,6 +2958,22 @@ def _final_by_runs(
     return frozenset(final)
 
 
+def _stop_uncovered(judged: list[AutoMerge], listed: list[Run]) -> None:
+    """Raise `UncoveredMergeStop` for the first judged merge no `listed`
+    dispatch run was created at or after. The full runs `_judge` reads are
+    these less the ones off the branch or replaced, so `_judge` finds no
+    `own` run for such a merge either, and it is neither verified nor
+    `dispatch_covered`. A merge with no commit or time is left to `_judge`,
+    which reads it unreadable."""
+    dispatched = [r.created_at for r in listed]
+    for merge in judged:
+        if not merge.merge_commit or not merge.merged_at:
+            continue
+        merged_at = _time(merge.merged_at)
+        if not any(at >= merged_at for at in dispatched):
+            raise UncoveredMergeStop(merge.number)
+
+
 def check(
     repo: str,
     *,
@@ -2894,6 +2987,7 @@ def check(
     quarantine_days: int | None = None,
     settled: Callable[[AutoMerge], bool] | None = None,
     rejudge: Callable[[AutoMerge], bool] | None = None,
+    stop_uncovered: bool = False,
 ) -> PostMergeVerdict:
     """Judge every auto-merge into `branch` since `merged_since`; with no
     `branch`, the repository's default branch, read once from the repos API.
@@ -2909,7 +3003,12 @@ def check(
     (`PinReader.settled`); such a merge is verified with none of its runs
     read. `rejudge` names the settled merges whose runs are read anyway, for
     `MergeState.final_by_runs` alone (`_final_by_runs`, `anchor_needs`).
-    Any read failure makes the verdict unreadable, which is never ok."""
+    Any read failure makes the verdict unreadable, which is never ok.
+
+    `stop_uncovered` raises `UncoveredMergeStop`, once the dispatch runs are
+    listed and before any other run is, for a judged merge with no listed
+    dispatch run created at or after it: `_judge` finds no `own` run for it, so the verdict
+    would be unreadable or need a dispatch."""
     if not agent_identity:
         return PostMergeVerdict(False, "agent-identity-unconfigured")
     if merged_since is None:
@@ -2956,7 +3055,8 @@ def check(
                     elif not json_object(pr.get("autoMerge")).get("nodes"):
                         optional_pins.add(derived.number)
         merges.sort(key=lambda m: (str(m.merged_at), m.number))
-        read = pinned_merges | optional_pins
+        pin_read = pinned_merges | optional_pins
+        read = set(pin_read)
         if settled is not None:
             read |= {m.number for m in merges if m.by_identity}
         if (prefetch := getattr(pinned_sha, "prefetch", None)) is not None:
@@ -2964,7 +3064,7 @@ def check(
         pins = {
             m.number: pinned_sha(m)
             for m in merges
-            if pinned_sha and m.number in pinned_merges | optional_pins
+            if pinned_sha and m.number in pin_read
         }
         done = {
             m.number
@@ -3012,7 +3112,19 @@ def check(
             if any(m.merged_at for m in judged)
             else merged_since
         )
-        full_runs, canary_runs = _listed_runs(ctx, floor, now, record=True)
+        # A merge no listed dispatch run covers stops before the schedule and
+        # canary listings and the branch reads that filter them; one only a
+        # filtered-out run covers stops once they are read.
+        dispatched = _dispatch_runs(ctx, floor, now) if stop_uncovered else None
+        if dispatched is not None:
+            _stop_uncovered(judged, dispatched)
+        full_runs, canary_runs = _listed_runs(
+            ctx, floor, now, record=True, dispatched=dispatched
+        )
+        if stop_uncovered:
+            _stop_uncovered(
+                judged, [r for signal, r in full_runs if signal == SIGNAL_DISPATCH]
+            )
         states = tuple(
             _settled_state(merge)
             if merge.number in done
@@ -3205,13 +3317,14 @@ def _identity_entries(
         raise PostMergeReadError(
             "merge queue: the entries read are not the whole queue"
         )
+    key = _login_key(identity)
     found = []
     unknown = 0
     for entry in nodes:
         enqueuer = _actor_key(entry.get("enqueuer"))
         if not enqueuer:
             unknown += 1
-        elif enqueuer == _login_key(identity):
+        elif enqueuer == key:
             pr = json_object(entry.get("pullRequest"))
             found.append((str(pr.get("id")), pr.get("number")))
     return found, unknown
@@ -3374,10 +3487,11 @@ def _identity_marks(
 ) -> list[int]:
     """The indexes of the identity's comments whose first line is `pattern`,
     oldest first. A comment anyone else wrote is no record."""
+    key = _login_key(identity)
     return [
         i
         for i, c in enumerate(comments)
-        if _actor_key(c.get("author")) == _login_key(identity)
+        if _actor_key(c.get("author")) == key
         and pattern.match(_first_line(c.get("body")))
     ]
 
@@ -3498,13 +3612,13 @@ def _pin_sha(
     alone: bool = False,
 ) -> str | None:
     """`read_pin`'s answer from the comments and reviews it read."""
-    mine = [_actor_key(c.get("author")) == _login_key(identity) for c in comments]
+    key = _login_key(identity)
     pins = _identity_marks(comments, identity, PIN_RE)
     if not pins or _edited(comments[pins[-1]]):
         return None
     newest = comments[pins[-1]]
     if alone:
-        if not all(mine[pins[-1] :]):
+        if any(_actor_key(c.get("author")) != key for c in comments[pins[-1] :]):
             return None
         if not is_json_array(reviews):
             raise PostMergeReadError(f"#{number} pin: no review list")
@@ -3513,7 +3627,7 @@ def _pin_sha(
             for review in map(json_object, reviews):
                 submitted = review.get("submittedAt")
                 if (
-                    _actor_key(review.get("author")) != _login_key(identity)
+                    _actor_key(review.get("author")) != key
                     and submitted is not None
                     and datetime.fromisoformat(str(submitted)) >= pinned_at
                 ):
@@ -3581,8 +3695,8 @@ def settle(repo: str, merges: Any, identity: str) -> tuple[list[int], list[str]]
         return posted, ["settle-unposted: the report lists no merges to settle"]
     wanted: dict[int, str] = {}
     for entry in merges:
-        number = json_object(entry).get("number")
-        sha = json_object(entry).get("mergeCommit")
+        item = json_object(entry)
+        number, sha = item.get("number"), item.get("mergeCommit")
         if (
             not isinstance(number, int)
             or isinstance(number, bool)
@@ -3748,9 +3862,15 @@ def _same_run(failure: Failure, body: Any) -> bool:
     this failure's record."""
     if not failure.run_url or "/attempts/" not in failure.run_url:
         return False
+    return _demotes_run(failure.run_url.rsplit("/attempts/", 1)[0], body)
+
+
+def _demotes_run(run_url: str, body: Any) -> bool:
+    """Whether a demotion record names run `run_url` (no attempt) as failing,
+    any attempt."""
     if not _first_line(body).startswith(policy.DEMOTION_MARKER):
         return False
-    prefix = f"- Failing run: {failure.run_url.rsplit('/attempts/', 1)[0]}/attempts/"
+    prefix = f"- Failing run: {run_url}/attempts/"
     return any(line.startswith(prefix) for line in _lines(body))
 
 
@@ -3794,6 +3914,35 @@ def _set_bug_type(owner: str, name: str, number: int) -> None:
         )
     except PostMergeWriteError as exc:
         print(f"Issue Type not set: {exc}", file=sys.stderr)
+
+
+def _filer_notes(
+    owner: str, name: str, number: Any, filers: Collection[str]
+) -> list[Any]:
+    """The bodies of issue `number`'s comments whose author's login key is
+    one of `filers`."""
+    return [
+        c.get("body")
+        for c in _paginated(
+            f"repos/{owner}/{name}/issues/{number}/comments?per_page=100",
+            f"#{number} comments",
+        )
+        if _login_key(json_object(c.get("user")).get("login")) in filers
+    ]
+
+
+def _post_comment(owner: str, name: str, number: Any, body: str) -> None:
+    _write(
+        [
+            "api",
+            "-X",
+            "POST",
+            f"repos/{owner}/{name}/issues/{number}/comments",
+            "-f",
+            f"body={body}",
+        ],
+        f"comment on #{number}",
+    )
 
 
 def file_quarantines(
@@ -3848,30 +3997,13 @@ def file_quarantines(
             continue
         number = issue.get("number")
         if "notes" not in issue:
-            issue["notes"] = [
-                c.get("body")
-                for c in _paginated(
-                    f"repos/{owner}/{name}/issues/{number}/comments?per_page=100",
-                    f"#{number} comments",
-                )
-                if _login_key(json_object(c.get("user")).get("login")) in keys
-            ]
+            issue["notes"] = _filer_notes(owner, name, number, keys)
         note = f"{QUARANTINE_NOTE}{q.run_url}"
         if f"- Failing run: {q.run_url}" in _lines(issue.get("body")) or any(
             note in _lines(b) for b in issue["notes"]
         ):
             continue
-        _write(
-            [
-                "api",
-                "-X",
-                "POST",
-                f"repos/{owner}/{name}/issues/{number}/comments",
-                "-f",
-                f"body={note}",
-            ],
-            f"comment on #{number}",
-        )
+        _post_comment(owner, name, number, note)
         report["comments"].append(number)
         issue["notes"].append(note)
 
@@ -4028,10 +4160,9 @@ def remediate(
     # `models.issue-status`, read when the first record is filed or matched open.
     status: Any = _UNREAD
     try:
-        filers = {_login_key(f) for f in (agent_identity, *DEMOTION_FILERS)}
-        existing = _demotion_issues(
-            owner, name, (agent_identity, *DEMOTION_FILERS), state="all"
-        )
+        filer_logins = (agent_identity, *DEMOTION_FILERS)
+        filers = {_login_key(f) for f in filer_logins}
+        existing = _demotion_issues(owner, name, filer_logins, state="all")
         role_label = label or _role_label(owner, name)
         # One record per marker (signal, SHA); every distinct sighting under it
         # is checked against that record, so a second red run on a closed
@@ -4123,15 +4254,7 @@ def remediate(
                                 _hold_record(owner, name, number, status)
                         except (policy.PolicyReadError, PostMergeWriteError) as exc:
                             report["errors"].append(f"demotion issue: {exc}")
-                comments = _paginated(
-                    f"repos/{owner}/{name}/issues/{number}/comments?per_page=100",
-                    f"#{number} comments",
-                )
-                notes_by_issue[number] = [
-                    c.get("body")
-                    for c in comments
-                    if _login_key(json_object(c.get("user")).get("login")) in filers
-                ]
+                notes_by_issue[number] = _filer_notes(owner, name, number, filers)
             notes = notes_by_issue[number]
             if _recorded(failure, match, notes):
                 continue
@@ -4151,19 +4274,10 @@ def remediate(
                 )
                 report["reopened"].append(number)
                 records[failure.marker] = {**match, "state": "open"}
-            _write(
-                [
-                    "api",
-                    "-X",
-                    "POST",
-                    f"repos/{owner}/{name}/issues/{number}/comments",
-                    "-f",
-                    f"body={FAILURE_NOTE}{_sighting(failure)}",
-                ],
-                f"comment on #{number}",
-            )
+            note = f"{FAILURE_NOTE}{_sighting(failure)}"
+            _post_comment(owner, name, number, note)
             report["comments"].append(number)
-            notes.append(f"{FAILURE_NOTE}{_sighting(failure)}")
+            notes.append(note)
     except (PostMergeReadError, PostMergeWriteError) as exc:
         report["errors"].append(f"demotion issue: {exc}")
 
@@ -4182,12 +4296,22 @@ def _default_is_human(
     """The merge policy's human test. A null actor, the identity, a self login,
     an automation login, or a login with no write permission is non-human. A
     permission read that fails raises `PostMergeReadError`, so the verdict is
-    unreadable rather than a human enqueue misjudged as an auto-merge."""
+    unreadable rather than a human enqueue misjudged as an auto-merge. A
+    permission another process of the run read within `run_cache.MAX_AGE`
+    (`policy.permission_reader`'s section) is reused, and each one read here
+    is saved for them; a 404 or a failure never is."""
     cache: dict[str, str | None] = {}
 
     def permission(login: str) -> str | None:
         if login not in cache:
             owner, name = _split_repo(repo)
+            key = f"{owner}/{name}|{login.casefold()}"
+            shared = run_cache.get_dated("permission", key, run_cache.MAX_AGE)
+            if shared is not None and isinstance(shared[0], str):
+                run_cache.note(shared[1])
+                cache[login] = shared[0]
+                return cache[login]
+            at = run_cache.now()
             endpoint = (
                 f"repos/{owner}/{name}/collaborators/{quote(login, safe='')}/permission"
             )
@@ -4210,6 +4334,7 @@ def _default_is_human(
                 if not isinstance(value, str):
                     raise PostMergeReadError(f"{label}: no permission in the response")
                 cache[login] = value
+                run_cache.put("permission", key, value, at)
         return cache[login]
 
     return lambda actor: policy.is_human(
@@ -4487,18 +4612,25 @@ def default_floor(
         repo, agent_identity=identity, self_logins=self_logins
     )
     floor = policy.merged_since_floor(repo, head, demotion)
-    times = (demotion.newest_created, demotion.cleared_at)
-    newest, cleared = (t.isoformat() if t else None for t in times)
     return floor, {
         "mainSha": head,
         "configSha": config,
-        "demotion": {
-            "active": demotion.active,
-            "reason": demotion.reason,
-            "records": list(demotion.records),
-            "newestCreated": newest,
-            "clearedAt": cleared,
-        },
+        "demotion": _demotion_report(demotion),
+    }
+
+
+def _demotion_report(demotion: policy.Demotion) -> dict[str, Any]:
+    """The demotion record as the report's `shared` binding states it."""
+    newest, cleared = (
+        t.isoformat() if t else None
+        for t in (demotion.newest_created, demotion.cleared_at)
+    )
+    return {
+        "active": demotion.active,
+        "reason": demotion.reason,
+        "records": list(demotion.records),
+        "newestCreated": newest,
+        "clearedAt": cleared,
     }
 
 
@@ -4593,9 +4725,7 @@ def _verifying_runs_unchanged(
         )
 
     owner, name = _split_repo(repo)
-    floor = quote(
-        f">={created.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')}", safe=""
-    )
+    floor = quote(f">={_stamp(created)}", safe="")
     for workflow in (FULL_RUN_WORKFLOW, CANARY_WORKFLOW):
         try:
             payload = json_object(
@@ -4709,12 +4839,11 @@ def _quarantine_touched(repo: str, since: datetime) -> bool:
     closed or edited at or after `since`, in one listing; a full page counts
     as touched. A read that fails raises `PostMergeReadError`."""
     owner, name = _split_repo(repo)
-    stamp = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     issues = json_array(
         _read(
             [
                 "api",
-                f"repos/{owner}/{name}/issues?state=all&since={stamp}&per_page=100",
+                f"repos/{owner}/{name}/issues?state=all&since={_stamp(since)}&per_page=100",
             ],
             "issues changed since the report",
         )
@@ -4867,8 +4996,7 @@ def read_shared(path: str) -> policy.SharedPostMerge | None:
     None when it is missing, malformed, unreadable as a verdict, or has no
     `shared` binding (a `--since` or `--branch` run)."""
     try:
-        with open(path, encoding="utf-8") as handle:
-            payload = json_object(json.load(handle))
+        payload = _read_json_object(path)
         shared = json_object(payload.get("shared"))
         record = json_object(shared.get("demotion"))
         times = [record.get("newestCreated"), record.get("clearedAt")]
@@ -4897,11 +5025,7 @@ def read_shared(path: str) -> policy.SharedPostMerge | None:
         demotion = policy.Demotion(
             record["active"], fields[3], tuple(records), newest, cleared
         )
-        report = {
-            k: v
-            for k, v in payload.items()
-            if k not in ("since", "shared", UNREADABLE_KEY)
-        }
+        report = _report_fields(payload)
         return policy.SharedPostMerge(
             main_sha=fields[0],
             config_sha=fields[1],
@@ -4929,22 +5053,13 @@ def write_shared(path: str, shared: policy.SharedPostMerge) -> bool:
     the new one, never part of one. The pr-merge job runs its candidates one
     after another, so there is no concurrent writer. Best effort: a failure is
     logged, the old file stays, and the caller's verdict stands."""
-    demotion = shared.demotion
-    times = (demotion.newest_created, demotion.cleared_at)
-    newest, cleared = (t.isoformat() if t else None for t in times)
     payload = {
         **shared.gate.report,
         "since": shared.floor.isoformat(),
         "shared": {
             "mainSha": shared.main_sha,
             "configSha": shared.config_sha,
-            "demotion": {
-                "active": demotion.active,
-                "reason": demotion.reason,
-                "records": list(demotion.records),
-                "newestCreated": newest,
-                "clearedAt": cleared,
-            },
+            "demotion": _demotion_report(shared.demotion),
             "identity": shared.identity,
             "policyFloor": (
                 shared.policy_floor.isoformat() if shared.policy_floor else None
@@ -4976,8 +5091,22 @@ def _replace_json(path: str, payload: Mapping[str, Any]) -> bool:
     return True
 
 
+def _read_json_object(path: str) -> dict[str, Any]:
+    """The JSON object in the file at `path` (an empty one for any other
+    value); raises `OSError` or `ValueError`."""
+    with open(path, encoding="utf-8") as handle:
+        return json_object(json.load(handle))
+
+
 # The run report's record of a gate's own check that came back unreadable.
 UNREADABLE_KEY = "unreadableRecompute"
+
+
+def _report_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """A run report's verdict fields: all but its floor and shared bindings."""
+    return {
+        k: v for k, v in payload.items() if k not in ("since", "shared", UNREADABLE_KEY)
+    }
 
 
 def _unreadable(report: Mapping[str, Any]) -> bool:
@@ -4999,8 +5128,7 @@ def _unreadable_at(
     `floor` for this identity and lane within `SHARED_MAX_AGE`, or None: the
     gate's own (`UNREADABLE_KEY`), else the job's check the file holds."""
     try:
-        with open(path, encoding="utf-8") as handle:
-            payload = json_object(json.load(handle))
+        payload = _read_json_object(path)
     except (OSError, ValueError):
         return None
     shared = json_object(payload.get("shared"))
@@ -5011,11 +5139,7 @@ def _unreadable_at(
         "identity": shared.get("identity"),
         "laneMergesOnly": shared.get("laneMergesOnly"),
         "computedAt": shared.get("computedAt"),
-        "report": {
-            k: v
-            for k, v in payload.items()
-            if k not in ("since", "shared", UNREADABLE_KEY)
-        },
+        "report": _report_fields(payload),
     }
     now = datetime.now(UTC)
     for record in (json_object(payload.get(UNREADABLE_KEY)), job):
@@ -5062,8 +5186,7 @@ def reuse_unreadable(
         answer = post_merge(floor, identity)
         if _unreadable(answer.report):
             try:
-                with open(path, encoding="utf-8") as handle:
-                    payload = json_object(json.load(handle))
+                payload = _read_json_object(path)
             except (OSError, ValueError):
                 payload = {}
             payload[UNREADABLE_KEY] = {
@@ -5087,37 +5210,41 @@ def _since(value: str) -> datetime:
     return parsed
 
 
+def _print_json(payload: Any, indent: int | None = 2) -> None:
+    json.dump(payload, sys.stdout, indent=indent)
+    sys.stdout.write("\n")
+
+
+def _acting_login() -> str | None:
+    """The session's acting login, or None when it cannot be read."""
+    try:
+        return policy.read_acting_login()
+    except policy.PolicyReadError:
+        return None
+
+
 def _preflight(repo: str, identity: str | None, self_logins: Collection[str]) -> int:
     """The merge gate's identity rule and credential chokepoint alone: a lane
     writes nothing unless both pass. With no identity given, the one the
     repository configures on its default branch is checked (push-branch.sh's
     lane path). Pushes are bound to the identity at push time by
     scripts/lane-push.sh, not here."""
-    report: dict[str, Any]
     if identity is None:
         try:
             identity = policy.resolve(repo).agent_identity
         except policy.PolicyReadError as exc:
-            report = {"ok": False, "error": f"config-unreadable: {exc}"}
-            json.dump(report, sys.stdout, indent=2)
-            sys.stdout.write("\n")
+            _print_json({"ok": False, "error": f"config-unreadable: {exc}"})
             return 2
-    try:
-        acting = policy.read_acting_login()
-    except policy.PolicyReadError:
-        acting = None
-    resolved = policy.resolve_identity(identity, acting, self_logins)
+    resolved = policy.resolve_identity(identity, _acting_login(), self_logins)
     refusal = resolved.reason
     if refusal is None and resolved.login:
         credentials = policy.credential_refusal(resolved.login)
         refusal = f"credentials:{credentials}" if credentials else None
-    report = (
+    _print_json(
         {"ok": False, "error": refusal}
         if refusal
         else {"ok": True, "identity": resolved.login}
     )
-    json.dump(report, sys.stdout, indent=2)
-    sys.stdout.write("\n")
     return 2 if refusal else 0
 
 
@@ -5134,6 +5261,12 @@ def _lane_alerted(repo: str, branch: str, run_id: int) -> int:
     return 0 if alerted else EXIT_NOT_ALERTED
 
 
+def _check_lines(path: str) -> frozenset[str]:
+    """The non-blank lines of a checks file, stripped."""
+    with open(path, encoding="utf-8") as handle:
+        return frozenset(line.strip() for line in handle if line.strip())
+
+
 def _judge_run(args: argparse.Namespace) -> int:
     """`--judge-run`: which of one red full run's newly failing checks demote
     (`_Context.demoting`), with the identity read from the default branch
@@ -5142,12 +5275,12 @@ def _judge_run(args: argparse.Namespace) -> int:
     --file-quarantine."""
     report: dict[str, Any] = {"ok": False}
     try:
-        with open(args.checks_file, encoding="utf-8") as handle:
-            checks = frozenset(line.strip() for line in handle if line.strip())
-        kept: frozenset[str] = frozenset()
-        if args.baseline_checks_file:
-            with open(args.baseline_checks_file, encoding="utf-8") as handle:
-                kept = frozenset(line.strip() for line in handle if line.strip())
+        checks = _check_lines(args.checks_file)
+        kept: frozenset[str] = (
+            _check_lines(args.baseline_checks_file)
+            if args.baseline_checks_file
+            else frozenset()
+        )
         identity = args.agent_identity or (
             policy.read_config_at(
                 args.repo, policy._default_branch_head(args.repo)[1]
@@ -5203,8 +5336,7 @@ def _judge_run(args: argparse.Namespace) -> int:
     except (OSError, PostMergeReadError, policy.PolicyReadError) as exc:
         report = {"ok": False, "error": f"unreadable: {exc}"}
         code = EXIT_UNREADABLE
-    json.dump(report, sys.stdout, indent=2)
-    sys.stdout.write("\n")
+    _print_json(report)
     return code
 
 
@@ -5243,15 +5375,14 @@ def _settle_from(repo: str, path: str, identity: str) -> int:
     exits 0 and a post that failed, or a report that cannot be read, is a
     warning; the next check lists the merge again."""
     try:
-        report = json_object(json.loads(Path(path).read_text(encoding="utf-8")))
+        report = _read_json_object(path)
     except (OSError, ValueError) as exc:
         report = {"error": f"{type(exc).__name__}: {exc}"}
     if report.get("readable") is True:
         posted, warnings = settle(repo, anchor_covered(repo, identity, report), identity)
     else:
         posted, warnings = [], [f"settle-unposted: no readable report at {path}"]
-    json.dump({"settled": posted, "warnings": warnings}, sys.stdout, indent=2)
-    sys.stdout.write("\n")
+    _print_json({"settled": posted, "warnings": warnings})
     return 0
 
 
@@ -5294,6 +5425,15 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "judge only merges the agent identity enqueued (the pr-merge lane); "
             "another App's or a person's merge is not the lane's"
+        ),
+    )
+    parser.add_argument(
+        "--stop-uncovered",
+        action="store_true",
+        help=(
+            "exit 6 with no verdict, once the runs are listed, when a judged merge "
+            "has no dispatch run created since it: the verdict would need a "
+            "dispatch or be unreadable (a pr-merge wake, which dispatches nothing)"
         ),
     )
     mode = parser.add_mutually_exclusive_group()
@@ -5359,6 +5499,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.stop_uncovered and (
+        args.remediate
+        or args.preflight
+        or args.settle_from
+        or args.judge_run is not None
+        or args.lane_alerted is not None
+    ):
+        parser.error("--stop-uncovered is for a read-only check alone")
     if args.preflight:
         return _preflight(args.repo, args.agent_identity, args.self_login)
     if args.lane_alerted is not None:
@@ -5379,18 +5527,14 @@ def main(argv: list[str] | None = None) -> int:
     # Only a dedicated App identity can be judged, and only that identity may
     # remediate: its dispatches, re-runs and filed issues are what the check
     # and the demotion record count.
-    acting = args.agent_identity
-    if args.remediate or args.settle_from:
-        try:
-            acting = policy.read_acting_login()
-        except policy.PolicyReadError:
-            acting = None
+    acting = (
+        _acting_login() if args.remediate or args.settle_from else args.agent_identity
+    )
     refusal = policy.resolve_identity(
         args.agent_identity, acting, args.self_login
     ).reason
     if refusal:
-        json.dump({"ok": False, "error": refusal}, sys.stdout, indent=2)
-        sys.stdout.write("\n")
+        _print_json({"ok": False, "error": refusal})
         return 2
     if args.settle_from:
         return _settle_from(args.repo, args.settle_from, args.agent_identity)
@@ -5418,8 +5562,7 @@ def main(argv: list[str] | None = None) -> int:
                     "policyFloor": since.isoformat(),
                 }
         except policy.PolicyReadError as exc:
-            json.dump({"ok": False, "error": f"floor unreadable: {exc}"}, sys.stdout)
-            sys.stdout.write("\n")
+            _print_json({"ok": False, "error": f"floor unreadable: {exc}"}, indent=None)
             return EXIT_UNREADABLE
         # Only the lane's own check on the default branch reads the anchor;
         # a full check, an explicit --since and --judge-run never do.
@@ -5427,18 +5570,31 @@ def main(argv: list[str] | None = None) -> int:
         if anchored:
             since, anchor = lane_floor(args.repo, args.agent_identity, since)
     out = os.environ.get(ANCHOR_ENV)
-    verdict = check(
-        args.repo,
-        agent_identity=args.agent_identity,
-        is_human=is_human,
-        merged_since=since,
-        branch=args.branch,
-        pinned_sha=(reader := pin_reader(args.repo, args.agent_identity)),
-        lane_merges_only=args.lane_merges_only,
-        settled=reader.settled,
-        # Only the check that writes the anchor reads settled merges' runs.
-        rejudge=anchor_needs(anchor) if anchored and out else None,
-    )
+    try:
+        verdict = check(
+            args.repo,
+            agent_identity=args.agent_identity,
+            is_human=is_human,
+            merged_since=since,
+            branch=args.branch,
+            pinned_sha=(reader := pin_reader(args.repo, args.agent_identity)),
+            lane_merges_only=args.lane_merges_only,
+            settled=reader.settled,
+            # Only the check that writes the anchor reads settled merges' runs.
+            rejudge=anchor_needs(anchor) if anchored and out else None,
+            stop_uncovered=args.stop_uncovered,
+        )
+    except UncoveredMergeStop as stop:
+        _print_json(
+            {
+                "ok": False,
+                "readable": False,
+                "stopped": "uncovered-merge",
+                "number": stop.number,
+                "since": since.isoformat(),
+            }
+        )
+        return EXIT_UNCOVERED
     report = verdict.report()
     report["since"] = since.isoformat()
     if shared is not None:
@@ -5474,8 +5630,7 @@ def main(argv: list[str] | None = None) -> int:
         report["remediation"]["errors"] = errors + report["remediation"]["errors"]
         if report["remediation"]["errors"]:
             code = EXIT_WRITE_FAILED
-    json.dump(report, sys.stdout, indent=2)
-    sys.stdout.write("\n")
+    _print_json(report)
     return code
 
 

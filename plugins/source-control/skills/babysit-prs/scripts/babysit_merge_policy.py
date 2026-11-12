@@ -338,6 +338,16 @@ def resolve_bash(
     return next((c for c in candidates if _accept_bash(c, windows, exists)), None)
 
 
+def _shared_bash(tool: str) -> str:
+    """This host's `resolve_bash`; raises `PolicyReadError` naming the shared
+    YAML `tool` when there is none."""
+    platform = "win32" if os.name == "nt" else sys.platform
+    bash = resolve_bash(os.environ, platform, os.path.isfile)
+    if bash is None:
+        raise PolicyReadError(f"no usable bash found to run the shared YAML {tool}")
+    return bash
+
+
 # The shared reader's answers by document, keys, reader script, command
 # runner and environment, of which it is a pure function: `read_config_at`
 # reads the same few config texts at hundreds of commits per gate run, and
@@ -380,10 +390,7 @@ def _read_concern_values(
     text: str, keys: list[tuple[str, bool]], run: Callable[..., Any]
 ) -> dict[str, list[str]] | None:
     """`_concern_values`, read through the shared reader every time."""
-    platform = "win32" if os.name == "nt" else sys.platform
-    bash = resolve_bash(os.environ, platform, os.path.isfile)
-    if bash is None:
-        raise PolicyReadError("no usable bash found to run the shared YAML reader")
+    bash = _shared_bash("reader")
     values: dict[str, list[str]] = {}
     with tempfile.TemporaryDirectory() as tmp:
         document = Path(tmp) / "concern.yaml"
@@ -422,15 +429,9 @@ def floor_paths_in(text: str) -> FloorRows:
     prints scalar items alone. Raises `FloorRowError` on a row the floor
     cannot use, and `PolicyReadError` when the parser cannot run or rejects
     the document."""
-    if text in _FLOOR_ROWS:
-        return _FLOOR_ROWS[text]
-    records = {
-        key[len(FLOOR_PATHS_KEY) + 1 :]: value
-        for key, value in yaml_records(text).items()
-        if key == FLOOR_PATHS_KEY or key.startswith(f"{FLOOR_PATHS_KEY}.")
-    }
-    _FLOOR_ROWS[text] = rows = floor_rows(records)
-    return rows
+    if text not in _FLOOR_ROWS:
+        _FLOOR_ROWS[text] = floor_rows(_records_below(text, FLOOR_PATHS_KEY))
+    return _FLOOR_ROWS[text]
 
 
 _ISSUE_STATUS: dict[str, IssueStatusConfig | None] = {}
@@ -445,11 +446,7 @@ def _issue_status_config(text: str) -> IssueStatusConfig | None:
         return None
     if text not in _ISSUE_STATUS:
         try:
-            rows = {
-                key[len(ISSUE_STATUS_KEY) + 1 :]: value
-                for key, value in yaml_records(text).items()
-                if key == ISSUE_STATUS_KEY or key.startswith(f"{ISSUE_STATUS_KEY}.")
-            }
+            rows = _records_below(text, ISSUE_STATUS_KEY)
             _ISSUE_STATUS[text] = _issue_status_rows(rows) if rows else None
         except PolicyReadError as exc:
             _ISSUE_STATUS[text] = IssueStatusConfig(0, (), (), (), (), str(exc))
@@ -530,10 +527,7 @@ def yaml_records(text: str) -> dict[str, str]:
     """A YAML document's `lib/yaml-subset.awk` records: each scalar's dotted
     key to its value. Raises `PolicyReadError` when the parser cannot run or
     rejects the document."""
-    platform = "win32" if os.name == "nt" else sys.platform
-    bash = resolve_bash(os.environ, platform, os.path.isfile)
-    if bash is None:
-        raise PolicyReadError("no usable bash found to run the shared YAML parser")
+    bash = _shared_bash("parser")
     with tempfile.TemporaryDirectory() as tmp:
         document = Path(tmp) / "concern.yaml"
         try:
@@ -550,6 +544,16 @@ def yaml_records(text: str) -> dict[str, str]:
         raise PolicyReadError(f"the shared YAML parser exited {proc.returncode}")
     pairs = (line.partition("\t") for line in proc.stdout.split("\n") if line)
     return {key: value for key, _, value in pairs}
+
+
+def _records_below(text: str, key: str) -> dict[str, str]:
+    """The `yaml_records` of `text` at `key` and below it, each keyed by what
+    follows `key.`."""
+    return {
+        k[len(key) + 1 :]: value
+        for k, value in yaml_records(text).items()
+        if k == key or k.startswith(f"{key}.")
+    }
 
 
 def _merge_names(text: str, key: str) -> bool:
@@ -754,6 +758,11 @@ def _time(value: Any) -> datetime:
     if parsed.utcoffset() is None:
         raise PolicyReadError(f"a timestamp without an offset: {value!r}")
     return parsed
+
+
+def _stamp(moment: datetime) -> str:
+    """`moment` to the second in UTC, as a `created=` qualifier names it."""
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _has_next_page(info: dict[str, Any], label: str) -> bool:
@@ -1170,53 +1179,64 @@ def read_config_at(
             " no work class is read"
         )
 
-    report_only = scalar("merge.report-only")
-    if report_only not in (None, "true", "false"):
-        notes.append(f"merge.report-only {report_only!r} is not true or false")
-    verdict = scalar("merge.require-verifier-verdict")
-    if verdict not in (None, "true", "false"):
-        notes.append(f"merge.require-verifier-verdict {verdict!r} is not true or false")
-    dependabot_mode = scalar("merge.dependabot.mode") or "off"
-    if dependabot_mode not in DEPENDABOT_MODES:
+    def choice(key: str, allowed: tuple[str, ...], problem: str) -> str:
+        """`key`'s value when `allowed` holds it, else `allowed[0]`, with a
+        note when the value was set."""
+        value = scalar(key) or allowed[0]
+        if value not in allowed:
+            notes.append(f"{key} {value!r} {problem}")
+            return allowed[0]
+        return value
+
+    def bounded(
+        key: str, pattern: str, ceiling: int | None, problem: str
+    ) -> str | None:
+        """`key`'s value, or None with a note when it does not fullmatch
+        `pattern` or exceeds `ceiling`."""
+        value = scalar(key)
+        if value is None or (
+            re.fullmatch(pattern, value) and (ceiling is None or int(value) <= ceiling)
+        ):
+            return value
+        notes.append(f"{key} {value!r} {problem}")
+        return None
+
+    def app_ids(key: str, consequence: str) -> tuple[int, ...]:
+        """`key`'s App ids, or none with a note when an entry is not an id."""
+        ids = values[key]
+        if all(re.fullmatch(r"[1-9][0-9]*", i) for i in ids):
+            return tuple(int(i) for i in ids)
         notes.append(
-            f"merge.dependabot.mode {dependabot_mode!r} is not off, report or enforce"
+            f"{key} {ids!r} holds an entry that is not an account id; {consequence}"
         )
-        dependabot_mode = "off"
-    dependabot_majors = scalar("merge.dependabot.majors") or "hold"
-    if dependabot_majors not in DEPENDABOT_MAJORS:
-        notes.append(
-            f"merge.dependabot.majors {dependabot_majors!r} is not hold or review"
-        )
-        dependabot_majors = "hold"
-    in_flight_cap = scalar("merge.max-in-flight")
-    if in_flight_cap is not None and not (
-        re.fullmatch(r"[1-9][0-9]*", in_flight_cap)
-        and int(in_flight_cap) <= MAX_IN_FLIGHT_CEILING
-    ):
-        notes.append(
-            f"merge.max-in-flight {in_flight_cap!r} is not a count from 1 to "
-            f"{MAX_IN_FLIGHT_CEILING}"
-        )
-        in_flight_cap = None
-    ejections = scalar("merge.max-queue-ejections")
-    if ejections is not None and not (
-        re.fullmatch(r"[1-9][0-9]?", ejections)
-        and int(ejections) <= MAX_QUEUE_EJECTIONS_LIMIT
-    ):
-        notes.append(
-            f"merge.max-queue-ejections {ejections!r} is not a count from 1 to "
-            f"{MAX_QUEUE_EJECTIONS_LIMIT}"
-        )
-        ejections = None
-    escalation_minutes = scalar("merge.risk-escalation-minutes")
-    if escalation_minutes is not None and not re.fullmatch(
-        r"0|[1-9][0-9]*", escalation_minutes
-    ):
-        notes.append(
-            f"merge.risk-escalation-minutes {escalation_minutes!r} is not a whole "
-            "number of minutes"
-        )
-        escalation_minutes = None
+        return ()
+
+    report_only = switch("merge.report-only")
+    verdict = switch("merge.require-verifier-verdict")
+    dependabot_mode = choice(
+        "merge.dependabot.mode", DEPENDABOT_MODES, "is not off, report or enforce"
+    )
+    dependabot_majors = choice(
+        "merge.dependabot.majors", DEPENDABOT_MAJORS, "is not hold or review"
+    )
+    in_flight_cap = bounded(
+        "merge.max-in-flight",
+        r"[1-9][0-9]*",
+        MAX_IN_FLIGHT_CEILING,
+        f"is not a count from 1 to {MAX_IN_FLIGHT_CEILING}",
+    )
+    ejections = bounded(
+        "merge.max-queue-ejections",
+        r"[1-9][0-9]?",
+        MAX_QUEUE_EJECTIONS_LIMIT,
+        f"is not a count from 1 to {MAX_QUEUE_EJECTIONS_LIMIT}",
+    )
+    escalation_minutes = bounded(
+        "merge.risk-escalation-minutes",
+        r"0|[1-9][0-9]*",
+        None,
+        "is not a whole number of minutes",
+    )
     verify_fails = scalar("merge.max-verify-fails")
     if verify_fails is None and _merge_names(text, "max-verify-fails"):
         verify_fails = ""
@@ -1233,52 +1253,31 @@ def read_config_at(
             f"merge.verify-cap-attempts {cap_attempts!r} is not a whole number"
         )
         cap_attempts = "0"
-    idle_text = scalar("adoption.idle-hours")
-    idle_hours: int | None = None
-    if idle_text is not None:
-        idle_hours = (
-            int(idle_text) if re.fullmatch(r"[1-9][0-9]{0,2}", idle_text) else None
-        )
-        if idle_hours is None or idle_hours > MAX_ADOPTION_IDLE_HOURS:
-            notes.append(
-                f"adoption.idle-hours {idle_text!r} is not a whole number from 1 "
-                f"to {MAX_ADOPTION_IDLE_HOURS}; nothing is adopted"
-            )
-            idle_hours = None
-    body_apps = tuple(values["adoption.spec-from-body-apps"])
-    if not all(re.fullmatch(r"[1-9][0-9]*", i) for i in body_apps):
-        notes.append(
-            f"adoption.spec-from-body-apps {list(body_apps)!r} holds an entry that "
-            "is not an account id; every App needs a closing issue"
-        )
-        body_apps = ()
-    self_merging = tuple(values["adoption.self-merging-apps"])
-    if not all(re.fullmatch(r"[1-9][0-9]*", i) for i in self_merging):
-        notes.append(
-            f"adoption.self-merging-apps {list(self_merging)!r} holds an entry "
-            "that is not an account id; every App gets its reasons comment"
-        )
-        self_merging = ()
-    quarantine_days = scalar("merge.quarantine-days")
-    if quarantine_days is not None and not (
-        re.fullmatch(r"[1-9][0-9]?", quarantine_days)
-        and int(quarantine_days) <= MAX_QUARANTINE_DAYS
-    ):
-        notes.append(
-            f"merge.quarantine-days {quarantine_days!r} is not a count from 1 to "
-            f"{MAX_QUARANTINE_DAYS}"
-        )
-        quarantine_days = None
-    confirm_wait = scalar("red-main.confirm-wait-minutes")
-    if confirm_wait is not None and not (
-        re.fullmatch(r"0|[1-9][0-9]?", confirm_wait)
-        and int(confirm_wait) <= MAX_CONFIRM_WAIT_MINUTES
-    ):
-        notes.append(
-            f"red-main.confirm-wait-minutes {confirm_wait!r} is not a whole number "
-            f"from 0 to {MAX_CONFIRM_WAIT_MINUTES}"
-        )
-        confirm_wait = None
+    idle_hours = bounded(
+        "adoption.idle-hours",
+        r"[1-9][0-9]{0,2}",
+        MAX_ADOPTION_IDLE_HOURS,
+        f"is not a whole number from 1 to {MAX_ADOPTION_IDLE_HOURS}; "
+        "nothing is adopted",
+    )
+    body_apps = app_ids(
+        "adoption.spec-from-body-apps", "every App needs a closing issue"
+    )
+    self_merging = app_ids(
+        "adoption.self-merging-apps", "every App gets its reasons comment"
+    )
+    quarantine_days = bounded(
+        "merge.quarantine-days",
+        r"[1-9][0-9]?",
+        MAX_QUARANTINE_DAYS,
+        f"is not a count from 1 to {MAX_QUARANTINE_DAYS}",
+    )
+    confirm_wait = bounded(
+        "red-main.confirm-wait-minutes",
+        r"0|[1-9][0-9]?",
+        MAX_CONFIRM_WAIT_MINUTES,
+        f"is not a whole number from 0 to {MAX_CONFIRM_WAIT_MINUTES}",
+    )
     lane_prs: str | None = scalar("merge.lane-prs") or "native"
     if lane_prs not in LANE_PRS_MODES:
         notes.append(f"merge.lane-prs {lane_prs!r} is not native or gate")
@@ -1295,8 +1294,8 @@ def read_config_at(
         denied_paths=tuple(values["merge.diff-check.denied-paths"]),
         loop_merge=loop_merge,
         notes=tuple(notes),
-        report_only=report_only not in (None, "false"),
-        require_verifier_verdict=verdict not in (None, "false"),
+        report_only=report_only,
+        require_verifier_verdict=verdict,
         dependabot_mode=dependabot_mode,
         dependabot_majors=dependabot_majors,
         high_path_floor=high_path_floor,
@@ -1313,9 +1312,9 @@ def read_config_at(
         if cap_attempts is not None
         else VERIFY_CAP_ATTEMPTS,
         check_inputs=tuple(values["merge.check-inputs"]),
-        adoption_idle_hours=idle_hours,
-        spec_from_body_apps=tuple(int(i) for i in body_apps),
-        self_merging_apps=tuple(int(i) for i in self_merging),
+        adoption_idle_hours=int(idle_hours) if idle_hours else None,
+        spec_from_body_apps=body_apps,
+        self_merging_apps=self_merging,
         quarantine_days=int(quarantine_days) if quarantine_days else QUARANTINE_DAYS,
         confirm_wait_minutes=int(confirm_wait)
         if confirm_wait is not None
@@ -1598,6 +1597,8 @@ def with_default_branch(
     when it cannot be parsed or the agent identities differ."""
     main = _default_branch_config(repo, branch)
     return base if main.base_sha == base.base_sha else stricter_config(base, main)
+
+
 def lane_identity(repo: str, base_sha: str) -> tuple[str | None, str]:
     """`merge.agent-identity` when the pull request's base commit and the
     default branch head both declare the same one, with where it was read.
@@ -1622,8 +1623,6 @@ def lane_identity(repo: str, base_sha: str) -> tuple[str | None, str]:
         f"merge.agent-identity in {CONFIG_PATH} at the base {base_sha} and the "
         f"default branch head {main.base_sha}"
     )
-
-
 
 
 # --- Effective rung ---------------------------------------------------------------
@@ -1885,6 +1884,15 @@ GREEN_PAGES = 5
 GREEN_SPAN = timedelta(days=7)
 # Spans read before giving up (holding the record), about a year.
 GREEN_SPANS = 53
+# Listings are read as fixed `GREEN_SPAN` cells counted from this instant, so
+# records filed close together read the same pages; each record's span is
+# cut from the one or two cells that cover it.
+GREEN_GRID = datetime(2026, 1, 5, 10, tzinfo=UTC)
+# Pages one cell may take. A record's span is still bound by `GREEN_PAGES`;
+# a cell holds the busy days before the record too, and a cell it cannot read
+# whole holds the record where its own span would not have. Main listed 582
+# green dispatch runs in the week from 2026-10-19T10:00:00Z.
+GREEN_CELL_PAGES = 2 * GREEN_PAGES
 # A canary, revert or read-back record, which `_lift` lifts. A canary record
 # may be a post-merge-failure one, which holds nothing but is closed the same
 # way (babysit_lift.py close).
@@ -1912,7 +1920,7 @@ PIN_LINE = re.compile(r"^<!-- babysit-merge-pin sha=([0-9a-f]{40}) -->$")
 # A pull request's merge and the agent identity's pin read-back over its first
 # 100 comments; a longer thread proves no read-back.
 LIFT_PULL = (
-    "number merged mergedAt baseRefName headRefOid mergeCommit{oid} "
+    "number merged mergedAt baseRefName stack{baseRefName} headRefOid mergeCommit{oid} "
     "repository{nameWithOwner} comments(first:100){pageInfo{hasNextPage} "
     "nodes{author{__typename login} body createdAt lastEditedAt}}"
 )
@@ -2061,28 +2069,38 @@ def _edits_refusal(issue: dict[str, Any], human: Callable[[Any], bool]) -> str |
 
 class _GreenMain:
     """`_recovered_at`'s reads, shared by the records of one `read_demotion`:
-    each record time's listing, one read of main's tip, and each compare once."""
+    each `GREEN_GRID` cell's listing, one read of main's tip, and each compare
+    once. Nothing outlives the instance, so every `read_demotion` reads fresh."""
 
     def __init__(self, owner: str, name: str) -> None:
         self.owner, self.name = owner, name
         self.runs: dict[str, list[dict[str, Any]]] = {}
+        self.cells: dict[tuple[str, int], list[dict[str, Any]]] = {}
         self.tip: str | None = None
         self.compares: dict[tuple[str, str], str | None] = {}
+        # babysit_postmerge's `_Context` for local ancestry; False: unavailable.
+        self.local: Any = None
 
     def _read(self, endpoint: str) -> Any:
+        """One retry for no answer (a timeout included) or a 5xx; 403 and 429
+        belong to babysit_gh's rate guard and are never retried."""
         status, answer = _get(endpoint)
+        if status is None or status >= 500:
+            status, answer = _get(endpoint)
         if status != 200:
             raise PolicyReadError(f"{endpoint}: {status}")
         return answer
 
-    def _window(self, since: str, until: str) -> list[dict[str, Any]]:
-        """Every green schedule and workflow_dispatch full run on main
-        created from `since` to `until`; more than `GREEN_PAGES` pages of
-        either raises, so the earliest is never a guess."""
-        found: list[dict[str, Any]] = []
-        created = quote(f"{since}..{until}", safe=":")
-        for event in GREEN_EVENTS:
-            for page in range(1, GREEN_PAGES + 1):
+    def _cell(self, event: str, cell: int) -> list[dict[str, Any]]:
+        """Every green `event` full run on main created in `GREEN_GRID` cell
+        `cell`, both ends included as `created=a..b` includes them, read
+        once; more than `GREEN_CELL_PAGES` pages raises, so the earliest is
+        never a guess."""
+        if (event, cell) not in self.cells:
+            start = GREEN_GRID + cell * GREEN_SPAN
+            created = quote(f"{_stamp(start)}..{_stamp(start + GREEN_SPAN)}", safe=":")
+            found: list[dict[str, Any]] = []
+            for page in range(1, GREEN_CELL_PAGES + 1):
                 answer = self._read(
                     GREEN_RUNS.format(self.owner, self.name, event, created, page)
                 )
@@ -2092,8 +2110,40 @@ class _GreenMain:
                     break
             else:
                 raise PolicyReadError(
+                    f"{event} green runs: more than {GREEN_CELL_PAGES} pages"
+                    f" in the week from {_stamp(start)}"
+                )
+            self.cells[event, cell] = found
+        return self.cells[event, cell]
+
+    def _window(self, since: str, until: str) -> list[dict[str, Any]]:
+        """Every green schedule and workflow_dispatch full run on main
+        created from `since` to `until`, cut from the cells that cover them.
+        A run on the line between two cells is listed by both and kept once.
+        `GREEN_PAGES` full pages of either event in the window raises, as
+        listing the window itself would. The new ways to raise are a cell
+        past `GREEN_CELL_PAGES` and a listed run with no readable
+        `created_at`."""
+        low, high = _time(since), _time(until)
+        first = (low - GREEN_GRID) // GREEN_SPAN
+        last = max(first, -((GREEN_GRID - high) // GREEN_SPAN) - 1)
+        found: list[dict[str, Any]] = []
+        for event in GREEN_EVENTS:
+            runs = [
+                run
+                for cell in range(first, last + 1)
+                for run in self._cell(event, cell)
+                if low <= _time(run.get("created_at")) <= high
+                and (
+                    cell == first
+                    or _time(run.get("created_at")) > GREEN_GRID + cell * GREEN_SPAN
+                )
+            ]
+            if len(runs) >= GREEN_PAGES * 100:
+                raise PolicyReadError(
                     f"{event} green runs: more than {GREEN_PAGES} pages"
                 )
+            found += runs
         return found
 
     def listed(self, since: datetime, now: datetime) -> Iterator[dict[str, Any]]:
@@ -2107,13 +2157,14 @@ class _GreenMain:
             start = since + span * GREEN_SPAN
             if start > now:
                 return
-            yield from self._span(start, start + GREEN_SPAN)
+            # No run is created after now, so the span stops there and reads
+            # no grid cell that starts in the future.
+            yield from self._span(start, min(start + GREEN_SPAN, now))
         raise PolicyReadError(f"green runs: more than {GREEN_SPANS} spans")
 
     def _span(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
         """`listed`'s runs created from `start` to `end`, read once."""
-        stamp = start.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        until = end.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        stamp, until = _stamp(start), _stamp(end)
         if stamp not in self.runs:
             repo = f"{self.owner}/{self.name}"
             self.runs[stamp] = sorted(
@@ -2141,13 +2192,32 @@ class _GreenMain:
         return self.runs[stamp]
 
     def ahead(self, base: str, head: str) -> bool:
-        """Whether `head` has `base` in its history and is a later commit."""
+        """Whether `head` has `base` in its history and is a later commit:
+        from a local full-history clone when one can decide two different
+        commits (`_local_ancestor`), else the compare API's `ahead`."""
         if (base, head) not in self.compares:
-            answer = self._read(
-                f"repos/{self.owner}/{self.name}/compare/{base}...{head}"
-            )
-            self.compares[base, head] = json_object(answer).get("status")
+            local = None if base == head else self._local_ancestor(base, head)
+            if local is not None:
+                self.compares[base, head] = "ahead" if local else "not-ancestor"
+            else:
+                answer = self._read(
+                    f"repos/{self.owner}/{self.name}/compare/{base}...{head}"
+                )
+                self.compares[base, head] = json_object(answer).get("status")
         return self.compares[base, head] == "ahead"
+
+    def _local_ancestor(self, ancestor: str, sha: str) -> bool | None:
+        """`babysit_postmerge._Context._local_contains` on main, with its
+        shallow, graft, replace-ref and lazy-fetch guards, or None when no
+        clone can decide."""
+        if self.local is None:
+            try:
+                import babysit_postmerge as postmerge
+            except ImportError:
+                self.local = False
+            else:
+                self.local = postmerge._Context(self.owner, self.name, "", branch="main")
+        return self.local._local_contains(ancestor, sha) if self.local else None
 
     def on_main(self, sha: str) -> bool:
         """Whether `sha` is on main's history, read by heads/main: a ref named
@@ -2203,17 +2273,17 @@ def _read_back_holds(pull: dict[str, Any], identity: str | None) -> bool:
     ):
         return False
     pins = [
-        c
+        (c, pinned)
         for c in map(json_object, json_array(comments.get("nodes")))
         # The judge's author test (`babysit_postmerge._identity_marks`): a
         # User who owns the bare slug is never the App.
         if actor_key(c.get("author")) == str(identity).strip().casefold()
-        and PIN_LINE.match(str(c.get("body") or "").split("\n", 1)[0].rstrip())
+        and (pinned := PIN_LINE.match(str(c.get("body") or "").split("\n", 1)[0].rstrip()))
     ]
     if not pins or not pull.get("merged"):
         return False
-    pin = pins[-1]
-    sha = PIN_LINE.match(str(pin.get("body")).split("\n", 1)[0].rstrip())[1]
+    pin, pinned = pins[-1]
+    sha = pinned[1]
     return (
         not pin.get("lastEditedAt")
         and _time(pin.get("createdAt")) <= _time(pull.get("mergedAt"))
@@ -2417,8 +2487,8 @@ def _lift(
             block = next(
                 (p for n in notes if (p := read_lift_block(n)) is not None), None
             )
-        if block is None and signal == "canary":
-            return None
+            if block is None:
+                return None
     own = json_object(data.get("pullRequest"))
     if (
         number is not None
@@ -2453,7 +2523,13 @@ def _lift(
         if (
             pull.get("__typename") != "PullRequest"
             or not pull.get("merged")
-            or pull.get("baseRefName") != "main"
+            # Into main, or an upper layer of a native stack into main, which
+            # keeps the lower layer's branch as its base when the stack lands.
+            or "main"
+            not in (
+                pull.get("baseRefName"),
+                json_object(pull.get("stack")).get("baseRefName"),
+            )
             or str(json_object(pull.get("repository")).get("nameWithOwner") or "").casefold()
             != f"{owner}/{name}".casefold()
             or not SHA_RE.fullmatch(oid)
@@ -2521,13 +2597,12 @@ def read_demotion(
     """
     owner, name = _split_repo(repo)
     filers = [DEMOTION_FILER, *([agent_identity.strip()] if agent_identity else [])]
-    permission = permission or permission_reader(repo)
-    human = lambda actor: is_human(  # noqa: E731
-        actor,
+    human = partial(
+        is_human,
         repo=repo,
         agent_identity=agent_identity,
         self_logins=self_logins,
-        permission=permission,
+        permission=permission or permission_reader(repo),
     )
     records: list[int] = []
     created: list[datetime] = []
@@ -2558,16 +2633,11 @@ def read_demotion(
                 issue = json_object(json_object(data.get("repository")).get("issue"))
             if not issue:
                 raise PolicyReadError(f"issue #{number} returned nothing")
-            revisions = [
-                json_object(e).get("diff")
-                for e in json_array(
-                    json_object(issue.get("userContentEdits")).get("nodes")
-                )
-            ]
-            texts = [issue.get("body"), *revisions]
             edits = json_object(issue.get("userContentEdits"))
+            revisions = json_array(edits.get("nodes"))
+            texts = [issue.get("body"), *(json_object(e).get("diff") for e in revisions)]
             # A truncated history may hide the marker in an older revision.
-            truncated = edits.get("totalCount") != len(json_array(edits.get("nodes")))
+            truncated = edits.get("totalCount") != len(revisions)
             if not truncated and not any(
                 t is None or DEMOTION_MARKER in str(t) for t in texts
             ):
@@ -2580,8 +2650,12 @@ def read_demotion(
                     recovered = _recovered_at(issue, human, green, clock)
                     if recovered is None:
                         recovered = _lifted_at(issue, human, green, agent_identity)
-                except PolicyReadError:
-                    recovered = None
+                except PolicyReadError as exc:
+                    # Still fail-closed: the record holds.
+                    print(
+                        f"::warning::demotion #{number}: recovery read failed: {exc}",
+                        file=sys.stderr,
+                    )
             if hold and recovered is None:
                 if held is None:
                     held = Demotion(True, f"#{number} {hold}", tuple(records))
@@ -3309,13 +3383,12 @@ def recheck_opt_in(
     enqueue: a removal (or a removal and a non-human re-add) after the
     eligibility read refuses. None when it stands or is not needed."""
     owner, name = _split_repo(repo)
-    permission = permission or permission_reader(repo)
-    human = lambda actor: is_human(  # noqa: E731
-        actor,
+    human = partial(
+        is_human,
         repo=repo,
         agent_identity=agent_identity,
         self_logins=self_logins,
-        permission=permission,
+        permission=permission or permission_reader(repo),
     )
     try:
         data = _graphql(ELIGIBILITY, f"#{number}", o=owner, r=name, n=number)
@@ -3351,13 +3424,12 @@ def eligibility(
     pull request's base branch).
     """
     owner, name = _split_repo(repo)
-    permission = permission or permission_reader(repo)
-    human = lambda actor: is_human(  # noqa: E731
-        actor,
+    human = partial(
+        is_human,
         repo=repo,
         agent_identity=agent_identity,
         self_logins=self_logins,
-        permission=permission,
+        permission=permission or permission_reader(repo),
     )
     try:
         data = _graphql(ELIGIBILITY, f"#{number}", o=owner, r=name, n=number)
@@ -3653,7 +3725,7 @@ def unran_head(activity: Any, ran: Any, decided: str, at: Any) -> str | None:
     moves: list[tuple[str, datetime]] = []
     for move in activity:
         after = str(json_object(move).get("after") or "")
-        if re.fullmatch(r"[0-9a-f]{40}", after) and after != "0" * 40:
+        if SHA_RE.fullmatch(after) and after != "0" * 40:
             made = parse_timestamp(json_object(move).get("timestamp"))
             if made is None:
                 return "the branch's push history is unreadable"
@@ -3715,7 +3787,7 @@ def _noticed_head(owner: str, name: str, branch: Any, base: str, at: Any) -> str
             if head_repo != f"{owner}/{name}" or started is None or started >= cutoff:
                 continue
             head = str(run.get("head_sha") or "")
-            if not re.fullmatch(r"[0-9a-f]{40}", head):
+            if not SHA_RE.fullmatch(head):
                 return None
             heads.append(head)
             if head not in vetted:
@@ -3847,11 +3919,7 @@ def merged_parents(then: Any, now: Any) -> list[str]:
     found: list[str] = []
     for commit in _new_commits(then, now) or ():
         for sha in (_parent_shas(commit) or [])[1:]:
-            if (
-                isinstance(sha, str)
-                and re.fullmatch(r"[0-9a-f]{40}", sha)
-                and sha not in found
-            ):
+            if isinstance(sha, str) and SHA_RE.fullmatch(sha) and sha not in found:
                 found.append(sha)
     return found
 
@@ -4115,7 +4183,7 @@ def auto_dismissed(events: Any) -> dict[str, str]:
             and d["dismissal_message"] is None
             and json_object(event.get("actor")).get("type") == "Bot"
             and isinstance(commit, str)
-            and re.fullmatch(r"[0-9a-f]{40}", commit) is not None
+            and SHA_RE.fullmatch(commit) is not None
         )
         if stale and key not in found:
             found[key] = commit
@@ -4145,7 +4213,7 @@ def base_tip(owner: str, name: str, base: str) -> str:
     when it does not read as a commit SHA (merge-holds.mjs `baseTip`)."""
     status, answer = _get(f"repos/{owner}/{name}/git/ref/heads/{base}")
     sha = json_object(json_object(answer).get("object")).get("sha")
-    if status != 200 or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+    if status != 200 or not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
         raise PolicyReadError(f"the base branch {base} did not resolve")
     if _BASE_TIPS is not None:
         _BASE_TIPS[f"{owner}/{name}@{base}"] = sha
@@ -4172,6 +4240,15 @@ def remembered_base_tip(owner: str, name: str, base: str) -> str:
     """`base`'s tip as read inside `base_tips_remembered`, else `base_tip`."""
     known = (_BASE_TIPS or {}).get(f"{owner}/{name}@{base}")
     return known or base_tip(owner, name, base)
+
+
+def _compare(owner: str, name: str, spec: str) -> Any:
+    """The compare of `spec` (`<base>...<head>`); PolicyReadError when it does
+    not read."""
+    status, answer = _get(f"repos/{owner}/{name}/compare/{spec}")
+    if status != 200:
+        raise PolicyReadError(f"compare {spec} is unreadable")
+    return answer
 
 
 def lifts_of(
@@ -4208,7 +4285,7 @@ def lifts_of(
         restored = (
             dismissed.get(key) if row.get("state") == "DISMISSED" and key else None
         )
-        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
             continue
         if row.get("state") == "APPROVED" or restored is not None:
             login = str(json_object(row.get("user")).get("login") or "")
@@ -4248,10 +4325,7 @@ def carried_lifters(
 
     def compare(spec: str) -> Any:
         if spec not in compares:
-            status, answer = _get(f"repos/{owner}/{name}/compare/{spec}")
-            if status != 200:
-                raise PolicyReadError(f"compare {spec} is unreadable")
-            compares[spec] = answer
+            compares[spec] = _compare(owner, name, spec)
         return compares[spec]
 
     def tree(commit: str) -> Any:
@@ -4262,8 +4336,8 @@ def carried_lifters(
 
     dismissed: dict[str, str] = {}
     if any(
-        json_object(json_object(r).get("user")).get("type") == "User"
-        and json_object(json_object(r).get("user")).get("id") in humans
+        (user := json_object(json_object(r).get("user"))).get("type") == "User"
+        and user.get("id") in humans
         and json_object(r).get("state") == "DISMISSED"
         for r in reviews
     ):
@@ -4314,10 +4388,7 @@ def carried_lifters(
             if (
                 base_merges_only(then, now, lifted, in_base)
                 and not same_net_change(then, now)
-                and all(
-                    isinstance(x, str) and re.fullmatch(r"[0-9a-f]{40}", x)
-                    for x in (start, end)
-                )
+                and all(isinstance(x, str) and SHA_RE.fullmatch(x) for x in (start, end))
             ):
                 merges, based = compare(f"{lifted}...{sha}"), compare(f"{start}...{end}")
                 trees = [tree(sha), tree(end)]
@@ -4375,13 +4446,7 @@ def _carries(repo: str, pr: Mapping[str, Any], comment: Mapping[str, Any]) -> bo
         return False
     if decided == sha:
         return True
-
-    def compare(spec: str) -> Any:
-        status, answer = _get(f"repos/{owner}/{name}/compare/{spec}")
-        if status != 200:
-            raise PolicyReadError(f"compare {spec} is unreadable")
-        return answer
-
+    compare = partial(_compare, owner, name)
     try:
         then, now = compare(f"{tip}...{decided}"), compare(f"{tip}...{sha}")
         in_base = base_parents(compare, tip, then, now)
@@ -4472,14 +4537,20 @@ def cost_decision(
     return None
 
 
+def _is_fork(pr: Mapping[str, Any], owner: str) -> bool:
+    """Whether the GraphQL pull request's head is outside `owner`'s
+    repository, or does not read as inside it."""
+    head_owner = json_object(pr.get("headRepositoryOwner")).get("login")
+    return (
+        pr.get("isCrossRepository") is not False
+        or str(head_owner).casefold() != owner.casefold()
+    )
+
+
 def _foreign_refusal(pr: dict[str, Any], owner: str) -> str | None:
     """`fork` for a head outside this repository, `dependency-manager` for a
     dependency manager's pull request, else None."""
-    head_owner = json_object(pr.get("headRepositoryOwner")).get("login")
-    if (
-        pr.get("isCrossRepository") is not False
-        or str(head_owner).casefold() != owner.casefold()
-    ):
+    if _is_fork(pr, owner):
         return "fork"
     if is_dependency_author(str(json_object(pr.get("author")).get("login") or "")):
         return "dependency-manager"
@@ -4927,6 +4998,19 @@ def _discussion(owner: str, name: str, number: int) -> list[dict[str, Any]]:
     ]
 
 
+def _people_discussion(
+    owner: str, name: str, number: int, identity: str
+) -> Iterator[dict[str, Any]]:
+    """Each `_discussion` item a person wrote: not the agent identity, an
+    automation account or a bot."""
+    skip = {_login_key(identity), *AUTOMATION_LOGINS}
+    for item in _discussion(owner, name, number):
+        author = _rest_actor(item.get("user"))
+        login = str((author or {}).get("login") or "")
+        if actor_kind({"author": author}) == "human" and _login_key(login) not in skip:
+            yield item
+
+
 def _quiet_since(
     owner: str, name: str, number: int, identity: str, since: datetime
 ) -> bool:
@@ -4935,12 +5019,7 @@ def _quiet_since(
     submitted. The agent identity, automation accounts and bots do not count;
     a person's item with no readable time does. An unreadable discussion
     raises."""
-    skip = {_login_key(identity), *AUTOMATION_LOGINS}
-    for item in _discussion(owner, name, number):
-        author = _rest_actor(item.get("user"))
-        login = str((author or {}).get("login") or "")
-        if actor_kind({"author": author}) != "human" or _login_key(login) in skip:
-            continue
+    for item in _people_discussion(owner, name, number, identity):
         stamps = [item.get(k) for k in ("created_at", "updated_at", "submitted_at")]
         stamps = [s for s in stamps if s]
         if not stamps or any(_time(s) >= since for s in stamps):
@@ -5042,20 +5121,15 @@ def lane_eligibility(
         issue, refusal = _linked_issue(node, repo)
         if refusal is None:
             issue_number = issue["number"]
-            permission = permission or permission_reader(repo)
-            refusal = trust_refusal(
-                owner,
-                name,
-                issue,
-                lambda actor: is_human(
-                    actor,
-                    repo=repo,
-                    agent_identity=agent_identity,
-                    self_logins=self_logins,
-                    permission=permission,
-                ),
-                {},
-            ) or issue_hold_refusal(issue, issue_holds, issue_status)
+            human = partial(
+                is_human,
+                repo=repo,
+                agent_identity=agent_identity,
+                self_logins=self_logins,
+                permission=permission or permission_reader(repo),
+            )
+            refusal = trust_refusal(owner, name, issue, human, {})
+            refusal = refusal or issue_hold_refusal(issue, issue_holds, issue_status)
         # An adopted pull request closing no issue here is its own intent,
         # the verifier judging its title and body (owner decision 2026-10-22),
         # when a person or a script wrote them (`spec_from_body_ids`: the
@@ -5083,10 +5157,23 @@ def lane_eligibility(
 
 # A commit's file list stops at this many entries, so a full one may hide more.
 COMMIT_FILES_LIMIT = 300
-CI_STATUS_CHECK = "ci-status"
-# GitHub Actions, the app the ruleset requires `ci-status` from; another app's
+# The gate job's check name. Its alias job reports CI Status's conclusion under
+# the old required context, `ci-status`, until the ruleset requires CI Status;
+# a head tested before the rename has only `ci-status`, the gate itself.
+GATE_CHECK = "CI Status"
+GATE_ALIAS = "ci-status"
+GATE_NAMES = frozenset({GATE_CHECK, GATE_ALIAS})
+# GitHub Actions, the app the ruleset requires the gate from; another app's
 # run of that name, with any start time it chooses, never decides the gate.
 ACTIONS_APP_ID = 15368
+
+
+def gate_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The gate's own jobs or check runs in a listing: CI Status's, else
+    `ci-status`'s. Never the alias's beside CI Status's: its steps and output
+    are not the gate's, and a re-run of it alone replays its old `needs`."""
+    gate = [e for e in entries if e.get("name") == GATE_CHECK]
+    return gate or [e for e in entries if e.get("name") == GATE_ALIAS]
 
 
 def is_dependabot_pull_request(pr: Mapping[str, Any]) -> bool:
@@ -5333,9 +5420,11 @@ def _commit_files(owner: str, name: str) -> Callable[[str], list[str] | None]:
             return None
         status, payload = _get(f"repos/{owner}/{name}/commits/{sha}")
         listing = json_object(payload).get("files")
-        if status != 200 or not is_json_array(listing):
-            return None
-        if len(listing) >= COMMIT_FILES_LIMIT:
+        if (
+            status != 200
+            or not is_json_array(listing)
+            or len(listing) >= COMMIT_FILES_LIMIT
+        ):
             return None
         return [str(json_object(f).get("filename") or "") for f in listing]
 
@@ -5343,17 +5432,27 @@ def _commit_files(owner: str, name: str) -> Callable[[str], list[str] | None]:
 
 
 def _ci_status(owner: str, name: str, head: str) -> str:
-    """`success`, `pending`, or the conclusion of a finished `ci-status` run on
+    """`success`, `pending`, or the conclusion of a finished gate run on
     `head` that did not succeed; `unreadable` when the runs cannot be read.
+    The gate's runs are CI Status's, else `ci-status`'s on a head tested
+    before the rename.
     `filter=latest` keeps the latest run of each check suite, so a re-triggered
     workflow leaves an older run beside a newer one: the runs that started last
     decide, and any failure among them decides, as it does among all runs when
     one has no readable start time. Only GitHub Actions' runs are read."""
-    status, payload = _get(
-        f"repos/{owner}/{name}/commits/{head}/check-runs"
-        f"?check_name={CI_STATUS_CHECK}&app_id={ACTIONS_APP_ID}&filter=latest&per_page=100"
-    )
-    runs = [json_object(r) for r in json_array(json_object(payload).get("check_runs"))]
+
+    def read(check: str) -> tuple[int, list[dict[str, Any]]]:
+        status, payload = _get(
+            f"repos/{owner}/{name}/commits/{head}/check-runs"
+            f"?check_name={quote(check)}&app_id={ACTIONS_APP_ID}&filter=latest&per_page=100"
+        )
+        return status, [
+            json_object(r) for r in json_array(json_object(payload).get("check_runs"))
+        ]
+
+    status, runs = read(GATE_CHECK)
+    if status == 200 and not runs:
+        status, runs = read(GATE_ALIAS)
     if status != 200 or not SHA_RE.fullmatch(head):
         return "unreadable"
     try:
@@ -5403,11 +5502,7 @@ def dependabot_eligibility(
         node = json_object(json_object(data.get("repository")).get("pullRequest"))
         if not node:
             return Eligibility(False, "pull-request-unreadable")
-        head_owner = json_object(node.get("headRepositoryOwner")).get("login")
-        if (
-            node.get("isCrossRepository") is not False
-            or str(head_owner).casefold() != owner.casefold()
-        ):
+        if _is_fork(node, owner):
             return Eligibility(False, "fork")
         author = json_object(node.get("author"))
         if author.get("__typename") != "Bot" or not dependabot.is_dependabot(
@@ -5740,13 +5835,12 @@ def in_flight(
         return InFlight(False, "merged-since-unset")
     if merged_since.utcoffset() is None:
         return InFlight(False, "merged-since-not-timezone-aware")
-    permission = permission or permission_reader(repo)
-    human = lambda actor: is_human(  # noqa: E731
-        actor,
+    human = partial(
+        is_human,
         repo=repo,
         agent_identity=agent_identity,
         self_logins=self_logins,
-        permission=permission,
+        permission=permission or permission_reader(repo),
     )
     queued: frozenset[int] | None = None
     count = unverified = 0
@@ -5805,20 +5899,9 @@ def _member_discussion(
     """Each human's comment, review or inline comment on the pull request. Only
     an owner, member or collaborator counts: on a public repository anyone can
     comment, and a stranger's text must not dequeue the identity's entry."""
-    for item in _discussion(owner, name, number):
-        author = _rest_actor(item.get("user"))
-        login = str((author or {}).get("login") or "")
-        if actor_kind({"author": author}) != "human" or _login_key(login) in {
-            _login_key(identity),
-            *AUTOMATION_LOGINS,
-        }:
-            continue
-        if (
-            str(item.get("author_association") or "").upper()
-            not in BLOCKER_ASSOCIATIONS
-        ):
-            continue
-        yield item
+    for item in _people_discussion(owner, name, number, identity):
+        if str(item.get("author_association") or "").upper() in BLOCKER_ASSOCIATIONS:
+            yield item
 
 
 def _discussion_login(item: dict[str, Any]) -> str:
@@ -5928,13 +6011,12 @@ def entry_hold(
     from babysit_postmerge import PostMergeReadError  # noqa: PLC0415
 
     owner, name = _split_repo(repo)
-    permission = permission or permission_reader(repo)
-    human = lambda actor: is_human(  # noqa: E731
-        actor,
+    human = partial(
+        is_human,
         repo=repo,
         agent_identity=identity,
         self_logins=self_logins,
-        permission=permission,
+        permission=permission or permission_reader(repo),
     )
     try:
         data = _graphql(ENTRY_HOLD_QUERY, f"#{number}", o=owner, r=name, n=number)
@@ -5954,14 +6036,11 @@ def entry_hold(
             return f"human-blocking-comment:{','.join(blockers)}"
         if not queued:
             return None
-        opt_in = _opt_in_hold(
+        return _opt_in_hold(
             owner, name, pr, json_object(events[-1]).get("createdAt"), human
         )
-        if opt_in:
-            return opt_in
     except (PolicyReadError, PostMergeReadError) as exc:
         return f"unreadable: {exc}"
-    return None
 
 
 # --- Composition ------------------------------------------------------------------------------
@@ -6048,24 +6127,22 @@ def _run_max_in_flight(
     if type(cached) is int and cached >= 1:
         return cached, "default-branch"
     owner, name = _split_repo(repo)
-    if head is None:
-        try:
+    try:
+        if head is None:
             head = base_tip(owner, name, branch)
-        except PolicyReadError:
-            return base.max_in_flight, "base"
-    if head == base.base_sha:
-        config = base
-    else:
-        try:
-            config = read_config_at(
+        config = (
+            base
+            if head == base.base_sha
+            else read_config_at(
                 repo,
                 head,
                 lambda path, sha: (
                     _file_at(owner, name, path, sha) if path == CONFIG_PATH else None
                 ),
             )
-        except PolicyReadError:
-            return base.max_in_flight, "base"
+        )
+    except PolicyReadError:
+        return base.max_in_flight, "base"
     if config.error:
         return base.max_in_flight, "base"
     if shared:
@@ -6352,10 +6429,9 @@ def pulumi_dirs_at(repo: str, pr: Mapping[str, Any]) -> tuple[str, ...] | None:
         return None
     return tuple(
         sorted(
-            path.rpartition("/")[0]
-            for path in modes
-            if path.rpartition("/")[2].casefold()
-            in ("pulumi.yaml", "pulumi.yml", "pulumi.json")
+            folder
+            for folder, _, file in (path.rpartition("/") for path in modes)
+            if file.casefold() in ("pulumi.yaml", "pulumi.yml", "pulumi.json")
         )
     )
 
@@ -6371,7 +6447,7 @@ def _tree_entries(
         if listing is not None:
             # Each entry is `<mode> <type> <id>\t<path>`.
             return {
-                path: (meta.split(" ")[0], meta.split(" ")[-1])
+                path: (meta.partition(" ")[0], meta.rpartition(" ")[2])
                 for meta, _, path in (
                     entry.partition("\t") for entry in listing.split("\0") if entry
                 )
@@ -6582,9 +6658,12 @@ def author_reviewed_paths(
     get none, so a lane changing its own powers still waits for a person."""
     user = json_object(pr.get("user"))
     uid = user.get("id")
-    if not verified or user.get("type") != "User" or type(uid) is not int:
-        return frozenset()
-    if uid not in humans:
+    if (
+        not verified
+        or user.get("type") != "User"
+        or type(uid) is not int
+        or uid not in humans
+    ):
         return frozenset()
     gate = [p for p in changed if any(glob_match(g, p) for g in floor.author_review)]
     others = foreign_paths(repo, pr, changed) if gate else frozenset()
@@ -6737,7 +6816,7 @@ def _window_start(at: datetime) -> str:
     at = at.astimezone(UTC)
     if at.microsecond:
         at = at.replace(microsecond=0) + timedelta(seconds=1)
-    return at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _stamp(at)
 
 
 @dataclass(frozen=True)
@@ -6813,10 +6892,10 @@ def read_promotion(
     if refusal:
         return Promotion(None, refusal)
     cells = {
-        cell: json_object(state).get("effective")
+        cell: str(json_object(state).get("effective"))
         for cell, state in json_object(result.get("cells")).items()
     }
-    return Promotion({c: str(v) for c, v in cells.items()}, None)
+    return Promotion(cells, None)
 
 
 @dataclass(frozen=True)
@@ -6924,11 +7003,7 @@ def _demotion_changed(
     marker stripped within the second its issue was opened escapes until the
     next fresh `read_demotion`; no code here edits a record's body. A full
     page or an unreadable one counts as changed."""
-    since = (
-        (shared.computed_at - SINCE_CLOCK_MARGIN)
-        .astimezone(UTC)
-        .strftime("%Y-%m-%dT%H:%M:%SZ")
-    )
+    since = _stamp(shared.computed_at - SINCE_CLOCK_MARGIN)
     status, issues = _get(
         f"repos/{owner}/{name}/issues?state=all&since={since}&per_page=100"
     )
@@ -7301,30 +7376,27 @@ def assess(
         try:
             head = base_tip(owner, name, default)
         except PolicyReadError:
-            head = None
+            pass
     demotion = reuse.demotion if reuse else read_demotion(repo, **readers)
     details["demotion"] = {
         "active": demotion.active,
         "reason": demotion.reason,
         "records": list(demotion.records),
     }
+    policy_floor: datetime | None = None
     if reuse:
-        floor = reuse.floor
+        floor, gate = reuse.floor, reuse.gate
     else:
         try:
-            floor = merged_since_floor(repo, history_sha, demotion, authority)
+            policy_floor = merged_since_floor(repo, history_sha, demotion, authority)
         except PolicyReadError as exc:
             return replace(stopped, reason=f"post-merge:floor-unreadable: {exc}")
-    gate = (
-        reuse.gate
-        if reuse
-        else post_merge(floor, resolved.login)
-        if post_merge is not None
-        else PostMergeGate("unchecked", {}, None)
-    )
-    policy_floor = None if reuse else floor
-    if not reuse:
-        floor = gate.floor_from(floor)
+        gate = (
+            post_merge(policy_floor, resolved.login)
+            if post_merge is not None
+            else PostMergeGate("unchecked", {}, None)
+        )
+        floor = gate.floor_from(policy_floor)
     details["mergedSince"] = floor.isoformat()
     details["postMerge"] = dict(gate.report)
     if (
@@ -7448,6 +7520,7 @@ def assess(
         # Read again right before the enqueue (`recheck_lane_issue`).
         inputs["issue_holds"] = issue_hold_labels(config, human_gated)
         inputs["issue_status"] = issue_status_reader(repo, config.issue_status, default)
+        pr_head = str(json_object(pr.get("head")).get("sha") or "")
         eligible = lane_eligibility(
             repo,
             number,
@@ -7458,11 +7531,7 @@ def assess(
             spec_from_body_ids=(*trusted[1], *config.spec_from_body_apps),
             human_gated=human_gated,
             queued_at_head=lambda: lane_queued_at_head(
-                repo,
-                number,
-                base_ref,
-                inputs["identity"],
-                str(json_object(pr.get("head")).get("sha") or ""),
+                repo, number, base_ref, inputs["identity"], pr_head
             ),
             adoption_human_ids=trusted[1],
             ejected_enqueue=lambda: ejected_enqueue(repo, number),
@@ -7470,7 +7539,7 @@ def assess(
                 repo,
                 number,
                 inputs["identity"],
-                str(json_object(pr.get("head")).get("sha") or ""),
+                pr_head,
                 str(pr.get("node_id") or ""),
             ),
             issue_holds=inputs["issue_holds"],
@@ -7598,14 +7667,24 @@ def _moved(
         return "demotion-changed"
     if not runs_unchanged(shared, default):
         return "runs-moved"
-    if probed and shared.demotion != read_demotion(
-        repo,
-        agent_identity=identity,
-        self_logins=shared.self_logins,
-        permission=permission_reader(repo),
+    if probed and shared.demotion != _read_demotion_as(
+        repo, identity, shared.self_logins
     ):
         return "demotion-changed"
     return None
+
+
+def _read_demotion_as(
+    repo: str, identity: str, self_logins: Collection[str]
+) -> Demotion:
+    """`read_demotion` for `identity` with `self_logins` and a fresh
+    `permission_reader`."""
+    return read_demotion(
+        repo,
+        agent_identity=identity,
+        self_logins=self_logins,
+        permission=permission_reader(repo),
+    )
 
 
 def _kept_unverified(
@@ -7644,12 +7723,7 @@ def _recompute_shared(
     computed_at = now or datetime.now(UTC)
     _, head = _default_branch_head(repo, default)
     config_sha = newest_config_commit(repo, head)
-    demotion = read_demotion(
-        repo,
-        agent_identity=identity,
-        self_logins=self_logins,
-        permission=permission_reader(repo),
-    )
+    demotion = _read_demotion_as(repo, identity, self_logins)
     policy_floor = merged_since_floor(repo, head, demotion, PR_MERGE)
     gate = post_merge(policy_floor, identity)
     if gate.report.get("readable") is not True:
@@ -7847,26 +7921,17 @@ def settle_shared(
     # a demotion-changed one when the demotion reads the same (an issue the
     # lane opened that triage edited, most runs); the unverified keep takes
     # that same demotion read when the probe trips.
+    current = False
     try:
-        if not keep:
-            current = False
-        elif unusable == "demotion-changed":
-            current = shared.demotion == read_demotion(
-                repo,
-                agent_identity=identity,
-                self_logins=frozenset(),
-                permission=permission_reader(repo),
-            )
-        elif unusable == "unverified-stale" and runs_unchanged is not None:
+        if keep and unusable == "demotion-changed":
+            current = shared.demotion == _read_demotion_as(repo, identity, frozenset())
+        elif keep and unusable == "unverified-stale" and runs_unchanged is not None:
             note["moved"] = _moved(
                 repo, default, identity, shared, runs_unchanged, reread_demotion=True
             )
             current = note["moved"] is None
-        else:
-            current = False
     except (RuntimeError, ValueError, OSError):
         note["moved"] = "unreadable" if unusable == "unverified-stale" else None
-        current = False
     if current:
         note["answer"] = "kept"
         return shared, None

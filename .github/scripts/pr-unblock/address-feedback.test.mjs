@@ -1115,7 +1115,7 @@ test("past the fresh fixer's round, a write-access fix request still runs one mo
 
 test("model-job check runs count toward the fresh fixer's bound as round markers do", async () => {
   const runs = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [String(i + 1).repeat(40), [check(at(10))]]));
-  const reviewComments = [comment(100, ACTIONS_BOT, { body: CODE_FINDING })];
+  const reviewComments = [comment(100, ACTIONS_BOT, { body: CODE_FINDING, created_at: at(0) })];
   const reviews = [{ id: 10, user: { id: ACTIONS_BOT }, commit_id: HEAD }];
   const after = (n) =>
     select({ api: fakeApi({ reviewComments, reviews, checks: runs(n) }), pr: 42, headSha: HEAD, repository: "o/r", appId: APP, reviewerId: REVIEWER, maxRounds: 3 });
@@ -1204,7 +1204,7 @@ test("main select writes outputs and the thread file; escalation writes no threa
   // At the bound (a cap of 1 plus the fresh fixer's round) the neutral checks
   // carry the round count.
   const bound = fakeApi({
-    reviewComments: [comment(100, ACTIONS_BOT, { body: CODE_FINDING })],
+    reviewComments: [comment(100, ACTIONS_BOT, { body: CODE_FINDING, created_at: at(0) })],
     reviews: [{ id: 10, user: { id: ACTIONS_BOT }, commit_id: HEAD }],
     issueComments: [
       { id: 1, user: { id: ACTIONS_BOT }, body: marker("claude-review", HEAD) },
@@ -1383,12 +1383,14 @@ test("listActivity rejects when a later page answers an error, never returning t
 });
 
 // apply-dependency-verdict.mjs runs from $RUNNER_TEMP/base-script, a copy of
-// this directory, with merge-holds.mjs staged beside it in $RUNNER_TEMP/pr-merge
+// this directory, with the shared modules in $RUNNER_TEMP/lib and
+// merge-holds.mjs staged beside it in $RUNNER_TEMP/pr-merge
 // (collect-base-activity).
 test("listActivity loads its cursor reader from the staged layout a script activity runs in", async () => {
   const root = tempDir("base-activity-");
   try {
     cpSync(dirname(fileURLToPath(import.meta.url)), join(root, "base-script"), { recursive: true });
+    cpSync(fileURLToPath(new URL("../lib", import.meta.url)), join(root, "lib"), { recursive: true });
     mkdirSync(join(root, "pr-merge"));
     cpSync(fileURLToPath(new URL("../pr-merge/merge-holds.mjs", import.meta.url)), join(root, "pr-merge", "merge-holds.mjs"));
     const { createGitHubApi: staged } = await import(pathToFileURL(join(root, "base-script", "address-feedback.mjs")).href);
@@ -1981,6 +1983,52 @@ test("an automatic Codex review a stranger triggered is skipped, and an untruste
   assert.deepEqual(logged, [untrusted("opening of the pull request")]);
 });
 
+// github-advanced-security[bot], the code scanning (CodeQL) alerts: listed, and
+// unsummoned (UNSUMMONED_REVIEWER_IDS), so its threads need no `@codex`
+// request, only a PR a trusted person or the lanes App opened.
+const CODEQL = 62310815;
+const CODEQL_LOGIN = "github-advanced-security[bot]";
+const codeqlApi = (extra = {}, root = CODEQL) => {
+  const base = botThread({ root, login: root === CODEQL ? CODEQL_LOGIN : CODEX_LOGIN });
+  return fakeApi({ ...base, issueComments: [base.issueComments[0]], ...extra });
+};
+const codeqlLogged = (api) => codexLogged(api, { reviewerIds: [CODEX, CODEQL] });
+// A CodeQL review of an earlier push, after the PR's opening: the window a
+// Codex review would need a fresh request in.
+const earlierScan = { reviews: [{ id: 9, user: { id: CODEQL }, commit_id: OLD_HEAD, submitted_at: "2026-10-17T19:00:00Z" }, ...botThread({ root: CODEQL, login: CODEQL_LOGIN }).reviews] };
+
+test("a CodeQL thread on a PR a trusted person or the lanes App opened is worked with no @codex request, on a later push's scan too", async () => {
+  for (const [label, extra] of [
+    ["a lanes App PR", {}],
+    ["an owner-authored PR", { opener: HUMAN, openedAt: OPENED }],
+    ["a later push's scan", { openedAt: OPENED, ...earlierScan }],
+  ]) {
+    const { result, lines } = await codeqlLogged(codeqlApi(extra));
+    assert.equal(result.decision, "proceed", `${label}\n${lines.join("\n")}`);
+    assert.deepEqual(lines, [], label);
+    assert.deepEqual(result.file.threads[0].comments.map((row) => [row.id, row.author, row.listed]), [[100, "reviewer", true]], label);
+  }
+  const { kept } = await currentThreads({ api: codeqlApi({ opener: HUMAN, openedAt: OPENED }), pr: 42, reviewerId: REVIEWER, reviewerIds: [CODEX, CODEQL], appId: APP, trustedHumans: new Set([HUMAN]) });
+  assert.deepEqual(kept.map((row) => row.id), ["PRRT_1"]);
+});
+
+test("a CodeQL thread on a stranger's PR or with unreadable triggers is skipped; Codex in the same place still needs its request", async () => {
+  const untrusted = `skip thread PRRT_1: codex-request-untrusted (the opening of the pull request behind the bot's review came from account ${STRANGER}, not on the trusted-actor list)`;
+  const notFound = "skip thread PRRT_1: codex-request-not-found (no trusted @codex request, and no readable opening or ready-for-review event, since the bot's previous review)";
+  for (const [label, api, line] of [
+    ["a stranger-authored PR", codeqlApi({ opener: STRANGER, openedAt: OPENED }), untrusted],
+    ["a timeline that cannot be read", codeqlApi({ timeline: new Error("GET timeline returned 502") }), notFound],
+    ["a Codex review of a later push with no request", codeqlApi({ openedAt: OPENED, reviews: [{ id: 9, user: { id: CODEX }, commit_id: OLD_HEAD, submitted_at: "2026-10-17T19:00:00Z" }, ...botThread().reviews] }, CODEX), notFound],
+  ]) {
+    const { result, lines } = await codeqlLogged(api);
+    assert.deepEqual([result.decision, result.escalationReason], ["escalate", "feedback-untaken-threads"], label);
+    assert.deepEqual(lines, [line], label);
+  }
+  // Unlisted, the same bot's thread is no reviewer's at all.
+  const unlisted = await codexRun(codeqlApi());
+  assert.notEqual(unlisted.decision, "proceed");
+});
+
 // A request read after the fact can have been edited out or deleted, so the
 // check fails closed on the history it can read: an untrusted comment or
 // review edited since the window opened counts whatever it says now, a
@@ -2552,4 +2600,76 @@ test("copyPathsFor lists the registered copies of the canonicals a PR changes", 
   assert.ok(copies.includes("plugins/source-control/hooks/hook-utils.sh"), copies.join(" "));
   assert.ok(copies.length >= 20 && copies.every((path) => /^plugins\/[^/]+\/.+\/hook-utils\.sh$/.test(path)), copies.join(" "));
   assert.deepEqual(copyPathsFor([{ filename: "README.md" }]), []);
+});
+
+// L469 (#14539, #14637): the code-review lane's advisory asked for a test the
+// closing issue's Out of scope list excludes, the lane added it, and the same
+// lane then blocked the PR. Only an unanswered advisory the code-review lane
+// posted may take a follow-up reply, and only with a closing issue's text read.
+test("an advisory code-review thread carries may_follow_up and the closing issues' text; a blocking one, a bot's own, or no issue text does not", async () => {
+  const laneBody = (first) => `${first}\n\nThe change has no test.\n\nclaude-lane: claude-review`;
+  const api = () =>
+    fakeApi({
+      reviews: [{ id: 10, user: { id: ACTIONS_BOT }, commit_id: HEAD }, { id: 11, user: { id: REVIEWER }, commit_id: HEAD }],
+      reviewComments: [
+        comment(100, ACTIONS_BOT, { body: laneBody("**Advisory: no test covers the rewritten branch.**") }),
+        comment(200, ACTIONS_BOT, { body: laneBody("**Blocking (closing-issue scope): these tests go beyond the issue.**") }),
+        comment(300, REVIEWER, { pull_request_review_id: 11, body: "**Advisory: add a test.**" }),
+      ],
+      threads: [thread("PRRT_a", [100]), thread("PRRT_b", [200]), thread("PRRT_c", [300])],
+    });
+  const issue = { number: 7, body: "## Out of scope\n\n- Tests beyond the asserted lines a change breaks", comments: ["Decision: no new tests."] };
+  const reads = [];
+  const withIssue = await select({
+    api: api(),
+    pr: 42,
+    headSha: HEAD,
+    repository: "o/r",
+    appId: APP,
+    reviewerId: REVIEWER,
+    trustedHumans: new Set([HUMAN]),
+    readSpec: async () => {
+      reads.push(1);
+      return [issue, { number: 8, body: null, comments: [] }];
+    },
+  });
+  assert.equal(withIssue.decision, "proceed");
+  assert.deepEqual(
+    withIssue.file.threads.map((t) => [t.id, t.may_follow_up === true]),
+    [
+      ["PRRT_a", true],
+      ["PRRT_b", false],
+      ["PRRT_c", false],
+    ],
+  );
+  assert.deepEqual(withIssue.file.closing_issues, [{ number: 7, url: "https://github.com/o/r/issues/7", body: issue.body, comments: ["Decision: no new tests."] }]);
+  assert.equal(reads.length, 1);
+  assert.deepEqual(
+    JSON.parse(runRecord(withIssue.file)).threads.map((t) => t.may_follow_up ?? false),
+    [true, false, false],
+    "run.json carries the mark the reply job checks",
+  );
+
+  const noIssue = await select({ api: api(), pr: 42, headSha: HEAD, repository: "o/r", appId: APP, reviewerId: REVIEWER, trustedHumans: new Set([HUMAN]), readSpec: async () => [] });
+  assert.equal(noIssue.decision, "proceed");
+  assert.ok(!noIssue.file.threads.some((t) => "may_follow_up" in t), "no closing issue text marks nothing");
+  assert.equal("closing_issues" in noIssue.file, false);
+
+  const plain = [];
+  const noAdvisory = await select({
+    api: fakeApi(),
+    pr: 42,
+    headSha: HEAD,
+    repository: "o/r",
+    appId: APP,
+    reviewerId: REVIEWER,
+    trustedHumans: new Set([HUMAN]),
+    readSpec: async () => {
+      plain.push(1);
+      return [issue];
+    },
+  });
+  assert.equal(noAdvisory.decision, "proceed");
+  assert.equal(plain.length, 0, "no advisory thread reads no issue");
+  assert.equal("closing_issues" in noAdvisory.file, false);
 });

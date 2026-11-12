@@ -100,6 +100,27 @@
           "default": 5,
           "description": "Issues one work-unblock sweep restarts or re-fires."
         },
+        "refire-queue-per-slot": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 2,
+          "description": "Kill-switch re-fires' queue target per issue-lane slot (SLOTS in work-resolve-issue.yml): a work-unblock sweep re-fires breaker-stranded issues, oldest first, only until the work-resolve-issue runs not yet finished reach this times SLOTS, within restarts-per-run."
+        },
+        "stale-queued-minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1440,
+          "default": 60,
+          "description": "Minutes after it was created past which a work-resolve-issue run still at status queued is not counted toward refire-queue-per-slot's room: its first job never got a runner, so GitHub lost it and it will never start. A reopened fix issue's in-flight check also ignores such a run when it names no issue; one that names the issue still holds it."
+        },
+        "sweep-gap-minutes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60,
+          "default": 15,
+          "description": "Minutes after a work-unblock full sweep (a run that uploaded work-unblock-verdicts) finished during which a sweep a finished work-resolve-issue run starts skips its work. A scheduled sweep or an issue close never skips. 0 turns the gap off."
+        },
         "readmit-per-run": {
           "type": "integer",
           "minimum": 1,
@@ -152,7 +173,7 @@
         "stranded-backoff-hours": {
           "type": "object",
           "additionalProperties": false,
-          "description": "Per cause work-unblock's sweep re-fires a stranded agent-ready issue for, the base hours of its re-fire backoff: the wait after the run ended (or the label was added) is these hours doubled once per re-fire already made on the same lane workflow files, or per trip past limit-stops-per-issue for kill-switch, up to 24 hours. no-run: no work-resolve-issue run started, and these hours are also the wait before the first re-fire; no-report: a run ended green with no report and no pull request, the same; failed-again: a re-fired run failed or was cancelled again, so the wait is at least twice these hours; failed-mint: a run got no lane token, backed off only past limit-stops-per-issue re-fires, so the wait is at least these hours doubled that many times; kill-switch: a run the lanes kill switch refused, backed off past limit-stops-per-issue trips.",
+          "description": "Per cause work-unblock's sweep re-fires a stranded agent-ready issue for, the base hours of its re-fire backoff: the wait after the run ended (or the label was added) is these hours doubled once per re-fire already made on the same lane workflow files, up to 24 hours, except kill-switch, which never doubles. no-run: no work-resolve-issue run started, and these hours are also the wait before the first re-fire; no-report: a run ended green with no report and no pull request, the same; failed-again: a re-fired run failed or was cancelled again, so the wait is at least twice these hours; failed-mint: a run got no lane token, backed off only past limit-stops-per-issue re-fires, so the wait is at least these hours doubled that many times; kill-switch: a run the lanes kill switch refused; past limit-stops-per-issue trips each re-fire waits these hours after the run ended, flat, with no doubling and no cap on trips.",
           "properties": {
             "no-run": { "type": "integer", "minimum": 1, "maximum": 24, "default": 3 },
             "no-report": { "type": "integer", "minimum": 1, "maximum": 24, "default": 3 },
@@ -206,7 +227,7 @@
         "api": {
           "type": "object",
           "additionalProperties": false,
-          "description": "GitHub API margins per pool. The pool's planned budget is the limit its x-ratelimit-limit header reports, at most its limit-cap; plan and read-floor are shares of that planned budget, writer-pause and breaker shares of the header's limit. A graphql call reads `graphql`; any other call reads the entry its token names. Unset fields take their defaults from .github/actions/log-api-budget/rate-limits.json, the only copy, which every merge hold list floors so a change to one waits for a person.",
+          "description": "GitHub API margins per pool. The pool's planned budget is the limit its x-ratelimit-limit header reports, at most its limit-cap; plan and read-floor are shares of that planned budget, writer-pause, breaker and stop-floor shares of the header's limit. A graphql call reads `graphql`; any other call reads the entry its token names. Unset fields take their defaults from .github/actions/log-api-budget/rate-limits.json, the only copy, which every merge hold list floors so a change to one waits for a person.",
           "properties": {
             "github-token": {
               "$ref": "#/$defs/api-pool",
@@ -216,6 +237,28 @@
             "graphql": { "$ref": "#/$defs/api-pool" },
             "owner-token": { "$ref": "#/$defs/api-pool" },
             "content-creation": { "$ref": "#/$defs/api-content-pool" }
+          }
+        },
+        "lane-level": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The adaptive lane level L, the issue lane's concurrency .github/scripts/lib/lane-level.mjs picks per window (owner decision Q111), published and read under shadow, variable and valid-minutes. L steps up 1 after clean-windows windows in a row with no limit signal, lane demand (runs waiting or every slot running) and room in each pool (peak share used x (L+1)/L at most api.<pool>.plan, and more than api.<pool>.writer-pause left), halves on any limit signal the lanes App's own calls meet (a breaker trip is not one), and stays within floor and ceiling; a floor above the ceiling is rejected. Missing data holds L.",
+          "properties": {
+            "floor": { "type": "integer", "minimum": 1, "maximum": 10, "default": 2, "description": "Lowest level; a step down never goes below it." },
+            "ceiling": { "type": "integer", "minimum": 1, "maximum": 10, "default": 4, "description": "Highest level; a level above it is read as it." },
+            "default": { "type": "integer", "minimum": 1, "maximum": 10, "default": 3, "description": "The level with no previous decision or a malformed one, clamped to floor and ceiling." },
+            "clean-windows": { "type": "integer", "minimum": 1, "maximum": 24, "default": 2, "description": "Clean windows with demand in a row before a step up." },
+            "pools": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "enum": ["github-token", "lanes-app", "graphql", "owner-token"] },
+              "default": ["lanes-app"],
+              "description": "The api pools whose room a step up needs; each takes plan and writer-pause from api."
+            },
+            "shadow": { "type": "boolean", "default": true, "description": "True: work-unblock's publish-lane-level job logs the level it decides, mints no token and writes nothing, and pick-slot and label-unblocked keep default while logging the published level they would use." },
+            "variable": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*_LANE_LEVEL$", "default": "CLAUDE_LANE_LEVEL", "description": "The repository variable the level is published in as <level>@<valid-until>; it must end in _LANE_LEVEL, so it can never name a lanes kill switch." },
+            "valid-minutes": { "type": "integer", "minimum": 60, "maximum": 1440, "default": 150, "description": "How long a published value holds; past it the readers use default. Above an hour, so one missed hourly run keeps the last level." }
           }
         }
       }
@@ -494,7 +537,7 @@
           "type": "number",
           "minimum": 0,
           "maximum": 1,
-          "description": "Share of the header's limit, projected left at the window's reset from the burn rate so far, under which a timer-driven lane skips its even-numbered scheduled ticks (.github/actions/log-api-budget/pace.mjs), so the timer lanes slow to half cadence before the breaker stops every lane. 0 turns pacing off."
+          "description": "Share of the header's limit, projected left at the window's reset from the burn rate so far, under which a timer-driven lane skips a scheduled tick whose previous scheduled run marked a clean pass of its work(.github/actions/log-api-budget/pace.mjs), so the timer lanes slow to half cadence before the breaker stops every lane. 0 turns pacing off."
         },
         "read-floor": {
           "type": "number",
@@ -502,10 +545,16 @@
           "maximum": 1,
           "description": "Share of the planned budget left below which the rate guard warns once per pool; calls continue."
         },
+        "stop-floor": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Share of the header's limit left, by the header's remaining, at or under which the rate guard stops the pool until the header's reset, as at a remaining of 0: it records the stop in the job's stop file, and the step holds where API_BUDGET_HOLD applies, else fails. A response without a readable limit, remaining or future reset never stops on it."
+        },
         "limit-cap": {
           "type": "integer",
           "minimum": 1,
-          "description": "Requests per window the pool plans to, whatever higher limit its header reports: planned = min(header limit, limit-cap), used = header limit - header remaining, left = planned - used. Unset in both the config and rate-limits.json: planned is the header's limit. The rate guard's stop still reads only the header's remaining and GitHub's refusals."
+          "description": "Requests per window the pool plans to, whatever higher limit its header reports: planned = min(header limit, limit-cap), used = header limit - header remaining, left = planned - used. Unset in both the config and rate-limits.json: planned is the header's limit. The rate guard's stop still reads only the header's remaining and limit (stop-floor) and GitHub's refusals."
         }
       }
     },
@@ -518,6 +567,7 @@
         "writer-pause": { "$ref": "#/$defs/api-pool/properties/writer-pause" },
         "breaker": { "$ref": "#/$defs/api-pool/properties/breaker" },
         "read-floor": { "$ref": "#/$defs/api-pool/properties/read-floor" },
+        "stop-floor": { "$ref": "#/$defs/api-pool/properties/stop-floor" },
         "limit-cap": { "$ref": "#/$defs/api-pool/properties/limit-cap" },
         "per-minute": {
           "type": "integer",
@@ -666,17 +716,12 @@
       }
     },
     "edit-runner": {
-      "anyOf": [
-        { "properties": { "effect": { "not": { "const": "read" } } } },
-        {
-          "required": ["applied-by"],
-          "properties": {
-            "applied-by": { "required": ["patch"] },
-            "prepare": { "not": { "const": "ci-context" } }
-          }
-        }
-      ],
-      "description": "Only the runner that stages a skill's edit tools grants checks, self-checks, verify-scripts and web-access: the write runner, or the read runner for a skill with applied-by.patch and no prepare: ci-context. Anywhere else they would do nothing, so they are refused."
+      "required": ["applied-by"],
+      "properties": {
+        "applied-by": { "required": ["patch"] },
+        "prepare": { "not": { "const": "ci-context" } }
+      },
+      "description": "Only the read runner stages a skill's edit tools, for a skill with applied-by.patch and no prepare: ci-context, so only that skill takes checks, self-checks, verify-scripts and web-access. Anywhere else they would do nothing, so they are refused."
     },
     "verify-runner": {
       "anyOf": [
@@ -684,10 +729,6 @@
         { "required": ["prepare"], "properties": { "prepare": { "const": "ci-context" } } }
       ],
       "description": "verify-scripts are staged where checks are, and under prepare: ci-context too, where the skill is told to run a listed script only from its base copy."
-    },
-    "no-head-test-check": {
-      "not": { "pattern": "^scripts/(affected-tests|run-outside-node-suites|selection-audit|check-guardrails-ps-differential|run-test-file)\\.sh( |$)" },
-      "description": "A check or self-check of a skill whose effect is not read runs in the write runner's run job, which holds the lane token and id-token: write, so it may not be a script that runs the checkout's test files. check-affected.sh --tests is allowed: run from the base copy against the checkout, it skips the branch's tests."
     },
     "leaf": {
       "type": "object",
@@ -739,16 +780,9 @@
       },
       "allOf": [
         {
-          "if": { "required": ["effect"], "properties": { "effect": { "not": { "const": "read" } } } },
-          "then": {
-            "properties": {
-              "checks": { "items": { "$ref": "#/$defs/no-head-test-check" } },
-              "self-checks": { "items": { "$ref": "#/$defs/no-head-test-check" } },
-              "verify-scripts": {
-                "items": { "not": { "enum": ["scripts/run-test-file.sh", "plugins/skill-quality/scripts/check-skill.sh"] } }
-              }
-            }
-          }
+          "if": { "required": ["skill"] },
+          "then": { "properties": { "effect": { "const": "read" } } },
+          "description": "A skill runs only in the read runner, which holds no write credential: its effect is read, and a script activity applies or publishes what it hands on."
         },
         {
           "if": { "required": ["effect", "prepare"], "properties": { "effect": { "const": "read" }, "prepare": { "enum": ["ci-context", "review-threads", "merge-base"] } } },
@@ -781,7 +815,7 @@
         "skill": { "$ref": "#/$defs/skill" },
         "prepare": {
           "enum": ["merge-base", "review-threads", "dependency-review", "ci-context", "apply-patch"],
-          "description": "What the runner does around the activity (README.md, Activities; pr-run-activity.md, the prepare sections). apply-patch is the one mode for a script, a mutate-branch one; the others run around a skill. ci-context needs effect read and hands its change on as a patch; merge-base, review-threads and dependency-review need an effect other than read unless their activity hands its change on as a patch, review-threads with effect read also hands on its replies (applied-by.feedback-replies), and dependency-review with effect read its verdict (applied-by.dependency-verdict). ci-context: download the failing-check context file a base job wrote, check its SHA-256 and head, make it read-only and name it to the skill, which also gets Bash, Edit and Write. apply-patch: check the patch artifact a producer left (one patch.diff with its SHA-256, on the head it worked on), apply it to the gated head, and push it as one commit without force; patch-rules.json registers the rules each producer's patch is to be held to (README.md, Patch rules). merge-base: merge the base tip without committing before the skill, then commit with the gated head and the base tip as parents (with effect read, a base job of the caller merges first and decides, the read runner merges the same base again and hands the skill's resolutions on as a patch measured from the conflict tree, and a prepare: apply-patch script commits the merge). review-threads: before any model turn, keep the PR's unresolved reviewer-bot threads on a reviewed head and escalate on a .github/** diff or the round cap (on the read runner, a base job of the caller does this and the runner checks its thread file); give the skill the review-thread tool; after it, upload the replies it recorded for a script job to validate and post. dependency-review: before any model turn, skip a PR Dependabot did not open or one sorted auto, and escalate on the round cap (on the read runner, a base job of the caller does this and the runner checks its context file); give the skill a read-only context file and a verdict schema for its structured output; after it, upload the verdict for a script job to validate and act on, and the fix as a patch a prepare: apply-patch script pushes only on a fix verdict."
+          "description": "What the runner does around the activity (README.md, Activities; pr-run-activity.md, the prepare sections). apply-patch is the one mode for a script, a mutate-branch one; the others run around a skill. A skill's mode hands its change on as a patch; review-threads also hands on its replies (applied-by.feedback-replies), and dependency-review its verdict (applied-by.dependency-verdict). ci-context: download the failing-check context file a base job wrote, check its SHA-256 and head, make it read-only and name it to the skill, which also gets Bash, Edit and Write. apply-patch: check the patch artifact a producer left (one patch.diff with its SHA-256, on the head it worked on), apply it to the gated head, and push it as one commit without force; patch-rules.json registers the rules each producer's patch is to be held to (README.md, Patch rules). merge-base: a base job of the caller merges the base tip first and decides, the read runner merges the same base again without committing and hands the skill's resolutions on as a patch measured from the conflict tree, and a prepare: apply-patch script commits the merge with the gated head and the base tip as parents. review-threads: before any model turn, keep the PR's unresolved reviewer-bot threads on a reviewed head and escalate on a .github/** diff or the round cap (on the read runner, a base job of the caller does this and the runner checks its thread file); give the skill the review-thread tool; after it, upload the replies it recorded for a script job to validate and post. dependency-review: before any model turn, skip a PR Dependabot did not open or one sorted auto, and escalate on the round cap (on the read runner, a base job of the caller does this and the runner checks its context file); give the skill a read-only context file and a verdict schema for its structured output; after it, upload the verdict for a script job to validate and act on, and the fix as a patch a prepare: apply-patch script pushes only on a fix verdict."
         },
         "applied-by": {
           "type": "object",
@@ -803,7 +837,7 @@
             "type": "string",
             "pattern": "^scripts/[A-Za-z0-9_-]+\\.sh( --[a-z][a-z-]*)*$"
           },
-          "description": "Repository check scripts the skill may run, each with its fixed flags. The runner that stages the skill's edit tools (the write runner, or the read runner for a skill with applied-by.patch) runs each from the base copy against the checkout, through a wrapper the skill can call with no arguments."
+          "description": "Repository check scripts the skill may run, each with its fixed flags. The runner that stages the skill's edit tools (the read runner, for a skill with applied-by.patch) runs each from the base copy against the checkout, through a wrapper the skill can call with no arguments."
         },
         "self-checks": {
           "type": "array",
@@ -823,7 +857,7 @@
             "type": "string",
             "pattern": "^(scripts|plugins/[a-z0-9-]+/(skills/[a-z0-9-]+/)?scripts)/[A-Za-z0-9_-]+\\.sh$"
           },
-          "description": "Exact repository-relative paths of scripts the skill may run with any arguments. The runner that stages the skill's edit tools copies each script's plugin (or the base scripts/) to a read-only directory, denies Edit and Write on it, and allows a wrapper that runs the script from the checkout, with GH_TOKEN and GITHUB_TOKEN unset (no ancestor process holds them either, though the write runner's checkout keeps the token in .git/config), with any arguments but a path outside it. A script that changes files, runs code from the checkout, or reaches the network hands the run that power: list one only when it limits itself, as scripts/run-test-file.sh, scripts/git-mv-rm.sh and scripts/new-changelog-fragment.sh do, or when the run may hold that power, as plugins/skill-quality/scripts/check-skill.sh (checkout test scripts and markdownlint) does. Those two run checkout code, so a skill whose effect is not read, whose run job holds the lane token and id-token: write, may list neither."
+          "description": "Exact repository-relative paths of scripts the skill may run with any arguments. The runner that stages the skill's edit tools copies each script's plugin (or the base scripts/) to a read-only directory, denies Edit and Write on it, and allows a wrapper that runs the script from the checkout, with GH_TOKEN and GITHUB_TOKEN unset (no ancestor process holds them either), with any arguments but a path outside it. A script that changes files, runs code from the checkout, or reaches the network hands the run that power: list one only when it limits itself, as scripts/run-test-file.sh, scripts/git-mv-rm.sh and scripts/new-changelog-fragment.sh do, or when the run may hold that power, as plugins/skill-quality/scripts/check-skill.sh (checkout test scripts and markdownlint) does."
         },
         "web-access": {
           "type": "object",
@@ -912,10 +946,11 @@
             "read",
             "mutate-branch",
             "mutate-tracker",
+            "mutate-variable",
             "publish-artifact",
             "merge"
           ],
-          "description": "What the activity may change. The runner derives ordering and the token grant from it and checks that a read activity left the tree clean, unless the activity hands its change on as a patch."
+          "description": "What the activity may change; a skill's is read. The runner derives ordering and the token grant from it and checks that a read activity left the tree clean, unless the activity hands its change on as a patch. mutate-variable reads everything and writes only what its lane's activity grant adds: repository Variables, for work-unblock's publish-lane-level alone."
         },
         "gating": {
           "enum": ["gate", "advisory"],
@@ -1358,12 +1393,6 @@
           "default": 1,
           "description": "Fresh attempts one issue gets after the pr-merge lane closes its pull request at `max-verify-fails` or as `verify:too-old`: the issue goes back to agent-ready with the FAIL findings, and the closed pull request's FAILs leave the cap's count. Past this many the issue is parked at `status: confirmed` (README.md, Verifier verdict). The lower of the base's and main's applies; any other value is 0, so no attempt starts."
         },
-        "verify-cache": {
-          "type": "string",
-          "enum": ["shadow", "serve"],
-          "default": "shadow",
-          "description": "How enable-auto-merge uses the verifier refusals the last run kept (babysit_verify_evidence.py --answers-in/--answers-out). shadow: every pull request is still read in full, and each read logs whether the kept answer's key matched and whether it decides as the fresh read does. serve: an unarmed pull request whose kept refusal's key still matches is answered from it with no further read. Only refusals are kept, an armed pull request is always read in full, and a kept answer never arms."
-        },
         "risk-escalation-minutes": {
           "type": "integer",
           "minimum": 0,
@@ -1401,14 +1430,9 @@
             "proxy": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["claude-code-version", "driven-model", "driven-small-model", "models", "token-cap", "driver-token-cap", "max-tokens-ceiling", "max-body-bytes", "max-in-flight", "max-count-tokens-requests", "max-preflight-requests", "upstream-timeout-ms", "betas", "body-keys", "block-types"],
+              "required": ["driven-model", "driven-small-model", "models", "token-cap", "driver-token-cap", "max-tokens-ceiling", "max-body-bytes", "max-in-flight", "max-count-tokens-requests", "max-preflight-requests", "upstream-timeout-ms", "betas", "body-keys", "block-types"],
               "description": "The key proxy the capture's driven Claude Code reaches the API through, and the driven session's models (README.md, Verifier verdict).",
               "properties": {
-                "claude-code-version": {
-                  "type": "string",
-                  "pattern": "^\\d+\\.\\d+\\.\\d+$",
-                  "description": "The Claude Code version the capture installs, equal to package-lock.json's pin; betas and body-keys were measured on it (README.md, Verifier verdict)."
-                },
                 "driven-model": {
                   "type": "string",
                   "pattern": "^claude-[a-z0-9-]+$",
@@ -1470,7 +1494,7 @@
                   "type": "array",
                   "uniqueItems": true,
                   "items": { "type": "string", "minLength": 1 },
-                  "description": "The anthropic-beta values a request may name, measured from the driven session on claude-code-version (README.md, Verifier verdict)."
+                  "description": "The anthropic-beta values a request may name, measured from the driven session on the Claude Code package-lock.json pins (README.md, Verifier verdict)."
                 },
                 "body-keys": {
                   "type": "array",

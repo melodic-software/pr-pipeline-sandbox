@@ -38,21 +38,24 @@ subdirectory). The binding lives in the convention home, which the repository bi
 region of `AGENTS.md` or `CLAUDE.md`:
 
 ```bash
-ROOT="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}"
+ROOT="<project root>"
 bash "${CLAUDE_PLUGIN_ROOT}/lib/resolve-convention-home.sh" --root "$ROOT"
 ```
 
+`<project root>` is the literal path [`tracker-seam.md`](${CLAUDE_PLUGIN_ROOT}/reference/tracker-seam.md) "Project root" resolves, in its own Bash call before this snippet; the same holds wherever `<project root>` appears below.
+
 Exit `0` prints the home; exit `1` (no pointer) means `docs/conventions`. Exit `4` (the repository
 declined a home) or `5` (the root is `$HOME`, an ancestor of it, or not a git work tree) means no home
-applies: the seam then reads only the legacy JSON file, so setup writes no binding and reports that the
+applies: nothing can bind the repository there, so setup writes no binding and reports that the
 repository needs a convention home first. Exit `3` (a broken pointer) is a `check` FAIL naming the
 resolver's message. With `<home>` resolved:
 
 - `BINDING` is the `tracker` key of `$ROOT/<home>/work-items.yaml`. That file may hold other
   work-items settings; setup edits only its `tracker` mapping.
 - `OVERRIDE` is the gitignored personal override `$ROOT/<home>/work-items.local.yaml` (its `tracker` mapping).
-- `LEGACY` is `$ROOT/.work-item-tracker.json` and its personal override `$ROOT/.work-item-tracker.local.json`:
-  read, and copied by step 1 of "Provider binding", never written.
+- `LEGACY` is the retired binding file `$ROOT/.work-item-tracker.json` and its personal override
+  `$ROOT/.work-item-tracker.local.json`. The seam no longer reads them; step 1 of "Provider binding"
+  copies them, and setup never writes them.
 - `SCHEDULE` is `$ROOT/.github/recurring-schedule.json`.
 
 The binding and schedule are version-controlled and shared by the whole team. They belong in the
@@ -63,8 +66,8 @@ consumer's tree, never in the plugin directory or any machine-local state.
 `apply` runs this first, the recurring-schedule and role-label passes below resolve the binding; the
 `check` binding probe validates it read-only. The tracker seam runs against exactly one provider per
 repo, declared under the `tracker` key of the tracked `<home>/work-items.yaml` (resolved as `BINDING`
-above); every seam verb resolves the bound provider from it, falling back to the legacy JSON file
-while that file is the only binding, and with no binding the seam hard-errors (exit 3). The seam **ships with this plugin** and bundles two adapters, `github` and `local-markdown`;
+above); every seam verb resolves the bound provider from it, and with no binding the seam hard-errors
+(exit 3) with a message naming `/work-items:setup apply`. The seam **ships with this plugin** and bundles two adapters, `github` and `local-markdown`;
 for those, installing the plugin is enough and a repo only declares which one it uses. `jira`, `gitea`,
 and `linear` ship as **seeds**, which step 4 copies into the consuming repo, where the repo owns them.
 Binding shape, discovery, and
@@ -90,9 +93,8 @@ when this pass must stop instead of guessing.
    `empty`). Exit `1` names a value it cannot copy (a null, an empty object, a list of mappings);
    `3` an `OVERRIDE` path that no `.gitignore` rule covers or that the index holds; `4` a repository
    where no home applies or whose pointer is broken. Each writes nothing and is a finding to report. The JSON files
-   stay where they are, unchanged: older installed plugin versions and the repository's own tooling
-   may still read only them. Say so, and say that a later
-   binding edit lands only in the YAML file. Then treat the copy as the current binding. If neither
+   stay where they are, unchanged, and no longer bind: a vendored seam or the repository's own tooling
+   may still read only them. Say so, and say that a later binding edit lands only in the YAML file. Then treat the copy as the current binding. If neither
    file binds the repository, say so and continue to the interview.
 2. **Choose the provider**, recommendation first. One line each below; the selection detail,
    how to verify a `github` bind, what each provider can and cannot do, and every config key,
@@ -174,7 +176,7 @@ probes first: it owns the probe order, every PASS/FAIL/INFO row, and the remedia
 prints. `apply` below consumes those probe results and never re-derives them. The `jq` and
 tracker-binding entry gates that check.md's probe 1 tests are defined in
 [`${CLAUDE_PLUGIN_ROOT}/reference/tracker-seam.md`](${CLAUDE_PLUGIN_ROOT}/reference/tracker-seam.md)
-"entry-point presence checks"; read it for what each gate enforces and its remediation.
+"Provider-neutral over the seam" (its three entry invariants); read it for what each gate enforces and its remediation.
 
 ## `apply` (idempotent)
 
@@ -244,8 +246,8 @@ unambiguous; ask only where an item genuinely needs the user.
    [reference/capability-tier-axis-migration.md](reference/capability-tier-axis-migration.md), which
    provisions the canonical `capability-tier: frontier` member defined in
    [`${CLAUDE_PLUGIN_ROOT}/reference/capability-tier-labels.md`](${CLAUDE_PLUGIN_ROOT}/reference/capability-tier-labels.md).
-   When the canonical member is still missing after this pass, stop. Triage cannot stamp frontier-tier
-   quota guard and the work-loop reader fails closed to general tier.
+   When the canonical member is still missing after this pass, stop: triage cannot stamp the
+   frontier-tier label, so the frontier-tier quota guard never applies and the work-loop reader fails closed to the general tier.
 5. **Backfill legacy frontier-tier body stamps.** Run the procedure in
    [reference/capability-tier-backfill.md](reference/capability-tier-backfill.md). This pass is
    load-bearing on upgrade: items already triaged with only a body prose frontier-tier stamp
@@ -338,7 +340,7 @@ unambiguous; ask only where an item genuinely needs the user.
    item (adapter: "List items", `--label <resolved recurring-maintenance label>`, with bodies) and keep
    only the one whose marker names the OLD `id` exactly. When exactly one exists. **Renamed id:**
    rewrite that marker line to the new `id` (a provider body-edit op, read-modify-write of the whole
-   body; GitHub adapter: `gh issue edit <N> --body-file ...`), or close it (adapter: "Close item") if
+   body; GitHub adapter: `gh issue edit <N> -R <owner>/<repo> --body-file ...`, the repository the item id names), or close it (adapter: "Close item") if
    the user is instead retiring the item; **Dropped row:** close that item (adapter: "Close item") with
    a comment noting the recurring item was retired from the schedule. Otherwise the
    `recurring`-labeled issue lingers unreachable. An id rename or drop with no matching open item
@@ -360,13 +362,13 @@ schedule work. Triage marks an untrusted item with `provenance: untrusted`, the 
 1. **Skip when no binding exists**, nothing is bound yet.
 2. **Skip when the bound provider has no label listing** (`local-markdown`, read-only `jira`), report
    INFO and continue; triage verifies at item-edit time.
-3. **Discover** via the adapter's label listing (GitHub: `gh label list --limit 200`, filter
+3. **Discover** via the adapter's label listing (GitHub: `gh label list -R <owner>/<repo> --limit 200`, the repository `check` probe 2 named, filter
    `provenance:`). Look for `provenance: untrusted`.
 4. **Present**. Report "provenance label provisioned" and continue.
 5. **Missing, label-as-code owner declared**, stop. Name the label and route remediation
    to that owner; never `gh label create` ad hoc.
 6. **Missing, no label-as-code owner, interactive user present**, offer to create it via the
-   adapter's label-creation mechanics (GitHub: `gh label create "<name>" --description
+   adapter's label-creation mechanics (GitHub: `gh label create "<name>" -R <owner>/<repo> --description
    "<description>" --color "<color>"` using the reference table). RECOMMENDED: create it, this pass
    is the upgrade migration for repos that predated the label. Re-list after creation and confirm
    it exists before continuing.
@@ -397,9 +399,9 @@ binding shape live in the plugin's
    - Verify the target label exists via the adapter's label listing; route creation through the
      repo's label-as-code owner under the same policy the schedule step applies, never create ad hoc.
    - For `human-gated`, warn before writing: the seam's `list-frontier --autonomous` exclusion
-     keys on this label, and the shipped seam reads `needs-human`. Remap it only when the bound
-     seam resolves the same `config.role_labels` key, or the frontier filter and the skill will
-     disagree about what autonomous agents may pick up.
+     keys on this label. The shipped seam resolves it from `config.role_labels`; a consumer-local
+     adapter must resolve the same key, or the frontier filter and the skill will disagree about
+     what autonomous agents may pick up.
 4. **Write the binding**: re-read `<home>/work-items.yaml` from disk immediately before writing
    and merge only the `tracker.config.role_labels` key, the binding carries seam-required keys
    (`provider`, `config.lease_ttl_hours`, …) that must survive untouched. Omit entries that keep
@@ -477,7 +479,7 @@ token resolving in a supporting file or in the Bash tool.
 - Author a provider adapter. The seam bundles `github` and `local-markdown`, and setup only copies
   the `jira`, `gitea`, or `linear` seed (step 4 of "Provider binding"); any other adapter lives in the
   consuming repo at
-  `${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/tools/work-item-tracker/adapters/<provider>/`, not written by setup.
+  `<project root>/tools/work-item-tracker/adapters/<provider>/`, not written by setup.
 - Store secrets, the binding is tracked in git and carries non-secret config only (a provider token is
   referenced by name from inside its adapter, never written here).
 - Write machine-local state, the binding and schedule live in the consumer's tracked tree, never in

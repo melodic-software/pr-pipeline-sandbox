@@ -85,7 +85,7 @@ SOURCE_CONTROL = "babysit_loop_merge: c2-mechanical\n"
 TEAM_YAML = "docs/conventions/source-control.yaml"
 # The retired legacy file the gate no longer reads.
 RETIRED_SOURCE_CONTROL = ".claude/source-control.md"
-TRACKER_LEGACY = policy.tracker_binding.LEGACY_PATH
+TRACKER_YAML = policy.tracker_binding.YAML_PATH
 # The YAML files `GhFake` answers absent when a test sets none.
 UNSET_YAML = (TEAM_YAML, policy.tracker_binding.YAML_PATH)
 
@@ -108,6 +108,14 @@ def file_payload(text: str) -> dict[str, Any]:
 
 class RawText(str):
     """A REST answer gh prints as it is: a raw-media-type file read."""
+
+
+class Answers(list):
+    """REST answers given one per call, in order; the last repeats."""
+
+
+# A REST answer where gh never reports a status: run_command's timeout.
+TIMEOUT = object()
 
 
 class GhFake:
@@ -151,6 +159,10 @@ class GhFake:
                     return http_error(404)
             raise AssertionError(f"unexpected gh call: {args}")
         answer = self.rest[endpoint]
+        if isinstance(answer, Answers):
+            answer = answer.pop(0) if len(answer) > 1 else answer[0]
+        if answer is TIMEOUT:
+            raise RuntimeError(f"gh api {endpoint} timed out after 60s")
         if isinstance(answer, int):
             return http_error(answer)
         if isinstance(answer, RawText):
@@ -1341,6 +1353,37 @@ class AutoClearOnGreen(unittest.TestCase):
                 result = read_demotion()
                 self.assertEqual((result.active, result.reason), (True, "#9 open"))
 
+    def listings(self, gh: GhFake) -> int:
+        return sum(1 for call in gh.calls if call[1] == DISPATCH_RUNS)
+
+    def test_a_server_error_then_an_answer_recovers(self) -> None:
+        gh = self.fake()
+        gh.rest[DISPATCH_RUNS] = Answers([502, {"workflow_runs": [green_run()]}])
+        result = read_demotion()
+        self.assertFalse(result.active, result.reason)
+        self.assertEqual(self.listings(gh), 2, "one retry after the 502")
+
+    def test_two_timeouts_hold_and_warn(self) -> None:
+        gh = self.fake()
+        gh.rest[DISPATCH_RUNS] = Answers([TIMEOUT, TIMEOUT])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            result = read_demotion()
+        self.assertEqual((result.active, result.reason), (True, "#9 open"))
+        self.assertEqual(self.listings(gh), 2, "one retry after the timeout")
+        self.assertIn(
+            f"::warning::demotion #9: recovery read failed: {DISPATCH_RUNS}: None\n",
+            err.getvalue(),
+        )
+
+    def test_a_403_is_not_retried_and_holds(self) -> None:
+        gh = self.fake()
+        gh.rest[DISPATCH_RUNS] = Answers([403, {"workflow_runs": [green_run()]}])
+        with contextlib.redirect_stderr(io.StringIO()):
+            result = read_demotion()
+        self.assertEqual((result.active, result.reason), (True, "#9 open"))
+        self.assertEqual(self.listings(gh), 1, "the rate guard owns 403")
+
     def test_other_records_never_clear_on_green_and_read_no_runs(self) -> None:
         for name, body in (
             ("canary", DEMOTION_BODY.replace("dispatch", "canary")),
@@ -1495,6 +1538,8 @@ class AutoClearOnGreen(unittest.TestCase):
         full = {"workflow_runs": [green_run()] * 100}
         for page in range(1, policy.GREEN_PAGES + 1):
             gh.rest[green_runs("schedule", page)] = full
+        # The span is the record's whole grid cell, which lists on past five.
+        gh.rest[green_runs("schedule", policy.GREEN_PAGES + 1)] = {"workflow_runs": []}
         result = read_demotion()
         self.assertEqual((result.active, result.reason), (True, "#9 open"))
 
@@ -2144,6 +2189,272 @@ class ReadDemotionBatched(unittest.TestCase):
             )
 
 
+class GreenRunsApi:
+    """GitHub's green-run listing over `runs`: each endpoint's event and
+    `created=a..b` range, both ends included, newest first, 100 a page. A
+    compare answers ahead and main's tip is `MAIN_TIP`."""
+
+    QUERY = re.compile(
+        r"event=(\w+)&status=success&created=([^&]+)\.\.([^&]+)&per_page=100&page=(\d+)$"
+    )
+
+    def __init__(self, runs: list[dict[str, Any]]) -> None:
+        self.runs = runs
+        self.listings: list[str] = []
+
+    def __call__(self, args: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        endpoint = unquote(args[1])
+        if endpoint.startswith(GREEN_RUNS_PATH):
+            self.listings.append(endpoint)
+            event, since, until, page = self.QUERY.search(endpoint).groups()
+            low, high = datetime.fromisoformat(since), datetime.fromisoformat(until)
+            hits = sorted(
+                (
+                    run
+                    for run in self.runs
+                    if run["event"] == event
+                    and low <= datetime.fromisoformat(run["created_at"]) <= high
+                ),
+                key=lambda run: run["created_at"],
+                reverse=True,
+            )
+            first = (int(page) - 1) * 100
+            return ok({"workflow_runs": hits[first : first + 100]})
+        if "/compare/" in endpoint:
+            return ok({"status": "ahead"})
+        if endpoint.endswith("/git/ref/heads/main"):
+            return ok({"object": {"sha": MAIN_TIP}})
+        raise AssertionError(f"unexpected gh call: {args}")
+
+
+class PerRecordGreenMain(policy._GreenMain):
+    """The reference: each record's span listed by its own `created=` range,
+    as `_GreenMain._window` read it before the shared grid. A pin: it proves
+    the grid answers the same, not that either answer is right."""
+
+    def _window(self, since: str, until: str) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        created = policy.quote(f"{since}..{until}", safe=":")
+        for event in policy.GREEN_EVENTS:
+            for page in range(1, policy.GREEN_PAGES + 1):
+                answer = self._read(
+                    policy.GREEN_RUNS.format(self.owner, self.name, event, created, page)
+                )
+                runs = policy.json_array(policy.json_object(answer).get("workflow_runs"))
+                found += map(policy.json_object, runs)
+                if len(runs) < 100:
+                    break
+            else:
+                raise policy.PolicyReadError(
+                    f"{event} green runs: more than {policy.GREEN_PAGES} pages"
+                )
+        return found
+
+
+def grid_run(created_at: str, **fields: Any) -> dict[str, Any]:
+    return green_run(id=next(GRID_IDS), created_at=created_at) | fields
+
+
+GRID_IDS = iter(range(10_000, 1_000_000))
+# A red-main record filed between grid lines: its first span,
+# 2026-10-14T03:00:00Z..2026-10-21T03:00:00Z, straddles the cells
+# 2026-10-12T10:00:00Z..2026-10-19T10:00:00Z and the one after.
+GRID_RECORD = "2026-10-14T03:00:00Z"
+
+
+def minutes_from(start: str, count: int, **fields: Any) -> list[dict[str, Any]]:
+    """`count` runs a minute apart from `start`, none of which clears a record
+    (attempt 2) unless `fields` says otherwise."""
+    base = datetime.fromisoformat(start)
+    return [
+        grid_run(
+            (base + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            **({"run_attempt": 2} | fields),
+        )
+        for i in range(count)
+    ]
+
+
+class SharedGreenGrid(unittest.TestCase):
+    """Records read main's green runs from shared `GREEN_GRID` cells, each
+    page once per `read_demotion`, and each record's recovery is the one its
+    own span listing gives; only a cell overflowing where the span would not
+    answers differently, and that holds."""
+
+    def recovered(
+        self, green_class: type, runs: list[dict[str, Any]], created: str = GRID_RECORD
+    ) -> Any:
+        api = GreenRunsApi(runs)
+        issue = {
+            "body": DEMOTION_BODY,
+            "createdAt": created,
+            "userContentEdits": {"totalCount": 0, "nodes": []},
+        }
+        green = green_class("owner", "repo")
+        green.local = False
+        with mock.patch.object(policy, "gh_capture", api):
+            try:
+                return policy._recovered_at(issue, lambda _: False, green, NOW)
+            except policy.PolicyReadError as exc:
+                return exc
+
+    def test_each_recovery_matches_the_per_record_listing(self) -> None:
+        at = policy.datetime.fromisoformat
+        cases = {
+            "none": ([], None),
+            "only before the record": ([grid_run("2026-10-13T00:00:00Z")], None),
+            "at the record's own second": ([grid_run(GRID_RECORD)], None),
+            "after the record": (
+                [grid_run("2026-10-14T05:00:00Z")],
+                at("2026-10-14T05:00:00Z"),
+            ),
+            "before and after": (
+                [grid_run("2026-10-13T00:00:00Z"), grid_run("2026-10-15T00:00:00Z")],
+                at("2026-10-15T00:00:00Z"),
+            ),
+            "on the line between two cells": (
+                [grid_run("2026-10-19T10:00:00Z")],
+                at("2026-10-19T10:00:00Z"),
+            ),
+            "on the line between two spans": (
+                [grid_run("2026-10-21T03:00:00Z")],
+                at("2026-10-21T03:00:00Z"),
+            ),
+            "in a later span": (
+                [grid_run("2026-10-29T00:00:00Z")],
+                at("2026-10-29T00:00:00Z"),
+            ),
+            "a schedule run beside two pages of dispatch runs": (
+                [
+                    *minutes_from("2026-10-15T00:00:00Z", 150),
+                    grid_run("2026-10-14T04:00:00Z", event="schedule"),
+                ],
+                at("2026-10-14T04:00:00Z"),
+            ),
+            "the earliest on a second page": (
+                [
+                    *minutes_from("2026-10-15T00:00:00Z", 150),
+                    grid_run("2026-10-14T04:00:00Z"),
+                ],
+                at("2026-10-14T04:00:00Z"),
+            ),
+        }
+        for name, (runs, expected) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.recovered(PerRecordGreenMain, runs), expected)
+                self.assertEqual(self.recovered(policy._GreenMain, runs), expected)
+
+    def test_a_span_past_the_page_bound_raises_though_no_cell_is(self) -> None:
+        # 301 runs in the first cell's part of the span and 199 from the line
+        # between the cells on, the first of which both cells list: 500 in
+        # the span, as five full pages of it would list.
+        runs = [
+            grid_run("2026-10-14T03:30:00Z"),
+            *minutes_from("2026-10-14T04:00:00Z", 300),
+            *minutes_from("2026-10-19T10:00:00Z", 199),
+        ]
+        for green_class in (PerRecordGreenMain, policy._GreenMain):
+            with self.subTest(green_class.__name__):
+                got = self.recovered(green_class, runs)
+                self.assertIsInstance(got, policy.PolicyReadError)
+                self.assertEqual(
+                    str(got), "workflow_dispatch green runs: more than 5 pages"
+                )
+        # One run fewer is 499, under the bound, and the earliest clears.
+        for green_class in (PerRecordGreenMain, policy._GreenMain):
+            self.assertEqual(
+                self.recovered(green_class, runs[:-1]),
+                policy.datetime.fromisoformat("2026-10-14T03:30:00Z"),
+            )
+
+    def test_a_cell_past_its_page_bound_raises_where_the_span_reads(self) -> None:
+        # 1000 runs in the cell before the record: the record's own span holds
+        # one run and clears, but the shared cell cannot be read whole.
+        runs = [
+            *minutes_from("2026-10-12T11:00:00Z", 1000),
+            grid_run("2026-10-14T05:00:00Z"),
+        ]
+        self.assertEqual(
+            self.recovered(PerRecordGreenMain, runs),
+            policy.datetime.fromisoformat("2026-10-14T05:00:00Z"),
+        )
+        got = self.recovered(policy._GreenMain, runs)
+        self.assertIsInstance(got, policy.PolicyReadError)
+        self.assertEqual(
+            str(got),
+            "workflow_dispatch green runs: more than 10 pages"
+            " in the week from 2026-10-12T10:00:00Z",
+        )
+
+    def test_a_busy_week_before_the_record_still_reads(self) -> None:
+        # 998 runs before the record, more than one span may list, and the
+        # green after it fill ten pages less one run: the cell reads whole and
+        # the span clears.
+        runs = [
+            *minutes_from("2026-10-12T11:00:00Z", 998),
+            grid_run("2026-10-14T05:00:00Z"),
+        ]
+        self.assertEqual(
+            self.recovered(policy._GreenMain, runs),
+            policy.datetime.fromisoformat("2026-10-14T05:00:00Z"),
+        )
+
+    def read(self, records: dict[int, str], runs: list[dict[str, Any]]) -> Any:
+        """`read_demotion` over open red-main records filed at `records`'
+        times, with `GreenRunsApi(runs)` answering every REST read."""
+        api = GreenRunsApi(runs)
+        fake = RecordsFake(
+            {
+                n: demotion_record(
+                    n, createdAt=created, state="OPEN", timelineItems={"nodes": []}
+                )
+                for n, created in records.items()
+            }
+        )
+
+        def gh(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            return fake(args, **kwargs) if args[:2] == ["api", "graphql"] else api(args)
+
+        with mock.patch.object(policy, "gh_capture", gh):
+            return read_demotion(), api.listings
+
+    def test_records_filed_close_together_read_each_page_once(self) -> None:
+        records = {
+            1: GRID_RECORD,
+            2: "2026-10-16T08:00:00Z",
+            3: "2026-10-18T20:00:00Z",
+        }
+        result, listings = self.read(records, [grid_run("2026-10-20T00:00:00Z")])
+        self.assertFalse(result.active, result.reason)
+        self.assertEqual(
+            result.cleared_at, policy.datetime.fromisoformat("2026-10-20T00:00:00Z")
+        )
+        cells = (
+            "created=2026-10-12T10:00:00Z..2026-10-19T10:00:00Z",
+            "created=2026-10-19T10:00:00Z..2026-10-26T10:00:00Z",
+        )
+        self.assertEqual(
+            sorted(listings),
+            sorted(
+                f"{GREEN_RUNS_PATH}?branch=main&event={event}&status=success"
+                f"&{cell}&per_page=100&page=1"
+                for cell in cells
+                for event in ("schedule", "workflow_dispatch")
+            ),
+        )
+
+    def test_a_span_past_the_page_bound_holds_the_record(self) -> None:
+        runs = [
+            grid_run("2026-10-14T03:30:00Z"),
+            *minutes_from("2026-10-14T04:00:00Z", 300),
+            *minutes_from("2026-10-19T10:00:00Z", 199),
+        ]
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            result, _ = self.read({1: GRID_RECORD}, runs)
+        self.assertEqual((result.active, result.reason), (True, "#1 open"))
+        self.assertIn("recovery read failed: workflow_dispatch green runs", err.getvalue())
+
+
 class ResolveIdentity(unittest.TestCase):
     def test_equal_logins_resolve(self) -> None:
         result = policy.resolve_identity(IDENTITY, "Agent-Lanes[bot]")
@@ -2330,12 +2641,14 @@ class IssueVouch(unittest.TestCase):
 
     def test_the_admission_label_reads_the_tracker_config(self) -> None:
         gh = GhFake().install(self)
-        path = f"repos/{REPO}/contents/{TRACKER_LEGACY}?ref=main"
-        mapped = {"config": {"role_labels": {"autonomous-eligible": "go"}}}
+        path = f"repos/{REPO}/contents/{TRACKER_YAML}?ref=main"
+        mapped = (
+            "tracker:\n  config:\n    role_labels:\n      autonomous-eligible: go\n"
+        )
         gh.rest[path] = {
             "type": "file",
             "encoding": "base64",
-            "content": base64.b64encode(json.dumps(mapped).encode()).decode(),
+            "content": base64.b64encode(mapped.encode()).decode(),
         }
         self.assertEqual(policy.admission_label("owner", "repo", "main"), "go")
         gh.rest[path] = 404
@@ -2428,7 +2741,7 @@ class IssueVouch(unittest.TestCase):
             self.assertEqual(eligibility().reason, "issue-not-vouched:no-labeled-event")
 
     def tracker(self, gh: GhFake, text: str) -> None:
-        gh.rest[f"repos/{REPO}/contents/{TRACKER_LEGACY}?ref=main"] = {
+        gh.rest[f"repos/{REPO}/contents/{TRACKER_YAML}?ref=main"] = {
             "type": "file",
             "encoding": "base64",
             "content": base64.b64encode(text.encode()).decode(),
@@ -2453,19 +2766,21 @@ class IssueVouch(unittest.TestCase):
                 "created_at": "2026-10-11T09:00:00Z",
             }
         ]
-        mapped = {"config": {"role_labels": {"autonomous-eligible": "ready-for-agent"}}}
-        self.tracker(gh, json.dumps(mapped))
+        self.tracker(
+            gh,
+            "tracker:\n  config:\n    role_labels:\n      autonomous-eligible: ready-for-agent\n",
+        )
         production = policy.eligibility(
             REPO, 7, agent_identity=IDENTITY, permission=HUMANS
         )
         self.assertTrue(production.eligible, production.reason)
 
-    def test_a_non_json_tracker_config_refuses_unreadable(self) -> None:
+    def test_a_tracker_config_that_does_not_parse_refuses_unreadable(self) -> None:
         gh = self.outside_issue(["agent-ready"], {"login": OPERATOR, "type": "User"})
         gh.graphql["PolicyEligibility"]["repository"]["pullRequest"]["baseRefName"] = (
             "main"
         )
-        self.tracker(gh, "{ not json")
+        self.tracker(gh, "tracker: {provider: github}\n")
         result = policy.eligibility(REPO, 7, agent_identity=IDENTITY, permission=HUMANS)
         self.assertFalse(result.eligible)
         self.assertTrue(result.reason.startswith("unreadable:"), result.reason)
@@ -9234,12 +9549,17 @@ class DependabotEligibility(unittest.TestCase):
         f"repos/{REPO}/commits/{'e' * 40}/check-runs"
         "?check_name=ci-status&app_id=15368&filter=latest&per_page=100"
     )
+    GATE = (
+        f"repos/{REPO}/commits/{'e' * 40}/check-runs"
+        "?check_name=CI%20Status&app_id=15368&filter=latest&per_page=100"
+    )
 
     def fake(
         self,
         *,
         commits: list[dict[str, Any]] | None = None,
         ci: list[dict[str, Any]] | None = None,
+        gate: list[dict[str, Any]] | None = None,
         comments: list[dict[str, Any]] | None = None,
         author: dict[str, str] | None = None,
         cross: bool = False,
@@ -9299,6 +9619,8 @@ class DependabotEligibility(unittest.TestCase):
         gh.rest[self.COMMITS] = self.commits
         runs = [{"status": "completed", "conclusion": "success"}] if ci is None else ci
         gh.rest[self.CI] = {"check_runs": runs}
+        # A head tested before the rename has no CI Status run.
+        gh.rest[self.GATE] = {"check_runs": gate or []}
         gh.rest[f"repos/{REPO}/issues/7/comments?per_page=100"] = comments or []
         gh.rest[f"repos/{REPO}/pulls/7/reviews?per_page=100"] = []
         gh.rest[f"repos/{REPO}/pulls/7/comments?per_page=100"] = []
@@ -10098,6 +10420,19 @@ class DependabotEligibility(unittest.TestCase):
                     self.assertEqual(
                         policy._ci_status(*REPO.split("/"), self.HEAD), expected
                     )
+
+    def test_ci_status_decides_and_its_alias_is_not_read(self) -> None:
+        red = {"status": "completed", "conclusion": "failure"}
+        green = {"status": "completed", "conclusion": "success"}
+        for gate, alias, expected in ((red, green, "failure"), (green, red, "success")):
+            with self.subTest(gate=gate["conclusion"]):
+                gh = self.fake(gate=[gate], ci=[alias])
+                self.assertEqual(
+                    policy._ci_status(*REPO.split("/"), self.HEAD), expected
+                )
+                read = [c[1] for c in gh.calls if c[:1] == ["api"]]
+                self.assertIn(self.GATE, read)
+                self.assertNotIn(self.CI, read)
 
     def test_ci_status_runs_that_started_together_keep_any_failure(self) -> None:
         at = "2026-10-24T05:40:00Z"

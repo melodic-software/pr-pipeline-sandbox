@@ -54,8 +54,8 @@ plugin: `track`, `work`, `work-loop`, `triage`, `decompose`, `attend-queue` and
 infrastructure skills (`setup`, `onboard-adapter`) speak in provider and tracker
 terms, and `ship` speaks in container and journey terms. Nobody says "add a
 ticket" to an adapter generator. Stuffing the tokens into their triggers to
-satisfy a fleet-wide claim would buy a tidier sentence at the cost of worse
-routing, so the claim is scoped instead.
+satisfy a fleet-wide claim would make the sentence tidier and the
+routing worse, so the claim is scoped instead.
 
 ## `/work-items:track` actions
 
@@ -131,10 +131,9 @@ enough that one skill no longer predicts its contents.
   which owns the copy from then on. On a re-run, setup fast-forwards a copy nobody edited and
   stops with the diff on one somebody did. The consuming repo declares its
   active provider under the `tracker` key of `<home>/work-items.yaml` in its convention home
-  (default `docs/conventions`). Until `/work-items:setup` writes that key, it writes a legacy
-  repo-root JSON binding, which the seam still reads with a notice. A personal override beside the
-  binding (`work-items.local.yaml` beside the YAML one; the legacy JSON override, which setup
-  gitignores, beside the legacy one) may carry the per-user
+  (default `docs/conventions`). A repo-root `.work-item-tracker.json` no longer binds:
+  `/work-items:setup apply` copies it under that key. A personal override beside the
+  binding (`work-items.local.yaml`) may carry the per-user
   lease TTL and the per-provider auth identity: `auth_email` and `auth_env` for jira, `auth_env`
   for linear, and `auth_env` for gitea. A repo
   may add or shadow an adapter consumer-local at
@@ -404,9 +403,6 @@ For a Claude Code release without `plugin configure`, see [Plugin install](https
 - [Plugins and skills settings](https://code.claude.com/docs/en/settings-reference#plugins-and-skills)
 - [Settings files and who they affect](https://code.claude.com/docs/en/settings#settings-files-and-who-they-affect)
 - [Manage installed plugins](https://code.claude.com/docs/en/plugins/install#manage-installed-plugins)
-
-As of 2026-11-04. Recheck trigger: one of these sections moves, or a Claude Code
-release note changes how plugin options are set or stored.
 
 <!-- END GENERATED: plugin options -->
 

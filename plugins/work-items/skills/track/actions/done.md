@@ -21,13 +21,15 @@ Close a work item with a completion comment.
 1. **Check if recurring.** Read the item's body and labels (adapter: "View item"). When it carries the resolved `recurring-maintenance` label (`config.role_labels["recurring-maintenance"]` from the binding, default `recurring`) and its body has a `<!-- recurring-schedule id=<id> -->` line ([`reference/issue-conventions.md`](../../../reference/issue-conventions.md) "Recurring marker"), check that `<id>` against `.github/recurring-schedule.json`; the title plays no part. Skip gracefully when the repo has no recurring schedule:
 
 ```bash
-SCHEDULE="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/.github/recurring-schedule.json"
+SCHEDULE="<project root>/.github/recurring-schedule.json"
 if [[ -f "$SCHEDULE" ]]; then
   jq --arg id "<id from the marker>" '[.items[] | select(.id == $id)] | length' "$SCHEDULE"
 else
   echo 0  # no recurring schedule configured
 fi
 ```
+
+`<project root>` is the literal path [`tracker-seam.md`](../../../reference/tracker-seam.md) "Project root" resolves, in its own Bash call before this snippet.
 
 If it's a recurring item, warn: "This is a recurring item. Did you mean `/work-items:track recheck` instead?" Proceed only if the user confirms.
 
@@ -53,6 +55,8 @@ The summary is institutional memory someone reads later, so lead with what was d
 
    Apply the read-modify-write keyword check + prepend from the adapter "PR closing-keyword mechanics" section, keyed to THIS item: if the (unmerged) PR body carries neither a closing keyword for this item (its `closes` line, or any of the provider's other closing keywords the adapter section lists) nor an opt-out marker for it (its `refs` line, an opt-out marker that section lists, or `No related issue:`), prepend the `closes` line. A closing keyword targeting a *different* item does not count. If an opt-out marker for this item is present, leave the body alone (Step 4's opt-out branch handles it); if merged, the keyword can no longer auto-fire and Step 4's close is the only path.
 
+1. **Check the decomposed parent.** When this run closed the item, its body has a `## Parent` section reading `Refs #<parent>` and the `<!-- work-items:born-triaged -->` marker, and that parent is open, run "Decomposed parent close" in [`reference/issue-conventions.md`](../../../reference/issue-conventions.md) for that parent, and report what it did.
+
 1. **Confirm:** "Closed **#N**: {title}. Summary: {summary}"
 
 ## Notes
@@ -60,4 +64,4 @@ The summary is institutional memory someone reads later, so lead with what was d
 - Always require a completion summary. Summaries are institutional memory of what was decided/learned.
 - If no `--summary` provided, ask for one before closing.
 - The `done` action closes with `completed` (default), or `not planned` when `--not-planned` is given, for items decided against, superseded, or no longer relevant. Superseded and duplicate items never close as `completed`.
-- **Duplicate close.** Close a duplicate via the adapter's native duplicate mechanic when it has one (adapter: "Close item", GitHub's `--duplicate-of`, which sets a structured, queryable `duplicateOf` relationship and close reason `duplicate`); otherwise fall back to appending a `## Duplicate of <ref>` body section, `#<M>` for a same-repo duplicate or the qualified `<owner>/<repo>#<M>` reference or issue URL for a cross-repo one, and closing with `--not-planned`, linking the original in a comment.
+- **Duplicate close.** Close a duplicate via the adapter's native duplicate mechanic when it has one (adapter: "Close item", GitHub's `--duplicate-of`: [`gh issue close` options](https://cli.github.com/manual/gh_issue_close#options), as of 2026-11-10; recheck when gh changes what `--duplicate-of` records); otherwise fall back to appending a `## Duplicate of <ref>` body section, `#<M>` for a same-repo duplicate or the qualified `<owner>/<repo>#<M>` reference or issue URL for a cross-repo one, and closing with `--not-planned`, linking the original in a comment.
