@@ -12,9 +12,10 @@ import { parse, stringify } from "yaml";
 
 import { OUTSIDE_ACTOR_LABEL } from "../../scripts/pr-merge/merge-holds.mjs";
 import { planPasses } from "../../scripts/pr-refine/plan-passes.mjs";
+import { decide } from "../../scripts/lib/lane-level.mjs";
 import { checkPatchRules } from "./patch-rules.mjs";
 import { configFromBase, ownedBranchesFromBase, postMergeFromBase } from "./resolve-config.mjs";
-import { laneSlots, resolve, resolveGrant, slotTargets } from "./resolve.mjs";
+import { laneSlots, resolve, resolveGrant, resolveLimits, slotTargets } from "./resolve.mjs";
 
 const read = (relative) =>
   readFileSync(new URL(relative, import.meta.url), "utf8");
@@ -591,10 +592,9 @@ test("live config: resolve-issue holds no write token; apply-issue-patch may onl
   });
 });
 
-// activity-rules.json is trust-root data: a config that gives resolve-issue a
-// write effect again is refused. The schema takes tidy only on a read skill
-// that hands on a patch, so the write-effect config drops it too, and the
-// refusal comes from the activity rules rather than the schema.
+// A config that gives resolve-issue a write effect again is refused: a skill's
+// effect is read. The write-effect config drops tidy, which the schema takes
+// only on a read skill that hands on a patch.
 test("live config: resolve-issue with a write effect is refused", () => {
   const writes = FILES.config
     .replace(
@@ -605,7 +605,7 @@ test("live config: resolve-issue with a write effect is refused", () => {
   assert.notEqual(writes, FILES.config);
   assert.throws(
     () => resolve({ ...FILES, config: writes }, { lane: "work-resolve-issue", activity: "resolve-issue", configPath: CONFIG_PATH, basePath: ".base", facts: { ...FACTS, ...ISSUE } }),
-    (error) => error.code === "forbidden-by-activity",
+    (error) => error.code === "invalid-config",
   );
 });
 
@@ -822,14 +822,14 @@ test("live config: fix-docs is not asked to fix an instruction surface", () => {
   assert.deepEqual(slot["changed-paths"], ["docs/guide.md"]);
 });
 
-// activity-rules.json is trust-root data: a config that gives fix-docs a
-// write effect again is refused.
+// A config that gives fix-docs a write effect again is refused: a skill's
+// effect is read.
 test("live config: fix-docs with a write effect is refused", () => {
   const writes = FILES.config.replace("effect: read\n    applied-by:\n      patch: apply-patch\n", "effect: mutate-branch\n");
   assert.notEqual(writes, FILES.config);
   assert.throws(
     () => resolve({ ...FILES, config: writes }, { lane: "pr-refine", activity: "fix-docs", configPath: CONFIG_PATH, basePath: ".base", facts: FACTS }),
-    (error) => error.code === "forbidden-by-activity",
+    (error) => error.code === "invalid-config",
   );
 });
 
@@ -872,6 +872,24 @@ test("live config: no live slot resolves an actions permission", () => {
     resolveGrant(FILES, { lane: "pr-merge", activity: "merge-pr", configPath: CONFIG_PATH }).grant.actions,
     undefined,
   );
+});
+
+// Owner decision Q113 (a): the lane level publisher is the one grant that may
+// write repository Variables, beside every other scope read.
+test("live config: only work-unblock's publish-lane-level resolves Variables write, with every other scope read", () => {
+  const doc = parse(FILES.config);
+  const holders = [];
+  for (const lane of Object.keys(doc.lanes)) {
+    const { lane: resolved } = resolve(FILES, { lane, configPath: CONFIG_PATH, basePath: ".base", facts: FACTS });
+    for (const slot of resolved.slots) {
+      if (slot.grant["actions-variables"] !== undefined) holders.push(`${lane}/${slot.name}`);
+    }
+  }
+  assert.deepEqual(holders, ["work-unblock/publish-lane-level"]);
+  assert.deepEqual(resolveGrant(FILES, { lane: "work-unblock", activity: "publish-lane-level", configPath: CONFIG_PATH }), {
+    effect: "mutate-variable",
+    grant: { contents: "read", "pull-requests": "read", issues: "read", "actions-variables": "write" },
+  });
 });
 
 // release-publish-plugins.yml owns and rebuilds release/plugins; run
@@ -922,6 +940,17 @@ test("live config: models.issue-status field-events-since loads as the S2a cutov
 // The merge lane reads this file through the source-control YAML subset
 // (plugins/source-control/lib/yaml-subset.awk); a construct outside it turns
 // the lane off with config-parse-error.
+// resolve-config passes limits.api through as set, {} here; decide() fills it
+// from rate-limits.json the way the rate guard does.
+test("live config: decide() on the resolved limits steps a quiet busy lane from 3 to 4 after two clean windows", () => {
+  const limits = resolveLimits(FILES, { configPath: CONFIG_PATH });
+  const window = (at) => ({ at, pools: { "lanes-app": { used: 100, limit: 5000 } }, signals: [] });
+  const demand = { waiting: 5, running: 3 };
+  const first = decide(null, window(1794340800), demand, limits);
+  assert.deepEqual(first, { level: 3, streak: 1, holdUntil: 0, reason: "streak" }, "the first clean busy window counts, not missing-data");
+  assert.deepEqual(decide(first, window(1794344400), demand, limits), { level: 4, streak: 0, holdUntil: 0, reason: "step-up" });
+});
+
 test("the live pr-pipeline.yaml stays inside the merge lane's YAML subset", () => {
   const awk = fileURLToPath(new URL("../../../plugins/source-control/lib/yaml-subset.awk", import.meta.url));
   const config = fileURLToPath(new URL("../../../docs/conventions/pr-pipeline.yaml", import.meta.url));

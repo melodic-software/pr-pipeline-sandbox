@@ -82,6 +82,17 @@ on:
         required: false
         type: string
         default: ""
+      start-gate:
+        description: >-
+          `true` for a caller whose call starts new work (the issue lane):
+          broker-check's kill-switch gate then also stops on a low
+          GITHUB_TOKEN budget, on the first call in the slot only (fallback
+          empty or `credit-stop`); a call that takes over a handed-off turn,
+          and every call of a caller that leaves this `false`, checks the
+          switches only.
+        type: boolean
+        required: false
+        default: false
       fallback:
         description: >-
           Empty for the first call, which runs on claude-api-key and hands off
@@ -91,8 +102,10 @@ on:
           first call handed off as this run's jobs show it, for a caller that
           reads that rather than the first call's outputs. `fallback` for the
           third, which runs on fallback-claude-code-oauth-token after the
-          second call handed off. Issue mode takes empty, `handoff` or
-          `fallback`.
+          second call handed off. Issue mode takes empty, `handoff`,
+          `credit-stop` or `fallback`; `credit-stop` there is a subscription
+          call the caller's own key-credit gate made the first in the slot, so
+          it re-checks the blockers and records the skipped key leg.
         required: false
         type: string
         default: ""
@@ -410,7 +423,8 @@ on:
       skip-reason:
         description: >-
           `kill-switch` when the broker refused the check because a lanes kill
-          switch is on, so no lane ran; empty otherwise.
+          switch is on, `budget` when broker-check's start gate stopped on a
+          low GITHUB_TOKEN budget, so no lane ran; empty otherwise.
         value: ${{ jobs.broker-check.outputs.skip-reason }}
       lease:
         description: >-
@@ -436,7 +450,9 @@ jobs:
   # neutral. A broker kill-switch refusal (a switch turned on after this run
   # read its variables) also ends green, with skip-reason kill-switch, which
   # skips the run job and every job after it but report, which posts the
-  # check neutral on a pull_request run. Any other broker answer but an allow, or none, fails this
+  # check neutral on a pull_request run. A start-gate stop on a low
+  # GITHUB_TOKEN budget ends green the same way, with skip-reason budget, and
+  # report posts the same neutral kill-switch check. Any other broker answer but an allow, or none, fails this
   # job, which skips the run job and fails the check. issues: write is for the issue
   # lease alone, posted before any model turn (CONTRACT.md "Lease protocol").
   broker-check:
@@ -454,7 +470,7 @@ jobs:
     # so the run job also checks that the allow came from its own attempt.
     outputs:
       allowed: ${{ steps.broker.outcome == 'success' && steps.broker.outputs.allowed == 'true' }}
-      skip-reason: ${{ steps.broker.outputs.skip-reason }}
+      skip-reason: ${{ steps.kill.outputs.cause == 'budget' && 'budget' || steps.broker.outputs.skip-reason }}
       attempt: ${{ github.run_attempt }}
       lease: ${{ steps.lease.outputs.lease }}
       lease-comment-id: ${{ steps.lease.outputs.lease-comment-id }}
@@ -507,7 +523,7 @@ jobs:
       # resolve-config.mjs, whose packages only the resolve-config action
       # installs; this job does not run it.
       - name: Install resolve-config's packages
-        if: inputs.issue-number != '' && inputs.fallback == ''
+        if: inputs.issue-number != '' && (inputs.fallback == '' || inputs.fallback == 'credit-stop')
         timeout-minutes: 5
         run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund --prefix .base/.github/actions/resolve-config
 
@@ -517,6 +533,19 @@ jobs:
         with:
           value: ${{ vars.CLAUDE_LANES_DISABLED }}
           repo-value: ${{ vars.CLAUDE_LANES_REPO_DISABLED }}
+          # A first call that starts new work also stops on a low GITHUB_TOKEN
+          # budget; a handed-off or fallback leg checks the switches only.
+          budget: ${{ inputs.start-gate && (inputs.fallback == '' || inputs.fallback == 'credit-stop') && 'true' || 'false' }}
+
+      # work-unblock's sweep reads this step's name and conclusion from the
+      # job listing (label-unblocked.mjs BUDGET_STEP): a stop on the
+      # GITHUB_TOKEN budget re-fires after the window's reset the name
+      # carries, without counting as a kill-switch trip.
+      - name: Stop on a low GITHUB_TOKEN budget until ${{ steps.kill.outputs.reset }}
+        if: steps.kill.outputs.cause == 'budget'
+        env:
+          RESET: ${{ steps.kill.outputs.reset }}
+        run: echo "::notice::the start gate stopped this run on a low GITHUB_TOKEN budget until $RESET (epoch seconds)"
 
       # The broker repeats the kill switch, including the repository-variable
       # shadow this job cannot see, and checks the job's OIDC claims.
@@ -555,10 +584,16 @@ jobs:
           probe-minutes: "0"
 
       # The skipped key's secret name, from the role as run-claude-cli names
-      # it (`issue-lane` gives ISSUE_LANE_CLAUDE_API_KEY).
+      # it (`issue-lane` gives ISSUE_LANE_CLAUDE_API_KEY). An issue caller
+      # whose own gate skipped the key call names it with fallback
+      # credit-stop, so this call, the first in the slot, records the skip
+      # once its broker allows it, as the key call would have.
       - name: Name the skipped key
         id: skipped-key
-        if: steps.credit.outputs.skip-key == 'true'
+        if: >-
+          steps.credit.outputs.skip-key == 'true'
+          || inputs.issue-number != '' && inputs.fallback == 'credit-stop'
+          && steps.broker.outcome == 'success' && steps.broker.outputs.allowed == 'true'
         env:
           ROLE: ${{ inputs.role }}
         run: |
@@ -569,7 +604,7 @@ jobs:
       # The skipped key leg's lane record: outcome skip, class credit-stop,
       # handed off, so leg counts before and after the gate compare.
       - name: Report the skipped key leg
-        if: steps.credit.outputs.skip-key == 'true'
+        if: steps.skipped-key.outcome == 'success'
         continue-on-error: true
         uses: melodic-software/ci-workflows/.github/actions/report-lane-outcome@6b9c640bf209c0c7e76f1111c5d18c96707348a2 # 6b9c640 2026-11-02
         with:
@@ -639,11 +674,13 @@ jobs:
       # fails, stops the run as admit's does: no model turn, no outcome
       # marker, agent-ready kept, and work-unblock's sweep re-fires the issue
       # once no blocker is open, matching the stop step below by name. The
-      # report job ends the lease. The first call alone checks: a later leg
-      # runs only after this one handed off.
+      # report job ends the lease. The first call in the slot alone checks:
+      # the key call, or the subscription call a caller's key-credit gate
+      # made first (fallback credit-stop). A later leg runs only after the
+      # first handed off.
       - name: Re-check the issue's blockers in the slot
         id: recheck-blockers
-        if: inputs.issue-number != '' && inputs.fallback == '' && steps.lease.outputs.lease == 'held'
+        if: inputs.issue-number != '' && (inputs.fallback == '' || inputs.fallback == 'credit-stop') && steps.lease.outputs.lease == 'held'
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ inputs.issue-number }}
@@ -793,13 +830,13 @@ jobs:
         run: |
           # Issue mode runs only on the issues event that names that issue,
           # trusting the default branch tip, with none of the PR inputs and
-          # a fallback only as handoff or fallback; the config step below holds it to
+          # a fallback only as handoff, credit-stop or fallback; the config step below holds it to
           # patch mode.
           if [ -n "$ISSUE_NUMBER" ] || [ "$EVENT_NAME" = issues ]; then
             if ! [[ $ISSUE_NUMBER =~ ^[1-9][0-9]{0,9}$ ]] || [ "$EVENT_NAME" != issues ] ||
               [ "$ISSUE_NUMBER" != "$EVENT_ISSUE" ] || [ "$TRUSTED_BASE" != default-tip ] ||
-              [ -n "$PR_NUMBER$DISPATCHER_RUN_ID" ] || { [ "${FALLBACK:-handoff}" != handoff ] && [ "$FALLBACK" != fallback ]; }; then
-              echo "::error::issue mode needs an issues event, the event's issue number, trusted-base default-tip, no pr-number or dispatcher-run-id, and a fallback of empty, handoff or fallback"
+              [ -n "$PR_NUMBER$DISPATCHER_RUN_ID" ] || { [ "${FALLBACK:-handoff}" != handoff ] && [ "$FALLBACK" != credit-stop ] && [ "$FALLBACK" != fallback ]; }; then
+              echo "::error::issue mode needs an issues event, the event's issue number, trusted-base default-tip, no pr-number or dispatcher-run-id, and a fallback of empty, handoff, credit-stop or fallback"
               exit 1
             fi
           fi
@@ -2028,7 +2065,7 @@ jobs:
           lane: >-
             ${{ inputs.issue-number != '' && inputs.fallback == 'fallback'
             && format('{0} (token {1} handed off)', inputs.lane, steps.launch.outputs.token-name)
-            || inputs.issue-number != '' && inputs.fallback == 'handoff'
+            || inputs.issue-number != '' && (inputs.fallback == 'handoff' || inputs.fallback == 'credit-stop')
             && format('{0} (key {1} handed off)', inputs.lane, steps.launch.outputs.key-name)
             || inputs.issue-number != '' && inputs.lane
             || inputs.fallback == 'credit-stop'
@@ -2604,7 +2641,9 @@ jobs:
   # Callers run this file on issues (default branch) and on
   # workflow_dispatch, which anyone with write access can send on any ref:
   # off main the environment refuses this job, so the run fails closed and
-  # publishes nothing.
+  # publishes nothing. deployment: false keeps the secrets and the branch
+  # policy but records no deployment:
+  # https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/control-deployments#using-environments-without-deployments
   scan:
     needs: [run, issue-fields]
     if: >-
@@ -2613,7 +2652,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     cache-mode: read
-    environment: pr-pipeline-scan-carrier
+    environment:
+      name: pr-pipeline-scan-carrier
+      deployment: false
     permissions:
       contents: read
     outputs:
@@ -3919,7 +3960,7 @@ jobs:
           API_HEAD: ${{ steps.pr-head.outputs.sha }}
           PR_MISMATCH: ${{ steps.pr-head.outputs.pr-mismatch }}
           TRUSTED_SKIP: ${{ needs.broker-check.outputs.allowed != 'true' }}
-          BROKER_STOP: ${{ needs.broker-check.outputs.skip-reason == 'kill-switch' }}
+          BROKER_STOP: ${{ needs.broker-check.outputs.skip-reason == 'kill-switch' || needs.broker-check.outputs.skip-reason == 'budget' }}
           POST_DECLINE: ${{ inputs.post-decline }}
         run: |
           out() { printf 'post=true\nsha=%s\nforged=%s\n' "$1" "$2" >>"$GITHUB_OUTPUT"; }
@@ -3929,7 +3970,9 @@ jobs:
             valid "$gated" || gated=$EVENT_HEAD
             if [ "$TRUSTED_SKIP" = true ] || [ "$POST_DECLINE" = false ] || ! valid "$gated"; then
               out "" false
-              # The broker's kill-switch refusal skipped the run job: neutral.
+              # The broker's kill-switch refusal, or broker-check's budget
+              # stop, skipped the run job: neutral, under the skip-reason
+              # enum's kill-switch.
               if [ "$BROKER_STOP" = true ]; then echo "not-run-reason=kill-switch" >>"$GITHUB_OUTPUT"; fi
             else
               out "$gated" false
@@ -4051,7 +4094,7 @@ jobs:
       # post, warns and leaves the job green. A broker kill-switch refusal ran
       # no lane, so it posts none.
       - name: Post the lane run report comment
-        if: always() && needs.broker-check.outputs.skip-reason != 'kill-switch'
+        if: always() && needs.broker-check.outputs.skip-reason != 'kill-switch' && needs.broker-check.outputs.skip-reason != 'budget'
         continue-on-error: true
         env:
           LANE: ${{ inputs.lane }}

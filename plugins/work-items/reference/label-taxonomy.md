@@ -28,7 +28,7 @@ These axes work in any repo and don't change per team. Do not snapshot their mem
 
 Four labels are **canonical roles**: skill and action prose speaks the role name, and
 the repo-actual label string resolves from the tracker binding (the `tracker` mapping of
-`<home>/work-items.yaml`, else the legacy repo-root JSON binding), key `config.role_labels`. When the key (or an individual role entry) is absent, the defaults below
+`<home>/work-items.yaml`), key `config.role_labels`. When the key (or an individual role entry) is absent, the defaults below
 apply, so existing repos need zero migration.
 
 | Role | Default label | What it marks |
@@ -62,8 +62,8 @@ lane pass. A present malformed, empty, or non-string entry is a configuration er
 fall back silently. Two constraints on remapping:
 
 - **`human-gated` is shared with the seam.** `list-frontier --autonomous` excludes items by that
-  label, and the shipped seam reads `needs-human`; remap this role only when the bound seam
-  resolves the same `config.role_labels` key, or the frontier filter and the skill will disagree.
+  label. The shipped seam resolves it from `config.role_labels`; a consumer-local adapter must
+  resolve the same key, or the frontier filter and the skill will disagree.
 - **The remapped label must exist** in the consuming repo (or route through its label-as-code
   owner), the same never-create-ad-hoc rule as every other label.
 

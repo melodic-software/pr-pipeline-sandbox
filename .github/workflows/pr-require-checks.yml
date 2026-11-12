@@ -63,7 +63,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       actions: read # the review lanes' runs and jobs
-      contents: read # .work-item-tracker.json and trusted-actors.json at the base
+      contents: read # docs/conventions/work-items.yaml and trusted-actors.json at the base
       issues: read # the PR's labels, comments and label events
       pull-requests: read # the PR and its files
     steps:
@@ -85,8 +85,8 @@ jobs:
       # A PULL REQUEST CARRYING THE HUMAN-GATED LABEL IS HELD. A review lane or
       # an escalation puts the label on so a person decides; removing it is the
       # approval, and the `unlabeled` event re-runs this job. The label's name
-      # is the base commit's .work-item-tracker.json role_labels.human-gated
-      # (default `needs-human`), resolved as pr-merge.yml resolves it, and read
+      # is the base commit's docs/conventions/work-items.yaml
+      # tracker.config.role_labels.human-gated (default `needs-human`), resolved as pr-merge.yml resolves it, and read
       # at the base so the pull request cannot rename its own hold. Labels are
       # read live, not from the event payload, which a later label event
       # outdates. The reason is the newest review-lane hold comment's text: a
@@ -94,8 +94,7 @@ jobs:
       # github-actions[bot] when its last non-blank line is the lane's
       # `claude-lane: <lane>` footer. Without one the error names none. An unreadable tracker config or label list fails closed.
       # It outputs the label's name, and `held=false` once the live labels
-      # read without it, for the hold-lift step below. Pinned
-      # by scripts/ci-hold-human-gated.test.sh, which runs this body.
+      # read without it, for the hold-lift step below.
       - name: Fail a pull request carrying the human-gated label
         id: human_gated
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
@@ -109,21 +108,26 @@ jobs:
             exit 1
           fi
           for attempt in 1 2 3; do
-            if tracker=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$GITHUB_REPOSITORY/contents/.work-item-tracker.json?ref=$BASE_SHA" 2>"$RUNNER_TEMP/tracker.err"); then
+            if tracker=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$GITHUB_REPOSITORY/contents/docs/conventions/work-items.yaml?ref=$BASE_SHA" 2>"$RUNNER_TEMP/tracker.err"); then
               break
             elif grep -q 'HTTP 404' "$RUNNER_TEMP/tracker.err"; then
               tracker=
               break
             fi
-            [ "$attempt" -lt 3 ] || { echo "::error::could not read .work-item-tracker.json at $BASE_SHA; re-run this run."; exit 1; }
+            [ "$attempt" -lt 3 ] || { echo "::error::could not read docs/conventions/work-items.yaml at $BASE_SHA; re-run this run."; exit 1; }
             sleep $((attempt * 5))
           done
           human_gated=needs-human
           if [ -n "$tracker" ]; then
+            # The binding is the `tracker` mapping; `null` when the file binds none.
+            tracker=$(yq -o=json -I=0 '.tracker' <<<"$tracker") || {
+              echo "::error::cannot parse docs/conventions/work-items.yaml at $BASE_SHA"
+              exit 1
+            }
             human_gated=$(jq -er '[objects | .config | objects | .role_labels | objects
               | .["human-gated"] | strings | gsub("^\\s+|\\s+$"; "")][0] // ""
               | if . == "" then "needs-human" else . end' <<<"$tracker") || {
-              echo "::error::cannot read the human-gated role label from .work-item-tracker.json at $BASE_SHA"
+              echo "::error::cannot read the human-gated role label from docs/conventions/work-items.yaml at $BASE_SHA"
               exit 1
             }
           fi
@@ -169,7 +173,6 @@ jobs:
       # does not remove the hold, and a review re-run that labels the same head
       # again starts a new hold. Unreadable comments, events or actor list fail
       # closed.
-      # Pinned by scripts/ci-hold-lifted-by.test.sh, which runs this body.
       - name: Fail a review-lane hold an untrusted account lifted
         if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.human_gated.outputs.held == 'false' }}
         env:
@@ -262,7 +265,6 @@ jobs:
       # no lane is there to hold it as trust-gate; a person merges it. A draft is exempt
       # (see `Note a draft`). pr-feedback-dispatch.yml re-runs this job when a
       # review run completes. An unreadable run or job list fails closed.
-      # Pinned by scripts/ci-review-lanes.test.sh, which runs this body.
       - name: Require both review lanes on this head
         if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.draft == false }}
         env:

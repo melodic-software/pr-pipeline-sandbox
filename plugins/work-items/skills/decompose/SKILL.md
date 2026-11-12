@@ -47,7 +47,7 @@ Collect the source's acceptance criteria with their ids for Step 2's criterion t
 
 When `## Plan` opens with a `### Behavior` list, extract it for Step 2's cut: each `- B<n>: <claim> (AC<i>, ...)` item with the criterion ids it cites, the list's `Process criteria:` line (criteria no behavior shows), and each phase's `**Delivers:**` line naming the B ids that phase builds.
 
-Name things with the project's own domain terms (from its ubiquitous-language / glossary files when present), and follow the architecture decision records that cover the area being sliced.
+Name things with the project's own domain terms: invoke `/domain-driven-design:ubiquitous-language lookup` via the Skill tool when that skill is available, otherwise Glob the repository for `**/*{glossary,Glossary,GLOSSARY,ubiquitous,UBIQUITOUS}*.md` (the root, any `docs/` folder and the module's own folder) and Read the match that covers the area; a path the project's instructions declare, or a `glossary_file` set in `docs/conventions/domain-driven-design.yaml`, wins, and a tool's own reference glossary under a plugin or package `reference/` or `context/` folder is skipped, and follow the architecture decision records that cover the area being sliced.
 
 ### 2. Draft vertical slices
 
@@ -104,7 +104,7 @@ Prefer AFK. Mark HITL only when the vertical slice genuinely needs judgment (arc
 
 The human-gated label (default `needs-human`) is what keeps an item out of autonomous pickup: `list-frontier --autonomous` excludes it (`${CLAUDE_PLUGIN_ROOT}/tools/work-item-tracker/CONTRACT.md` "Verbs (core public surface)"). Merely omitting the autonomous-eligible label does NOT; an unlabeled HITL item would still be claimable by `/work-items:work`. An HITL item wants the human-gated label set AND the autonomous-eligible one (default `agent-ready`) omitted.
 
-**Investigation tickets, decisions, not deliverables.** When the source still carries unresolved unknowns (open design questions, unvalidated approaches, fuzzy scope), emit **investigation tickets** alongside, or ahead of. Build vertical slices. An investigation ticket resolves ONE decision and records the resolution as a closing comment; it produces no production code. Type each by the skill that resolves it:
+**Investigation tickets, decisions, not deliverables.** When the source still carries unresolved unknowns (open design questions, unvalidated approaches, fuzzy scope), emit **investigation tickets** alongside, or ahead of, the build vertical slices. An investigation ticket resolves ONE decision and records the resolution as a closing comment; it produces no production code. Type each by the skill that resolves it:
 
 | Investigation type | Resolves | Routes to |
 |--------------------|----------|-----------|
@@ -113,7 +113,7 @@ The human-gated label (default `needs-human`) is what keeps an item out of auton
 | interview | Scope/contract ambiguity only the user can settle | `/planning:interview` |
 | design | Type, contract, module-boundary, topology, or data-model unknown | `/planning:design` |
 
-A build vertical slice waiting on an unresolved decision names that investigation ticket as a blocker (its `--blocked-by` edge and its `## Depends on` body list). Investigation tickets are HITL by default (their output is a decision a human confirms). Label them `needs-human`, never `agent-ready`.
+A build vertical slice waiting on an unresolved decision names that investigation ticket as a blocker (its `--blocked-by` edge and its `## Depends on` body list). Investigation tickets are HITL by default (their output is a decision a human confirms). Label them with the human-gated role label, never the autonomous-eligible one.
 
 ### 2b. Wide refactors: expand, migrate, contract
 
@@ -149,7 +149,7 @@ Show the user the draft items, numbered. **work the frontier** (unblocked items 
 
 - **Title**: short descriptive name; read the house style ([`${CLAUDE_PLUGIN_ROOT}/reference/issue-house-style.md`](${CLAUDE_PLUGIN_ROOT}/reference/issue-house-style.md)) before drafting these titles and hold them to it
 - **Type**: HITL / AFK, with a `Basis:` for the call: `verified` with the `file:line` or source section it rests on, or `judgment` (not for a consequential call: cross-repo, shared infrastructure, irreversible, or security). A consequential call the source cannot settle is withheld: mark the item HITL and emit an investigation ticket naming the evidence that would settle it. Contract: [`${CLAUDE_PLUGIN_ROOT}/context/recommendation-basis.md`](../../context/recommendation-basis.md); full convention: [recommendation-basis](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/contracts/recommendation-basis/README.md#basis-label)
-- **Blocked by**: which other items (by number) must complete first
+- **Blocked by**: which other items (by number) must complete first. A chain where each item builds on the one before can ship as stacked PRs instead of waiting for each merge ([execution-shape.md](${CLAUDE_PLUGIN_ROOT}/reference/execution-shape.md) "Stacked per-item PRs")
 - **User stories covered**: which user stories this addresses (if PRD source)
 - **Criteria carried**: the criterion ids this item carries, from Step 2's criterion trace
 - **Demo**: what someone runs or sees after merge to show this item works, from Step 2's Proof on its own check (a prefactor: the check showing behavior is unchanged; an investigation ticket: the decision it records)
@@ -217,7 +217,7 @@ Run each call as its own plain Bash command: no `$(...)`, no `git`, and no `&&` 
 - **As of**: 2026-10-11
 - **Recheck trigger**: a Claude Code release in which the pre-#6929 snippet (tracker path fallback through `$(git rev-parse --show-toplevel)`, body through `"$(cat "$BODY_FILE")"`) runs from a worktree-isolated session.
 
-Every item body uses the one structure below. It is the agent-brief template ([`${CLAUDE_PLUGIN_ROOT}/reference/agent-brief.md`](${CLAUDE_PLUGIN_ROOT}/reference/agent-brief.md)) laid out as sections: `## Outcome` carries that template's Summary and Current/Desired behavior, `## Done when` carries its Acceptance criteria, and `## Key interfaces` and `## Out of scope` are its fields of the same names, so an AFK item needs no second `## Agent Brief` block. When the source is a PR (an item with attached code), use that reference's PR-variant (current-behavior-of-the-diff, finish-what-exists); do not replace the bug/feature template for ordinary items. Body structure:
+Every item body uses the one structure below. It is the agent-brief template ([`${CLAUDE_PLUGIN_ROOT}/reference/agent-brief.md`](${CLAUDE_PLUGIN_ROOT}/reference/agent-brief.md)) laid out as sections: `## Outcome` carries that template's Summary and Current/Desired behavior, `## Done when` carries its Acceptance criteria, and `## Key interfaces` and `## Out of scope` are its fields of the same names, so an AFK item needs no second `## Agent Brief` block. When the source is a PR (an item with attached code), use that reference's PR-variant (current-behavior-of-the-diff, finish-what-exists); do not replace the bug/feature template for ordinary items. The required sections (Outcome, Key interfaces, Done when, Out of scope) are the `decomposed-item` type of the issue-body contract ([`${CLAUDE_PLUGIN_ROOT}/reference/issue-body-contract.json`](${CLAUDE_PLUGIN_ROOT}/reference/issue-body-contract.json)): take their headings and order from its `fields`, and when the contract and the structure below disagree, the contract wins. Body structure:
 
 ```markdown
 ## Parent
@@ -244,6 +244,7 @@ Goal: <the Brief's Goal paragraph, copied>
 - Intent (why, in the user's words): <copied>
 - Vision (where this heads): <copied>
 - When goals conflict, prefer: <copied>
+- Finish line: <copied>
 Constraints:
 - <each of the Brief's Constraints, copied>
 <!-- Prototype output: when /prototype:pressure-test settled a data shape or a transition table,
@@ -286,7 +287,7 @@ Fill the sections this way:
   picker knows what to run or show after merge. Redact it as Outcome is: no file paths.
 - **Problem**, **Goal** and **Constraints** carry the why to a session that works one item alone. Fill them
   only when no spec container was approved and the source PLAN.md has a `## Brief`: copy its
-  Problem, its Goal paragraph with the Intent, Vision and When-goals-conflict lines, and its
+  Problem, its Goal paragraph with the Intent, Vision, When-goals-conflict and Finish line lines, and its
   Constraints bullets as written, dropping any memory-slice path, since
   that slice is never committed. Replace any other file path with the module or type it names, as
   Key interfaces does, and drop or generalize a machine-specific path, hostname or
@@ -322,7 +323,7 @@ Classify per taxonomy: the **issue type** from the item's nature. `Bug` (fixing 
 
 Items published here are **born triaged**: they enter the tracker classified, role-labeled, and briefed at creation, so `/work-items:triage` never re-processes them. Keep the body's last line, `<!-- work-items:born-triaged -->`, verbatim: a repository's intake automation may key on it, together with the author, the Issue Type and the role label, to skip items born triaged.
 
-**Leave the parent item untouched**: no close, no edit. The new items sit under it; they do not stand in for it.
+**Leave the parent item untouched at publish**: no close, no edit. The new items sit under it; they do not stand in for it. Once they close, "Decomposed parent close" in [`${CLAUDE_PLUGIN_ROOT}/reference/issue-conventions.md`](${CLAUDE_PLUGIN_ROOT}/reference/issue-conventions.md) owns the parent's close, run by `/work-items:track done` and `/work-items:track audit`.
 
 ### Container lifecycle (spec-on-tracker). Opt-in
 

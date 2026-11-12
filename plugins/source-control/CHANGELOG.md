@@ -3,6 +3,412 @@
 All notable changes to the `source-control` plugin are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this plugin uses semantic versioning.
 
+## [10.0.8] - 2026-11-12
+
+### Changed
+
+- `babysit-prs` reads the gate as `CI Status`, else `ci-status` on a head tested before the
+  rename: the Dependabot class's gate read, the post-merge check (CI Status and its `ci-status`
+  alias count as one check) and the verifier's draft-run read (CI Status's job, never the alias's).
+
+- Internal restructuring, no behavior change.
+
+## [10.0.7] - 2026-11-11
+
+### Fixed
+
+- The `worktree` skill and the `commit` skill's config probes no longer say the Bash tool returns a command's
+  complete output into context. The rule stands (the pipe is the bound, so it belongs in the command); the reason now points at the Output
+  limits section of the Claude Code tools reference for what a result returns inline.
+
+## [10.0.6] - 2026-11-11
+
+### Changed
+
+- The README options reference lists its upstream documentation as pointers only, with no as-of date or recheck trigger.
+
+## [10.0.5] - 2026-11-11
+
+### Changed
+
+- The setup skill's reconfiguration guidance keeps its decisions (reconfigure through the native configure flow, never uninstall to reconfigure, recheck in a fresh session) and now points at the plugin-reconfiguration convention's "The routes" and "Caveats" sections and the plugin CLI reference's `plugin configure` section instead of restating the headless command, its version floor and failure signals, and drops any claim that option values are fixed at session start or skill load, which the docs do not state.
+- The plugin now ships a generated copy of the plugin-reconfiguration convention at `reference/plugin-reconfiguration.md`, and its skills link that copy by relative path, so an agent without network access can read the routes and caveats the skills point at.
+- The setup skill tells the agent to read the convention's routes and caveats sections and print what they give (the fallback route, its behavior on an already-installed plugin and the scope to pass), leaving out the verified-version record, rather than only naming the sections.
+
+### Fixed
+
+- set the lane comment legacy cutoff
+
+  The review lanes write run bindings since ci-workflows#1071 merged
+  (2026-11-11T22:24:32Z). LEGACY_CUTOFF is now 48 hours later,
+  2026-11-13T22:24:32Z, in both ports: a lane comment with no binding counts
+  only when posted at or before it and never edited. The 48 hours cover a run
+  that resolved the reusable before the merge, and a re-run of one within the
+  lost-run reconciler's 24-hour lookback.
+
+  The clear-escalations test of an edited hold with no binding now expects
+  it to read as no lane's; fixtures for unbound lane comments carry dates
+  before the cutoff.
+
+## [10.0.4] - 2026-11-11
+
+### Fixed
+
+- count a lane comment record only once it is complete
+
+  The lane now closes each attempt's comment record with a
+  `{"complete":true}` line once its publish and hold steps did not fail
+  (ci-workflows pr-review-cli). The lane-binding checker counts a record as
+  covering its attempt only when it holds that line; an attempt cut off
+  between posting and recording reads as one that left no record, so its
+  comments fall to the time-window check instead of being rejected.
+
+  Test fixtures for lane comments with no binding now carry their
+  createdAt, ready for LEGACY_CUTOFF, which stays null here. The Python
+  test pins its cutoff to the JavaScript port's.
+
+## [10.0.3] - 2026-11-11
+
+### Changed
+
+- The stacked pull request reference moves to the plugin level, `reference/stacked-prs.md`, so other plugins can point at it. Its "When to stack" section is now the one place that says when to stack: dependent changes, a large change split for review, and ordered series stack; independent changes stay separate PRs off the trunk. It also says to check that the repository's PR pipeline accepts a layer whose base is not the default branch before stacking, replacing the stale line that said the pipeline lanes skip such a layer.
+- `pull-request` asks the stack-or-separate question before `create` opens a PR that builds on another open PR, and `worktree` create points a stacked layer at the layer below it.
+
+### Fixed
+
+- bind lane comments to their producing run
+
+  Every workflow's job token posts as github-actions[bot], so the
+  `claude-lane: <lane>` footer alone does not show a comment came from a
+  review lane. Readers now accept a github-actions[bot] lane comment only
+  when the run its binding line names (`<!-- claude-lane-run id=<run>
+  sha=<head> -->`, written by ci-workflows' pr-review-cli) is that lane's
+  caller workflow, ran on that head, and lists the comment's kind, id and
+  body digest in one of its `claude-lane-comments-<lane>-<attempt>`
+  artifacts. Every attempt's record counts; a run whose record expired
+  proves its comments by time. A comment that fails reads as one with no
+  footer; one that passes is read without its binding line, so severity
+  and footer parsing is unchanged. Comments with no binding keep counting
+  while LEGACY_CUTOFF is unset; a later change sets it once the lanes
+  write bindings.
+
+  - .github/scripts/lib/lane-binding.mjs, its fixtures and test (copies in
+    the review and work-items plugins), and babysit_lane_binding.py.
+  - pr-unblock: address-feedback, feedback-dispatch, publish-feedback,
+    resolve-threads, lane-hold, gate-recheck, dispatch and fix-ci-context
+    read comments and timelines through withLaneBinding.
+  - pr-merge: clear-escalations (thread roots, hold timelines, and the
+    ci-status filterLaneHolds entry), enable-auto-merge's lift check.
+  - ci-status: hold comments pass through filterLaneHolds from the base.
+  - babysit merge gate, review prior-findings, morning-brief
+    review-precision.
+  - ARTIFACT_READ_TOKEN and `actions: read` where a job reads the records;
+    the library and Python module join the hold floor as enforcement.
+
+- In a fork checkout, `pull-request` create, ready and evidence no longer leave the target repository to `gh`, which can pick upstream. Each phase resolves it once with the new `scripts/target-repo.sh`, prints it, and names it in every write. Ready and create export it as `GH_REPO` once it is resolved, so their later reads, and the scripts they run, target it too; evidence resolves it first and names it on every read. `branch-update-signals.sh` without `--repo` now reads the repository through `gh api`, which follows `GH_REPO`, instead of `gh repo view`, which ignores it. A fork checkout resolves to the fork even when `gh` records upstream as its default, but only a fork you can push to, so a maintainer who adds a contributor's fork as a remote keeps writing to the recorded default; a failed repository read stops the phase instead of falling back to upstream. Remotes naming two or more GitHub repositories, none a fork of another that you can push to, with no `gh repo set-default` recorded, are refused with that fix.
+- The create provider reference no longer says the worktree-anchored default-branch read returns the fork's branch: it returns the branch of whichever repository `gh` resolves, which can be upstream.
+
+## [10.0.2] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [10.0.1] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+### Fixed
+
+- A demotion record's lift by a referencing pull request now also counts an upper layer of a native stack into main. Such a layer keeps the lower layer's branch as its base when the stack lands together, so the lift reads its `stack.baseRefName` beside `baseRefName`; its merge commit must still be on main.
+
+## [10.0.0] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+### Removed
+
+- The `worktree_create_gate_enabled` option. Its only off position made the WorktreeCreate gate refuse, so every harness-driven worktree creation failed. The gate now always runs; a stored `false` is ignored. To stop the gate placing worktrees, disable the plugin.
+
+## [9.0.1] - 2026-11-11
+
+### Fixed
+
+- The pr-merge verifier gate no longer holds a pull request with `verify:earlier-fail` for a FAIL that ties to it only by head branch when the pull request that FAIL judged is merged, so a new release pull request on the reused `release/plugins` branch stops inheriting the FAILs of earlier, merged release pull requests. A FAIL from an open or closed-unmerged pull request on the same branch, or one whose state cannot be read, still holds.
+
+## [9.0.0] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+Internal simplification, no behavior change.
+
+- The `worktree-add-claim-gate` hook is renamed `worktree-add-claim` (`hooks/worktree-add-claim.sh`), and its option `worktree_add_claim_gate_enabled` is renamed `worktree_add_claim_enabled` (environment form `CLAUDE_PLUGIN_OPTION_WORKTREE_ADD_CLAIM_ENABLED`). The hook never blocks a command: it claims the worktree a `git worktree add` created. A stored value under the old key is ignored and the new key starts at its default, `true`; if you had turned the hook off, set `worktree_add_claim_enabled` to `false` through `/plugin configure`.
+
+## [8.13.6] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [8.13.5] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [8.13.4] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- The `babysit-prs` and `worktree` skills now cite the gather-block convention record, "The pre-compute block runs as one shell
+  invocation", instead of restating how the harness runs the pre-compute block. No behavior
+  change.
+
+## [8.13.3] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+## [8.13.2] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+## [8.13.1] - 2026-11-11
+
+### Changed
+
+- The `babysit-prs` safety reference's auto mode link uses the section id the permission-modes
+  page renders now. No behavior change.
+
+## [8.13.0] - 2026-11-10
+
+### Added
+
+- `/source-control:pull-request create`: an unattended change names new code from the project's glossary, read before naming, and lists each domain term it coins that the glossary lacks under a `## Glossary candidates` section for a person to curate. The run never writes the glossary.
+
+## [8.12.9] - 2026-11-10
+
+### Changed
+
+- `--stop-uncovered` stops on the dispatch run listing alone, before the schedule and canary listings and the branch reads that filter them. `babysit_verify_evidence.py check-code` answers settle's code-changed refusal with no GitHub read.
+
+## [8.12.8] - 2026-11-10
+
+### Changed
+
+- The `babysit-prs` worker prompt template now carries the subagent discipline preamble the
+  loop-lane convention requires of every dispatch: the discipline plugin's sweep skill when it is
+  installed, else the three standing instructions inline.
+
+## [8.12.7] - 2026-11-10
+
+### Changed
+
+- `babysit-prs` prints nothing on an iteration where no PR materially changed. Every iteration
+  still completes its evidence checklist and writes it to `babysit-checklist.md` in the working-notes
+  location, where the next iteration reads its `Subscribed PRs` line; an iteration with a material
+  change prints the Reporting lines followed by the completed checklist.
+
+## [8.12.6] - 2026-11-10
+
+### Changed
+
+- Skill bodies point at the live upstream sections for scheduling bounds, worktree isolation,
+  plugin variables, GitHub limits and auto-mode scopes instead of restating them, and the commit
+  type set no longer claims every source lists the same 11 types. No behavior change.
+
+### Fixed
+
+- Links to Claude Code's docs that pointed at moved section anchors now resolve: the permissions page's wrapper list, the permission-modes auto-mode section, and Code Review's setup and review-request sections.
+
+## [8.12.5] - 2026-11-10
+
+### Changed
+
+- The demotion read now lists main's green runs in fixed weekly cells shared by every red-main record in one read, so records filed close together read each listing page once instead of once per record. Each record's recovery is unchanged; a weekly cell too large to read whole holds the record.
+
+## [8.12.4] - 2026-11-10
+
+### Changed
+
+Internal simplification, no behavior change.
+
+## [8.12.3] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- answer empty exact-name artifact reads with a 304
+
+  In a job that names `BABYSIT_VERIFY_LISTING`, the verdict reader makes
+  one read of an artifact name nothing uploads and keeps that empty
+  answer's ETag beside the listing, but only when the body is exactly
+  empty. Each first page of an exact-name read then sends it as
+  `If-None-Match`, and a 304 reads as the empty page, so the verdict is
+  the one a 200 gives. A failed or non-empty seed sends no header, and a
+  304 to a read that sent none stays unreadable.
+
+## [8.12.2] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+## [8.12.1] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [8.12.0] - 2026-11-10
+
+### Removed
+
+- The babysit-prs verdict-evidence script's `evidence` command no longer takes `--answers-in`, `--answers-out`, `--answers-mode` or `--answers-only`, and no longer probes an answer key before its read: every call reads in full and prints the plain report, as it did without those flags.
+
+## [8.11.6] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+## [8.11.5] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+## [8.11.4] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+### Fixed
+
+- `worktree-create.sh --base-ref fresh` now fetches the default branch on every run, still capped at 5 seconds. Before, it skipped the fetch when the repository had been fetched in the last 24 hours, as Claude Code's native `fresh` does. It then reported a base hours behind the remote as `(base fresh)`. When the fetch fails or hits the cap, the final line now reads `(base <remote>/<branch>@<short-sha>, not refreshed)`.
+
+## [8.11.3] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+## [8.11.2] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+## [8.11.1] - 2026-11-09
+
+### Fixed
+
+- retry a demotion's recovery read once and warn when it still fails
+
+  A red-main demotion record's recovery reads (the green-runs listing,
+  main's tip and the compares) now retry once on no answer, a timeout
+  or a 5xx; a 403 or 429 is left to the rate guard. When the read still
+  fails the record holds as before, and the merge policy prints
+  `::warning::demotion #<n>: recovery read failed: <error>` instead of
+  holding lane merges in silence.
+
+## [8.11.0] - 2026-11-09
+
+### Changed
+
+- `comments --ci` answers a code-review advisory whose change falls outside the closing issue's acceptance criteria or Out of scope list with the new `follow-up` disposition instead of a fix; the review-thread tool's new `issues` command prints the closing issues' text, and `record` takes `follow-up` only on a thread the select job marked `may_follow_up`
+
+### Fixed
+
+- `landed-work.sh --merged-pr-proof` reads merged pull requests again. The listing asked `gh pr list` for `commits`, which gh expands with each commit's authors, so GitHub refused the query at any limit of 50 or more (more than 500,000 possible nodes) and every worktree stayed unproven with `merged-pr-read-failed:gh-pr-list (GraphQL: ...)`. It now pages a `gh api graphql` query that reads only the head and base refs, the head oid and each PR's commit oids, 100 PRs a page, until `--merged-pr-limit` PRs are read. The stderr gh call count counts each page. The `--merged-pr-limit` window is now the most recently updated merged PRs rather than the most recently created.
+
+- let a re-run flake stop holding the post-merge anchor
+
+  A full run whose identity re-run passed (a flake) kept its merge from
+  ever reading final, so the lane's floor anchor stopped there and every
+  pr-merge check re-read every merge after it. Such a flake now counts as
+  final once `merge.quarantine-days` have passed since the run and no open
+  demotion record names it. A flake read through a newer run superseding
+  it still never counts as final.
+
+## [8.10.3] - 2026-11-09
+
+### Changed
+
+- The post-merge check and the demotion reads make fewer GitHub calls with the same answers: `--stop-uncovered` ends a check whose verdict would need a dispatch once its runs are listed, and ancestry, the default branch and permissions are answered from a local clone or a read already made.
+
+## [8.10.2] - 2026-11-09
+
+### Fixed
+
+- point the commit trailer model check at /status
+
+  The commit skill told the model to invoke /usage to confirm the trailer
+  model. The model cannot run that user-typed command, and /usage shows
+  cost and limits, not the model. When unsure, the model now asks the
+  person to check /status instead of guessing.
+
+## [8.10.1] - 2026-11-09
+
+### Changed
+
+- Internal simplification of the shared view helpers this plugin carries, no behavior change.
+
+- Simplified the shared yaml-subset parser copies; behavior is unchanged.
+
+- Simplified the internals of the hook launcher; its behavior is unchanged.
+
 ## [8.10.0] - 2026-11-09
 
 ### Added

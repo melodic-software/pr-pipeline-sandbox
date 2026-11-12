@@ -750,17 +750,22 @@ test("a review lane's labeled event is a hold until a trusted person unlabels it
   assert.equal(lifted.writes().at(-1)?.method, "DELETE");
 });
 
-test("a review-lane hold edited after the unlabel keeps it", async () => {
-  const w = world({
-    timeline: [
-      laneHold(ACTIONS_BOT, "2026-10-18T08:00:00Z", { updatedAt: "2026-10-18T09:30:00Z" }),
-      unlabeled(OWNER, "2026-10-18T09:00:00Z"),
-      labeled(BOT, "2026-10-18T10:00:00Z"),
-      escalated(),
-    ],
-  });
-  await run(w);
-  assert.deepEqual(w.writes(), []);
+test("a review-lane hold with no binding counts only unedited: an edit after posting makes it no lane's", async () => {
+  // The lanes never edit a hold comment, and any workflow's token can, so an
+  // edited hold with no binding is no review lane's (lane-binding.mjs
+  // legacyCounts). An unedited one still holds.
+  const timeline = (updatedAt) => [
+    laneHold(ACTIONS_BOT, "2026-10-18T08:00:00Z", { updatedAt }),
+    unlabeled(OWNER, "2026-10-18T09:00:00Z"),
+    labeled(BOT, "2026-10-18T10:00:00Z"),
+    escalated(),
+  ];
+  const edited = world({ timeline: timeline("2026-10-18T09:30:00Z") });
+  await run(edited);
+  assert.equal(edited.writes().at(-1)?.method, "DELETE");
+  const kept = world({ timeline: [laneHold(ACTIONS_BOT, "2026-10-18T11:00:00Z"), labeled(BOT, "2026-10-18T10:00:00Z"), escalated()] });
+  await run(kept);
+  assert.deepEqual(kept.writes(), []);
 });
 
 test("a hold marker from github-actions[bot] with no lane footer, or from another bot, is not a review-lane hold", async () => {
@@ -1494,7 +1499,7 @@ test("a ci-fix stop comes off once a trusted push moved the head and no check bu
     await run(w, TRUST_ENV);
     assert.equal(w.writes().length, 2, reason);
     assert.match(w.writes()[0].body.body, new RegExp(`reason=${reason} head=${HEAD}`));
-    assert.match(w.writes()[0].body.body, /no check other than ci-status fails/);
+    assert.match(w.writes()[0].body.body, /no check other than CI Status fails/);
   }
 });
 
@@ -1794,16 +1799,24 @@ test("a needs-session stop on an older head comes off once the new head carries 
     const { code, logs } = await run(w);
     assert.equal(code, 0);
     assert.deepEqual(w.writes(), [{ method: "DELETE", path: `/repos/${REPO}/issues/8/labels/needs-session`, body: undefined }], reason);
-    const cleared = new RegExp(`#8 needs-session cleared: ${reason} stopped at ${KEY}, and no ${laneContext(reason)} status fails at the new head ${HEAD}; no check other than ci-status fails`);
+    const cleared = new RegExp(`#8 needs-session cleared: ${reason} stopped at ${KEY}, and no ${laneContext(reason)} status fails at the new head ${HEAD}; no check other than CI Status fails`);
     assert.ok(logs.some((line) => cleared.test(line)), logs.join("\n"));
   }
+});
+
+test("a red CI Status and its ci-status alias are not counted either", async () => {
+  const headChecks = [check("test-node", "success"), check("CI Status", "failure", { id: 2 }), check("ci-status", "failure", { id: 3 })];
+  const keyStatuses = [status("failure", ACTIONS_BOT, "2026-10-18T10:00:01Z", laneContext("ci-fix-escalated"))];
+  const w = sessionWorld({ timeline: [sessionLabeled(BOT), stopped("ci-fix-escalated", KEY)], keyStatuses, headChecks });
+  assert.equal((await run(w)).code, 0);
+  assert.deepEqual(w.writes(), [{ method: "DELETE", path: `/repos/${REPO}/issues/8/labels/needs-session`, body: undefined }]);
 });
 
 test("a new head keeps needs-session while the stop's status fails there or its checks do not pass", async () => {
   for (const [options, kept] of [
     [{ statuses: [status("failure")], headChecks: NEW_HEAD_GREEN }, /pr-unblock\/fix-ci reads failure at the new head/],
     [{ statuses: [status("pending"), status("success")], headChecks: NEW_HEAD_GREEN }, /pr-unblock\/fix-ci reads pending at the new head/],
-    [{ headChecks: RED }, /stays at the new head: a check other than ci-status fails/],
+    [{ headChecks: RED }, /stays at the new head: a check other than CI Status fails/],
     [{ headChecks: [check("ci-status", "failure")] }, /stays at the new head/],
     [{ headChecks: [{ ...check("test-node", "success"), status: "in_progress", conclusion: null }] }, /stays at the new head/],
     [{ headChecks: new Error("HTTP 403") }, /stays at the new head/],

@@ -193,9 +193,10 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 
 import { LIMIT_DEFAULTS, clampReset, readLimits } from "./limits.mjs";
-import { networkError, retryFetch } from "./retry-fetch.mjs";
+import { networkError, retryFetch } from "../lib/retry-fetch.mjs";
 import { refusalText, sayWhy } from "../lib/admission-comment.mjs";
 import { doneEvidence, parentDone, RUN_WORDS, stopLine } from "../lib/done-evidence.mjs";
+import { markLaneHold } from "../lib/lane-hold-marker.mjs";
 import { personReasonLines } from "../lib/stop-reason.mjs";
 import { OUTSIDE_ACTOR_LABEL, trackerBindingText, UNTRUSTED_LABELS, visibleLines } from "../pr-merge/merge-holds.mjs";
 import { ATTENDED_LABEL, causeName, HOST_RUN_LABEL, leadingCode, runCode, securityWord, STOP_ROUTES, stopFault, stopReasonCode, stopRetries, stopRoute, stopWhy } from "./stop-routes.mjs";
@@ -2353,6 +2354,7 @@ async function finishStop(github, repo, plan, { bot, appId, humans, runId, limit
     const counted = { ...(await read()), outcome: plan.exit };
     if (spentOnFaults(plan, restartMarkers(counted), runId, limits)) {
       console.log(`::notice title=report-outcome::issue #${plan.issueNumber} stopped on a fault (${plan.stop}), and every retry since a person last added agent-ready was one too; it keeps agent-ready and a later run tries again`);
+      markLaneHold();
       return;
     }
     plan = capRetries(plan, countRestarts(counted), limits);

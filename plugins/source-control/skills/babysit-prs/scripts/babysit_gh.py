@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Literal, cast, overload
 from urllib.parse import quote, unquote, urlparse
 
+import babysit_lane_binding as lane_binding
 import babysit_run_cache as run_cache
 from babysit_util import (
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
@@ -292,14 +293,15 @@ def _send(
     limits_pool = _limits_pool(args, env_overrides)
     if guarded:
         _refuse_if_exhausted(pool, limits_pool)
-    if guarded and _is_write(args) and writes_paused(limits_pool):
+    write = guarded and _is_write(args)
+    if write and writes_paused(limits_pool):
         raise WritesPaused(
             f"{' '.join(['gh', *args[:2]])} not sent: the {limits_pool} pool "
             "is below its writer-pause share"
         )
     if (
         guarded
-        and not _is_write(args)
+        and not write
         and os.environ.get(READ_FLOOR_STOP_ENV) == "1"
         and low_headroom(limits_pool)
     ):
@@ -420,7 +422,6 @@ class RateLimitExhausted(BaseException):
         self.reason = reason
 
     def error_line(self) -> str:
-        pool = "every" if self.pool == ALL_POOLS else f"the {self.pool}"
         try:
             reset = (
                 "unknown"
@@ -433,7 +434,8 @@ class RateLimitExhausted(BaseException):
             # MAX_RESET is past the year 9999 datetime can show.
             reset = f"epoch second {int(self.reset)}"
         return (
-            f"::error title=GitHub rate limit::{pool} pool is exhausted "
+            "::error title=GitHub rate limit::"
+            f"{_pool_label(self.pool)} pool is exhausted "
             f"({self.reason}); no GitHub call is sent before {reset}"
         )
 
@@ -530,6 +532,11 @@ def stopped_until(pool: str, *, now: float | None = None) -> int | None:
     return at if at > (time.time() if now is None else now) else None
 
 
+def _pool_label(pool: str) -> str:
+    """`every` for `ALL_POOLS`, else `the <pool>`, as an `::error` names it."""
+    return "every" if pool == ALL_POOLS else f"the {pool}"
+
+
 def _record_stop(pool: str, reset: float) -> None:
     """Append a stop to the job's stop file, as rate-guard.mjs writes one.
     Never raises: the in-process trip still holds, and a stop the file cannot
@@ -542,9 +549,9 @@ def _record_stop(pool: str, reset: float) -> None:
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(f"{pool} {int(reset)}\n")
     except OSError as exc:
-        name = "every" if pool == ALL_POOLS else f"the {pool}"
         print(
-            f"::error title=GitHub rate limit::{name} pool's stop could not be "
+            "::error title=GitHub rate limit::"
+            f"{_pool_label(pool)} pool's stop could not be "
             f"recorded in the job's stop file ({exc.strerror or exc}), so later "
             "steps do not see it",
             file=sys.stderr,
@@ -665,12 +672,20 @@ def _limits_pool(args: list[str], env_overrides: Mapping[str, str] | None) -> st
     `github-token` in Actions and `owner-token` anywhere else."""
     if _call_pool(args) == "graphql":
         return "graphql"
-    own = bool(env_overrides and "GH_TOKEN" in env_overrides)
-    name = os.environ.get("API_BUDGET_OVERRIDE_TOKEN" if own else "API_BUDGET_TOKEN")
+    name = _budget_token_name(env_overrides)
     if name in TOKEN_POOLS:
-        return str(name)
+        return name
     return (
         "github-token" if os.environ.get("GITHUB_ACTIONS") == "true" else "owner-token"
+    )
+
+
+def _budget_token_name(env_overrides: Mapping[str, str] | None) -> str:
+    """The token name the job gives for a call: API_BUDGET_OVERRIDE_TOKEN for a
+    call carrying its own GH_TOKEN, else API_BUDGET_TOKEN; empty when unset."""
+    own = bool(env_overrides and "GH_TOKEN" in env_overrides)
+    return os.environ.get(
+        "API_BUDGET_OVERRIDE_TOKEN" if own else "API_BUDGET_TOKEN", ""
     )
 
 
@@ -803,16 +818,8 @@ def _guard_response(
     limit = _int_header(headers, "x-ratelimit-limit")
     # `limits.api` shares a token's core and GraphQL pools; a smaller pool
     # (search, code search) is no reading of either.
-    if (
-        remaining is not None
-        and limit
-        and headers.get("x-ratelimit-resource")
-        in (
-            None,
-            "core",
-            "graphql",
-        )
-    ):
+    resource = headers.get("x-ratelimit-resource")
+    if remaining is not None and limit and resource in (None, "core", "graphql"):
         _headroom[limits_pool] = (remaining, limit)
     if not reading["latched"]:
         return
@@ -945,10 +952,7 @@ def _includes_headers(args: list[str]) -> bool:
 
 
 def _api_budget_token(env_overrides: Mapping[str, str] | None) -> str | None:
-    own = bool(env_overrides and "GH_TOKEN" in env_overrides)
-    name = os.environ.get(
-        "API_BUDGET_OVERRIDE_TOKEN" if own else "API_BUDGET_TOKEN", ""
-    )
+    name = _budget_token_name(env_overrides)
     if not os.environ.get("RUNNER_TEMP") or not _API_BUDGET_NAME.fullmatch(name):
         return None
     return name
@@ -984,11 +988,17 @@ def _api_budget_write(
         for key, value in headers.items()
         if key.startswith("x-ratelimit-")
     }
+    _api_budget_append(token, [_api_budget_line(str(status), readings, route)])
+
+
+def _api_budget_append(token: str, lines: Iterable[str]) -> None:
+    """Append lines to the token's file under $RUNNER_TEMP/api-budget. Never
+    raises: lines that cannot be written are dropped."""
     try:
         path = os.path.join(os.environ["RUNNER_TEMP"], "api-budget")
         os.makedirs(path, exist_ok=True)
         with open(os.path.join(path, token), "a", encoding="utf-8") as handle:
-            handle.write(_api_budget_line(str(status), readings, route))
+            handle.writelines(lines)
     except OSError:
         pass
 
@@ -1037,13 +1047,7 @@ def _api_budget_trace(token: str, stderr: str) -> str:
             kept.append(line)
             last = line
     if routes:
-        try:
-            path = os.path.join(os.environ["RUNNER_TEMP"], "api-budget")
-            os.makedirs(path, exist_ok=True)
-            with open(os.path.join(path, token), "a", encoding="utf-8") as handle:
-                handle.writelines(f"request {route}\n" for route in routes)
-        except OSError:
-            pass
+        _api_budget_append(token, [f"request {route}\n" for route in routes])
     text = "\n".join(kept)
     return text + "\n" if text and stderr.endswith("\n") else text
 
@@ -1308,9 +1312,7 @@ def is_owner_repo_pair(owner: str, repo: str) -> bool:
 
 def parse_repo_number(value: str) -> tuple[str, int]:
     value = value.strip()
-    owner = ""
-    repo = ""
-    number = ""
+    owner = repo = number = ""
     parsed = urlparse(value)
     if parsed.scheme or parsed.netloc:
         parts = [unquote(part) for part in parsed.path.strip("/").split("/")]
@@ -1368,12 +1370,8 @@ def rest_list_repos_for_owner(owner: str) -> list[str]:
         rows = fetch_paginated_api(
             f"users/{owner}/repos?per_page=100", f"{owner} repositories"
         )
-    repos: list[str] = []
-    for row in rows:
-        name = str(row.get("full_name") or "").strip().casefold()
-        if name:
-            repos.append(name)
-    return repos
+    names = (str(row.get("full_name") or "").strip().casefold() for row in rows)
+    return [name for name in names if name]
 
 
 def list_repos_for_owner(owner: str) -> list[str]:
@@ -1626,24 +1624,20 @@ def discover_prs(
     repo_list = [repo for repo in (repos or []) if repo]
     if bool(owner_list) == bool(repo_list):
         raise ValueError("discover_prs requires exactly one of owners or repos")
-    author_list: list[str | None] = [author for author in (authors or []) if author]
-    if not author_list:
-        author_list = [None]
+    author_list: list[str | None] = [
+        author for author in (authors or []) if author
+    ] or [None]
     found: dict[str, tuple[str, int]] = {}
     errors: list[str] = []
-    if repo_list:
-        per_repo_limit = max(limit, 1)
-        for author in author_list:
+    for author in author_list:
+        if repo_list:
             for repo in repo_list:
-                _list_prs_for_repo(repo, per_repo_limit, author, found, errors)
-    else:
-        for author in author_list:
-            searched, search_errors = _search_prs_for_owners(owner_list, limit, author)
-            listed, list_errors = _list_prs_for_owners(owner_list, limit, author)
-            found.update(searched)
-            found.update(listed)
-            errors.extend(search_errors)
-            errors.extend(list_errors)
+                _list_prs_for_repo(repo, max(limit, 1), author, found, errors)
+            continue
+        for strategy in (_search_prs_for_owners, _list_prs_for_owners):
+            rows, strategy_errors = strategy(owner_list, limit, author)
+            found.update(rows)
+            errors.extend(strategy_errors)
     return sorted(found.values()), list(dict.fromkeys(errors))
 
 
@@ -1651,8 +1645,7 @@ def fetch_pull_request_author(repo: str, number: int) -> str:
     """The PR author's login from `gh pr view --json author`."""
     repo = repo.casefold()
     payload = gh_json(["pr", "view", str(number), "--repo", repo, "--json", "author"])
-    author = payload.get("author") if is_json_object(payload) else None
-    login = author.get("login") if is_json_object(author) else None
+    login = dig(payload, "author", "login")
     if not isinstance(login, str) or not login:
         # Fail closed: an unread author cannot be shown not to be a self login.
         raise RuntimeError(f"Unexpected gh pr view author for {repo}#{number}")
@@ -1790,7 +1783,7 @@ def rest_check_rollup(repo: str, head_sha: str) -> list[dict[str, Any]]:
         f"{repo}@{head_sha} check runs",
         items_key="check_runs",
     ):
-        suite_id = json_object(run.get("check_suite")).get("id")
+        suite_id = dig(run, "check_suite", "id")
         rollup.append(
             {
                 "__typename": "CheckRun",
@@ -1871,8 +1864,8 @@ def rest_view_pr(repo: str, number: int) -> dict[str, Any]:
     pull = cast(dict[str, Any], data)
     head = json_object(pull.get("head"))
     base = json_object(pull.get("base"))
-    head_repo = str(json_object(head.get("repo")).get("full_name") or "")
-    base_repo = str(json_object(base.get("repo")).get("full_name") or "")
+    head_repo = str(dig(head, "repo", "full_name") or "")
+    base_repo = str(dig(base, "repo", "full_name") or "")
     head_sha = str(head.get("sha") or "")
     mergeable = pull.get("mergeable")
     reviews = fetch_pull_request_reviews(repo, number)
@@ -1885,10 +1878,7 @@ def rest_view_pr(repo: str, number: int) -> dict[str, Any]:
         "headRefOid": head_sha,
         "headRepository": {"nameWithOwner": head_repo},
         "headRepositoryOwner": {
-            "login": str(
-                json_object(json_object(head.get("repo")).get("owner")).get("login")
-                or ""
-            )
+            "login": str(dig(head, "repo", "owner", "login") or "")
         },
         "isDraft": bool(pull.get("draft")),
         "isCrossRepository": bool(head_repo and base_repo and head_repo != base_repo),
@@ -2025,26 +2015,24 @@ def flatten_paginated_items(
     page, each with no name, no status and no conclusion, and every real check
     run on the commit disappears behind it.
     """
+    items: list[Any]
     if items_key is not None:
         pages = value if is_json_array(value) else [value]
-        items: list[Any] = []
-        for page in pages:
-            if not is_json_object(page) or not is_json_array(page.get(items_key)):
-                raise RuntimeError(f"Unexpected paginated response for {label}")
-            items.extend(page[items_key])
-        if not all(is_json_object(item) for item in items):
-            raise RuntimeError(f"Unexpected paginated response items for {label}")
-        return items
-    if not is_json_array(value):
+        if not all(
+            is_json_object(page) and is_json_array(page.get(items_key))
+            for page in pages
+        ):
+            raise RuntimeError(f"Unexpected paginated response for {label}")
+        items = [item for page in pages for item in page[items_key]]
+    elif not is_json_array(value):
         raise RuntimeError(f"Unexpected paginated response for {label}")
-    if value and all(is_json_array(page) for page in value):
+    elif value and all(is_json_array(page) for page in value):
         items = [item for page in value for item in page]
-        if not all(is_json_object(item) for item in items):
-            raise RuntimeError(f"Unexpected paginated response items for {label}")
-        return items
-    if all(is_json_object(item) for item in value):
-        return list(value)
-    raise RuntimeError(f"Unexpected paginated response items for {label}")
+    else:
+        items = list(value)
+    if not all(is_json_object(item) for item in items):
+        raise RuntimeError(f"Unexpected paginated response items for {label}")
+    return items
 
 
 # A filtered workflow-run listing returns at most this many runs per search:
@@ -2221,16 +2209,13 @@ def fetch_pull_request_commits(
         )
     out: list[dict[str, Any]] = []
     for row in rows:
-        commit = row.get("commit")
-        verification = commit.get("verification") if is_json_object(commit) else None
-        if is_json_object(verification):
-            verified = verification.get("verified") is True
-            reason = str(verification.get("reason") or "unreadable")
-        else:
-            verified = False
-            reason = "unreadable"
+        verification = json_object(dig(row, "commit", "verification"))
         out.append(
-            {"sha": str(row.get("sha") or ""), "verified": verified, "reason": reason}
+            {
+                "sha": str(row.get("sha") or ""),
+                "verified": verification.get("verified") is True,
+                "reason": str(verification.get("reason") or "unreadable"),
+            }
         )
     return out
 
@@ -2282,10 +2267,9 @@ def rest_hydrate_reviews(pr: dict[str, Any], repo: str, number: int) -> None:
     it again would repeat an identical paginated request per PR per pass, so
     the drop of `latestReviews` still runs and the refetch does not.
     """
-    if pr.get("_graphql_available") is False and is_json_array(pr.get("reviews")):
-        pr.pop("latestReviews", None)
-        return
-    pr["reviews"] = fetch_pull_request_reviews(repo, number)
+    from_rest = pr.get("_graphql_available") is False
+    if not (from_rest and is_json_array(pr.get("reviews"))):
+        pr["reviews"] = fetch_pull_request_reviews(repo, number)
     pr.pop("latestReviews", None)
 
 
@@ -2294,6 +2278,12 @@ def fetch_pull_request_review_comments(repo: str, number: int) -> list[dict[str,
         f"repos/{repo}/pulls/{number}/comments?per_page=100",
         f"{repo}#{number} review comments",
     )
+
+
+# What `fetch_review_threads` requires of every comment it returns.
+_REVIEW_COMMENT_KEYS = frozenset(
+    {"body", "path", "url", "createdAt", "updatedAt", "databaseId"}
+)
 
 
 def fetch_review_threads(
@@ -2394,11 +2384,7 @@ def fetch_review_threads(
                 raise RuntimeError(f"Malformed review thread for {repo}#{number}")
             if thread["isResolved"] and not include_resolved:
                 continue
-            comment_connection = thread.get("comments")
-            if not is_json_object(comment_connection):
-                raise RuntimeError(
-                    f"Malformed comments connection in review thread {thread['id']}"
-                )
+            comment_connection = json_object(thread.get("comments"))
             comment_page_info = comment_connection.get("pageInfo")
             comment_nodes = comment_connection.get("nodes")
             total_count = comment_connection.get("totalCount")
@@ -2422,17 +2408,7 @@ def fetch_review_threads(
                     raise RuntimeError(
                         f"Malformed comment author in review thread {thread['id']}"
                     )
-                if any(
-                    key not in comment
-                    for key in (
-                        "body",
-                        "path",
-                        "url",
-                        "createdAt",
-                        "updatedAt",
-                        "databaseId",
-                    )
-                ):
+                if not _REVIEW_COMMENT_KEYS.issubset(comment):
                     raise RuntimeError(
                         f"Incomplete comment in review thread {thread['id']}"
                     )
@@ -2567,6 +2543,51 @@ def carried_lane_attempts(
     return [*attempts[:-1], {**item, "jobs": latest["jobs"]}]
 
 
+def _api_read(
+    path: str, env: Mapping[str, str] | None = None, binary: bool = False
+) -> Any:
+    """One REST GET: parsed JSON, or the raw bytes when `binary`. A failed
+    read raises `RuntimeError`."""
+    if binary:
+        return _run_gh(
+            ["api", path],
+            timeout_seconds=None,
+            check=True,
+            env_overrides=env,
+            binary=True,
+        ).stdout
+    return gh_json(["api", path], env) if env else gh_json(["api", path])
+
+
+def lane_binding_checker(
+    repo: str,
+    number: int,
+    workflows: Mapping[str, str],
+    env_overrides: Mapping[str, str] | None = None,
+) -> lane_binding.Check:
+    """A `babysit_lane_binding.lane_checker` for one pull request's lane
+    comments, reading the pull request, runs, their artifacts and the record
+    zips over REST with `env_overrides`. It reads only for a comment that
+    carries a binding; a failed read raises."""
+    return lane_binding.lane_checker(
+        pr=number,
+        get_pull=lambda pr: json_object(_api_read(f"repos/{repo}/pulls/{pr}", env_overrides)),
+        get_run=lambda run_id: json_object(
+            _api_read(f"repos/{repo}/actions/runs/{run_id}", env_overrides)
+        ),
+        list_artifacts=lambda run_id: fetch_paginated_api(
+            f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100",
+            f"run {run_id} artifacts",
+            items_key="artifacts",
+            env_overrides=env_overrides,
+        ),
+        download=lambda artifact_id: _api_read(
+            f"repos/{repo}/actions/artifacts/{artifact_id}/zip", env_overrides, True
+        ),
+        workflows=workflows,
+    )
+
+
 def collect_main_reviews(
     repo: str,
     names: Mapping[str, str],
@@ -2586,15 +2607,7 @@ def collect_main_reviews(
     env = env_overrides
 
     def read(path: str, binary: bool = False) -> Any:
-        if binary:
-            return _run_gh(
-                ["api", path],
-                timeout_seconds=None,
-                check=True,
-                env_overrides=env,
-                binary=True,
-            ).stdout
-        return gh_json(["api", path], env) if env else gh_json(["api", path])
+        return _api_read(path, env, binary)
 
     records: list[dict[str, Any]] = []
     on_branch: dict[str, bool] = {}
