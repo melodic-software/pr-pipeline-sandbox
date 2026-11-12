@@ -19,7 +19,9 @@ import process from "node:process";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { GitHubError } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
+import { createHash } from "node:crypto";
+
+import { createGitHub, GitHubError } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
 import { createRateLimitLatch } from "../../actions/log-api-budget/rate-guard.mjs";
 import { CARRY_MAX, carryMain, closing, CONTRACT_STEP, DO_NOT_MERGE_LINE, DRAFT_STEP, failureAnnotation, HOLD_STEP, linkedIssues, main, packReads, ratedBy, RELINK_QUERY, resolvePull, SIBLINGS_MAX, siblingNumbers, takeReads } from "./resolve-pr.mjs";
 import { KEPT_JOBS, keptJobs, shapeJobs } from "./upstream-jobs.mjs";
@@ -740,7 +742,7 @@ const CI_STEPS = [
   ["Complete job", "success"],
 ];
 const ciJob = (steps = CI_STEPS, conclusion = "failure") => ({ id: 9001, name: "ci-status", conclusion, steps: steps.map(([name, c]) => ({ name, conclusion: c })) });
-const heldJobs = (ci = ciJob(), others = [{ id: 9002, name: "lint-repo", conclusion: "success" }, { id: 9003, name: "pr-unblock / address-feedback", conclusion: "neutral" }]) => {
+const heldJobs = (ci = ciJob(), others = [{ id: 9002, name: "Lint Repo", conclusion: "success" }, { id: 9003, name: "pr-unblock / address-feedback", conclusion: "neutral" }]) => {
   const jobs = [...others, ci];
   return { total_count: jobs.length, jobs };
 };
@@ -767,9 +769,9 @@ test("a run that failed only on a hold an approval of the head lifts is judged",
 test("a held run reads CI Status's log, and its ci-status alias is no other failure", async () => {
   const gate = { ...ciJob(), name: "CI Status" };
   const alias = { id: 9009, name: "ci-status", conclusion: "failure", steps: [{ name: "Report the conclusion of `CI Status`", conclusion: "failure" }] };
-  const jobs = heldJobs(gate, [{ id: 9002, name: "lint-repo", conclusion: "success" }, alias]);
+  const jobs = heldJobs(gate, [{ id: 9002, name: "Lint Repo", conclusion: "success" }, alias]);
   assert.equal(await held(logOf(PATH_HOLD), { jobs }), "ok");
-  const failedLane = heldJobs(gate, [{ id: 9002, name: "lint-repo", conclusion: "failure" }, alias]);
+  const failedLane = heldJobs(gate, [{ id: 9002, name: "Lint Repo", conclusion: "failure" }, alias]);
   assert.equal(await held(logOf(PATH_HOLD), { jobs: failedLane }), "not-a-passing-run");
 });
 
@@ -785,8 +787,8 @@ test("a run that failed on anything but a hold an approval lifts starts nothing"
     "a second failed step's exit": [`${logOf(PATH_HOLD)}\n2026-10-28T16:21:46.0000000Z ##[error]Process completed with exit code 1.`],
     "an unreadable log": [null, { jobs: heldJobs() }, async () => { throw new Error("502"); }],
     "a pr-unblock stop too": [logOf(PATH_HOLD), { jobs: heldJobs(ciJob(CI_STEPS.map(([n, c]) => [n, n.includes("pr-unblock") ? "failure" : c]))) }],
-    "a failed lane": [logOf(PATH_HOLD), { jobs: heldJobs(ciJob(), [{ id: 9002, name: "lint-repo", conclusion: "failure" }]) }],
-    "a cancelled lane": [logOf(PATH_HOLD), { jobs: heldJobs(ciJob(), [{ id: 9002, name: "lint-repo", conclusion: "cancelled" }]) }],
+    "a failed lane": [logOf(PATH_HOLD), { jobs: heldJobs(ciJob(), [{ id: 9002, name: "Lint Repo", conclusion: "failure" }]) }],
+    "a cancelled lane": [logOf(PATH_HOLD), { jobs: heldJobs(ciJob(), [{ id: 9002, name: "Lint Repo", conclusion: "cancelled" }]) }],
     "a failed aggregate": [logOf(PATH_HOLD), { jobs: heldJobs(ciJob(CI_STEPS.map(([n, c]) => [n, n === "Aggregate lane results" ? "failure" : c]))) }],
     "a step list cut before the aggregate": [logOf(PATH_HOLD), { jobs: heldJobs(ciJob(CI_STEPS.slice(0, 6))) }],
     "no step list": [logOf(PATH_HOLD), { jobs: heldJobs(ciJob([])) }],
@@ -1164,7 +1166,7 @@ const UNREADABLE_DRAFT_STATE = {
   "an empty step list": ciStatusWith([]),
   "the draft step listed with no conclusion": ciStatusWith([{ name: "Note a draft", conclusion: null }]),
   "the draft step not listed": ciStatusWith([{ name: "Aggregate lane results", conclusion: "success" }]),
-  "no ci-status job": { total_count: 1, jobs: [{ id: 9002, name: "lint-repo", conclusion: "success", steps: [] }] },
+  "no ci-status job": { total_count: 1, jobs: [{ id: 9002, name: "Lint Repo", conclusion: "success", steps: [] }] },
 };
 
 test("a run whose draft step is not listed with a conclusion is not judged, and a skipped one is", async () => {
@@ -2030,9 +2032,9 @@ test("main keeps the run's jobs in RUNNER_TEMP for upstream-jobs.mjs only when i
   const withUrl = { ...jobs, jobs: jobs.jobs.map((job) => (job.id === 9002 ? { ...job, html_url: jobPage } : job)) };
   await main(linked, { github: fake({ jobs: withUrl }) });
   const keptLinked = JSON.parse(readFileSync(path.join(linked.RUNNER_TEMP, KEPT_JOBS), "utf8")).jobs;
-  assert.deepEqual(keptLinked.find((job) => job.name === "lint-repo"), { name: "lint-repo", conclusion: "success", url: jobPage });
+  assert.deepEqual(keptLinked.find((job) => job.name === "Lint Repo"), { name: "Lint Repo", conclusion: "success", url: jobPage });
   assert.equal(keptLinked.find((job) => job.name === "ci-status").url, null);
-  assert.deepEqual(keptJobs(linked, RUN).jobs.find((job) => job.name === "lint-repo"), { name: "lint-repo", conclusion: "success", url: jobPage });
+  assert.deepEqual(keptJobs(linked, RUN).jobs.find((job) => job.name === "Lint Repo"), { name: "Lint Repo", conclusion: "success", url: jobPage });
   // A head already judged, after its jobs were read, leaves no file.
   const skipped = { ...env, RUNNER_TEMP: tempDir("pr-verify-temp-") };
   await main(skipped, { github: fake({ jobs, artifacts: [artifact(`pr-verify-41-${HEAD}-fail-i7`, 77)], runs: { 77: verifyRun(77) } }) });
@@ -2228,7 +2230,7 @@ test("each path through the resolver makes a pinned number of API calls", async 
 
 test("a failed run whose jobs are not a hold's skips on the run and its jobs alone, never reading the commit's pull requests", async () => {
   const readLog = async (id) => (id === 9001 ? logOf(PATH_HOLD) : "");
-  const failedLane = heldJobs(ciJob(), [{ id: 9002, name: "lint-repo", conclusion: "failure" }]);
+  const failedLane = heldJobs(ciJob(), [{ id: 9002, name: "Lint Repo", conclusion: "failure" }]);
   const jobsPath = `/repos/${REPO}/actions/runs/${RUN}/jobs?filter=latest&per_page=100`;
   // Accepted precedence: such a run of a draft or another author's pull
   // request skips as not-a-passing-run, which no pull request read decides.
@@ -2429,6 +2431,189 @@ test("a rated read skips a head its own origin already rated, and only that", as
   assert.equal(await reason({ artifacts: [artifact(name, 903, true)], runs: { 903: rateRun(903) } }, { rated }), "ok");
   assert.equal(await reason({ pulls: [pull({ draft: true })] }, { rated }), "draft");
   assert.equal(await reason({ pulls: [HUMAN_PR] }, { rated }), "author-not-lane");
+});
+
+// fake()'s answers over HTTP through createGitHub. Each artifact-name listing
+// carries an ETag computed from its body, and one sent back as If-None-Match
+// that equals the current body's ETag answers 304 with no body. Sources:
+// GitHub's "Use conditional requests" ("If the response has not changed, you
+// will receive a 304 Not Modified response",
+// https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)
+// and the babysit reader's observation that the ETag follows the body across
+// names (babysit_verify_evidence.py, EMPTY_ETAG_SUFFIX). `etags: false`
+// sends none; `answer(listing)` may replace a listing's response.
+const tagOf = (text) => `W/"${createHash("sha256").update(text).digest("hex")}"`;
+const EMPTY_TAG = tagOf(JSON.stringify({ total_count: 0, artifacts: [] }));
+function overHttp(setup, { etags = true, answer } = {}) {
+  const github = fake(setup);
+  const listings = [];
+  const paths = [];
+  const fetchImpl = async (url, init) => {
+    const { pathname, search, searchParams } = new URL(url);
+    paths.push(pathname + search);
+    const json = await github(init.method, pathname + search, init.body === undefined ? undefined : JSON.parse(init.body));
+    const text = JSON.stringify(json);
+    if (!pathname.endsWith("/actions/artifacts")) {
+      return new Response(text, { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    const sent = init.headers["If-None-Match"] ?? null;
+    const tag = etags ? tagOf(text) : null;
+    const listing = { name: searchParams.get("name"), page: Number(searchParams.get("page")), sent, status: sent !== null && sent === tag ? 304 : 200 };
+    listings.push(listing);
+    const replaced = answer?.(listing);
+    if (replaced) {
+      listing.status = replaced.status;
+      return replaced;
+    }
+    if (listing.status === 304) {
+      return new Response(null, { status: 304, headers: { ETag: tag } });
+    }
+    return new Response(text, { status: 200, headers: { "Content-Type": "application/json", ...(tag && { ETag: tag }) } });
+  };
+  const latch = createRateLimitLatch({ log: () => {}, fail: () => {}, stopFile: null, limits: () => ({}) });
+  return { github: createGitHub({ token: "t", fetchImpl, latch, log: () => {}, sleep: async () => {} }), listings, paths };
+}
+const resolveOverHttp = (http, options = {}) =>
+  resolvePull({ github: http.github, repository: REPO, upstreamRunId: String(RUN), humans: HUMANS, laneIdentity: LANE, ...options });
+const FAIL_NAME = `pr-verify-41-${HEAD}-fail`;
+const PASS_NAME = `pr-verify-41-${HEAD}-pass`;
+const NOTES_NAME = `pr-verify-41-${HEAD}-pass-notes`;
+const FAIL_I7_NAME = `pr-verify-41-${HEAD}-fail-i7`;
+
+const OTHER_HEAD = { sha: HEAD, ref: "feat/other", repo: { full_name: REPO } };
+const OTHER_FAIL_NAME = `pr-verify-99-${HEAD}-fail`;
+
+test("after an empty listing that carries an ETag, pass names send it and a 304 reads as an empty name", async () => {
+  const http = overHttp({});
+  assert.equal((await resolveOverHttp(http)).reason, "ok");
+  assert.deepEqual(http.listings, [
+    { name: FAIL_NAME, page: 1, sent: null, status: 200 },
+    { name: PASS_NAME, page: 1, sent: EMPTY_TAG, status: 304 },
+    { name: NOTES_NAME, page: 1, sent: EMPTY_TAG, status: 304 },
+    { name: FAIL_I7_NAME, page: 1, sent: null, status: 200 },
+  ]);
+});
+
+test("no FAIL name is ever listed with If-None-Match", async () => {
+  // An already-judged head: a counted pass.
+  const pass = overHttp({ artifacts: [artifact(PASS_NAME, 77)], runs: { 77: verifyRun(77) } });
+  assert.equal((await resolveOverHttp(pass)).reason, "already-judged");
+  assert.deepEqual(pass.listings, [
+    { name: FAIL_NAME, page: 1, sent: null, status: 200 },
+    { name: PASS_NAME, page: 1, sent: EMPTY_TAG, status: 200 },
+    { name: NOTES_NAME, page: 1, sent: EMPTY_TAG, status: 304 },
+  ]);
+  // Another pull request's FAIL at the head, read after the empty own FAIL.
+  const other = overHttp({ pulls: [pull(), pull({ number: 99, state: "closed", head: OTHER_HEAD })], artifacts: [artifact(OTHER_FAIL_NAME, 78)], runs: { 78: verifyRun(78) } });
+  assert.equal((await resolveOverHttp(other)).reason, "already-judged");
+  assert.deepEqual(other.listings, [
+    { name: FAIL_NAME, page: 1, sent: null, status: 200 },
+    { name: OTHER_FAIL_NAME, page: 1, sent: null, status: 200 },
+  ]);
+  // This pull request's own FAIL, which no relink lifts.
+  const own = overHttp({ artifacts: [artifact(FAIL_NAME, 79)], runs: { 79: verifyRun(79) } });
+  assert.equal((await resolveOverHttp(own)).reason, "already-judged");
+  assert.deepEqual(own.listings, [{ name: FAIL_NAME, page: 1, sent: null, status: 200 }]);
+  // The same own FAIL after only trusted people linked an issue: the names after
+  // it (afterOwn) are read too, and every FAIL among them goes unconditional.
+  const relink = relinkAnswer({ edits: [{ editedAt: "2026-10-20T07:00:00Z", editor: PERSON }], events: [{ createdAt: "2026-10-20T08:00:00Z", actor: PERSON }] });
+  const relinkedHead = overHttp(relinked(relink, { pulls: [pull(), pull({ number: 99, state: "closed", head: OTHER_HEAD })] }));
+  assert.equal((await resolveOverHttp(relinkedHead)).reason, "relinked");
+  assert.deepEqual(relinkedHead.listings, [
+    { name: FAIL_NAME, page: 1, sent: null, status: 200 },
+    { name: OTHER_FAIL_NAME, page: 1, sent: null, status: 200 },
+    { name: PASS_NAME, page: 1, sent: EMPTY_TAG, status: 304 },
+    { name: NOTES_NAME, page: 1, sent: EMPTY_TAG, status: 304 },
+    { name: FAIL_I7_NAME, page: 1, sent: null, status: 200 },
+  ]);
+});
+
+test("a pass name that holds an artifact answers 200 under the ETag and its run is judged as before", async () => {
+  const pass = overHttp({ artifacts: [artifact(PASS_NAME, 77)], runs: { 77: verifyRun(77) } });
+  assert.equal((await resolveOverHttp(pass)).reason, "already-judged");
+  assert.ok(pass.paths.includes(`/repos/${REPO}/actions/runs/77`), pass.paths.join("\n"));
+  assert.ok(pass.paths.includes(`/repos/${REPO}/compare/${MAIN}...main`), pass.paths.join("\n"));
+  // More than one page: page 1 sends the ETag, later pages read as before, and
+  // the one unexpired artifact on page 2 still counts.
+  const many = [...Array.from({ length: 100 }, () => artifact(PASS_NAME, 77, true)), artifact(PASS_NAME, 78)];
+  const paged = overHttp({ artifacts: many, runs: { 78: verifyRun(78) } });
+  assert.equal((await resolveOverHttp(paged)).reason, "already-judged");
+  assert.deepEqual(paged.listings.slice(0, 3), [
+    { name: FAIL_NAME, page: 1, sent: null, status: 200 },
+    { name: PASS_NAME, page: 1, sent: EMPTY_TAG, status: 200 },
+    { name: PASS_NAME, page: 2, sent: null, status: 200 },
+  ]);
+});
+
+test("a server that answers 304 to every conditional read hides no FAIL, only a pass, which is judged again", async () => {
+  const lie = { answer: (listing) => (listing.sent !== null ? new Response(null, { status: 304 }) : undefined) };
+  // A recorded FAIL with this pull request's issues, and one under another pull request: each still stops the judgment.
+  const ownIssues = overHttp({ artifacts: [artifact(FAIL_I7_NAME, 78)], runs: { 78: verifyRun(78) } }, lie);
+  assert.equal((await resolveOverHttp(ownIssues)).reason, "already-judged");
+  const other = overHttp({ pulls: [pull(), pull({ number: 99, state: "closed", head: OTHER_HEAD })], artifacts: [artifact(OTHER_FAIL_NAME, 78)], runs: { 78: verifyRun(78) } }, lie);
+  assert.equal((await resolveOverHttp(other)).reason, "already-judged");
+  // A hidden pass costs one more judgment: the head proceeds and the pass's run is never read.
+  const pass = overHttp({ artifacts: [artifact(PASS_NAME, 77)], runs: { 77: verifyRun(77) } }, lie);
+  assert.equal((await resolveOverHttp(pass)).reason, "ok");
+  assert.ok(!pass.paths.includes(`/repos/${REPO}/actions/runs/77`), pass.paths.join("\n"));
+});
+
+test("only an empty listing's ETag is sent, and a 304 to a read that sent none throws", async () => {
+  // A first listing that is not empty (an expired FAIL) gives no ETag to send:
+  // the pass name is read unconditionally, and only its empty answer's ETag is sent after.
+  const expired = overHttp({ artifacts: [artifact(FAIL_NAME, 77, true)], runs: { 77: verifyRun(77) } });
+  assert.equal((await resolveOverHttp(expired)).reason, "ok");
+  assert.deepEqual(
+    expired.listings.map(({ sent }) => sent),
+    [null, null, EMPTY_TAG, null],
+  );
+  // A 304 to a read that sent no ETag is a failed read.
+  const unasked = overHttp({}, { answer: (listing) => (listing.sent === null ? new Response(null, { status: 304 }) : undefined) });
+  await assert.rejects(resolveOverHttp(unasked), (error) => error instanceof GitHubError && error.status === 304);
+});
+
+test("with no ETag on the empty listing, every name is read as before", async () => {
+  const http = overHttp({}, { etags: false });
+  assert.equal((await resolveOverHttp(http)).reason, "ok");
+  assert.deepEqual(http.listings, [
+    { name: FAIL_NAME, page: 1, sent: null, status: 200 },
+    { name: PASS_NAME, page: 1, sent: null, status: 200 },
+    { name: NOTES_NAME, page: 1, sent: null, status: 200 },
+    { name: FAIL_I7_NAME, page: 1, sent: null, status: 200 },
+  ]);
+  // The same reads, in the same order, as the plain fake makes them.
+  const plain = [];
+  const github = fake({});
+  await resolvePull({
+    github: async (method, apiPath, body) => (plain.push(apiPath), github(method, apiPath, body)),
+    repository: REPO,
+    upstreamRunId: String(RUN),
+    humans: HUMANS,
+    laneIdentity: LANE,
+  });
+  assert.deepEqual(http.paths, plain);
+});
+
+test("a conditional listing that fails still throws", async () => {
+  const refused = overHttp(
+    {},
+    { answer: (listing) => (listing.sent !== null ? new Response(JSON.stringify({ message: "API rate limit exceeded" }), { status: 403, headers: { "Content-Type": "application/json" } }) : undefined) },
+  );
+  await assert.rejects(resolveOverHttp(refused), (error) => error instanceof GitHubError && error.status === 403);
+});
+
+test("a proceeding job bills two artifact listings, and a pass-judged one two", async () => {
+  const billed = (http) => http.listings.filter(({ status }) => status !== 304).map(({ name }) => name);
+  const unjudged = overHttp({});
+  assert.equal((await resolveOverHttp(unjudged)).reason, "ok");
+  assert.deepEqual(billed(unjudged), [FAIL_NAME, FAIL_I7_NAME]);
+  const judgedByPass = overHttp({ artifacts: [artifact(PASS_NAME, 77)], runs: { 77: verifyRun(77) } });
+  assert.equal((await resolveOverHttp(judgedByPass)).reason, "already-judged");
+  assert.deepEqual(billed(judgedByPass), [FAIL_NAME, PASS_NAME]);
+  assert.deepEqual(
+    judgedByPass.listings.filter(({ status }) => status === 304).map(({ name }) => name),
+    [NOTES_NAME],
+  );
 });
 
 test("the failure and hold lines name RESOLVE_LANE when it is set", () => {
