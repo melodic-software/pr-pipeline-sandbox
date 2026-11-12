@@ -44,6 +44,7 @@ jobs:
   # human's PR event (refine-dispatch.activities), naming itself as
   # dispatcher-run-id, which both jobs pass to the trusted-trigger gate.
   fix-marker:
+    name: Fix Marker
     needs: fix-docs-head
     if: >-
       inputs.pr-number != '' && inputs.activity == 'fix-marker'
@@ -77,6 +78,7 @@ jobs:
   # fix-marker's push job, on a written patch only; every input is the scan
   # job's, never the run job's, since the run job runs head code.
   apply-marker-patch:
+    name: Apply Marker Patch
     needs: [fix-docs-head, fix-marker]
     if: ${{ !cancelled() && needs.fix-marker.outputs.scan-patch-state == 'written' }}
     permissions:
@@ -111,6 +113,7 @@ jobs:
   # cannot be forced. On main because a dispatch runs there and the broker
   # refuses a caller that differs from main's tip. Remove after the probe.
   fix-ci-context:
+    name: Fix CI Context
     if: >-
       github.event_name == 'workflow_dispatch' && inputs.activity == 'fix-ci-fallback'
       && format('{0}', github.event.sender.id) != vars.AUTOMATION_LANES_APP_SENDER_ID
@@ -176,6 +179,7 @@ jobs:
           if-no-files-found: error
 
   fix-ci:
+    name: Fix CI
     needs: fix-ci-context
     if: ${{ !cancelled() && needs.fix-ci-context.outputs.proceed == 'true' }}
     permissions:
@@ -205,6 +209,7 @@ jobs:
       scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
 
   fix-ci-subscription:
+    name: Fix CI Subscription
     needs: [fix-ci-context, fix-ci]
     if: >-
       ${{ !cancelled() && needs.fix-ci-context.outputs.proceed == 'true'
@@ -237,6 +242,7 @@ jobs:
       scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
 
   apply-patch:
+    name: Apply Patch
     needs: [fix-ci-context, fix-ci, fix-ci-subscription]
     if: >-
       ${{ !cancelled() && ((needs.fix-ci-subscription.outputs.patch-state || needs.fix-ci.outputs.patch-state) == 'written'
@@ -279,6 +285,7 @@ jobs:
   # It also reads whether the human-gated label holds fix-docs: only when a
   # lane escalation did not put it on (lane-hold.mjs); a held PR runs nothing.
   fix-docs-head:
+    name: Fix Docs Head
     if: >-
       inputs.pr-number != '' && (inputs.activity == 'fix-docs' || inputs.activity == 'fix-docs-no-key' || inputs.activity == 'fix-marker')
       && format('{0}', github.event.sender.id) != vars.AUTOMATION_LANES_APP_SENDER_ID
@@ -332,6 +339,7 @@ jobs:
   # role's API key alone (automations here). Drafts and do-not-merge PRs skip in the config's
   # applies-when, a human-gated hold in fix-docs-head, before any model turn.
   fix-docs:
+    name: Fix Docs
     needs: fix-docs-head
     if: >-
       inputs.pr-number != '' && (inputs.activity == 'fix-docs' || inputs.activity == 'fix-docs-no-key')
@@ -370,6 +378,7 @@ jobs:
   # empty, which starts no fallback; with no check posted,
   # fix-docs-dispatch.mjs dispatches the PR again.
   fix-docs-handoff:
+    name: Fix Docs Handoff
     needs: [fix-docs-head, fix-docs]
     if: ${{ !cancelled() && needs.fix-docs.result != 'skipped' }}
     runs-on: ubuntu-24.04
@@ -407,6 +416,7 @@ jobs:
   # fix-docs output: only the run job knows whether it was a credit stop or an
   # empty key, and head code can forge that.
   fix-docs-subscription:
+    name: Fix Docs Subscription
     needs: [fix-docs-head, fix-docs, fix-docs-handoff]
     if: >-
       ${{ !cancelled() && needs.fix-docs.result != 'skipped'
@@ -448,6 +458,7 @@ jobs:
   # head code. The head is fix-docs-head's, read by a job that ran no head
   # code; apply-patch still applies onto the head its own gate reads.
   apply-docs-patch:
+    name: Apply Docs Patch
     needs: [fix-docs-head, fix-docs, fix-docs-subscription]
     if: >-
       ${{ !cancelled()
