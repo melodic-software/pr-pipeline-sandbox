@@ -10,8 +10,6 @@ name: PR Refine
 run-name: "${{ github.event_name == 'workflow_dispatch' && format('pr-refine {0} #{1}', inputs.activity, inputs.pr-number) || 'pr-refine' }}"
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
       pr-number:
@@ -20,12 +18,12 @@ on:
         type: string
       activity:
         description: >-
-          refine runs nothing (fix-marker runs on pull_request only); fix-ci-fallback runs only
+          refine runs nothing; fix-marker runs the fix-marker probe; fix-ci-fallback runs only
           the Phase 5b fallback probe below; fix-docs runs main's fix-docs, and
           fix-docs-no-key runs it with an empty key (Phase 7.1 probes).
         required: false
         type: choice
-        options: [refine, fix-ci-fallback, fix-docs, fix-docs-no-key]
+        options: [refine, fix-marker, fix-ci-fallback, fix-docs, fix-docs-no-key]
         default: refine
       dispatcher-run-id:
         description: The dispatcher run that sent this dispatch; empty for a human dispatch.
@@ -38,13 +36,16 @@ permissions: {}
 jobs:
   # fix-marker is a read skill: the read runner runs it with no write token
   # and uploads its uncommitted edit as a patch, and apply-marker-patch pushes
-  # it under patch-rules.json's default row. It runs on pull_request only,
-  # whose event names the head the patch is made on, which no head code wrote.
+  # it under patch-rules.json's default row. It runs on a dispatch from main,
+  # as claude-code-plugins' pr-refine does, because the scan job's
+  # pr-pipeline-scan-carrier environment admits main only; fix-docs-head
+  # reads the head the patch is made on, which no head code wrote.
   fix-marker:
-    # The lanes App's own pull_request events never start a lane.
+    needs: fix-docs-head
     if: >-
-      github.event_name == 'pull_request'
+      inputs.pr-number != '' && inputs.activity == 'fix-marker'
       && format('{0}', github.event.sender.id) != vars.AUTOMATION_LANES_APP_SENDER_ID
+      && needs.fix-docs-head.outputs.held == 'false'
     permissions:
       actions: read # the read runner's key-credit gate lists the credit-stop markers
       contents: read
@@ -54,7 +55,7 @@ jobs:
       id-token: write
     concurrency:
       # One per-PR queue shared by every write lane: it queues, never cancels.
-      group: pr-pipeline-write-${{ github.event.pull_request.number || inputs.pr-number }}
+      group: pr-pipeline-write-${{ inputs.pr-number }}
       queue: max
     uses: ./.github/workflows/pr-run-activity-read.yml # zizmor: ignore[self-repository]
     with:
@@ -64,7 +65,7 @@ jobs:
       # No API key is passed, so the run takes the OAuth-token leg.
       fallback: no-key
       pr-number: ${{ inputs.pr-number }}
-      head-sha: ${{ github.event.pull_request.head.sha }}
+      head-sha: ${{ needs.fix-docs-head.outputs.head-sha }}
     secrets:
       claude-code-oauth-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
       scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
@@ -72,7 +73,7 @@ jobs:
   # fix-marker's push job, on a written patch only; every input is the scan
   # job's, never the run job's, since the run job runs head code.
   apply-marker-patch:
-    needs: fix-marker
+    needs: [fix-docs-head, fix-marker]
     if: ${{ !cancelled() && needs.fix-marker.outputs.scan-patch-state == 'written' }}
     permissions:
       actions: read # the write runner's run job reads the review lanes' comment records
@@ -82,7 +83,7 @@ jobs:
       issues: write
       id-token: write
     concurrency:
-      group: pr-pipeline-write-${{ github.event.pull_request.number || inputs.pr-number }}
+      group: pr-pipeline-write-${{ inputs.pr-number }}
       queue: max
     uses: ./.github/workflows/pr-run-activity-write.yml # zizmor: ignore[self-repository]
     with:
@@ -94,7 +95,7 @@ jobs:
       patch-sha256: ${{ needs.fix-marker.outputs.scan-patch-sha256 }}
       patch-attempt: ${{ needs.fix-marker.outputs.scan-patch-attempt }}
       patch-activity: fix-marker
-      patch-head-sha: ${{ github.event.pull_request.head.sha }}
+      patch-head-sha: ${{ needs.fix-docs-head.outputs.head-sha }}
       reply-attempt: ${{ needs.fix-marker.outputs.scan-reply-attempt }}
 
   # Sandbox-only probe of fix-ci's subscription fallback (claude-code-plugins
@@ -274,7 +275,7 @@ jobs:
   # lane escalation did not put it on (lane-hold.mjs); a held PR runs nothing.
   fix-docs-head:
     if: >-
-      inputs.pr-number != '' && (inputs.activity == 'fix-docs' || inputs.activity == 'fix-docs-no-key')
+      inputs.pr-number != '' && (inputs.activity == 'fix-docs' || inputs.activity == 'fix-docs-no-key' || inputs.activity == 'fix-marker')
       && format('{0}', github.event.sender.id) != vars.AUTOMATION_LANES_APP_SENDER_ID
     runs-on: ubuntu-24.04
     timeout-minutes: 5
