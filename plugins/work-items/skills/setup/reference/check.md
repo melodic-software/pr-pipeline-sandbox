@@ -10,31 +10,34 @@ check.
 
 1. **`jq` entry gate**, the authoritative check is
    [`reference/tracker-seam.md`](../../../reference/tracker-seam.md)
-   "entry-point presence checks"; probe it (`command -v jq`), don't restate it. Absent is FAIL with that
+   "Provider-neutral over the seam" (its three entry invariants); probe it (`command -v jq`), don't restate it. Absent is FAIL with that
    reference's install remediation, the schedule snippets parse with `jq` unconditionally.
 2. **Tracker provider binding**, resolve the convention home and `BINDING` (SKILL.md "Resolving the
    paths"). A broken pointer (resolver exit `3`) is FAIL, naming the resolver's message. Where no home
-   applies (exit `4` or `5`) → INFO: the seam reads only the legacy JSON file there, and setup
-   writes no binding until the repository binds a convention home. Then branch on which files bind:
+   applies (exit `4` or `5`) → INFO: nothing binds the repository there, and setup writes no
+   binding until the repository binds a convention home. Then branch on which files bind:
    - **Neither** `BINDING` nor `LEGACY` → INFO: the tracker seam is not bound, so every seam verb
      hard-errors (exit 3) until `apply` seeds it, and the role remap has nothing to configure; the
      remediation is `/work-items:setup apply`.
    - **`LEGACY` only** (`.work-item-tracker.json` exists and `<home>/work-items.yaml` has no
-     `tracker` key) → INFO: the binding exists only in the legacy JSON file, which the seam still
-     reads with a notice; `/work-items:setup apply` copies it into `<home>/work-items.yaml` and
-     keeps the JSON file. Validate the JSON file as below.
-   - **`BINDING`, with `LEGACY` too** → INFO: the JSON file is kept for the readers that still read
-     only it (SKILL.md "Provider binding" step 1); name any `provider` or `config` value that
-     differs between the two. When a `.work-item-tracker.local.json` exists and
+     `tracker` key) → FAIL: the binding exists only in the retired JSON file, which the seam no
+     longer reads, so every seam verb hard-errors (exit 3); the remediation is
+     `/work-items:setup apply`, which copies it into `<home>/work-items.yaml` and keeps the JSON
+     file. Validate the JSON file as below, so the copy's findings show up front.
+   - **`BINDING`, with `LEGACY` too** → INFO: the JSON file no longer binds and is kept only for
+     readers outside the plugin that still read it (SKILL.md "Provider binding" step 1); name any
+     `provider` or `config` value that differs between the two. When a `.work-item-tracker.local.json` exists and
      `<home>/work-items.local.yaml` has no `tracker` key, say the seam no longer reads that
      personal override, since it reads the one beside the YAML binding; `apply` copies it.
 
    Validate the binding that binds without mutating: `<home>/work-items.yaml` parses with
    `awk -f <plugin-root>/skills/triage/scripts/yaml-subset.awk` and its `tracker` mapping carries no
-   key outside `schema_version`, `provider`, `config` and `docs`, or the legacy file parses as JSON.
+   key outside `schema_version`, `provider`, `config` and `docs`, or, for `LEGACY` only, the JSON
+   file parses as JSON.
    It carries `schema_version` and a `provider`, and that provider resolves to a bundled
    adapter (`github`, `local-markdown`) or a consumer-local one at
-   `${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/tools/work-item-tracker/adapters/<provider>/`.
+   `<project root>/tools/work-item-tracker/adapters/<provider>/` ([`tracker-seam.md`](../../../reference/tracker-seam.md)
+   "Project root").
    A seeded provider (`jira`, `gitea`, `linear`) resolves only through that consumer-local copy: with
    none there it is FAIL, remediation `/work-items:setup apply`, which copies the seed. `config.lease_ttl_hours` is
    present, `local-markdown` additionally carries `config.storage_dir`, and `jira` additionally carries
@@ -42,10 +45,10 @@ check.
    unknown/unresolvable provider, or a missing required config key is FAIL, naming what is wrong.
    The ignore rule for `OVERRIDE` (`<home>/work-items.local.yaml`) is required whether or not the
    personal override file exists. A present personal override must parse (the YAML file with the same parser, its
-   `tracker` mapping; a legacy `.work-item-tracker.local.json`, still read beside a legacy-only
-   binding, as JSON), carry only allowlisted keys
+   `tracker` mapping; a legacy `.work-item-tracker.local.json`, which `apply` copies beside a
+   legacy-only binding, as JSON), carry only allowlisted keys
    (CONTRACT.md "Setup (binding file)"), and be gitignored, never tracked. Otherwise FAIL.
-   Ignored and untracked are **two independent probes**: run the same pair `apply` step 5 uses, per
+   Ignored and untracked are **two independent probes**: run the same pair "Provider binding" step 5 uses, per
    [`reference/personal-override-ignore-probes.md`](personal-override-ignore-probes.md). A bare
    `git check-ignore` is silent for an already-tracked personal override. Tracked is the more serious FAIL;
    name it as such when both hold.
@@ -58,7 +61,29 @@ check.
    check is the wrong gate), so an unrelated stale credential cannot skip the probe and let the
    very binding this exists to catch go unreported. Verdict on *why* the call failed
    rather than on failure alone:
-   - Resolves → INFO naming the `owner/repo` the seam will address.
+   - Resolves → INFO naming the `owner/repo` the seam will address. Then check that this is the
+     repository the user means: in a fork checkout the repository gh resolves can be upstream, and
+     the tracker is the fork. Run `gh repo set-default --view` and list the distinct GitHub
+     `owner/repo` values the remotes' fetch URLs name (`git remote -v`; the ssh and https forms of
+     one repository, with or without `.git`, compared case-insensitively, are one). Judge
+     `--view` by what it prints on stdout, never by its exit code:
+     - One distinct repository → nothing to add.
+     - Two or more, and `--view` printed no repository on stdout and its stderr reports that no
+       default is set → FAIL: the seam's repository is gh's guess.
+     - Two or more, and the default `--view` printed is not the fork → FAIL. The fork is the
+       tracker in a fork checkout; it is normally the repository `origin` names, and
+       `gh api repos/<owner>/<repo> --jq .parent.full_name` on it names its upstream.
+     - Two or more, and the default is the fork → INFO naming it.
+     - Any other `--view` output (gh missing, a gh without `--view`, an error) → INFO, naming the
+       message verbatim, for the reason the last bullet below gives.
+
+     The remediation for either FAIL is to print, with the fork filled in,
+     `gh repo set-default <owner>/<repo>`, and to say that the user confirms the repository first;
+     `check` never runs it. Pointer: the
+     [`gh repo set-default`](https://cli.github.com/manual/gh_repo_set-default) and
+     [`gh repo clone`](https://cli.github.com/manual/gh_repo_clone) manuals for how gh picks and
+     records the default and what `--view` prints; as of 2026-11-11 (gh 2.103.3); recheck when a
+     gh release changes how commands pick the base repository or what `--view` prints.
    - No remote, or no remote pointing at a known GitHub host → FAIL: nothing here can derive a repo,
      so every repo-scoped verb that is not handed the CONTRACT's explicit `--repo <owner>/<repo>`
      override fails at call time. Remediation is `/work-items:setup apply` with a user present,

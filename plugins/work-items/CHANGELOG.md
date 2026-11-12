@@ -3,6 +3,227 @@
 All notable changes to the `work-items` plugin are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this plugin uses semantic versioning.
 
+## [12.10.0] - 2026-11-12
+
+### Added
+
+- read issue-body skeletons from the org issue-body contract
+
+  track add, decompose, the agent brief and bugs:write now take their
+  issue-body headings from the issue-body contract the standards sync
+  delivers into each plugin's reference/ directory, the same record the
+  org issue forms are generated from. triage checks an issue body against
+  the contract with scripts/check-body.mjs, which accepts a field under
+  a `##` or `###` heading and treats a form's skipped answer as empty. The tidy
+  deferred-item body follows the task type.
+
+- fan the synced issue-body contract into the plugins
+
+  The standards sync delivers the contract once, to
+  docs/contracts/issue-body/contract.json. sync-shared-copies.sh now
+  copies a JSON canonical byte for byte (JSON has no comment syntax for a
+  header) and generates plugins/bugs and plugins/work-items
+  reference/issue-body-contract.json from it; the cross-plugin registry
+  records the cluster.
+
+## [12.9.6] - 2026-11-11
+
+### Changed
+
+- The README options reference lists its upstream documentation as pointers only, with no as-of date or recheck trigger.
+
+## [12.9.5] - 2026-11-11
+
+### Fixed
+
+- set the lane comment legacy cutoff
+
+  The review lanes write run bindings since ci-workflows#1071 merged
+  (2026-11-11T22:24:32Z). LEGACY_CUTOFF is now 48 hours later,
+  2026-11-13T22:24:32Z, in both ports: a lane comment with no binding counts
+  only when posted at or before it and never edited. The 48 hours cover a run
+  that resolved the reusable before the merge, and a re-run of one within the
+  lost-run reconciler's 24-hour lookback.
+
+  The clear-escalations test of an edited hold with no binding now expects
+  it to read as no lane's; fixtures for unbound lane comments carry dates
+  before the cutoff.
+
+## [12.9.4] - 2026-11-11
+
+### Fixed
+
+- count a lane comment record only once it is complete
+
+  The lane now closes each attempt's comment record with a
+  `{"complete":true}` line once its publish and hold steps did not fail
+  (ci-workflows pr-review-cli). The lane-binding checker counts a record as
+  covering its attempt only when it holds that line; an attempt cut off
+  between posting and recording reads as one that left no record, so its
+  comments fall to the time-window check instead of being rejected.
+
+  Test fixtures for lane comments with no binding now carry their
+  createdAt, ready for LEGACY_CUTOFF, which stays null here. The Python
+  test pins its cutoff to the JavaScript port's.
+
+## [12.9.3] - 2026-11-11
+
+### Changed
+
+- `reference/execution-shape.md` adds "Stacked per-item PRs": a chain of items that each build on the one before can ship as a stack under `per-item PRs`, deciding by the source-control plugin's `reference/stacked-prs.md`. `decompose`, `ship run` and `work` point at it; `work` states that CI mode never stacks.
+
+### Fixed
+
+- bind lane comments to their producing run
+
+  Every workflow's job token posts as github-actions[bot], so the
+  `claude-lane: <lane>` footer alone does not show a comment came from a
+  review lane. Readers now accept a github-actions[bot] lane comment only
+  when the run its binding line names (`<!-- claude-lane-run id=<run>
+  sha=<head> -->`, written by ci-workflows' pr-review-cli) is that lane's
+  caller workflow, ran on that head, and lists the comment's kind, id and
+  body digest in one of its `claude-lane-comments-<lane>-<attempt>`
+  artifacts. Every attempt's record counts; a run whose record expired
+  proves its comments by time. A comment that fails reads as one with no
+  footer; one that passes is read without its binding line, so severity
+  and footer parsing is unchanged. Comments with no binding keep counting
+  while LEGACY_CUTOFF is unset; a later change sets it once the lanes
+  write bindings.
+
+  - .github/scripts/lib/lane-binding.mjs, its fixtures and test (copies in
+    the review and work-items plugins), and babysit_lane_binding.py.
+  - pr-unblock: address-feedback, feedback-dispatch, publish-feedback,
+    resolve-threads, lane-hold, gate-recheck, dispatch and fix-ci-context
+    read comments and timelines through withLaneBinding.
+  - pr-merge: clear-escalations (thread roots, hold timelines, and the
+    ci-status filterLaneHolds entry), enable-auto-merge's lift check.
+  - ci-status: hold comments pass through filterLaneHolds from the base.
+  - babysit merge gate, review prior-findings, morning-brief
+    review-precision.
+  - ARTIFACT_READ_TOKEN and `actions: read` where a job reads the records;
+    the library and Python module join the hold floor as enforcement.
+
+- **Work-items snippets no longer embed `$(git rev-parse --show-toplevel)`.** The tracker, schedule, evaluator and backfill path fallbacks in `attend-queue`, `scan-todos`, `setup`, `ship`, `track`, `triage` and `work` now write a literal `<project root>`, which the shared tracker reference's new "Project root" section resolves in its own Bash call (`$CLAUDE_PROJECT_DIR` when set, else the repository root). This is the worktree-isolation rewrite `decompose` and `track add` got for [#6929](https://github.com/melodic-software/claude-code-plugins/issues/6929).
+
+- `setup check` now reports when the remotes name more than one GitHub repository and no `gh repo set-default` is recorded, or the recorded default is not the fork, and prints the `gh repo set-default <owner>/<repo>` fix.
+- The tracker's `CONTRACT.md`, the GitHub adapter and the morning briefing script's comments describe `gh`'s real repository order (`GH_REPO`, the recorded default, then the first remote by name) instead of "the working directory's git remote".
+- Plan comments, schedule reconciliation, label provisioning and the auto-merge disarm name the repository with `-R` instead of leaving it to `gh`.
+
+## [12.9.2] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [12.9.1] - 2026-11-11
+
+### Changed
+
+- Skill text that restated GitHub, `gh`, git and Claude Code behavior now points at the live
+  docs section, with an as-of date and a recheck trigger. Fixed broken sentences, wrong step and
+  section references, a stale warning that the shipped seam ignores a human-gated label remap,
+  a missing exit-18 row and a wrong verification limit in the attend-queue telemetry reference,
+  and an adapter-spec example that disagreed with the Gitea seed. No behavior change.
+
+## [12.9.0] - 2026-11-10
+
+### Added
+
+- `/work-items:work`: the dispatch brief tells the implementation worker to look up the project's glossary before naming new code and to return each domain term it coins for the PR body's `## Glossary candidates` section.
+
+- A parent issue that `/work-items:decompose` split into plain issues, with no spec container, now
+  gets closed. Once every child is closed, the new "Decomposed parent close" ritual in the issue
+  conventions reads the parent's Finish line. A `merged` Finish line closes the parent as
+  completed. Otherwise the parent stays open with one marked comment that says what is still open:
+  a child closed as not planned with no carrier among the other children, a missing Finish line,
+  or a `released` or `in use` check and the person who runs it. `/work-items:track done` runs the ritual for the parent of each item it
+  closes. `/work-items:track audit` runs it for every parent, which covers children a merged pull
+  request closed. Decompose's "leave the parent untouched" rule now points at the ritual.
+
+## [12.8.8] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [12.8.7] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [12.8.6] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+## [12.8.5] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [12.8.4] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [12.8.3] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+## [12.8.2] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+## [12.8.1] - 2026-11-10
+
+### Changed
+
+- `/work-items:triage` and `/work-items:decompose` read the glossary through the `/domain-driven-design:ubiquitous-language lookup` read action, with a repository search (root, any `docs/` folder, the module folder) when that plugin is absent.
+
+## [12.8.0] - 2026-11-09
+
+### Changed
+
+- `/work-items:decompose` copies the Brief Goal's `Finish line:` line into each item body and into a spec container's Brief, beside the Intent, Vision and tiebreak lines.
+
+## [12.7.5] - 2026-11-09
+
+### Changed
+
+- Simplified the shared HTML escape helper without changing its output.
+
+## [12.7.4] - 2026-11-09
+
+### Changed
+
+- Simplified the session-bridge view app and watcher code (`view_bridge.py`, `watch.sh`). Behavior is unchanged.
+
+- Internal simplification of the shared view helpers this plugin carries, no behavior change.
+
+- Simplified the shared yaml-subset parser copies; behavior is unchanged.
+
 ## [12.7.3] - 2026-11-09
 
 ### Changed

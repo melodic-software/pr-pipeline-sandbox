@@ -185,6 +185,7 @@ jobs:
     timeout-minutes: 15
     cache-mode: read
     permissions:
+      actions: read # the review lanes' comment records
       contents: read # check out main and the PR head
       pull-requests: read # the PR's head and mergeable state
     outputs:
@@ -313,6 +314,8 @@ jobs:
         if: steps.slot.outputs.applies == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # The review lanes' comment records (actions: read).
+          ARTIFACT_READ_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr-number }}
           APP_SENDER_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
           ACTIVITY: resolve-conflicts
@@ -761,6 +764,7 @@ jobs:
       && ((needs.resolve-conflicts-fallback.result != 'skipped' && needs.resolve-conflicts-fallback.outputs.scan-patch-state || needs.resolve-conflicts-fallback.result == 'skipped' && needs.resolve-conflicts-subscription.result != 'skipped' && needs.resolve-conflicts-subscription.outputs.scan-patch-state || needs.resolve-conflicts-fallback.result == 'skipped' && needs.resolve-conflicts-subscription.result == 'skipped' && needs.resolve-conflicts.outputs.scan-patch-state || '') == 'written'
       || (needs.resolve-conflicts-fallback.result != 'skipped' && needs.resolve-conflicts-fallback.outputs.scan-patch-state || needs.resolve-conflicts-fallback.result == 'skipped' && needs.resolve-conflicts-subscription.result != 'skipped' && needs.resolve-conflicts-subscription.outputs.scan-patch-state || needs.resolve-conflicts-fallback.result == 'skipped' && needs.resolve-conflicts-subscription.result == 'skipped' && needs.resolve-conflicts.outputs.scan-patch-state || '') == 'empty')) }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
@@ -896,6 +900,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
+      actions: read # the review lanes' comment records
       contents: read # check out main and the PR head
       pull-requests: read # the PR's head, author and labels
     outputs:
@@ -1033,6 +1038,8 @@ jobs:
         if: steps.slot.outputs.applies == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # The review lanes' comment records (actions: read).
+          ARTIFACT_READ_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr-number }}
           APP_SENDER_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
           ACTIVITY: sync-shared-copies
@@ -1285,6 +1292,7 @@ jobs:
     needs: sync-shared-copies-select
     if: ${{ !cancelled() && needs.sync-shared-copies-select.outputs.proceed == 'true' }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
@@ -1338,6 +1346,7 @@ jobs:
       pull-requests: read # the PR, its reviews, review comments and threads
       checks: read # the model check runs that count rounds
       actions: read # an earlier FAIL's verdict artifact and its pr-verify run (verify-earlier-fail-heads)
+      issues: read # the closing issues' spec text an advisory thread is judged against (closing_issues)
     outputs:
       # true once the context is uploaded; false on a skip or an escalation;
       # empty when the job stopped before deciding.
@@ -1459,6 +1468,8 @@ jobs:
         if: steps.slot.outputs.applies == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # The review lanes' comment records (actions: read).
+          ARTIFACT_READ_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr-number }}
           HEAD_SHA: ${{ steps.head.outputs.sha }}
           PULL_FILE: ${{ runner.temp }}/pr-head.json
@@ -1482,6 +1493,8 @@ jobs:
           # The listed review bots' ids (review-threads.reviewer-ids), one per line.
           REVIEWER_IDS=$(jq -r '.["review-threads"]["reviewer-ids"] // [] | .[]' "$RESOLVED")
           export REVIEWER_IDS
+          LANE_IDENTITY=$(yq '.merge."agent-identity" // ""' .base/docs/conventions/pr-pipeline.yaml)
+          export LANE_IDENTITY
           THREAD_FILE="$FEEDBACK_DIR/threads.json" RUN_FILE="$FEEDBACK_DIR/run.json" \
             node .base/.github/scripts/pr-unblock/address-feedback.mjs select
           if [ -f "$FEEDBACK_DIR/threads.json" ]; then
@@ -1860,6 +1873,7 @@ jobs:
       && (needs.address-feedback-fallback.result != 'skipped' && needs.address-feedback-fallback.outputs.scan-patch-state || needs.address-feedback-fallback.result == 'skipped' && needs.address-feedback-subscription.result != 'skipped' && needs.address-feedback-subscription.outputs.scan-patch-state || needs.address-feedback-fallback.result == 'skipped' && needs.address-feedback-subscription.result == 'skipped' && needs.address-feedback.outputs.scan-patch-state || '') == 'written'
       && (needs.address-feedback-fallback.result != 'skipped' && needs.address-feedback-fallback.outputs.feedback-attempt || needs.address-feedback-fallback.result == 'skipped' && needs.address-feedback-subscription.result != 'skipped' && needs.address-feedback-subscription.outputs.feedback-attempt || needs.address-feedback-fallback.result == 'skipped' && needs.address-feedback-subscription.result == 'skipped' && needs.address-feedback.outputs.feedback-attempt || '') != '' }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
@@ -2974,6 +2988,7 @@ jobs:
     needs: [address-feedback-select, address-feedback, address-feedback-subscription, address-feedback-fallback, apply-feedback-patch, adjudicate-feedback]
     if: ${{ !cancelled() && (needs.address-feedback-select.outputs.proceed == 'true' || needs.address-feedback-select.outputs.resolve-only == 'true') }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
@@ -3042,6 +3057,7 @@ jobs:
       || needs.publish-feedback.outputs.skip-reason == 'finding-stands'
       || needs.publish-feedback.outputs.skip-reason == 'no-model-turn') }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
@@ -3590,6 +3606,7 @@ jobs:
       && (needs.review-dependency-fallback.result != 'skipped' && needs.review-dependency-fallback.outputs.scan-patch-state || needs.review-dependency-fallback.result == 'skipped' && needs.review-dependency-subscription.result != 'skipped' && needs.review-dependency-subscription.outputs.scan-patch-state || needs.review-dependency-fallback.result == 'skipped' && needs.review-dependency-subscription.result == 'skipped' && needs.review-dependency.outputs.scan-patch-state || '') == 'written'
       && (needs.review-dependency-fallback.result != 'skipped' && needs.review-dependency-fallback.outputs.dependency-verdict || needs.review-dependency-fallback.result == 'skipped' && needs.review-dependency-subscription.result != 'skipped' && needs.review-dependency-subscription.outputs.dependency-verdict || needs.review-dependency-fallback.result == 'skipped' && needs.review-dependency-subscription.result == 'skipped' && needs.review-dependency.outputs.dependency-verdict || '') == 'fix' }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
@@ -3634,6 +3651,7 @@ jobs:
     needs: review-dependency-select
     if: ${{ !cancelled() && needs.review-dependency-select.outputs.pin-state == 'written' }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
@@ -3668,6 +3686,7 @@ jobs:
     needs: [review-dependency-select, review-dependency, review-dependency-subscription, review-dependency-fallback, apply-dependency-patch]
     if: ${{ !cancelled() && needs.review-dependency-select.outputs.proceed == 'true' }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
@@ -3794,6 +3813,8 @@ jobs:
         if: steps.kill.outputs.proceed == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # The review lanes' comment records (actions: read).
+          ARTIFACT_READ_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr-number }}
           APP_SENDER_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
           CONTEXT_FILE: ${{ runner.temp }}/ci-context/context.json
@@ -4155,6 +4176,7 @@ jobs:
       || (needs.fix-ci-fallback.result != 'skipped' && needs.fix-ci-fallback.outputs.scan-patch-state || needs.fix-ci-fallback.result == 'skipped' && needs.fix-ci-subscription.result != 'skipped' && needs.fix-ci-subscription.outputs.scan-patch-state || needs.fix-ci-fallback.result == 'skipped' && needs.fix-ci-subscription.result == 'skipped' && needs.fix-ci.outputs.scan-patch-state || '') == 'empty'
       || (needs.fix-ci-fallback.result != 'skipped' && needs.fix-ci-fallback.outputs.scan-collect-refused || needs.fix-ci-fallback.result == 'skipped' && needs.fix-ci-subscription.result != 'skipped' && needs.fix-ci-subscription.outputs.scan-collect-refused || needs.fix-ci-fallback.result == 'skipped' && needs.fix-ci-subscription.result == 'skipped' && needs.fix-ci.outputs.scan-collect-refused || '') == 'true') }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
@@ -4434,6 +4456,7 @@ jobs:
       || (needs.fix-ci-rung-up-fallback.result != 'skipped' && needs.fix-ci-rung-up-fallback.outputs.scan-patch-state || needs.fix-ci-rung-up-fallback.result == 'skipped' && needs.fix-ci-rung-up-subscription.result != 'skipped' && needs.fix-ci-rung-up-subscription.outputs.scan-patch-state || needs.fix-ci-rung-up-fallback.result == 'skipped' && needs.fix-ci-rung-up-subscription.result == 'skipped' && needs.fix-ci-rung-up.outputs.scan-patch-state || '') == 'empty'
       || (needs.fix-ci-rung-up-fallback.result != 'skipped' && needs.fix-ci-rung-up-fallback.outputs.scan-collect-refused || needs.fix-ci-rung-up-fallback.result == 'skipped' && needs.fix-ci-rung-up-subscription.result != 'skipped' && needs.fix-ci-rung-up-subscription.outputs.scan-collect-refused || needs.fix-ci-rung-up-fallback.result == 'skipped' && needs.fix-ci-rung-up-subscription.result == 'skipped' && needs.fix-ci-rung-up.outputs.scan-collect-refused || '') == 'true') }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write
@@ -4754,6 +4777,7 @@ jobs:
       && needs.apply-patch-rung-up.outputs.escalation-reason == ''
       && needs.apply-patch-rung-up.outputs.patch-skip-reason == '')) }}
     permissions:
+      actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
       pull-requests: read
       checks: write

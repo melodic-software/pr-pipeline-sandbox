@@ -22,6 +22,7 @@ permissions: {}
 jobs:
   check-read-token:
     permissions:
+      actions: read # the read runner's key-credit gate lists the credit-stop markers
       contents: read
       pull-requests: read
       checks: write

@@ -8,7 +8,8 @@
 //           review threads the reviewer bot or a listed review bot opened
 //           in a review on a head a review lane's marker confirms, when
 //           every comment is the bot's (a listed bot's only behind a trusted
-//           person's `@codex` request, requestSkip), a trusted person with
+//           person's `@codex` request, or for an unsummoned one a PR a trusted
+//           person opened, requestSkip), a trusted person with
 //           write access asked the lane to fix it, or a trusted person answered
 //           the lane's escalation, then decides skip (no such thread), escalate
 //           (the PR changes .github/workflows/**; or the configured number of
@@ -19,7 +20,10 @@
 //           review-thread tool reads, with the same-plugin files a write-access
 //           fix request names (namedPaths) and the files the PR already changes
 //           (pr_paths, prPathsOf) and the shared copies of the canonicals it
-//           changes (copy_paths, copyPathsFor), and run.json, the record the
+//           changes (copy_paths, copyPathsFor), and, when a kept thread is an
+//           advisory code-review finding (advisoryFinding), the closing
+//           issues' spec text (closing_issues, linkedSpec) with that thread
+//           marked may_follow_up, and run.json, the record the
 //           reply job checks the replies against, with the reviewed heads the
 //           threads were kept on (runRecord). On a PR carrying the human-gated
 //           label it keeps only threads a trusted person with write access
@@ -42,8 +46,9 @@ import { appendFileSync, lstatSync, readdirSync, readFileSync, writeFileSync } f
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { FOOTER as LANE_FOOTER, laneChecker, laneFooter, withoutBinding, withoutLaneFooters } from "../lib/lane-binding.mjs";
 import { commentItems, FAILING, gateSource, laneHold, latestRuns, listLabelEvents, prHold, ROUND_MARKER } from "./gate-source.mjs";
-import { retryFetch } from "./retry-fetch.mjs";
+import { retryFetch } from "../lib/retry-fetch.mjs";
 import { copyPathsOf, isProtectedPath, namedInScope, prPathsOf, sharedCopyPairs } from "./thread-scope.mjs";
 import { retryRung, ROUTES, stopSkip } from "./escalation-routes.mjs";
 
@@ -69,6 +74,11 @@ export { ROUND_MARKER };
 const ACTIVITY = "address-feedback";
 // github-actions[bot], the author of the review lanes' reviewed-head markers.
 export const MARKER_AUTHOR_ID = 41898282;
+// Listed review bots no comment can summon: github-advanced-security[bot],
+// which posts code scanning (CodeQL) alerts after each analysis of a pushed
+// head. requestSkip asks only that a trusted person or the lanes App opened
+// the PR, in place of a `@codex` request.
+export const UNSUMMONED_REVIEWER_IDS = Object.freeze([62310815]);
 const REVIEWED_HEAD =
   /^<!-- claude-lane-reviewed-head lane=(claude-review|claude-security-review) sha=([0-9a-f]{40}) -->$/;
 export const SHA = /^[0-9a-f]{40}$/;
@@ -229,8 +239,9 @@ export function staleVerifyNotes(threads, head, { supersededHead } = {}) {
 // A review lane's own comment as the pr-review-cli reusable posts it: by
 // github-actions[bot] (MARKER_AUTHOR_ID), its last non-blank line the lane's
 // `claude-lane: <lane>` footer. Any other github-actions[bot] comment is not a
-// finding.
-const LANE_FOOTER = /^`?claude-lane: (claude-review|claude-security-review)`?$/;
+// finding. Any workflow's token posts as github-actions[bot], so the comments
+// reach these readers through bindLaneRows, which keeps the footer only on a
+// comment bound to the lane's own run.
 const lastLine = (body) =>
   String(body ?? "")
     .split("\n")
@@ -239,6 +250,96 @@ const lastLine = (body) =>
 // The lane a comment body's footer names, or null.
 export const laneOf = (body) => LANE_FOOTER.exec(lastLine(body))?.[1] ?? null;
 export const isLaneComment = (comment) => comment.authorId === MARKER_AUTHOR_ID && laneOf(comment.body) !== null;
+
+// A lane footer's comment as one with no footer: every trailing footer line
+// and the binding line removed (lane-binding.mjs withoutLaneFooters).
+export const withoutLaneFooter = withoutLaneFooters;
+
+// A comment's fields as a REST row and as a GraphQL comment node carry them.
+// REST has no edit time, so lastEditedAt stays undefined there.
+export const restFields = (row) => ({ authorId: row.user?.id, id: row.id, createdAt: row.created_at, updatedAt: row.updated_at, lastEditedAt: undefined });
+export const nodeFields = (node) => ({ authorId: node.author?.databaseId, id: node.databaseId, createdAt: node.createdAt, lastEditedAt: node.lastEditedAt });
+
+// `rows` as every reader in this directory takes them. Each github-actions[bot]
+// comment whose last line is a lane footer goes to `check` (lane-binding.mjs
+// laneChecker), with its body as GitHub stored it: one it accepts loses its
+// binding line, so it parses as before; one it refuses loses its footer, so
+// it reads as any other github-actions[bot] comment. No other row is read or
+// changed. A failed read throws.
+export async function bindLaneRows(rows, { kind, check, fields = restFields }) {
+  const bound = [];
+  for (const row of rows) {
+    const { authorId, id, createdAt, updatedAt, lastEditedAt } = fields(row);
+    if (authorId !== MARKER_AUTHOR_ID || laneFooter(row.body) === null) {
+      bound.push(row);
+      continue;
+    }
+    const lane = await check({ kind, id, body: row.body, createdAt, updatedAt, lastEditedAt });
+    bound.push({ ...row, body: lane ? withoutBinding(row.body) : withoutLaneFooter(row.body) });
+  }
+  return bound;
+}
+
+// A REST issue timeline with its `commented` items passed through
+// bindLaneRows; every other event is left as it is.
+export async function bindTimeline(timeline, check) {
+  const comments = await bindLaneRows(timeline.filter((item) => item.event === "commented"), { kind: "issue_comment", check });
+  let next = 0;
+  return timeline.map((item) => (item.event === "commented" ? comments[next++] : item));
+}
+
+// `api` with its comment reads passed through bindLaneRows: issue comments,
+// timeline comments, review comments, the comments of each review thread
+// (listReviewThreads, feedback-dispatch.mjs) and of a thread's re-read
+// (readThread). `actions` ({ getRun, listArtifacts, download }) reads the lane
+// runs' comment records; one checker per pull request reads each run once.
+export function withLaneBinding(api, actions) {
+  const checkers = new Map();
+  const checkerFor = (pr) => {
+    if (!checkers.has(Number(pr))) {
+      checkers.set(Number(pr), laneChecker({ pr: Number(pr), ...actions }));
+    }
+    return checkers.get(Number(pr));
+  };
+  const bindNodes = (nodes, pr) => bindLaneRows(nodes ?? [], { kind: "review_comment", check: checkerFor(pr), fields: nodeFields });
+  const wrap = (name, kind) =>
+    api[name] && { [name]: async (pr, ...rest) => bindLaneRows(await api[name](pr, ...rest), { kind, check: checkerFor(pr) }) };
+  return {
+    ...api,
+    ...wrap("listIssueComments", "issue_comment"),
+    ...(api.listTimeline && { listTimeline: async (pr, ...rest) => bindTimeline(await api.listTimeline(pr, ...rest), checkerFor(pr)) }),
+    ...wrap("listReviewComments", "review_comment"),
+    ...(api.listReviewThreads && {
+      async listReviewThreads(pr, ...rest) {
+        const threads = [];
+        for (const thread of await api.listReviewThreads(pr, ...rest)) {
+          threads.push({ ...thread, comments: { ...thread.comments, nodes: await bindNodes(thread.comments?.nodes, pr) } });
+        }
+        return threads;
+      },
+    }),
+    ...(api.readThread && {
+      async readThread(id) {
+        const thread = await api.readThread(id);
+        return { ...thread, nodes: await bindNodes(thread.nodes, thread.pr) };
+      },
+    }),
+  };
+}
+
+// The Actions reads withLaneBinding needs, with ARTIFACT_READ_TOKEN (the job's
+// own token, actions: read), never the token the script writes with. Without
+// it, a comment that needs a read fails closed.
+export function laneReader(env, { fetch } = {}) {
+  if (!env.ARTIFACT_READ_TOKEN) {
+    const refuse = async () => {
+      throw new Error("ARTIFACT_READ_TOKEN is not set, so a lane comment's binding cannot be checked");
+    };
+    return { getPull: refuse, getRun: refuse, listArtifacts: refuse, download: refuse };
+  }
+  const reads = createGitHubApi({ token: env.ARTIFACT_READ_TOKEN, repository: env.GITHUB_REPOSITORY, apiUrl: env.GITHUB_API_URL ?? "https://api.github.com", graphqlUrl: "", fetch });
+  return { getPull: reads.getPull, getRun: reads.getRun, listArtifacts: reads.listArtifacts, download: reads.downloadArtifact };
+}
 
 // The security-review lane's ratings, lowest first (security-review SKILL.md,
 // "Reporting": one `severity: <rating>` line per inline comment), and the
@@ -846,14 +947,24 @@ export const anyListed = (authorIds, reviewerIds = []) => reviewerIds.length > 0
 // Why a thread threadAuthors accepted (`authors`) is not worked for want of a
 // trusted `@codex` request (codexRequest), or null. Only a thread no trusted
 // person directed is checked, at each listed bot's comment (`comments`, each
-// { authorId, review: { authorId, submittedAt } }). The select step and the
-// reply job (keepThreads) and the dispatcher (feedback-dispatch.mjs) all ask.
+// { authorId, review: { authorId, submittedAt } }). An unsummoned bot's
+// comment (UNSUMMONED_REVIEWER_IDS) needs instead a PR a trusted person or the
+// lanes App opened, failing closed on unreadable triggers. The select step and
+// the reply job (keepThreads) and the dispatcher (feedback-dispatch.mjs) all ask.
 export function requestSkip({ authors, comments, reviews, mentions, triggers = null, reviewerIds = [], trustedHumans, appId }) {
   if (authors.some((author) => author.direction === true)) {
     return null;
   }
   for (const comment of comments) {
-    if (reviewerIds.includes(comment.authorId)) {
+    if (reviewerIds.includes(comment.authorId) && UNSUMMONED_REVIEWER_IDS.includes(comment.authorId)) {
+      if (triggers === null) {
+        return { reason: "codex-request-not-found" };
+      }
+      const opener = triggers.opened?.actorId;
+      if (!trustedHumans.has(opener) && opener !== appId) {
+        return { reason: "codex-request-untrusted", requester: opener, via: "opening of the pull request" };
+      }
+    } else if (reviewerIds.includes(comment.authorId)) {
       const submittedAt = comment.review?.authorId === comment.authorId ? comment.review.submittedAt : undefined;
       const skip = codexRequest({ authorId: comment.authorId, submittedAt, reviews, mentions, triggers, reviewerIds, trustedHumans, appId });
       if (skip) {
@@ -963,7 +1074,7 @@ export function keepThreads({ threads, reviewComments, reviews, heads, security 
       is_outdated: thread.isOutdated === true,
       root_comment_id: rows[0].id,
       // A lane only from the github-actions[bot] author whose footer the
-      // review lanes write; claude[bot] writes its own body.
+      // review lanes write and bindLaneRows kept; claude[bot] writes its own body.
       comments: rows.map((row, i) => {
         const lane = isLaneComment({ authorId: row.user?.id, body: row.body }) ? laneOf(row.body) : null;
         const listed = authors[i].author === "reviewer" && reviewerIds.includes(row.user?.id);
@@ -1048,6 +1159,53 @@ async function earlierFailRound({ api, pr, headSha, repository, appId, files, is
   };
 }
 
+// A kept thread whose only comment is the code-review lane's finding rated
+// advisory (its first line opens `**Advisory`): one the lane may answer with
+// a follow-up reply instead of a fix when the change it asks for falls outside
+// the closing issue's scope (comments-ci.md). A blocking finding, a security
+// finding, another bot's, or a thread already answered never qualifies.
+const ADVISORY = /^\*\*Advisory\b/;
+export const advisoryFinding = (thread) =>
+  thread.comments.length === 1 && thread.comments[0].author === "reviewer" && thread.comments[0].lane === "claude-review" && ADVISORY.test(firstLine(thread.comments[0].body));
+
+// The linked issues' spec text as the thread file and contract.json stage it:
+// each issue's URL, its body when trusted people wrote it, and its trusted
+// comments, all as resolve-pr.mjs linkedIssues returns them (`specText`).
+export function contractIssues(specText, repository) {
+  return (Array.isArray(specText) ? specText : [])
+    .filter((issue) => Number.isSafeInteger(issue?.number) && issue.number > 0)
+    .map((issue) => ({
+      number: issue.number,
+      url: `https://github.com/${repository}/issues/${issue.number}`,
+      body: typeof issue.body === "string" ? issue.body : null,
+      comments: (Array.isArray(issue.comments) ? issue.comments : []).filter((comment) => typeof comment === "string"),
+    }));
+}
+
+// The linked issues' spec text trusted people wrote, as pr-verify reads it
+// (resolve-pr.mjs linkedIssues): [] when PR_NUMBER is unset or the read
+// fails. Loaded on call, from the full base checkout: publish-feedback.mjs
+// imports this module from a copy of this directory alone.
+export async function linkedSpec(env, log) {
+  if (!/^[1-9][0-9]*$/.test(env.PR_NUMBER ?? "")) {
+    return [];
+  }
+  try {
+    const { linkedIssues } = await import("../pr-verify/resolve-pr.mjs");
+    const { createGitHub, loadTrustedList } = await import("../../actions/check-trusted-trigger/check-trusted-trigger.mjs");
+    const { loadRules } = await import("../intake-triage/admit.mjs");
+    const trusted = loadTrustedList(env.TRUSTED_ACTORS_PATH || ".base/.github/standards/trusted-actors/trusted-actors.json");
+    const api = (keepGraphQLErrors) => createGitHub({ token: env.GITHUB_TOKEN, apiUrl: env.GITHUB_API_URL, keepGraphQLErrors });
+    const identity = String(env.LANE_IDENTITY ?? "").trim().toLowerCase().replace(/\[bot\]$/, "");
+    const taskList = loadRules(new URL("../../actions/resolve-config/admission-rules.json", import.meta.url).pathname)["task-list"];
+    const { specText } = await linkedIssues(api(false), api(true), env.GITHUB_REPOSITORY, Number(env.PR_NUMBER), trusted.humans, identity ? trusted.logins.get(`${identity}[bot]`) : undefined, taskList);
+    return specText;
+  } catch (error) {
+    log(`::warning::cannot read the linked issues' spec text (${String(error?.message ?? error).slice(0, 300)}); this round reads none`);
+    return [];
+  }
+}
+
 export async function select({
   api,
   pr,
@@ -1070,6 +1228,8 @@ export async function select({
   },
   // The REST pull request when the caller already read it (pullFromFile).
   pull: given,
+  // The closing issues' spec text (linkedSpec).
+  readSpec = async () => [],
   log = () => {},
 }) {
   // Serial reads: element 6.
@@ -1227,6 +1387,15 @@ export async function select({
       thread.named_paths = named;
     }
   }
+  // The closing issues' scope, read only when a kept thread could take a
+  // follow-up reply: an advisory the lane then need not implement.
+  const advisory = worked.filter(advisoryFinding);
+  const closing = advisory.length > 0 ? contractIssues(await readSpec(), repository).filter((issue) => issue.body !== null || issue.comments.length > 0) : [];
+  if (closing.length > 0) {
+    for (const thread of advisory) {
+      thread.may_follow_up = true;
+    }
+  }
   return {
     decision: "proceed",
     // A retry after the reply job stopped on this head runs one rung up.
@@ -1239,7 +1408,17 @@ export async function select({
     // escalation that lets this activity work put the label on.
     humanGate: labeled ? (gated ? "fix-request" : "lane-escalation") : "",
     threads: worked,
-    file: { version: 1, repository, pr, head_sha: headSha, pr_paths: prPathsOf(files), copy_paths: copyPathsFor(files), threads: worked, ...(retry ? { retry } : {}) },
+    file: {
+      version: 1,
+      repository,
+      pr,
+      head_sha: headSha,
+      pr_paths: prPathsOf(files),
+      copy_paths: copyPathsFor(files),
+      threads: worked,
+      ...(closing.length > 0 ? { closing_issues: closing } : {}),
+      ...(retry ? { retry } : {}),
+    },
     reviewedHeads: [...heads].sort(),
     ci: await ci({ headSha, files }),
   };
@@ -1262,6 +1441,7 @@ export function runRecord(file, reviewedHeads, ci) {
       path: t.path,
       comment_ids: t.comments.map((c) => c.id),
       ...(t.named_paths ? { named_paths: t.named_paths } : {}),
+      ...(t.may_follow_up ? { may_follow_up: true } : {}),
     })),
     ...(file.stale_notes ? { stale_notes: file.stale_notes } : {}),
     ...(file.superseded_head ? { superseded_head: file.superseded_head } : {}),
@@ -1295,7 +1475,7 @@ const THREAD_QUERY = `query($id: ID!) {
       isResolved isOutdated pullRequest { number }
       comments(first: 100) {
         totalCount
-        nodes { databaseId body lastEditedAt editor { ... on User { databaseId } ... on Bot { databaseId } } }
+        nodes { databaseId body createdAt lastEditedAt author { ... on User { databaseId } ... on Bot { databaseId } } editor { ... on User { databaseId } ... on Bot { databaseId } } }
       }
     }
   }
@@ -1443,6 +1623,7 @@ export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch: 
       return (await response.json()).permission;
     },
     closePull: async (pr) => requestData(`${repo}/pulls/${pr}`, "PATCH", { state: "closed" }, true),
+    updatePullBody: async (pr, body) => requestData(`${repo}/pulls/${pr}`, "PATCH", { body }, true),
     createIssue: (fields) => requestData(`${repo}/issues`, "POST", fields),
     listIssues: (query) => paginate(`issues?${query}`),
     listPullFiles: (pr) => paginate(`pulls/${pr}/files`),
@@ -1562,6 +1743,19 @@ export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch: 
     },
     compare: async (base, head) => requestData(`${repo}/compare/${base}...${head}`),
     getRun: async (id) => requestData(`${repo}/actions/runs/${id}`),
+    getPull: async (pr) => requestData(`${repo}/pulls/${pr}`),
+    // Every artifact of a run, page by page until total_count.
+    async listArtifacts(id) {
+      const artifacts = [];
+      for (let page = 1; ; page += 1) {
+        const data = await requestData(`${repo}/actions/runs/${id}/artifacts?per_page=100&page=${page}`);
+        const rows = data.artifacts ?? [];
+        artifacts.push(...rows);
+        if (rows.length === 0 || artifacts.length >= (data.total_count ?? 0)) {
+          return artifacts;
+        }
+      }
+    },
     createReviewComment: async (pr, fields) => requestData(`${repo}/pulls/${pr}/comments`, "POST", fields),
     replyToComment: async (pr, commentId, body) => requestData(`${repo}/pulls/${pr}/comments/${commentId}/replies`, "POST", { body }),
     async resolveThread(id) {
@@ -1761,7 +1955,7 @@ export function pullFromFile(path, pr, headSha) {
   }
 }
 
-export async function main(argv, env, { api, log = (line) => console.log(line) } = {}) {
+export async function main(argv, env, { api, actions, log = (line) => console.log(line) } = {}) {
   const command = argv[0];
   need(env, ["GITHUB_TOKEN", "GITHUB_REPOSITORY", "GITHUB_OUTPUT", "PR_NUMBER", "HEAD_SHA", "APP_SENDER_ID"]);
   const pr = positive(env.PR_NUMBER, "PR_NUMBER");
@@ -1769,15 +1963,18 @@ export async function main(argv, env, { api, log = (line) => console.log(line) }
   if (!SHA.test(env.HEAD_SHA)) {
     throw new Error("HEAD_SHA is not a commit id");
   }
-  const client =
+  const fetch = api ? undefined : await countedFetch();
+  const client = withLaneBinding(
     api ??
-    createGitHubApi({
-      token: env.GITHUB_TOKEN,
-      repository: env.GITHUB_REPOSITORY,
-      apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
-      graphqlUrl: env.GITHUB_GRAPHQL_URL ?? "https://api.github.com/graphql",
-      fetch: await countedFetch(),
-    });
+      createGitHubApi({
+        token: env.GITHUB_TOKEN,
+        repository: env.GITHUB_REPOSITORY,
+        apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
+        graphqlUrl: env.GITHUB_GRAPHQL_URL ?? "https://api.github.com/graphql",
+        fetch,
+      }),
+    actions ?? laneReader(env, { fetch }),
+  );
   const output = (key, value) => appendFileSync(env.GITHUB_OUTPUT, `${key}=${value}\n`);
   const earlierFailHeads = earlierFailHeadsFrom(env);
   const selectThreads = async () => {
@@ -1802,6 +1999,7 @@ export async function main(argv, env, { api, log = (line) => console.log(line) }
         return earlierFailNotes({ actions: { read: client.readPath, download: client.downloadArtifact }, repository: env.GITHUB_REPOSITORY, pr, heads, files });
       },
       pull: pullFromFile(env.PULL_FILE, pr, env.HEAD_SHA),
+      readSpec: () => linkedSpec({ ...env, TRUSTED_ACTORS_PATH: env.TRUSTED_ACTORS }, log),
       log,
     });
   };

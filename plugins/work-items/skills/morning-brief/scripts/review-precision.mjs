@@ -14,12 +14,18 @@
 // GraphQL query for merged PRs with their review threads, comments and each comment's edit
 // history, from which each lane's reviewed heads are read. compute() is a pure function of the
 // snapshot: the same snapshot gives the same bytes. Fetch stops at the first rate-limit error
-// and says so.
+// and says so. Any workflow's job token posts as github-actions, so fetch checks each
+// github-actions review comment with a lane footer against the run its binding names
+// (lib/lane-binding.mjs, reading that run and its comment-record artifacts): one that fails is
+// saved with `lane_bound: false` and read as having no footer; one that passes is saved without
+// its binding line.
 // Exit 0 done, 1 a read failed, 2 usage, 3 rate limited.
 
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+
+import { laneChecker, withoutBinding } from "../../../lib/lane-binding.mjs";
 
 export const LANES = Object.freeze(["claude-review", "claude-security-review"]);
 // The current lane format (the reviewed-head comment with its counts line, and the
@@ -95,6 +101,10 @@ function tables(text) {
   return out.filter((t) => t.length > 1).map(([header, ...body]) => ({ header, body }));
 }
 
+const verdictColumn = (header) => header.findIndex((cell) => /^(verdict|classification)$/i.test(cell));
+// A table row's text, led by its verdict cell when the table has a verdict column.
+const rowText = (cells, col) => (col >= 0 ? `${cells[col]} | ${cells.join(" | ")}` : cells.join(" | "));
+
 // The label a piece of answer text carries, or null. A verdict column wins over the rest of the
 // row; prose counts only its uppercase D5 labels, never a paraphrase.
 export function labelOf(text) {
@@ -137,10 +147,10 @@ export function bucketOf(text, prNumber, repo = null) {
 // the whole reply.
 function replyText(body) {
   for (const { header, body: rows } of tables(body)) {
-    const col = header.findIndex((cell) => /^(verdict|classification)$/i.test(cell));
+    const col = verdictColumn(header);
     if (col < 0) continue;
     const row = rows.find((cells) => labelOf(cells[col] ?? "") !== null);
-    if (row) return `${row[col]} | ${row.join(" | ")}`;
+    if (row) return rowText(row, col);
   }
   return body;
 }
@@ -158,9 +168,9 @@ const botLogin = (login) => String(login ?? "").replace(/\[bot\]$/, "");
 function summaryRows(body) {
   const out = [];
   for (const { header, body: rows } of tables(body)) {
-    const col = header.findIndex((cell) => /^(verdict|classification)$/i.test(cell));
+    const col = verdictColumn(header);
     const m = SUMMARY_HEADER.exec(header[0] ?? "");
-    const text = (cells) => (col >= 0 ? `${cells[col]} | ${cells.join(" | ")}` : cells.join(" | "));
+    const text = (cells) => rowText(cells, col);
     if (m) {
       for (const cells of rows) out.push({ lane: m[1], sha: m[2] ?? null, login: null, text: text(cells) });
     } else if (header[0] === "#" && col >= 0) {
@@ -182,6 +192,9 @@ function footerLane(body) {
   return tag && LANES.includes(tag[1]) ? tag[1] : null;
 }
 
+// A snapshot comment's lane: its footer's, unless fetch found the footer unbound.
+const laneOf = (comment) => (comment.lane_bound === false ? null : footerLane(comment.body));
+
 export function normalizeFirstLine(body) {
   const first = String(body).split(/\r?\n/).find((line) => line.trim() !== "") ?? "";
   return first
@@ -196,10 +209,12 @@ export function normalizeFirstLine(body) {
 
 // ---------------------------------------------------------------- compute
 
-const byTime = (a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : String(a.key) < String(b.key) ? -1 : String(a.key) > String(b.key) ? 1 : 0);
-const emptyOutcomes = () => Object.fromEntries(BUCKETS.map((bucket) => [bucket, 0]));
+const cmp = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+const byTime = (a, b) => cmp(a.at, b.at) || cmp(String(a.key), String(b.key));
+const zeros = (keys) => Object.fromEntries(keys.map((key) => [key, 0]));
 // The answered outcomes per answer author kind; an unanswered finding has no answerer.
-const emptyByAuthor = () => Object.fromEntries(AUTHOR_KINDS.map((kind) => [kind, { outcomes: Object.fromEntries(ANSWERED.map((bucket) => [bucket, 0])) }]));
+const emptyByAuthor = () => Object.fromEntries(AUTHOR_KINDS.map((kind) => [kind, { outcomes: zeros(ANSWERED) }]));
+const emptyStats = () => ({ findings: 0, reposts: 0, outcomes: zeros(BUCKETS), by_author_kind: emptyByAuthor(), defer_unlinked: 0, resolved_unanswered: 0 });
 
 function laneRounds(reviews) {
   // Heads in order, up to and including the first clean one after the last head with findings;
@@ -211,8 +226,7 @@ function laneRounds(reviews) {
 }
 
 function computePr(pr, until, repo, roundAuthor) {
-  const reviews = {};
-  for (const lane of LANES) reviews[lane] = [];
+  const reviews = Object.fromEntries(LANES.map((lane) => [lane, []]));
   for (const review of pr.reviews ?? []) {
     if (!(review.at < until) || !LANES.includes(review.lane) || !Number.isInteger(review.findings)) continue;
     reviews[review.lane].push({ sha: review.sha, at: review.at, key: review.sha, findings: review.findings, inline: review.inline });
@@ -234,9 +248,9 @@ function computePr(pr, until, repo, roundAuthor) {
     const root = comments[0];
     if (!root || root.replyTo) continue;
     for (const c of comments) rootOf.set(String(c.id), String(root.id));
-    const lane = footerLane(root.body);
+    const lane = laneOf(root);
     if (!lane) continue;
-    const replies = comments.slice(1).filter((c) => footerLane(c.body) === null);
+    const replies = comments.slice(1).filter((c) => laneOf(c) === null);
     findings.push({ lane, sha: root.commit ?? null, at: root.createdAt, key: root.id, id: String(root.id), path: thread.path ?? "", first: normalizeFirstLine(root.body), resolved: thread.resolved === true, answers: replies.map((c) => ({ body: c.body, kind: authorKind(c.author_type, c.body) })) });
   }
 
@@ -290,10 +304,7 @@ function computePr(pr, until, repo, roundAuthor) {
     return false;
   };
 
-  const lanes = {};
-  for (const lane of LANES) {
-    lanes[lane] = { findings: 0, reposts: 0, outcomes: emptyOutcomes(), by_author_kind: emptyByAuthor(), defer_unlinked: 0, resolved_unanswered: 0 };
-  }
+  const lanes = Object.fromEntries(LANES.map((lane) => [lane, emptyStats()]));
   for (const f of findings) {
     const stats = lanes[f.lane];
     stats.findings++;
@@ -317,7 +328,7 @@ function computePr(pr, until, repo, roundAuthor) {
   // A round is a comment whose first line is the marker, from the lanes App when the snapshot
   // names it (address-feedback.mjs isRoundMarker); a quote of the marker elsewhere is not one.
   const isRound = (c) => String(c.body).split(/\r?\n/)[0].trim() === ROUND_MARKER && (!roundAuthor || botLogin(c.author) === botLogin(roundAuthor));
-  const markers = (pr.comments ?? []).filter((c) => c.createdAt < until && isRound(c)).length;
+  const markers = comments.filter(isRound).length;
   return {
     number: pr.number,
     lanes,
@@ -343,7 +354,7 @@ export function compute(snapshot) {
     .map((pr) => computePr(pr, until, snapshot.repo, snapshot.round_author ?? null));
   const lanes = {};
   for (const lane of LANES) {
-    const total = { findings: 0, reposts: 0, outcomes: emptyOutcomes(), by_author_kind: emptyByAuthor(), defer_unlinked: 0, resolved_unanswered: 0, inline_mismatch: 0, heads_reviewed: 0 };
+    const total = { ...emptyStats(), inline_mismatch: 0, heads_reviewed: 0 };
     for (const pr of prs) {
       const one = pr.lanes[lane];
       for (const key of ["findings", "reposts", "defer_unlinked", "resolved_unanswered", "inline_mismatch", "heads_reviewed"]) total[key] += one[key];
@@ -426,13 +437,14 @@ export function renderMarkdown(result) {
 export class RateLimited extends Error {}
 let calls = 0;
 
-function gh(args) {
+function gh(args, encoding = "utf8") {
   calls++;
   try {
-    return execFileSync("gh", args, { encoding: "utf8", maxBuffer: 1 << 30, stdio: ["ignore", "pipe", "pipe"] });
+    return execFileSync("gh", args, { encoding, maxBuffer: 1 << 30, stdio: ["ignore", "pipe", "pipe"] });
   } catch (error) {
-    const why = `${error.stderr ?? ""}${error.stdout ?? ""}`.trim().split("\n")[0] || error.message;
-    if (/rate limit|HTTP 429|secondary rate/i.test(`${error.stderr ?? ""}${error.stdout ?? ""}`)) throw new RateLimited(`gh ${args[1] ?? ""}: ${why}`);
+    const output = `${error.stderr ?? ""}${error.stdout ?? ""}`;
+    const why = output.trim().split("\n")[0] || error.message;
+    if (/rate limit|HTTP 429|secondary rate/i.test(output)) throw new RateLimited(`gh ${args[1] ?? ""}: ${why}`);
     throw new Error(`gh ${args.slice(0, 2).join(" ")}: ${why}`);
   }
 }
@@ -450,7 +462,7 @@ const PR_QUERY = `query($owner:String!, $name:String!, $endCursor:String) {
             path line originalLine isResolved
             comments(first:50) {
               pageInfo { hasNextPage }
-              nodes { databaseId createdAt author { __typename login } body originalCommit { oid } replyTo { databaseId } }
+              nodes { databaseId createdAt lastEditedAt author { __typename login } body originalCommit { oid } replyTo { databaseId } }
             }
           }
         }
@@ -477,7 +489,37 @@ export function reviewsOf(comment) {
   return out;
 }
 
-function fetchPrs(repo, since, until, truncated) {
+// Raw review-comment nodes with each github-actions one carrying a lane footer checked by
+// `check` (lane-binding.mjs laneChecker): a pass drops its binding line, a failure marks it
+// unbound. Other comments are not read. A failed read rejects.
+export async function bindComments(nodes, check) {
+  return Promise.all(
+    nodes.map(async (c) => {
+      if (c.author?.__typename !== "Bot" || c.author.login !== "github-actions" || footerLane(c.body) === null) return c;
+      const ok = await check({ kind: "review_comment", id: c.databaseId, body: c.body, createdAt: c.createdAt, lastEditedAt: c.lastEditedAt });
+      return ok ? { ...c, body: withoutBinding(c.body) } : { ...c, unbound: true };
+    }),
+  );
+}
+
+// lane-binding.mjs's readers through gh, for one repository.
+function actionsReaders(repo) {
+  return {
+    getPull: (pr) => ghJson(["api", `repos/${repo}/pulls/${pr}`]),
+    getRun: (id) => ghJson(["api", `repos/${repo}/actions/runs/${id}`]),
+    listArtifacts: (id) => {
+      const all = [];
+      for (let page = 1; ; page++) {
+        const { artifacts = [] } = ghJson(["api", `repos/${repo}/actions/runs/${id}/artifacts?per_page=100&page=${page}`]);
+        all.push(...artifacts);
+        if (artifacts.length < 100) return all;
+      }
+    },
+    download: (id) => gh(["api", `repos/${repo}/actions/artifacts/${id}/zip`], "buffer"),
+  };
+}
+
+async function fetchPrs(repo, since, until, truncated) {
   const [owner, name] = repo.split("/");
   const prs = [];
   let cursor = null;
@@ -495,11 +537,14 @@ function fetchPrs(repo, since, until, truncated) {
         if (found.length && c.userContentEdits.totalCount > c.userContentEdits.nodes.length) truncated.push(`PR ${pr.number}: a lane comment with more than 100 edits`);
         reviews.push(...found.filter((r) => r.at < until));
       }
+      const check = laneChecker({ pr: pr.number, ...actionsReaders(repo) });
+      const threads = [];
+      for (const t of pr.reviewThreads.nodes) threads.push({ ...t, comments: { ...t.comments, nodes: await bindComments(t.comments.nodes, check) } });
       prs.push({
         number: pr.number,
         createdAt: pr.createdAt,
         mergedAt: pr.mergedAt,
-        threads: pr.reviewThreads.nodes.map((t) => {
+        threads: threads.map((t) => {
           if (t.comments.pageInfo.hasNextPage) truncated.push(`PR ${pr.number}: a thread with more than 50 comments`);
           return {
             path: t.path,
@@ -508,7 +553,7 @@ function fetchPrs(repo, since, until, truncated) {
             resolved: t.isResolved === true,
             comments: t.comments.nodes
               .filter((c) => c.createdAt < until)
-              .map((c) => ({ id: c.databaseId, author: c.author?.login ?? null, author_type: c.author?.__typename ?? null, createdAt: c.createdAt, body: c.body, commit: c.originalCommit?.oid ?? null, replyTo: c.replyTo?.databaseId ?? null })),
+              .map((c) => ({ id: c.databaseId, author: c.author?.login ?? null, author_type: c.author?.__typename ?? null, createdAt: c.createdAt, body: c.body, commit: c.originalCommit?.oid ?? null, replyTo: c.replyTo?.databaseId ?? null, ...(c.unbound ? { lane_bound: false } : {}) })),
           };
         }),
         comments: pr.comments.nodes.filter((c) => c.createdAt < until).map((c) => ({ author: c.author?.login ?? null, author_type: c.author?.__typename ?? null, createdAt: c.createdAt, body: c.body })),
@@ -540,10 +585,10 @@ function fetchPipeline(repo) {
   };
 }
 
-export function fetchSnapshot({ repo, since, until }) {
+export async function fetchSnapshot({ repo, since, until }) {
   const truncated = [];
   const { rounds_cap, round_author } = fetchPipeline(repo);
-  const prs = fetchPrs(repo, since, until, truncated);
+  const prs = await fetchPrs(repo, since, until, truncated);
   console.error(`review-precision: ${prs.length} merged PRs in the window`);
   prs.sort((a, b) => a.number - b.number);
   return { schema: 3, repo, window: { since, until }, earliest_supported: EARLIEST_SUPPORTED, rounds_cap, round_author, truncated, prs };
@@ -590,7 +635,7 @@ function currentRepo() {
   return gh(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]).trim();
 }
 
-export function main(argv) {
+export async function main(argv) {
   let opts;
   try {
     opts = parseArgs(argv);
@@ -602,7 +647,7 @@ export function main(argv) {
   try {
     const snapshot = opts.snapshot
       ? JSON.parse(readFileSync(opts.snapshot, "utf8"))
-      : fetchSnapshot({ repo: opts.repo ?? currentRepo(), since: opts.since, until: opts.until });
+      : await fetchSnapshot({ repo: opts.repo ?? currentRepo(), since: opts.since, until: opts.until });
     if (!opts.snapshot) console.error(`review-precision: ${calls} gh calls`);
     if (opts.action === "fetch" || opts.save) writeFileSync(opts.out ?? opts.save, stableStringify(snapshot));
     if (opts.action === "fetch") return 0;
@@ -615,4 +660,8 @@ export function main(argv) {
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) process.exitCode = main(process.argv.slice(2));
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  main(process.argv.slice(2)).then((code) => {
+    process.exitCode = code;
+  });
+}

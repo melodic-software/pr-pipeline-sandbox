@@ -51,10 +51,11 @@ import { testedRun } from "../maintenance-reconcile-lost-runs/infra-failure.mjs"
 import { LIMIT_DEFAULTS } from "../work-resolve-issue/limits.mjs";
 import { DEPENDABOT_ID, POLICY_PATH } from "./dependency-classify.mjs";
 import { dispatchDependencyReviews } from "./dependency-dispatch.mjs";
-import { emptyRecord, isHandled, markHandled, pruneRecord, readRecord, writeRecord } from "./dispatch-record.mjs";
+import { emptyRecord, isHandled, markHandled, pruneRecord, readRecord, RUN_ID, sendDispatch, writeRecord } from "./dispatch-record.mjs";
+import { laneReader, withLaneBinding } from "./address-feedback.mjs";
 import { prHold, reviewReader } from "./gate-source.mjs";
 import { runTitle, shareWorkflowRuns } from "./feedback-dispatch.mjs";
-import { DEFAULTS as CI_FIX_DEFAULTS, dispatchCiFixes, humanGatedLabel } from "./fix-ci-dispatch.mjs";
+import { adoptableOwnerIds, DEFAULTS as CI_FIX_DEFAULTS, dispatchCiFixes, humanGatedLabel } from "./fix-ci-dispatch.mjs";
 import { TRACKER_BINDING_PATH, trackerBindingText } from "../pr-merge/merge-holds.mjs";
 import { HISTORY_QUERY as DOCS_FIX_HISTORY_QUERY } from "./fix-docs-dispatch.mjs";
 import { anyHandles, cappedAt, headLagStop, laneStop, limitStop, pendingStop, permanentlyHandles, releasedBy, stopRelease } from "./limit-stop.mjs";
@@ -84,8 +85,6 @@ export const DEFAULTS = Object.freeze({
   holdLabels: Object.freeze(["do-not-merge", "needs-human"]),
 });
 
-// The run id form the record's readers accept.
-const RUN_ID = /^[1-9][0-9]{0,14}$/;
 const SHA = /^[0-9a-f]{40}$/;
 
 // The check-run handling both dispatchers read a head's runs under.
@@ -108,26 +107,6 @@ function inFlightRun(log, active, { workflow, activity, node }) {
     log(`skip #${node.number}: ${workflow} run ${inFlight.id} for ${activity} is not done yet`);
   }
   return inFlight;
-}
-
-// One pr-unblock.yml dispatch for the PR: the run id it started, or null when
-// it failed or named no usable id. The dispatched run's gate and the broker
-// refuse a run this run did not record, so a dispatch with no usable id counts
-// as failed. `label` prefixes the activity in its log lines.
-async function sendDispatch(api, log, { workflow, base, node, inputs, label = "" }) {
-  try {
-    const { workflowRunId } = await api.dispatchWorkflow({ workflow, ref: `refs/heads/${base}`, inputs });
-    const id = String(workflowRunId);
-    if (!RUN_ID.test(id)) {
-      log(`::error::#${node.number}: ${label}dispatch returned no valid workflow_run_id`);
-      return null;
-    }
-    log(`dispatched ${label}#${node.number} head ${node.headRefOid} workflow_run_id=${id}`);
-    return id;
-  } catch (error) {
-    log(`::error::#${node.number}: ${label}dispatch failed: ${error.message}`);
-    return null;
-  }
 }
 
 // The log line that names a head-lag stop on the head as the cause of this
@@ -436,7 +415,7 @@ export async function dispatchSharedCopies({
       continue;
     }
     sent += 1;
-    const id = await sendDispatch(api, log, { workflow, base, node, label: `${activity} `, inputs: { "pr-number": String(node.number), activity, "dispatcher-run-id": String(runId) } });
+    const id = await sendDispatch(api, log, { workflow, base, node, label: `${activity} `, errorLabel: `${activity} `, inputs: { "pr-number": String(node.number), activity, "dispatcher-run-id": String(runId) } });
     if (id === null) {
       failed += 1;
     } else {
@@ -819,6 +798,8 @@ export async function main(
   env,
   {
     api,
+    // The review lanes' run records (address-feedback.mjs laneReader).
+    actions,
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     log = (line) => console.log(line),
     loadLimits = loadBaseLimits,
@@ -836,15 +817,19 @@ export async function main(
     }
   }
   const budget = api ? null : budgetedFetch({ log });
-  const base =
+  // Every held PR's timeline binds the review lanes' hold comments to their
+  // runs (address-feedback.mjs withLaneBinding), read with ARTIFACT_READ_TOKEN.
+  const base = withLaneBinding(
     api ??
-    createGitHubApi({
-      token: env.GITHUB_TOKEN,
-      repository: env.GITHUB_REPOSITORY,
-      apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
-      graphqlUrl: env.GITHUB_GRAPHQL_URL ?? "https://api.github.com/graphql",
-      fetch: budget.fetch,
-    });
+      createGitHubApi({
+        token: env.GITHUB_TOKEN,
+        repository: env.GITHUB_REPOSITORY,
+        apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
+        graphqlUrl: env.GITHUB_GRAPHQL_URL ?? "https://api.github.com/graphql",
+        fetch: budget.fetch,
+      }),
+    actions ?? laneReader(env, { fetch: budget?.fetch }),
+  );
   try {
     return await dispatchAll(env, { client: shareWorkflowRuns(shareTimeline(wrapRunIds(base, env))), sleep, log, loadLimits, loadAdoption, loadOwnedBranches, verifyCapped, now });
   } finally {
@@ -867,6 +852,9 @@ async function dispatchAll(env, { client, sleep, log, loadLimits, loadAdoption, 
     log(`::warning::the open pull request listing could not be read (${error.message}); nothing dispatched, a later run retries`);
     return 0;
   }
+  // The burn-rate pacer paces the next scheduled tick only after a run that
+  // listed (pr-unblock-dispatch.yml `Mark this tick's work done`).
+  appendFileSync(env.GITHUB_OUTPUT, "listed=true\n");
   const { record, text } = readRecord(env.DISPATCH_RECORD);
   pruneRecord(record, new Set(listed.map((node) => node.headRefOid)));
   // The human-gated label another lane's escalation may leave on for
@@ -896,15 +884,15 @@ async function dispatchAll(env, { client, sleep, log, loadLimits, loadAdoption, 
   // human-gated label is read only when owners are adopted; an unreadable
   // tracker config holds the adopted owner PRs alone, as a failure.
   // With `adoption.idle-hours` set (as pr-merge requires), every account on
-  // the base's trusted-actors list is adoptable, by id, but Dependabot:
-  // review-dependency owns its red PRs.
+  // the base's trusted-actors list is adoptable, by id, but the bot authors
+  // fix-ci-dispatch.mjs adoptableOwnerIds leaves out.
   let fixes = { dispatched: [], failed: 1 };
   let ownerIds = [];
   let holdLabels = CI_FIX_DEFAULTS.holdLabels;
   let ownersHeld = "";
   if (adoption["idle-hours"] !== undefined) {
     try {
-      ownerIds = [...loadTrustedList(`${basePath(env)}/${TRUSTED_ACTORS_PATH}`).ids].filter((id) => id !== DEPENDABOT_ID);
+      ownerIds = adoptableOwnerIds(loadTrustedList(`${basePath(env)}/${TRUSTED_ACTORS_PATH}`).ids);
       holdLabels = [...new Set([...holdLabels, baseHumanGatedLabel(env)])];
     } catch (error) {
       log(`::error::cannot read the base trusted-actors list or the human-gated label from the base tracker binding (${error.message}); no adopted PR gets fix-ci`);

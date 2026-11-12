@@ -5,6 +5,8 @@ import { test } from "node:test";
 import { parse, stringify } from "yaml";
 
 import { WIP_DEFAULTS, resolveWip } from "../../scripts/work-resolve-issue/limits.mjs";
+import { LANE_LEVEL_DEFAULTS } from "../../scripts/lib/lane-level.mjs";
+import { LEVEL_VARIABLE } from "../../scripts/lib/lane-level-value.mjs";
 
 import {
   checkAppliedBySupported,
@@ -13,6 +15,7 @@ import {
   Rejection,
   resolve,
   resolveGrant,
+  resolveLimits,
 } from "./resolve.mjs";
 import { checkPatchRules } from "./patch-rules.mjs";
 
@@ -140,9 +143,30 @@ test("rejection 3: a gate activity in pr-explain is rejected", () => {
 
 test("rejection 3: a merge effect outside pr-merge is rejected in a lane the run did not ask for", () => {
   const config = edited((doc) => {
-    doc.activities["fix-prose"].effect = "merge";
+    doc.activities["apply-prose"].effect = "merge";
+    delete doc.activities["apply-prose"].prepare;
   });
   assertRejected(() => run(config), "forbidden-by-lane");
+});
+
+// A skill runs only in the read runner: the schema and the reader each refuse
+// a skill whose effect is not read, in any lane.
+test("a skill with an effect other than read fails the schema and the reader", () => {
+  const schemaWithoutRule = structuredClone(SCHEMA);
+  schemaWithoutRule.$defs.leaf.allOf = schemaWithoutRule.$defs.leaf.allOf.filter(
+    (rule) => JSON.stringify(rule.if) !== JSON.stringify({ required: ["skill"] }),
+  );
+  assert.equal(schemaWithoutRule.$defs.leaf.allOf.length, SCHEMA.$defs.leaf.allOf.length - 1);
+  for (const effect of ["mutate-branch", "publish-artifact", "mutate-tracker"]) {
+    const config = edited((doc) => {
+      doc.activities["measure-coverage"].effect = effect;
+    });
+    assertRejected(() => run(config, { lane: "pr-refine", activity: "fix-prose" }), "invalid-config");
+    assertRejected(
+      () => run(config, { lane: "pr-refine", activity: "fix-prose" }, { schema: schemaWithoutRule }),
+      "skill-not-read",
+    );
+  }
 });
 
 // Rejection 4
@@ -332,6 +356,12 @@ const LIMITS = {
   "reset-clamp-min": 1,
   "reset-clamp-max": 168,
   "restarts-per-run": 5,
+  // Kill-switch re-fires fill the issue lane to two runs per slot (owner decision Q109).
+  "refire-queue-per-slot": 2,
+  // A lane run still queued an hour after it was created is lost, not counted.
+  "stale-queued-minutes": 60,
+  // A work-resolve-issue run's sweep waits 15 minutes after the last full sweep.
+  "sweep-gap-minutes": 15,
   "readmit-per-run": 20,
   "parent-rescan-per-run": 5,
   "limit-stops-per-head": 3,
@@ -351,6 +381,8 @@ const LIMITS = {
   "stranded-backoff-hours": { "no-run": 3, "no-report": 3, "failed-again": 3, "failed-mint": 3, "kill-switch": 3 },
   // Passed through as set; rate-guard.mjs fills it from the schema's defaults.
   api: {},
+  // The adaptive lane level's bounds and streak (owner decision Q111, 2026-11-10).
+  "lane-level": { floor: 2, ceiling: 4, default: 3, "clean-windows": 2, pools: ["lanes-app"], shadow: true, variable: "CLAUDE_LANE_LEVEL", "valid-minutes": 150 },
 };
 
 test("limits: a config with no limits leaf resolves today's thirteen values", () => {
@@ -362,6 +394,69 @@ test("limits: a set leaf overrides its default and leaves the others", () => {
     doc.limits = { "fallback-reset": 2, "limit-stops-per-issue": 4, "turn-cap-restarts": 1, "admission-factor": 0.5 };
   });
   assert.deepEqual(run(config).limits, { ...LIMITS, "fallback-reset": 2, "limit-stops-per-issue": 4, "turn-cap-restarts": 1, "admission-factor": 0.5 });
+});
+
+test("limits: a set lane-level key overrides its default and keeps the others; an out-of-range one or an unknown pool is rejected", () => {
+  const set = edited((doc) => {
+    doc.limits = { "lane-level": { ceiling: 5, pools: ["lanes-app", "github-token"] } };
+  });
+  assert.deepEqual(run(set).limits["lane-level"], { ...LIMITS["lane-level"], ceiling: 5, pools: ["lanes-app", "github-token"] });
+  for (const bad of [
+    { ceiling: 11 },
+    { floor: 0 },
+    { "clean-windows": 1.5 },
+    { pools: ["content-creation"] },
+    { pools: [] },
+    { step: 1 },
+    { shadow: "false" },
+    { variable: "CLAUDE_LANES_REPO_DISABLED" },
+    { variable: "CLAUDE_LANES_DISABLED" },
+    { "valid-minutes": 59 },
+  ]) {
+    const rejected = edited((doc) => {
+      doc.limits = { "lane-level": bad };
+    });
+    assertRejected(() => run(rejected), "invalid-config");
+  }
+});
+
+test("limits: a lane-level floor above its ceiling is rejected, set or defaulted; a floor equal to it resolves", () => {
+  const level = (laneLevel) =>
+    edited((doc) => {
+      doc.limits = { "lane-level": laneLevel };
+    });
+  assert.deepEqual(run(level({ floor: 4 })).limits["lane-level"], { ...LIMITS["lane-level"], floor: 4 });
+  for (const bad of [{ floor: 5, ceiling: 3 }, { floor: 5 }, { ceiling: 1 }]) {
+    assertRejected(() => run(level(bad)), "invalid-config");
+    assertRejected(() => resolveLimits(files(level(bad)), { configPath: CONFIG_PATH }), "invalid-config");
+  }
+});
+
+test("lane-level: the schema's defaults, resolve-config's, decide()'s and the live yaml's are one set", () => {
+  const schema = Object.fromEntries(Object.entries(SCHEMA.properties.limits.properties["lane-level"].properties).map(([key, value]) => [key, value.default]));
+  const live = parse(read("../../../docs/conventions/pr-pipeline.yaml")).limits["lane-level"];
+  const decides = { ...LANE_LEVEL_DEFAULTS, pools: [...LANE_LEVEL_DEFAULTS.pools] };
+  assert.deepEqual(schema, LIMITS["lane-level"], "the schema's defaults are the ceiling-4 set");
+  assert.deepEqual(run(fixture("valid.yaml")).limits["lane-level"], schema, "resolve-config's");
+  assert.deepEqual(decides, schema, "LANE_LEVEL_DEFAULTS in lane-level.mjs");
+  assert.deepEqual(live, schema, "docs/conventions/pr-pipeline.yaml");
+});
+
+test("lane-level: the schema's variable pattern is the publisher's name guard", () => {
+  assert.equal(SCHEMA.properties.limits.properties["lane-level"].properties.variable.pattern, LEVEL_VARIABLE.source);
+});
+
+test("limits: refire-queue-per-slot is a whole number from 1 to 10", () => {
+  const set = edited((doc) => {
+    doc.limits = { "refire-queue-per-slot": 3 };
+  });
+  assert.equal(run(set).limits["refire-queue-per-slot"], 3);
+  for (const bad of [0, 11, 1.5]) {
+    const rejected = edited((doc) => {
+      doc.limits = { "refire-queue-per-slot": bad };
+    });
+    assertRejected(() => run(rejected), "invalid-config");
+  }
 });
 
 test("limits: fix-docs-per-run 0 is accepted, turning CI fix-docs off", () => {
@@ -731,7 +826,7 @@ test("resolveGrant returns the selected slot's effect and grant", () => {
     grant: READ_GRANT,
   });
   assert.deepEqual(
-    grantOf(fixture("valid.yaml"), { lane: "pr-refine", activity: "fix-prose" }),
+    grantOf(fixture("valid.yaml"), { lane: "pr-refine", activity: "apply-prose" }),
     {
       effect: "mutate-branch",
       grant: { contents: "write", "pull-requests": "read", issues: "read" },
@@ -881,12 +976,27 @@ test("a lane-rules.json activity grant adds actions read to that activity alone"
   assert.deepEqual(EFFECT_GRANTS.read, READ_GRANT);
 });
 
-test("an activity grant other than exactly actions read is rejected", () => {
+test("a lane-rules.json activity grant adds actions-variables write to that activity alone", () => {
+  const overrides = withActivityGrants({ "run-tests": { "actions-variables": "write" } });
+  assert.deepEqual(
+    grantOf(fixture("valid.yaml"), { activity: "run-tests" }, overrides),
+    { effect: "read", grant: { ...READ_GRANT, "actions-variables": "write" } },
+  );
+  assert.deepEqual(
+    grantOf(fixture("valid.yaml"), { activity: "measure-coverage" }, overrides),
+    { effect: "read", grant: READ_GRANT },
+  );
+});
+
+test("an activity grant other than exactly actions read or actions-variables write is rejected", () => {
   const grants = [
     null,
     [],
     "actions",
     { "run-tests": { actions: "write" } },
+    { "run-tests": { "actions-variables": "read" } },
+    { "run-tests": { actions_variables: "write" } },
+    { "run-tests": { actions: "read", "actions-variables": "write" } },
     { "run-tests": { contents: "write" } },
     { "run-tests": { actions: "read", contents: "write" } },
     { "run-tests": {} },
@@ -1021,7 +1131,7 @@ test("changed-paths with nothing left skips the activity as not-applicable-paths
 
 test("a read activity's changed-paths keeps instruction surfaces and owned paths", () => {
   const config = withChangedPaths((doc) => {
-    doc.activities["fix-prose"].effect = "read";
+    delete doc.activities["fix-prose"]["applied-by"];
   });
   assert.deepEqual(
     targetsOf(["CLAUDE.md", "plugins/ai-slop/README.md"], config)[
@@ -1051,7 +1161,7 @@ const COMPOSITE = `version: 2
 activities:
   simplify:
     skill: code-tidying:batch-simplify
-    effect: mutate-branch
+    effect: read
     gating: advisory
     reads-untrusted: false
   fix-lint:
@@ -1361,13 +1471,23 @@ test("selecting a composite key is rejected as undefined-activity", () => {
 
 // prepare
 
+// simplify hands its change on as a patch to apply-simplify, which needs it.
 const withPrepare = (edit) =>
   composite((doc) => {
     doc.activities.simplify.prepare = "merge-base";
+    doc.activities.simplify["applied-by"] = { patch: "apply-simplify" };
+    doc.activities["apply-simplify"] = {
+      script: ".github/scripts/apply-patch/apply-patch.mjs",
+      prepare: "apply-patch",
+      effect: "mutate-branch",
+      gating: "advisory",
+      "reads-untrusted": false,
+    };
+    doc.lanes["pr-refine"].slots.push({ activity: "apply-simplify", needs: ["simplify"] });
     edit?.(doc);
   });
 
-test("prepare on a non-read skill leaf resolves and is carried on the slot", () => {
+test("prepare on a skill leaf that hands on a patch resolves and is carried on the slot", () => {
   const selected = runRefine(withPrepare(), {
     activity: "simplify",
     facts: LINT_FACTS,
@@ -1383,9 +1503,10 @@ test("prepare on a non-read skill leaf resolves and is carried on the slot", () 
   );
 });
 
-test("prepare: review-threads on a non-read skill leaf resolves and is carried on the slot", () => {
+test("prepare: review-threads on a skill leaf that hands on a patch and replies resolves and is carried on the slot", () => {
   const config = withPrepare((doc) => {
     doc.activities.simplify.prepare = "review-threads";
+    doc.activities.simplify["applied-by"]["feedback-replies"] = "apply-simplify";
   });
   assert.equal(runRefine(config, { activity: "simplify", facts: LINT_FACTS }).selected.prepare, "review-threads");
 });
@@ -1394,7 +1515,7 @@ test("prepare: review-threads on a non-read skill leaf resolves and is carried o
 // requires applied-by.patch of it.
 test("prepare on a read skill leaf with no applied-by.patch is rejected", () => {
   const config = withPrepare((doc) => {
-    doc.activities.simplify.effect = "read";
+    delete doc.activities.simplify["applied-by"];
   });
   assertRejected(() => runRefine(config), "invalid-config");
 });
@@ -1412,16 +1533,16 @@ test("prepare on a script leaf, or a value other than merge-base, fails the sche
 
 // A read ci-context skill that hands on its patch resolves: the live fix-ci
 // (live-config.test.mjs). Without applied-by.patch its edits would leave nowhere.
-test("prepare: ci-context needs effect read, and a read one needs applied-by.patch", () => {
-  const read = withPrepare((doc) => {
-    doc.activities.simplify.prepare = "ci-context";
-    doc.activities.simplify.effect = "read";
-  });
-  assertRejected(() => runRefine(read), "invalid-config");
-  const write = withPrepare((doc) => {
+test("prepare: ci-context resolves on a skill that hands on a patch, and fails the schema without one", () => {
+  const handsOn = withPrepare((doc) => {
     doc.activities.simplify.prepare = "ci-context";
   });
-  assertRejected(() => runRefine(write), "invalid-prepare");
+  assert.equal(runRefine(handsOn, { activity: "simplify", facts: LINT_FACTS }).selected.prepare, "ci-context");
+  const none = withPrepare((doc) => {
+    doc.activities.simplify.prepare = "ci-context";
+    delete doc.activities.simplify["applied-by"];
+  });
+  assertRejected(() => runRefine(none), "invalid-config");
 });
 
 test("prepare: apply-patch is the one mode a script may set, and it needs effect mutate-branch", () => {
@@ -1542,17 +1663,18 @@ lanes:
       - activity: ${activity}
 `;
 
-// address-feedback runs on the read runner: it neither pushes nor posts.
-for (const [activity, allowed, forbidden] of [
-  ["address-feedback", "read", ["mutate-branch", "publish-artifact", "mutate-tracker", "merge"]],
-  ["publish-feedback", "publish-artifact", ["mutate-branch", "mutate-tracker", "merge"]],
+// address-feedback runs on the read runner: it neither pushes nor posts. As a
+// skill, the schema refuses any other effect before its activity rule does.
+for (const [activity, allowed, forbidden, code] of [
+  ["address-feedback", "read", ["mutate-branch", "publish-artifact", "mutate-tracker", "merge"], "invalid-config"],
+  ["publish-feedback", "publish-artifact", ["mutate-branch", "mutate-tracker", "merge"], "forbidden-by-activity"],
 ]) {
   test(`the shipped activity rules give ${activity} ${allowed} and nothing that ${allowed === "read" ? "pushes or posts" : "pushes"}`, () => {
     // The live vocabulary: the fixture lacks the verb "publish".
     const live = { vocabulary: JSON.parse(readFileSync(LIVE_VOCABULARY, "utf8")) };
     assert.equal(run(feedbackLeaf(activity, allowed), { lane: "pr-unblock", activity }, live).selected.effect, allowed);
     for (const effect of forbidden) {
-      assertRejected(() => run(feedbackLeaf(activity, effect), { lane: "pr-unblock", activity }, live), "forbidden-by-activity");
+      assertRejected(() => run(feedbackLeaf(activity, effect), { lane: "pr-unblock", activity }, live), code);
     }
   });
 }
@@ -1610,7 +1732,7 @@ function resolveEveryExampleSlot(vocabulary) {
 
 test("the README example validates and resolves for each of its lanes", () => {
   const results = resolveEveryExampleSlot(VOCABULARY);
-  assert.equal(Object.keys(results).length, 16);
+  assert.equal(Object.keys(results).length, 17);
   // The example's models block routes claude to review and leaves the rest
   // on default-profile standard.
   assert.deepEqual(results["pr-review / claude"].models, {
@@ -1660,7 +1782,7 @@ test("integration: the README example resolves against the synced standards voca
   const results = resolveEveryExampleSlot(
     JSON.parse(readFileSync(LIVE_VOCABULARY, "utf8")),
   );
-  assert.equal(Object.keys(results).length, 16);
+  assert.equal(Object.keys(results).length, 17);
 });
 
 // applied-by: a read skill names the script activity that applies each thing
