@@ -3,6 +3,108 @@
 All notable changes to the `source-control` plugin are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this plugin uses semantic versioning.
 
+## [11.2.3] - 2026-11-12
+
+### Changed
+
+- `babysit-prs`: the `/autofix-pr` record keeps a conflicting PR with this skill's conflict handling and points at the Auto-fix docs for comparing coverage.
+
+- Corrected in place: the released entries [0.42.2] now name the spell-check plugin `spelling`, its current name.
+
+## [11.2.2] - 2026-11-12
+
+### Fixed
+
+- babysit-prs's GitHub rate guard reports an HTTP 5xx whose only signal is a `Retry-After` header as `GitHub server error` ("GitHub answered HTTP 503 with a Retry-After; no GitHub call is sent before ..."), not as an exhausted rate-limit pool. The hold is unchanged: every pool, for the `Retry-After`, exit 75. A 5xx that also carries `x-ratelimit-remaining: 0`, a rate-limit or secondary-limit message or a GraphQL `RATE_LIMITED` error, and any 403 or 429, keep the rate-limit wording. Each stop's cause also goes in the job's `api-budget/cause` file beside the stop file, so a later process refused by the stop names a server error hold as one; a stop with no cause reads as a rate limit. The merge-queue ejection discount counts and forgives exactly the gate lines it did before, under their new wording.
+
+## [11.2.1] - 2026-11-12
+
+### Changed
+
+- Internal restructuring, no behavior change.
+
+## [11.2.0] - 2026-11-12
+
+### Changed
+
+- `babysit_postmerge.py --uncovered-at LANE_SHA --branch BRANCH` replaces `--uncovered-since MERGED_AT`: it makes one read of the branch's newest full dispatch run and exits 6 when its head commit does not contain LANE_SHA (ancestry read from a local full-history clone; a head commit no clone holds counts as covered), the point where `--stop-uncovered` would stop. pr-merge's PR-scoped wake runs it first and ends there on 6, before its last-report, carry, lane-records and fresh-check reads.
+
+## [11.1.5] - 2026-11-12
+
+### Fixed
+
+- babysit-prs: the raw-text workflow reading in the risk scorer now strips anchors and tags and finds block-scalar openers in one linear pass, so a long workflow patch line can no longer slow the scorer.
+
+## [11.1.4] - 2026-11-12
+
+### Changed
+
+- Internal restructuring, no behavior change.
+
+## [11.1.3] - 2026-11-12
+
+### Fixed
+
+- `babysit-prs` no longer counts toward `merge.max-queue-ejections` a merge-queue removal caused
+  by the merge group's `CI Status` failing on a GitHub rate limit alone, once that limit has
+  reset, so an exhausted `GITHUB_TOKEN` pool no longer strands a head until a push. Any other
+  failed-check removal, or one whose evidence cannot be read, counts as before.
+
+## [11.1.2] - 2026-11-12
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [11.1.1] - 2026-11-12
+
+### Changed
+
+- Pointer records no longer carry an as-of date or recheck trigger; stored values keep theirs.
+
+- Internal simplification, no behavior change.
+
+- Internal restructuring, no behavior change.
+
+## [11.1.0] - 2026-11-12
+
+### Added
+
+- `babysit_postmerge.py --uncovered-since MERGED_AT --branch BRANCH` makes one read of the branch's newest full dispatch run and exits 6 when it was created before MERGED_AT, the point where `--stop-uncovered` would stop. pr-merge's PR-scoped wake runs it first and ends there on 6, before its last-report, carry, lane-records and fresh-check reads.
+
+## [11.0.2] - 2026-11-12
+
+### Changed
+
+- Pointer records no longer carry an as-of date or recheck trigger; stored values keep theirs.
+
+- Internal restructuring, no behavior change.
+
+- `babysit-prs` reads the claude-code-plugins jobs by their Title Case check names (`PR Review /
+  review-status`, `Kill Switch`, `Test Bash (3)`), else by the job id on a head tested before the
+  rename or in a repository whose jobs have no display name; post-merge baselines compare a check
+  across both forms. `pull-request` review-venue finds `Test *` lanes too.
+
+- Internal simplification, no behavior change.
+
+## [11.0.1] - 2026-11-12
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [11.0.0] - 2026-11-12
+
+### Changed
+
+- The babysit-loop skill, the babysit safety reference and the pull-request create reference no longer describe a JSON binding.
+
+- Internal simplification, no behavior change.
+
+### Removed
+
+- The babysit scripts no longer read role labels from a repo-root `.work-item-tracker.json`. `babysit_tracker_binding.py` reads only the `tracker` mapping of `docs/conventions/work-items.yaml`; `LEGACY_PATH` is gone and `PATHS` holds only that file, so the merge-skip cache key no longer covers the JSON file. A repository bound only by the JSON file gets the default role labels. Fix: run `/work-items:setup apply`, which copies the binding into `docs/conventions/work-items.yaml`.
+
 ## [10.0.8] - 2026-11-12
 
 ### Changed
@@ -2737,7 +2839,7 @@ Internal simplification, no behavior change.
 
 ### Changed
 
-- `resolve-conflicts ci` runs no command and stages nothing: it reads the merge context the runner writes to `.lane/merge/` (each conflicted path's base, ours and theirs versions and both sides' history) in place of git, resolves each conflicted file in place, edits no other file, and leaves a path it cannot resolve with its conflict markers, which hands the run to a person ([`SKILL.md`](https://github.com/melodic-software/claude-code-plugins/blob/main/plugins/source-control/skills/resolve-conflicts/SKILL.md#ci-mode)). The CI-mode evals follow: `resolve-conflicts-ci-mode-stages-resolved-paths` becomes `resolve-conflicts-ci-mode-resolves-in-place`.
+- `resolve-conflicts ci` runs no command and stages nothing: it reads the merge context the runner writes to `.lane/merge/` (each conflicted path's base, ours and theirs versions and both sides' history) in place of git, resolves each conflicted file in place, edits no other file, and leaves a path it cannot resolve with its conflict markers, which hands the run to a person ([`SKILL.md`](https://github.com/melodic-software/claude-code-plugins/blob/38eda1ecac7fd1b602ae837e2bd657dc1ea4be61/plugins/source-control/skills/resolve-conflicts/SKILL.md#ci-mode)). The CI-mode evals follow: `resolve-conflicts-ci-mode-stages-resolved-paths` becomes `resolve-conflicts-ci-mode-resolves-in-place`.
 
 ## [2.11.8] - 2026-10-23
 
@@ -8323,7 +8425,7 @@ Internal simplification, no behavior change.
   session whose project directory is the user's home admitted everything under the OS temp root,
   including Claude Code's own per-session scratchpad, which lives there. Hooks that lint, rewrite, or
   autocorrect then ran on throwaway files that are not project content and carry no project config to
-  opt out with; the reported case was `typos-format` autocorrecting a shell variable in a scratch
+  opt out with; the reported case was `spelling` autocorrecting a shell variable in a scratch
   script and silently breaking it. The guard now rejects a file inside the OS temp tree when the
   project root is outside it. The exemption is deliberate and required: when the project root
   itself lives under temp, its files are still accepted. That case is a `mktemp -d` fixture

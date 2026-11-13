@@ -43,8 +43,8 @@
 // recorded.
 
 import { appendFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
 
+import { runAsScript } from "../lib/run-main.mjs";
 import { loadTrustedList } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
 import { countRequests } from "../../actions/log-api-budget/rate-guard.mjs";
 import { testedRun } from "../maintenance-reconcile-lost-runs/infra-failure.mjs";
@@ -761,6 +761,11 @@ export async function loadBaseTidyCutoffs(env) {
   return fromBase(env, "tidyCutoffsFromBase");
 }
 
+// The base config's refine-dispatch.activities, the same way, or [].
+export async function loadBaseRefineActivities(env) {
+  return fromBase(env, "refineDispatchActivitiesFromBase");
+}
+
 // Each run id is also appended to RUN_IDS_FILE as soon as its dispatch
 // returns, so a run cancelled mid-step still records what it sent.
 export function wrapRunIds(base, env) {
@@ -934,14 +939,4 @@ async function dispatchAll(env, { client, sleep, log, loadLimits, loadAdoption, 
   return failed === 0 ? 0 : 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main(process.env).then(
-    (code) => {
-      process.exitCode = code;
-    },
-    (error) => {
-      console.log(`::error::pr-unblock dispatch failed: ${error.message}`);
-      process.exitCode = 1;
-    },
-  );
-}
+runAsScript(import.meta.url, "pr-unblock dispatch", () => main(process.env));

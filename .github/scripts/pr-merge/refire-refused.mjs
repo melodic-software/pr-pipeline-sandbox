@@ -35,8 +35,9 @@
 // A run of an activity no dispatcher tick re-dispatches (the lane's
 // `transientActivities`; the pr-unblock-dispatch tick dispatches the others,
 // so no head gets two retry paths) also gets the empty commit
-// when its token step failed transiently: `broker-unreachable`, or
-// `lane-token-denied` with a 5xx status. No 403 reason is transient, so a 403
+// when its token step failed transiently: `broker-unreachable`,
+// `lane-token-denied` with a 5xx status, or an OIDC token request still
+// failing with a 5xx or a curl network error. No 403 reason is transient, so a 403
 // other than workflow-modified is never re-fired. The new head starts the
 // review lanes, whose completion is the activity's own fresh event. Such a
 // re-fire is recorded per run in a `transient` marker, and is capped at one
@@ -93,20 +94,22 @@ const LANES = Object.freeze({
       ".github/workflows/pr-unblock-dispatch.yml",
       ".github/workflows/pr-feedback-dispatch.yml",
     ],
-    // The jobs that call the write runner, whose `run` job alone requests the
-    // lane token; the jobs API names each `<caller> / run`.
+    // The jobs that call the write runner, as [display name, job id], whose
+    // `run` job alone requests the lane token; the jobs API names each
+    // `<display name> / Run`, or `<job id> / run` on a head tested before the
+    // rename.
     writeCallers: [
-      "apply-conflict-patch",
-      "apply-feedback-patch",
-      "publish-feedback",
-      "resolve-feedback-threads",
-      "apply-dependency-patch",
-      "apply-dependency-verdict",
-      "apply-dependency-pin",
-      "apply-patch",
-      "apply-patch-rung-up",
-      "apply-shared-copies",
-      "report-escalation",
+      ["Apply Conflict Patch", "apply-conflict-patch"],
+      ["Apply Feedback Patch", "apply-feedback-patch"],
+      ["Publish Feedback", "publish-feedback"],
+      ["Resolve Feedback Threads", "resolve-feedback-threads"],
+      ["Apply Dependency Patch", "apply-dependency-patch"],
+      ["Apply Dependency Verdict", "apply-dependency-verdict"],
+      ["Apply Dependency Pin", "apply-dependency-pin"],
+      ["Apply Patch", "apply-patch"],
+      ["Apply Patch Rung Up", "apply-patch-rung-up"],
+      ["Apply Shared Copies", "apply-shared-copies"],
+      ["Report Escalation", "report-escalation"],
     ],
     // The activities the pr-unblock-dispatch tick does not dispatch: it
     // dispatches resolve-conflicts, review-dependency, fix-ci and
@@ -127,10 +130,12 @@ const LANES = Object.freeze({
 const REFUSED =
   /^lane-token-denied: the broker answered 403 with reason workflow-modified: (\.github\/workflows\/[A-Za-z0-9._-]+\.yml) differs from refs\/heads\/main$/;
 // A token step that failed for a reason the broker or the network may not
-// give next time (request-lane-token/action.yml): no response at all, or a
-// 5xx after the action's own retries. Group 1 is the label a marker records.
+// give next time (request-lane-token/action.yml): no response at all, a 5xx
+// after the action's own retries, or an OIDC token request still failing with
+// a 5xx or a curl network error after them (a 429 is a rate limit, not
+// re-fired). Group 1 or 4 is the label a marker records.
 const TRANSIENT =
-  /^(broker-unreachable): the lanes token broker gave no response|^lane-token-denied: the broker answered (5[0-9]{2}) with reason ([a-z]+(?:-[a-z]+)*)/;
+  /^(broker-unreachable): the lanes token broker gave no response|^lane-token-denied: the broker answered (5[0-9]{2}) with reason ([a-z]+(?:-[a-z]+)*)|^(the OIDC token request failed: (?:HTTP 5[0-9]{2}|curl exit [0-9]{1,2})) on attempt /;
 // At most this many transient re-fires per head tree (judgment, owner decision
 // on #8446: two per head).
 export const TRANSIENT_PER_HEAD = 2;
@@ -284,7 +289,7 @@ export async function tokenRefusal({ jobs, readAnnotations, lane = LANES["pr-unb
     // Only a write runner job requests the token. The jobs API can list a
     // completed job's steps empty or cut short: such a job whose list lacks
     // the token step is judged by its annotations.
-    const writer = lane.writeCallers.some((caller) => job.name === `${caller} / run`);
+    const writer = lane.writeCallers.some(([name, id]) => job.name === `${name} / Run` || job.name === `${id} / run`);
     const token = (Array.isArray(job.steps) ? job.steps : []).find((step) => step.name === STEP);
     const failedAtToken = writer && job.conclusion === "failure" && (token === undefined || token.conclusion === "failure");
     if (!failedAtToken || !Number.isSafeInteger(job.id)) {
@@ -302,7 +307,7 @@ export async function tokenRefusal({ jobs, readAnnotations, lane = LANES["pr-unb
       }
       const match = transientOk && transient === null ? TRANSIENT.exec(message) : null;
       if (match !== null) {
-        transient = { kind: "transient", label: match[1] ?? `lane-token-denied ${match[2]} ${match[3]}` };
+        transient = { kind: "transient", label: match[1] ?? match[4] ?? `lane-token-denied ${match[2]} ${match[3]}` };
       }
     }
   }

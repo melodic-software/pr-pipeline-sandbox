@@ -193,7 +193,7 @@ import { anyListed, fixRequesters, HOLD_LINE, humanGatedLabelFrom, isFixRequest,
 // fix-ci-dispatch.mjs imports HOLD_LINE from here.
 export { HOLD_LINE, NO_ADOPTION, ownerAdoption, ownerAuthored };
 import { commentItems, gateSource, listLabelEvents, prHold, reviewReader } from "./gate-source.mjs";
-import { emptyRecord, isHandled, markHandled, readRecord, RUN_ID, writeRecord } from "./dispatch-record.mjs";
+import { emptyRecord, isHandled, markHandled, readRecord, RUN_ID, startOf, writeRecord } from "./dispatch-record.mjs";
 import { anyHandles, KILL_SWITCH_STOP, LANE_STOP, laneStop, limitResetsAt, permanentlyHandles } from "./limit-stop.mjs";
 import { budgetedFetch } from "./request-budget.mjs";
 import { FAIL as VERIFY_FAIL, final as capFinal, deadlineWarning, verifyReader } from "./verify-cap.mjs";
@@ -256,7 +256,6 @@ export const SWEEP_WORKFLOW = ".github/workflows/pr-unblock-dispatch.yml";
 // address-feedback.mjs DEFAULT_MAX_ROUNDS, may end it sooner).
 export const SWEEP_HEAD_CAP = 3;
 
-const startOf = (run) => Date.parse(run.started_at ?? "");
 const newestStarted = (runs) => runs.reduce((a, b) => (startOf(b) > startOf(a) ? b : a), runs[0]);
 // An ISO time to the second, as the API's `created` filter takes it.
 const isoSeconds = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -1253,9 +1252,10 @@ async function sweepRefused(context) {
 // This file's workflow, whose lost runs the tick recovers.
 export const DISPATCH_WORKFLOW = ".github/workflows/pr-feedback-dispatch.yml";
 
-// The workflow's job that dispatches; a loss of its other jobs leaves no head
-// undispatched.
-const DISPATCH_JOB = "dispatch";
+// The workflow's job that dispatches, by its display name, or by its id
+// (`dispatch`) on a run started before the rename; a loss of its other jobs
+// leaves no head undispatched.
+const DISPATCH_JOB = new Set(["Dispatch", "dispatch"]);
 // A job that ran a step, as reconcile.mjs holdReason reads one.
 const jobStarted = (job) => (Array.isArray(job?.steps) ? job.steps : []).some((step) => step?.conclusion != null && step.conclusion !== "skipped");
 // A failed dispatch job sent nothing either (#11344: its POST threw), and
@@ -1267,7 +1267,7 @@ const RECOVERABLE = new Set([...LOST, "failure"]);
 // lose it). A POST the API rejects starts no round to hold the PR, and the
 // tick logs it and ends green (sweepPulls), so this age is the only bound.
 export const FAILED_RUN_WINDOW_HOURS = 2;
-const dispatchLost = (job) => job?.name === DISPATCH_JOB && RECOVERABLE.has(job.conclusion) && jobStarted(job);
+const dispatchLost = (job) => DISPATCH_JOB.has(job?.name) && RECOVERABLE.has(job.conclusion) && jobStarted(job);
 
 // The newest run of DISPATCH_WORKFLOW other than this one, created within
 // LOOKBACK_HOURS (FAILED_RUN_WINDOW_HOURS for a failed one), that ended in

@@ -805,6 +805,12 @@ branch-cleanup:
   # A run deletes at most this many; the rest wait for the next run.
   max-deletes-per-run: 25
 
+# Sandbox: pr-unblock-dispatch.yml's refine job also starts fix-marker on a
+# listed human's pull request event (owner decision 2026-11-12), since
+# pr-refine.yml runs it only on a dispatch from main.
+refine-dispatch:
+  activities: [fix-marker]
+
 merge:
   # The rung is a pacing cap; C2 is the accepted alias for merge. The lane reads
   # no `work-class:` label: its merge criterion is the verifier verdict below.

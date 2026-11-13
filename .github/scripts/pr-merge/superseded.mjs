@@ -61,17 +61,19 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 
 import { createGitHub, loadTrustedList, REPOSITORY } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
-import { WAKE_TITLE } from "./rotation.mjs";
+import { escapeCommand, WAKE_TITLE } from "./rotation.mjs";
 import { GITHUB_ACTIONS_BOT_ID } from "./who.mjs";
 
 export const RANKS = Object.freeze({
   merge: Object.freeze({ pull_request_target: 0, workflow_dispatch: 1, schedule: 2 }),
   "enable-auto-merge": Object.freeze({ pull_request_target: 0, workflow_dispatch: 1, schedule: 1 }),
 });
+// Each job's display name, which the jobs API lists it by, then its id, which a
+// run queued before the rename lists it by.
+const NAMES = Object.freeze({ merge: "Merge", "enable-auto-merge": "Enable Auto Merge" });
+const jobNamed = (jobs, job) => jobs.find((j) => j?.name === NAMES[job]) ?? jobs.find((j) => j?.name === job);
 const WAITING = new Set(["queued", "pending", "waiting", "requested"]);
 export const MAX_JOB_READS = 5;
-
-const escapeCommand = (text) => String(text).replaceAll(/[\r\n%]/g, " ");
 
 // The run's actor and its triggering actor (who last re-ran it) are each a
 // listed human, by id.
@@ -148,7 +150,7 @@ export async function main({ env = process.env, actions } = {}) {
       if (!Array.isArray(read?.jobs)) {
         throw new Error(`the jobs of run ${run.id} have an unexpected shape`);
       }
-      if (!WAITING.has(read.jobs.find((j) => j?.name === job)?.status)) {
+      if (!WAITING.has(jobNamed(read.jobs, job)?.status)) {
         continue;
       }
       superseded = true;

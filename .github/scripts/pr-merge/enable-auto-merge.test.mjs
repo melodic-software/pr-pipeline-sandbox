@@ -221,7 +221,7 @@ function world(pulls, { failArm = false, armErrors = {}, disarmErrors = {}, file
       return { files: [{ filename: "infra/main.tf" }] };
     }
     if (method === "GET" && path === "/repos/melodic-software/claude-code-plugins/actions/runs/9/jobs?filter=all&per_page=100&page=1") {
-      return { jobs: [{ id: 90, name: "pr-review / review-status", completed_at: "2026-10-22T11:00:00Z" }] };
+      return { jobs: [{ id: 90, name: "PR Review / review-status", completed_at: "2026-10-22T11:00:00Z" }] };
     }
     if (method === "GET" && path === "/repos/melodic-software/claude-code-plugins/check-runs/90/annotations?per_page=100&page=1") {
       return [{ annotation_level: "notice", message: `claude-lane-hold lane=claude-review sha=${HEAD} criteria=cost label=needs-human` }];
@@ -3304,6 +3304,47 @@ test("a gate reader stopped on a rate limit ends the run: no later pull request 
   assert.match(errors[0], /2100-01-01T00:00:00Z/);
 });
 
+// babysit_gh.py exits 75 on a server error hold too (a 5xx whose only signal
+// was Retry-After), titling its line "GitHub server error": the stop names
+// that line and keeps its cause, as it names a rate limit's.
+test("a reader stopped on a server error hold names its guard's line and cause", () => {
+  const line = "GitHub answered HTTP 503 with a Retry-After; no GitHub call is sent before 2100-01-01T00:00:00Z";
+  const held = new ReaderRateLimited("the lane-room read", `::error title=GitHub server error::${line}\nbabysit-gh-calls {"total": 1}`);
+  assert.equal(held.message, `the lane-room read stopped on a GitHub server error hold: ${line}`);
+  assert.equal(held.serverError, true);
+  const limited = new ReaderRateLimited("the lane-room read", "::error title=GitHub rate limit::every pool is exhausted (x); no GitHub call is sent before 2100-01-01T00:00:00Z");
+  assert.equal(limited.message, "the lane-room read stopped on a GitHub rate limit: every pool is exhausted (x); no GitHub call is sent before 2100-01-01T00:00:00Z");
+  assert.equal(limited.serverError, false);
+});
+
+test("a lane-room reader stopped on a server error hold disarms as on a rate limit, under the server error title", async () => {
+  const dir = tempDir("enable-auto-merge-room-hold-");
+  const stopFile = join(dir, "stop");
+  const latch = createRateLimitLatch({ log: () => {}, fail: () => {}, limits: () => ({}), stopFile });
+  const stopped = () => {
+    writeFileSync(stopFile, "* 4102444800\n");
+    return { status: 75, signal: null, stdout: "", stderr: "::error title=GitHub server error::GitHub answered HTTP 503 with a Retry-After; no GitHub call is sent before 2100-01-01T00:00:00Z\n" };
+  };
+  const armed = pull(1, { autoMergeRequest: { enabledAt: "2026-10-23T10:00:00Z" } });
+  const { github, writes } = world([armed, pull(2)]);
+  const lines = [];
+  const log = console.log;
+  console.log = (line) => lines.push(String(line));
+  let code;
+  try {
+    code = await main({ env: ENV, github, verify: world([]).verify, room: pythonRoom({ GITHUB_REPOSITORY: REPO }, stopped), sleep: async () => {}, latch });
+  } finally {
+    console.log = log;
+    rmSync(dir, { recursive: true, force: true });
+  }
+  assert.equal(code, 1);
+  assert.deepEqual(writes(), [], "every pool is held, GraphQL's disarm included");
+  assert.deepEqual(lines.filter((line) => line.startsWith("::error title=GitHub rate limit::")), []);
+  const errors = lines.filter((line) => line.startsWith("::error title=GitHub server error::enable-auto-merge: "));
+  assert.equal(errors.length, 1, lines.join("\n"));
+  assert.match(errors[0], /stopped on a GitHub server error hold: GitHub answered HTTP 503 with a Retry-After; no GitHub call is sent before 2100-01-01T00:00:00Z/);
+});
+
 // A lane-room reader stopped on a rate limit: its child wrote `pool` to the
 // job's stop file before exiting 75.
 async function roomStoppedOn(pool, pulls) {
@@ -4269,18 +4310,19 @@ test("vetoLabelOwned pairs the lanes App's label with its veto comment", () => {
   assert.equal(vetoLabelOwned([...ownedTimeline, { ...restSaid(KYLE, "do not merge", "2026-10-23T09:40:00Z"), author_association: "CONTRIBUTOR" }], login), false);
 });
 
-// #13657 done-when 2: the Merge-Risk line is report-only, so a rating that
-// fails, a read that hangs and a body edit that fails each leave the arm as
-// it was. recordMergeRisk runs on fakes of its own; the world's GitHub sees
-// only the arm.
+// The Merge-Risk record is report-only, so a rating that
+// fails, a read that hangs and a comment write that fails each leave the arm
+// as it was. recordMergeRisk runs on fakes of its own; the world's GitHub
+// sees only the arm. The record never edits the pull request body.
 import { recordMergeRisk, unratedLine } from "./merge-risk-line.mjs";
 
-const riskWriter = ({ failPatch = false } = {}) => {
+const riskWriter = ({ failPost = false } = {}) => {
   const sent = [];
   const github = async (method, path, payload) => {
     sent.push({ method, path, payload });
-    if (method === "PATCH" && failPatch) throw new Error("PATCH /pulls failed with status 502");
-    return method === "GET" ? { body: "" } : {};
+    if (method === "GET" || path.includes("/pulls/")) throw new Error(`not a record write: ${method} ${path}`);
+    if (method === "POST" && failPost) throw new Error("POST /issues/1/comments failed with status 502");
+    return {};
   };
   return { github, sent };
 };
@@ -4288,24 +4330,44 @@ const failingReads = async () => {
   throw new Error("GET /actions failed with status 502");
 };
 
-test("a rating whose reads and body edit both fail still arms, and records unrated", async () => {
-  const writer = riskWriter({ failPatch: true });
-  const mergeRisk = (target) => recordMergeRisk({ bot: LANES.login, pull: { ...target, body: "", userContentEdits: { totalCount: 0, nodes: [] } }, repository: "o/r", actions: failingReads, github: writer.github, download: () => "" });
+test("a rating whose reads and comment write both fail still arms, and records unrated", async () => {
+  const writer = riskWriter({ failPost: true });
+  const mergeRisk = (target, comments) => recordMergeRisk({ bot: LANES.login, pull: target, comments, repository: "o/r", actions: failingReads, github: writer.github, download: () => "" });
   const { code, writes, lines } = await run([pull(1)], {}, { mergeRisk });
   assert.equal(code, 0);
   assert.deepEqual(writes, [{ mutation: "arm", id: "PR_1", head: HEAD }]);
   assert.ok(lines.includes(`enable-auto-merge: #1 armed at ${HEAD}`));
   assert.ok(lines.some((line) => line.startsWith(`::notice title=merge-risk::pr=1 head=${HEAD} merge-risk=unrated:unreadable read-ms=`) && line.endsWith(" write=write-failed")), lines.join("\n"));
-  assert.equal(writer.sent.filter((call) => call.method === "PATCH").length, 1);
+  assert.deepEqual(writer.sent.map((call) => `${call.method} ${call.path}`), ["POST /repos/o/r/issues/1/comments"]);
 });
 
 test("a rating read that hangs is cut off at its deadline, recorded over-budget, and the pull request arms", async () => {
   const writer = riskWriter();
-  const mergeRisk = (target) => recordMergeRisk({ bot: LANES.login, pull: { ...target, body: "", userContentEdits: { totalCount: 0, nodes: [] } }, repository: "o/r", actions: () => new Promise(() => {}), github: writer.github, download: () => "", readMs: 20 });
+  const mergeRisk = (target, comments) => recordMergeRisk({ bot: LANES.login, pull: target, comments, repository: "o/r", actions: () => new Promise(() => {}), github: writer.github, download: () => "", readMs: 20 });
   const { code, writes } = await run([pull(1)], {}, { mergeRisk });
   assert.equal(code, 0);
   assert.deepEqual(writes, [{ mutation: "arm", id: "PR_1", head: HEAD }]);
-  assert.equal(writer.sent.find((call) => call.method === "PATCH").payload.body, unratedLine("over-budget"));
+  assert.deepEqual(writer.sent.map((call) => call.payload.body), [`<!-- merge-risk-line head=${HEAD} -->\n${unratedLine("over-budget")}`]);
+});
+
+test("the Merge-Risk record reads the comments the arm already read, lists none again and writes no body", async () => {
+  const record = { ...lanesSaid(`<!-- merge-risk-line head=${HEAD} -->\n${unratedLine("unreadable")}`), databaseId: 91 };
+  const writer = riskWriter();
+  const handed = [];
+  const mergeRisk = (target, comments) => {
+    handed.push(comments);
+    return recordMergeRisk({ bot: LANES.login, pull: target, comments, repository: "o/r", actions: failingReads, github: writer.github, download: () => "" });
+  };
+  const { code, writes, calls, lines } = await run([pull(1, { discussion: { comments: [record] } })], {}, { mergeRisk });
+  assert.equal(code, 0);
+  assert.deepEqual(writes, [{ mutation: "arm", id: "PR_1", head: HEAD }]);
+  assert.deepEqual(handed, [[record]]);
+  // The head's record already holds this line: nothing is written.
+  assert.deepEqual(writer.sent, []);
+  assert.ok(lines.some((line) => line.startsWith(`::notice title=merge-risk::pr=1 head=${HEAD} merge-risk=unrated:unreadable read-ms=`) && !line.includes("write=")), lines.join("\n"));
+  // No comment list was read beyond the one discussion read.
+  assert.equal(calls.filter(({ body }) => body?.query === DETAIL_QUERY).length, 1);
+  assert.equal(calls.filter(({ body }) => body?.query === DISCUSSION_PAGE_QUERIES.comments).length, 0);
 });
 
 test("a merge-risk step that throws outright still arms", async () => {

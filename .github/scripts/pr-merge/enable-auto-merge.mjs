@@ -168,18 +168,16 @@
 // and the run goes on to the rest, then exits 1. While
 // merge.report-only is true it reports
 // each decision and writes nothing.
-// Just before an arm, after its pin, the run sets the report-only Merge-Risk
-// line as the body's last line (merge-risk-line.mjs recordMergeRisk): the
-// rating pr-rate-merge-risk.yml uploaded for the head, or `unrated` with a
-// closed reason, read and written within about 40 seconds at most (15 for
-// the reads, 5 for the write, and a download capped at 8 for gh and 8 for
-// unzip that no timer can cut short), only on a body the lanes App alone
-// wrote (appOnlyBody); whatever happens,
-// the arm goes on, and no rule here or in ci-status reads the line. The edit
-// is a `pull_request: edited` event, so the queue takes the pull request only
-// after that contract-only ci-status run reports (docs/conventions/pr-pipeline/
-// README.md, "The Merge-Risk line", states the wait). It logs a `merge-risk`
-// notice per arm and adds its token to the step summary.
+// Just before an arm, after its pin, the run records the report-only
+// Merge-Risk line in the lanes App's marker comment for the head
+// (merge-risk-line.mjs recordMergeRisk): the rating pr-rate-merge-risk.yml
+// uploaded for the head, or `unrated` with a closed reason, read and written
+// within about 40 seconds at most (15 for the reads, 5 for the write, and a
+// download capped at 8 for gh and 8 for unzip that no timer can cut short),
+// from the comments the run already read. It never edits the body, so no
+// `pull_request: edited` run delays the queue. Whatever happens, the arm goes
+// on, and no rule here or in ci-status reads the record. It logs a
+// `merge-risk` notice per arm and adds its token to the step summary.
 //
 // Environment:
 //   GH_TOKEN             the lane App token (contents and pull-requests write)
@@ -307,7 +305,7 @@ export const PULLS_QUERY = `query($owner: String!, $name: String!, $after: Strin
 }`;
 // One candidate's discussion: the newest 100 of each, and wholeDiscussion
 // reads the rest of any list that has more.
-const COMMENT_FIELDS = "databaseId author { __typename login } body createdAt updatedAt lastEditedAt authorAssociation";
+const COMMENT_FIELDS = "databaseId author { __typename login } editor { __typename login } body createdAt updatedAt lastEditedAt authorAssociation";
 const REVIEW_FIELDS = "author { __typename login ... on User { databaseId } } state commit { oid } body submittedAt authorAssociation";
 const THREAD_COMMENT_FIELDS = "author { __typename login } body createdAt authorAssociation";
 const THREAD_FIELDS = `id comments(last: 100) { totalCount nodes { ${THREAD_COMMENT_FIELDS} } }`;
@@ -1148,15 +1146,22 @@ export function liftedByPerson(timeline, label, since) {
 // latch read before the child wrote it and takes in again (reload) on this exit.
 export const READER_RATE_LIMIT_EXIT = 75;
 const GUARD_ERROR = "::error title=GitHub rate limit::";
+// babysit_gh.py's title for a server error hold (a 5xx whose only signal was
+// Retry-After), which exits 75 and holds the same way.
+const SERVER_ERROR = "::error title=GitHub server error::";
 
-// A reader stopped on a rate limit; `line` is its guard's ::error.
+// A reader stopped on a rate limit or a server error hold (serverError);
+// `line` is its guard's ::error.
 export class ReaderRateLimited extends Error {
   constructor(what, stderr) {
     const line = String(stderr ?? "")
       .split("\n")
-      .find((text) => text.startsWith(GUARD_ERROR));
-    super(`${what} stopped on a GitHub rate limit: ${line ? line.slice(GUARD_ERROR.length) : `it exited ${READER_RATE_LIMIT_EXIT}`}`);
+      .find((text) => text.startsWith(GUARD_ERROR) || text.startsWith(SERVER_ERROR));
+    const serverError = line?.startsWith(SERVER_ERROR) === true;
+    const cause = serverError ? "a GitHub server error hold" : "a GitHub rate limit";
+    super(`${what} stopped on ${cause}: ${line ? line.slice((serverError ? SERVER_ERROR : GUARD_ERROR).length) : `it exited ${READER_RATE_LIMIT_EXIT}`}`);
     this.name = "ReaderRateLimited";
+    this.serverError = serverError;
   }
 }
 
@@ -1840,17 +1845,18 @@ export async function main({ env = process.env, github, actions, laneReads, veri
     };
     verify ??= pythonVerify(env);
     whole ??= pythonWholeReview(env);
-    // The Merge-Risk line's reads on the job token, its body edit on the
-    // lanes App token; a test that injects GitHub writes none unless it
+    // The Merge-Risk record's reads on the job token, its comment write on
+    // the lanes App token; a test that injects GitHub writes none unless it
     // injects this too. Imported here, not at the top: ci-status loads this
     // module from a sparse checkout (clear-escalations.mjs) that holds none
     // of merge-risk-line.mjs's imports, and a failed import only skips the line.
     mergeRisk ??= injected
       ? null
-      : async (pull) => {
+      : async (pull, comments) => {
           const [{ ARTIFACT_PREFIX, RATING_FILE, recordMergeRisk }, { ghDownloadArtifact }] = await Promise.all([import("./merge-risk-line.mjs"), import("./rotation.mjs")]);
           return recordMergeRisk({
             pull,
+            comments,
             repository: repo[0],
             actions,
             github,
@@ -2519,12 +2525,12 @@ export async function main({ env = process.env, github, actions, laneReads, veri
           console.log(`enable-auto-merge: #${pull.number} evidence comment not posted: ${describe(error)}`);
         }
       }
-      // The report-only Merge-Risk line for the head about to arm
+      // The report-only Merge-Risk record for the head about to arm
       // (merge-risk-line.mjs): read and written within its own deadline, and
       // whatever it meets, the arm below goes on. Nothing reads it back.
       if (action === "arm" && mergeRisk) {
         try {
-          const risk = await mergeRisk(pull);
+          const risk = await mergeRisk(pull, detail?.comments?.nodes);
           const write = risk.skipped && risk.skipped !== "exact" ? ` write=${risk.skipped}` : "";
           console.log(`::notice title=merge-risk::pr=${pull.number} head=${pull.headRefOid} merge-risk=${risk.token} read-ms=${risk.readMs}${write}`);
           riskTokens.push(`#${pull.number} merge-risk=${risk.token} read-ms=${risk.readMs}`);
@@ -2646,7 +2652,7 @@ export async function main({ env = process.env, github, actions, laneReads, veri
     }
     if (stopped !== null) {
       failed += 1;
-      console.log(`${GUARD_ERROR}enable-auto-merge: ${escapeCommand(stopped.message)}; no pull request is read, noted or armed after it this run, and each armed lanes App pull request is disarmed`);
+      console.log(`${stopped.serverError ? SERVER_ERROR : GUARD_ERROR}enable-auto-merge: ${escapeCommand(stopped.message)}; no pull request is read, noted or armed after it this run, and each armed lanes App pull request is disarmed`);
     }
     // Each verifier read's cost too, so a run's spend reads per pull request.
     const summary = [...lines.map(([, text]) => text), ...unblockSkips, ...(verify.costs ?? []).map(costLine), ...riskTokens];
