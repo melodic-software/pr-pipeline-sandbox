@@ -3,6 +3,14 @@
 All notable changes to the `source-control` plugin are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this plugin uses semantic versioning.
 
+## [11.2.3] - 2026-11-12
+
+### Changed
+
+- `babysit-prs`: the `/autofix-pr` record keeps a conflicting PR with this skill's conflict handling and points at the Auto-fix docs for comparing coverage.
+
+- Corrected in place: the released entries [0.42.2] now name the spell-check plugin `spelling`, its current name.
+
 ## [11.2.2] - 2026-11-12
 
 ### Fixed
@@ -8417,7 +8425,7 @@ Internal simplification, no behavior change.
   session whose project directory is the user's home admitted everything under the OS temp root,
   including Claude Code's own per-session scratchpad, which lives there. Hooks that lint, rewrite, or
   autocorrect then ran on throwaway files that are not project content and carry no project config to
-  opt out with; the reported case was `typos-format` autocorrecting a shell variable in a scratch
+  opt out with; the reported case was `spelling` autocorrecting a shell variable in a scratch
   script and silently breaking it. The guard now rejects a file inside the OS temp tree when the
   project root is outside it. The exemption is deliberate and required: when the project root
   itself lives under temp, its files are still accepted. That case is a `mktemp -d` fixture
