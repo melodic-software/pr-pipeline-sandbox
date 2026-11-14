@@ -22,7 +22,7 @@ jobs:
       contents: read
       pull-requests: write
       id-token: write
-    uses: melodic-software/ci-workflows/.github/workflows/pr-review.yml@a92020292976c2e9b50f7adc922693a45a6c1226
+    uses: melodic-software/ci-workflows/.github/workflows/pr-review.yml@main
     with:
       runner: ubuntu-24.04
       allowed-bot-sender-ids: ""
