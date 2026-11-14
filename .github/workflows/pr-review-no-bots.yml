@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   pr-review-no-bots:
+    name: PR Review No Bots
     if: github.event.pull_request.draft == false
     permissions:
       contents: read
