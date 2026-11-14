@@ -349,7 +349,7 @@ jobs:
             verdict=$(jq -r --arg checks "$checks" --arg run_status "$(jq -r .status <<<"$run")" '
               def newest($names): first($names[] as $n | .jobs | map(select(.name == $n)) | max_by(.id) | values) // null;
               newest($checks | split("|")) as $s
-              | (.jobs | map(select(.name == "kill-switch")) | max_by(.id)) as $k
+              | (.jobs | map(select(.name == "Kill Switch" or .name == "kill-switch")) | max_by(.id)) as $k
               | if $s != null and $s.status != "completed" then "pending"
                 elif $s.conclusion == "success" then
                   if any($s.steps[]?; .name == "Apply the hold" and .conclusion == "success") then "pass" else "uncounted" end
