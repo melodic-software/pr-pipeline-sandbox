@@ -11,6 +11,7 @@ permissions: {}
 
 jobs:
   payload:
+    name: Payload
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   kill-switch:
+    name: Kill Switch
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -60,6 +61,7 @@ jobs:
           echo "::notice::a kill switch stops this security review (lanes: ${REASON:-unreadable}, CLAUDE_SECURITY_REVIEW_DISABLED: ${LANE_SWITCH:-unset})"
 
   pr-review-security:
+    name: PR Review Security
     needs: [kill-switch]
     if: ${{ !cancelled() && github.event.pull_request.draft == false && needs.kill-switch.outputs.proceed == 'true' }}
     permissions:

@@ -38,6 +38,7 @@ permissions:
 
 jobs:
   check-force-red:
+    name: Check Force Red
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -278,10 +279,10 @@ jobs:
           # .github/standards/trusted-actors/trusted-actors.json lists them.
           exempt_author_ids='49699333 337859524 300666570'
           # Each lane's status job names, `|`-separated: pr-review-cli.yml's
-          # status job `Status` under the caller job id, the one the messages
-          # below name, then its earlier name `review-status`.
-          lanes='pr-review-hosted.yml pr-review / Status|pr-review / review-status
-          pr-review-security-hosted.yml pr-review-security / Status|pr-review-security / review-status'
+          # status job `Status` under the caller job's display name, the one the
+          # messages below name, then under the caller job id, then its earlier name `review-status`.
+          lanes='pr-review-hosted.yml PR Review / Status|pr-review / Status|PR Review / review-status|pr-review / review-status
+          pr-review-security-hosted.yml PR Review Security / Status|pr-review-security / Status|PR Review Security / review-status|pr-review-security / review-status'
           if [[ ! $HEAD_SHA =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::the head '$HEAD_SHA' is not a commit SHA."
             exit 1

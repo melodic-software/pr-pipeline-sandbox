@@ -23,6 +23,7 @@ jobs:
   # The reusable reads no kill switch, so this caller does. ci-status passes a
   # lane this job stopped by its `Report the kill switch` step.
   kill-switch:
+    name: Kill Switch
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -64,6 +65,7 @@ jobs:
           echo "::notice::a kill switch stops this review (lanes: ${REASON:-unreadable}, CLAUDE_REVIEW_DISABLED: ${LANE_SWITCH:-unset})"
 
   pr-review:
+    name: PR Review
     needs: [kill-switch]
     if: ${{ !cancelled() && github.event.pull_request.draft == false && needs.kill-switch.outputs.proceed == 'true' }}
     permissions:
