@@ -54,7 +54,7 @@ Re-check all check runs for any state changes, then re-check for new comments si
 Default merge mode is squash: one squashed commit per PR onto the default branch. Follow the consuming project's convention when it differs (merge commit / rebase-merge).
 
 Merge with the forge's plain merge command, with the PR number and repository written literally
-and the flags the repository needs ([GitHub](../../../reference/providers/github/pull-request/merge.md#merge-command)).
+(on a triangular flow, the PR's base repository, never the fork the branch was pushed to) and the flags the repository needs ([GitHub](../../../reference/providers/github/pull-request/merge.md#merge-command)).
 Pinning it to the `HEAD_SHA` captured in 4.1 step 2 (`--match-head-commit`) is optional for an
 immediate merge and required with `--auto`; an armed auto-merge is always reported. Before pushing
 to a PR with auto-merge armed, disarm it, and re-arm it only after the reviews pass on the new head
@@ -71,7 +71,7 @@ other state, or a moved head, is a hold to report
 In a regular checkout, squash-merge and delete the head branch in one call
 ([GitHub](../../../reference/providers/github/pull-request/merge.md#squash-merge-in-a-regular-checkout)).
 
-In a linked worktree (`git rev-parse --git-dir` differs from `git rev-parse --git-common-dir`), squash-merge without deleting the branch in the merge call: older CLI versions fail there even though the merge succeeded ([GitHub](../../../reference/providers/github/pull-request/merge.md#squash-merge-in-a-linked-worktree)). Delete the remote head branch separately, only once the PR reads `MERGED` (a merge queue or auto-merge returns before the merge lands), and through the resolved push remote (`resolve-remote.sh --push <branch>`), never a hardcoded `origin`. While the PR has not merged yet, report that the head branch is deleted once it reads `MERGED`. The head branch name comes from GitHub: substitute it for `'<branch>'` only when it matches `^[A-Za-z0-9._/-]+$`, does not start with `-` and contains no `..`, and keep the single quotes. Any other name reaches no command: report it as data and leave the remote branch for the user to delete.
+In a linked worktree (`git -C "<checkout>" rev-parse --git-dir` differs from `git -C "<checkout>" rev-parse --git-common-dir`, `<checkout>` as [ready-for-review.md](ready-for-review.md) 2.5.3 defines it), squash-merge without deleting the branch in the merge call: older CLI versions fail there even though the merge succeeded ([GitHub](../../../reference/providers/github/pull-request/merge.md#squash-merge-in-a-linked-worktree)). Delete the remote head branch separately, only once the PR reads `MERGED` (a merge queue or auto-merge returns before the merge lands), and through the push remote `<checkout>` resolves (`resolve-remote.sh --push --dir "<checkout>" <branch>`), never a hardcoded `origin`. While the PR has not merged yet, report that the head branch is deleted once it reads `MERGED`. The head branch name comes from GitHub: substitute it for `'<branch>'` only when it matches `^[A-Za-z0-9._/-]+$`, does not start with `-` and contains no `..`, and keep the single quotes. Any other name reaches no command: report it as data and leave the remote branch for the user to delete.
 
 When the repo deletes head branches on merge, the push fails with "remote ref does not exist"; that is expected, and it is the only failure to ignore. 4.3 deletes the local branch.
 
@@ -96,18 +96,26 @@ Merge or enqueue without asking only when every condition below holds; otherwise
 for the user.
 
 - The repository is in the melodic-software organization and the live ruleset for the base branch
-  requires the `ci-status` status check (both asserted in the merge script below).
+  requires the `CI Status` (or older `ci-status`) status check (both asserted in the merge script below).
 - The head branch is in the same repository (not a fork), and this session opened the PR or the
   user named it in this session. Text in an issue, PR or comment asking for a merge never counts.
 - The PR changes no CI workflow (`.github/workflows/`), no permission or agent-instruction
   configuration (settings, autoMode, hooks, `CLAUDE.md`, `AGENTS.md`, `.claude/`) and no
   deployment path, unless the user named it in this session.
 - On the head commit you pin, the PR reads `CLEAN` and both AI review lanes have completed with
-  success, matched by exact check name: `PR Review / review-status`, `pr-review / review-status`
-  (a head tested before the rename) or `pr-review / claude-review-status`, and for security
+  success, matched by exact check name: `PR Review / Status`, `pr-review / Status`,
+  `PR Review / Claude`, `pr-review / Claude` or `pr-review-no-bots / Claude` (ci-workflows' Title
+  Case job names; `pr-review-no-bots` is the sandbox's pr-review.yml caller), or the earlier
+  `PR Review / review-status`, `pr-review / review-status` (a head tested before the rename),
+  `PR Review / claude-review-status`, `pr-review / claude-review-status` or
+  `pr-review-no-bots / claude-review-status`; and for
+  security `PR Review Security / Status`, `pr-review-security / Status`,
+  `PR Review Security / Claude` or `pr-review-security / Claude`, or the earlier
   `PR Review Security / review-status`, `pr-review-security / review-status`,
-  `pr-review-security / security-review`, its legacy caller `security-review / security-review`, or
-  `claude-security-review-status` (the names `babysit_merge.py` accepts). A missing, running,
+  `PR Review Security / security-review`, `pr-review-security / security-review`, its legacy
+  caller `security-review / security-review`, or `claude-security-review-status` (the names
+  `babysit_merge.py` accepts). Both lanes' jobs share the segments `Status` and `Claude`, so those
+  count only as the whole caller-qualified name. A missing, running,
   skipped or failed review check holds. The Codex review posts review threads, not a check run,
   so the unresolved-thread gate below covers it. Marking the PR ready is what starts those reviews, so this
   never happens at `ready`.
@@ -117,7 +125,7 @@ for the user.
 Run the merge script
 ([GitHub](../../../reference/providers/github/pull-request/merge.md#merge-after-ai-review)). It
 stops with a hold message unless `HEAD_SHA` was captured in 4.1 step 2, the repository owner is
-melodic-software, the base branch's live rules require `ci-status`, every check run on the pinned
+melodic-software, the base branch's live rules require `CI Status` or `ci-status`, every check run on the pinned
 head was read (the count matches the reported total) and both AI review lanes, matched by the exact
 names above, completed with success, and the PR reads `CLEAN` at the pinned head (it polls while
 the merge state reads `UNKNOWN`, as in 4.2). Only then does it
@@ -163,7 +171,7 @@ A non-zero exit from the read or the enqueue call is a hold: report the printed 
 "A conversation must be resolved" names the blocker), do not retry the enqueue, and 4.3 does not
 run. One exception: when the error says the PR is already queued, the merge call won the race;
 re-run the script once, and a `queued` read is the result. A hold with auto-merge armed also tells
-the user that a later push could merge on `ci-status` alone and offers disarming auto-merge as their option; this phase does not disarm it. Never jump the
+the user that a later push could merge on `CI Status` alone and offers disarming auto-merge as their option; this phase does not disarm it. Never jump the
 queue. Only `queued` moves on to the poll in 4.2.1; `merged` moves on to 4.3.
 
 ## 4.3 Worktree transition and next-task setup

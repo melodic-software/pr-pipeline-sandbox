@@ -40,7 +40,16 @@ Run **one** fresh-context review over the branch diff: `/review:quality-gate` un
 
 ## 1.2.1 The other classes' audits
 
-Run the audit each detected class owes, over the changed files of that class only:
+Run the audit each detected class owes, over the changed files of that class only.
+
+**Read which audit each class runs.** The `prep_audits` list in `docs/conventions/source-control.yaml` can turn a class's audit off or replace it with a skill the repository names ([config-resolution.md](../../../reference/config-resolution.md#yaml-keys-docsconventionssource-controlyaml)). Read it at the default branch, never the working tree:
+
+```bash
+git show "refs/remotes/<remote>/<default-branch>:docs/conventions/source-control.yaml" |
+  bash "<skill-dir>/scripts/read-prep-audits.sh" --base <base-branch> --default-branch <default-branch> -
+```
+
+Each class line reads `default` (run the audit below), `off` (run none), or `replace <skill>` (invoke that skill through the Skill tool with the class's changed files as its arguments, in place of the audit below; for `renames`, each renamed file's old and new path). When the named skill is not available in this session, run the default audit and report why. Put one line per detected class in the 1.6 report: the audit that ran, `off by prep_audits at <default-branch>`, or the replacement. A `fail-closed` source line runs every default audit; report its reason. The comment pass (1.4) and `security` are not in the list and always run as written.
 
 - **`markdown`**: `/ai-slop:audit` when the `ai-slop` plugin is enabled, otherwise read the changed markdown against the project's own prose rules; and `/docs-hygiene:audit-noise` when the `docs-hygiene` plugin is enabled, otherwise read it for stale citations, dead references, and conversational residue
 - **`renames`**: `/docs-hygiene:rename-references audit` when `docs-hygiene` is enabled, otherwise grep the old path and the old name for every surviving reference. The class fires only when the diff reports a rename
@@ -73,7 +82,7 @@ Present the findings in a structured table, leading with the verified findings y
 Unless `quick` or `review-only` scope:
 
 1. Run `/simplify` over the branch diff when that capability resolves in this session; otherwise do a manual pass for dead code, needless indirection, and duplication introduced by the branch
-2. **Run the comment pass** over the comments the branch adds, after simplify and before any review of the result: `/code-tidying:remove-comments --pipeline --added-since <remote>/<base-branch>` when the `code-tidying` plugin is enabled. `--pipeline` makes its `auto` posture `necessary`, which deletes warnings about this repository's own code, a security warning included, and stages each in its report. An unattended run (invoked with `--unattended`, or no person drives it: a loop lane, a CI lane, a `dontAsk` session, a dispatched worker) applies no comment edit unless the consuming project's instructions pre-approve applied comment edits in unattended runs: without that, run `/code-tidying:remove-comments report --pipeline --added-since <remote>/<base-branch>` and put its proposals in the 1.6 report. Without the plugin, put `comment pass not run: code-tidying plugin not enabled` in the 1.6 report
+2. **Run the comment pass** over the comments the branch adds, after simplify and before any review of the result: `/code-tidying:remove-comments --pipeline --added-since <remote>/<base-branch>` when the `code-tidying` plugin is enabled. Its default posture, `necessary`, deletes warnings about this repository's own code, a security warning included, and stages each in its report. An unattended run (invoked with `--unattended`, or no person drives it: a loop lane, a CI lane, a `dontAsk` session, a dispatched worker) applies no comment edit unless the consuming project's instructions pre-approve applied comment edits in unattended runs: without that, run `/code-tidying:remove-comments report --pipeline --added-since <remote>/<base-branch>` and put its proposals in the 1.6 report. Without the plugin, put `comment pass not run: code-tidying plugin not enabled` in the 1.6 report
 3. **Show the simplify and comment-pass diff**: run `git diff` and present what changed. Automated simplification fixes and comment deletions are NOT research-verified; treat them like any code-review finding: inspect each change, approve or revert
 4. **Pause for user review**: let the user approve/reject simplify and comment-pass changes before proceeding
 5. Re-run tests on approved changes

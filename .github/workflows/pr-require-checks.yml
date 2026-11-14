@@ -277,8 +277,11 @@ jobs:
           # melodic-standards-sync[bot], as
           # .github/standards/trusted-actors/trusted-actors.json lists them.
           exempt_author_ids='49699333 337859524 300666570'
-          lanes='pr-review-hosted.yml pr-review / review-status
-          pr-review-security-hosted.yml pr-review-security / review-status'
+          # Each lane's status job names, `|`-separated: pr-review-cli.yml's
+          # status job `Status` under the caller job id, the one the messages
+          # below name, then its earlier name `review-status`.
+          lanes='pr-review-hosted.yml pr-review / Status|pr-review / review-status
+          pr-review-security-hosted.yml pr-review-security / Status|pr-review-security / review-status'
           if [[ ! $HEAD_SHA =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::the head '$HEAD_SHA' is not a commit SHA."
             exit 1
@@ -328,7 +331,8 @@ jobs:
             exit 0
           fi
           failed=0
-          while read -r file check; do
+          while read -r file checks; do
+            check=${checks%%|*}
             runs=$(read_api "the $file runs on $HEAD_SHA" \
               "repos/$GITHUB_REPOSITORY/actions/workflows/$file/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100") || exit 1
             run=$(jq -c --arg path ".github/workflows/$file" --arg sha "$HEAD_SHA" \
@@ -341,8 +345,9 @@ jobs:
             id=$(jq -r .id <<<"$run")
             url=$(jq -r .html_url <<<"$run")
             jobs=$(read_api "the jobs of run $id" "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?filter=latest&per_page=100") || exit 1
-            verdict=$(jq -r --arg check "$check" --arg run_status "$(jq -r .status <<<"$run")" '
-              (.jobs | map(select(.name == $check)) | max_by(.id)) as $s
+            verdict=$(jq -r --arg checks "$checks" --arg run_status "$(jq -r .status <<<"$run")" '
+              def newest($names): first($names[] as $n | .jobs | map(select(.name == $n)) | max_by(.id) | values) // null;
+              newest($checks | split("|")) as $s
               | (.jobs | map(select(.name == "kill-switch")) | max_by(.id)) as $k
               | if $s != null and $s.status != "completed" then "pending"
                 elif $s.conclusion == "success" then

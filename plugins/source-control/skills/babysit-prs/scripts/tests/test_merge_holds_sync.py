@@ -13,7 +13,8 @@ workflow change after auto-merge is armed.
 - The copies: `scripts/sync-hold-floor.py --check` finds `HOLD_PATH_CLASSES`,
   `COST_PATHS`, the review callers' `hold-paths` and ci-status's
   `hold_patterns` as it writes them from the effective floor and
-  `COST_PATHS`.
+  `COST_PATHS`, and the required-checks workflow's two `API_BUDGET_SH`
+  blocks as it writes them from api-budget.bash.
 - The floor (owner decisions Q-FLOOR (B), Q-ENFORCE (A) and Q26 option B):
   `pathHold` holds, with no configured glob, exactly the paths `glob_match`
   matches over `babysit_risk.Floor.high` (its `trust` and `gate` globs), case
@@ -121,10 +122,6 @@ def import_closure(entries: tuple[str, ...]) -> list[str]:
         file = todo.pop().resolve()
         name = file.relative_to(ROOT).as_posix()
         if name in seen:
-            continue
-        # A directory URL (admit.mjs lists `../../workflows/` for their
-        # names) loads no code; each gated workflow is floored by name.
-        if file.is_dir():
             continue
         seen.add(name)
         for spec in IMPORT.findall(file.read_text(encoding="utf-8")):
@@ -987,6 +984,25 @@ CARRIES = {
     "a status job under another caller job": {
         "runs": [_run(HEAD, job="other / review-status")]
     },
+    "a Title Case status job": {"runs": [_run(HEAD, job="PR Review / Status")]},
+    "a Title Case status job under its caller id": {
+        "runs": [_run(HEAD, job="pr-review / Status")]
+    },
+    "the security lane's Title Case status job": {
+        "runs": [
+            _run(
+                HEAD,
+                lane="pr-review-security-hosted.yml",
+                job="PR Review Security / Status",
+            )
+        ]
+    },
+    "the other lane's Title Case status job": {
+        "runs": [_run(HEAD, job="PR Review Security / Status")]
+    },
+    "a Title Case status job under another caller job": {
+        "runs": [_run(HEAD, job="other / Status")]
+    },
     "a notice naming another head than its run's": {"runs": [_run(OLD, notice=HEAD)]},
     "a notice without cost": {"runs": [_run(HEAD, criteria="trust-gate")]},
     "a run whose head is in another repository": {"runs": [_run(HEAD, repo="f/r")]},
@@ -1305,6 +1321,9 @@ class TheCostDecisionIsTheGates(unittest.TestCase):
             "a notice from the security lane",
             "a newer head pushed before it with a run of every lane",
             "a status job under its caller before the rename",
+            "a Title Case status job",
+            "a Title Case status job under its caller id",
+            "the security lane's Title Case status job",
         }
         for case in carried:
             self.assertEqual(answers[case], _link(7), case)

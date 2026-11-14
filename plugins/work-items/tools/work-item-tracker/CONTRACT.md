@@ -221,7 +221,7 @@ value (named by file, key and value; the personal override when it set the value
 
 ```text
 work-item-tracker.sh create-item --title <t> [--body <b> | --body-file <path>] [--labels a,b] [--type <name>] [--parent <id>] [--blocked-by <id>[,<id>]] [--repo <o>/<r>]
-work-item-tracker.sh get-item <id>
+work-item-tracker.sh get-item <id> [--history]
 work-item-tracker.sh claim <id> [--ttl-hours <n>] [--ttl-minutes <n>] [--session-id <s>] [--holder <h>] [--lease-only] [--phase <kind>]
 work-item-tracker.sh renew-lease <id> --lease-comment-id <n>
 work-item-tracker.sh release <id> --lease-comment-id <n> [--holder <h>]
@@ -254,6 +254,23 @@ an existing marker only from the authors a lease comment counts from ("Lease pro
 anyone can comment on a public repository. local-markdown appends the marker line to the item
 file. The check and the write are two calls with no compare-and-set, so two concurrent calls
 with one link can both write. An adapter that declares no `add-recurrence` key exits `6`.
+
+`get-item <id> --history` adds `state_history` to the item object: when the item was closed and
+reopened. It costs one more provider read, so only a caller that asks pays it; `list-items`,
+`list-sub-items` and `list-frontier` never read it. The flag is core-gated like `--label`: core
+hands `--history` to an adapter only when its manifest declares `features.state_history: true`, and
+that adapter emits `{available: true, events: [{state, at, actor}], reopen_count, reason: null}`,
+`events` oldest first, each `state` `closed` or `reopened`, `at` a UTC timestamp, `actor` a login or
+`null`, `reopen_count` the number of `reopened` events. For any other adapter, core runs the plain
+`get-item` and adds `{available: false, events: null, reopen_count: null, reason: "state history not
+available for provider '<provider>'"}`, so a caller tells "cannot know" apart from `events: []`,
+which means the item was never closed. A failed history read exits with the mapped code and prints
+no item, never an empty history. GitHub reads the issue timeline's `closed` and `reopened` events
+over REST (`GET /repos/{owner}/{repo}/issues/{number}/timeline`, paginated), so the read also works
+in a session whose proxy refuses GraphQL (pointer:
+[issue event types](https://docs.github.com/en/rest/using-the-rest-api/issue-event-types), recheck
+trigger: the timeline API drops either event). local-markdown and the jira, gitea and linear seeds
+declare no state history.
 
 `create-item --body-file <path>` is core-side: the dispatcher reads the file and hands the adapter
 `--body <content>`, so adapters implement only `--body`. It lets a caller pass a body with no
@@ -372,7 +389,7 @@ ceiling stays truncated after the filter, because a labeled item may sit past th
 `list-frontier` is a CORE-side derivation (no provider has a native counterpart): it calls
 the adapter's `list-items` and filters `state == open` AND `blocked_by_count == 0` (so a
 blocker closed as won't-do keeps its dependent off the frontier) AND no
-assignee AND not a container (a `work-map` item is never its own frontier item, see
+assignee AND not a container (a container item is never its own frontier item, see
 "Containers and state") AND no label starting with the wayfind prefix (`config.wayfind_label_prefix`,
 default `wayfind:`; a wayfind map item belongs to
 `/planning:wayfind`, never to `/work-items:work`). With `--autonomous`, items labeled
@@ -593,7 +610,7 @@ Per-verb result objects:
 | Verb | Result fields (beyond `schema_version`) |
 |---|---|
 | `create-item` | normalized item object |
-| `get-item` | normalized item object |
+| `get-item` | normalized item object; with `--history`, plus `state_history: {available, events, reopen_count, reason}` ("Verbs") |
 | `claim` | `id, holder, acquired_at, renewed_at, ttl_hours, lease_comment_id, session_id` |
 | `renew-lease` | same as `claim` (with bumped `renewed_at`) |
 | `release` | `id, lease_comment_id, released` (bool), `reason` |
@@ -758,24 +775,24 @@ claim's `lease_comment_id`) rather than relying on push activity (`/work-items:w
 ## Containers and state
 
 Two axes, one item model: a **container** is an ordinary item carrying the container
-label (default `work-map`; a navigable graph root such as wayfind maps and decompose breakdowns);
+label (default `spec-container`; a spec container, the graph root of a decompose breakdown);
 **state** is the
 provider's native open/closed. Containers are never claimable by workers (no
 `agent-ready`), so **a container is never its own frontier item**: `list-frontier` excludes
 any item carrying the container label, unconditionally (global and `--parent`-scoped alike).
 The container label resolves from the binding key `config.container_label`, a sibling of
 `config.role_labels` (the marker names a graph root, not a worker role, so it is not a
-role entry), with the shipped default `work-map` when the key is absent or empty
+role entry), with the shipped default `spec-container` when the key is absent or empty
 (resolution in `lib/binding.sh`, exported as `WIT_CONTAINER_LABEL`; default defined once
 in `lib/labels.sh`). The remapped label must exist in the consuming repo, and remapping a
 repo that already holds containers requires relabeling them: the frontier exclusion is an
 exact match against the resolved string, so items still carrying the old marker would
-surface as frontier items. `planning:wayfind` maps share this contract and resolve the
-same binding key (its `tracker-mechanics` doc carries the read), so one remap governs both
-container producers. Read one container's children with
+surface as frontier items. A `planning:wayfind` map is known by its wayfind-prefixed label, not
+the container label ([`label-taxonomy.md`](../../reference/label-taxonomy.md#maps-and-containers) "Maps and containers"). Read
+one container's children with
 `list-sub-items <container>`; read the workable frontier within one container with
 `list-frontier --parent <container>`. The frontier also excludes, unconditionally, any item
-carrying a label that starts `wayfind:`: those are a wayfind map's own items, which
+carrying a label that starts `wayfind:`: those are a wayfind map and its own items, which
 `/planning:wayfind` drives, so a `--parent` frontier over a wayfind map holds only its
 children without such a label. Aside from those exclusions the frontier is label-agnostic
 and simply never surfaces items that are assigned or blocked.
@@ -813,7 +830,8 @@ Building `sources` is demand-gated: a consumer who needs it opens a new item cit
 ```
 
 `change_link` is the branch grammar "Change links" defines. `features.list_items_label_filter`
-is optional, and absent reads as `false` ("Adapter contract").
+and `features.state_history` are optional, and absent reads as `false` ("Adapter contract",
+"Verbs").
 
 Provider ceilings surface as exit `7` with the ceiling named on stderr when hit at
 runtime (e.g. GitHub: 100 sub-issues/parent, 8 nesting levels, 50 dependencies/type).
@@ -1007,7 +1025,7 @@ expiry, `list-items` reports empty `assignees` (effective post-expiry
 assignment) while `get-item` still shows the stored assignee.
 
 This confinement is why multi-session / multi-machine work needs a
-tracker-published spec on a coordination provider, a `work-map` container lane
+tracker-published spec on a coordination provider, a spec container lane
 (see "Containers and state"). local-markdown is never that surface.
 
 ## jira adapter
@@ -1201,7 +1219,9 @@ adapter through the core CLI only: every verb, valid + invalid input, exit-code 
 `schema_version` + JSON-shape assertions, claim-race back-off, CR-free stdout,
 capability-gated skips (declared-unsupported verbs asserted to exit `6`), and the list
 contract: `list-items` rows carry `created_at` as a UTC timestamp or `null` and `milestone` as a
-name or `null`, and `--label` with a label no item carries returns no items. Bindings live
+name or `null`, `--label` with a label no item carries returns no items, and `get-item --history`
+on a new item reports no events where `features.state_history` is declared and `available: false`
+with a reason where it is not. Bindings live
 at `conformance/bindings/<name>.sh` and provide setup (clean-at-start), target context,
 and teardown.
 

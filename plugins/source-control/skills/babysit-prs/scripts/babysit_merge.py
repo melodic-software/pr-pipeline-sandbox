@@ -317,23 +317,38 @@ def is_unarmed_status(check: dict[str, Any]) -> bool:
 # share. `PR Review / review-status` and `PR Review Security / review-status`
 # are the callers' display names; the lower-case callers are a head tested
 # before the rename, or a repository whose caller job has no display name.
-# `pr-review-security / security-review` is the caller of pr-review-security.yml,
+# `pr-review-security / security-review` is the caller of pr-review-security.yml
+# (`PR Review Security / security-review` under its display name),
 # `security-review / security-review` the previous one, and
 # `claude-security-review-status` the job of a pin that predates the fold.
-# Old and new callers run side by side while repos migrate. Every matching
-# check must succeed.
+# ci-workflows names these jobs in Title Case: pr-review-cli.yml's status job
+# `Status`, and both pr-review.yml's and pr-review-security.yml's job `Claude`.
+# Both segments are shared by the two lanes, so each counts only as a whole
+# name under the lane's own callers (`pr-review-no-bots` is the sandbox's
+# pr-review.yml caller). Old and new callers and job names run side by side
+# while repos migrate. Every matching check must succeed.
 AI_REVIEW_CHECKS = {
     "claude-review-status": (
         "claude-review-status",
         "PR Review / review-status",
         "pr-review / review-status",
+        "PR Review / Status",
+        "pr-review / Status",
+        "PR Review / Claude",
+        "pr-review / Claude",
+        "pr-review-no-bots / Claude",
     ),
     "claude-security-review-status": (
         "claude-security-review-status",
         "security-review / security-review",
         "pr-review-security / security-review",
+        "PR Review Security / security-review",
         "PR Review Security / review-status",
         "pr-review-security / review-status",
+        "PR Review Security / Status",
+        "pr-review-security / Status",
+        "PR Review Security / Claude",
+        "pr-review-security / Claude",
     ),
 }
 
@@ -3422,7 +3437,7 @@ def _main_reviews(
 _FORCE_PUSHES_QUERY = (
     "query($o:String!,$r:String!,$n:Int!,$c:String){repository(owner:$o,name:$r){"
     "pullRequest(number:$n){timelineItems(first:100,after:$c,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT])"
-    "{totalCount pageInfo{hasNextPage endCursor}"
+    "{pageInfo{hasNextPage endCursor}"
     "nodes{... on HeadRefForcePushedEvent{beforeCommit{oid}}}}}}}"
 )
 # A pull request rebased more often than this is past what the gate reads.
@@ -3433,11 +3448,12 @@ def _force_pushed_heads(repo: str, number: int) -> list[str]:
     """The heads force pushes replaced, which the commits list no longer
     names but whose recorded counts still hold, read a page of 100 at a time
     up to _FORCE_PUSH_PAGES. Any doubt raises, so the evidence is unbound
-    rather than missing a count."""
+    rather than missing a count. The listing is whole when its last page says
+    `hasNextPage: false`: the connection's totalCount counts every timeline
+    item, not only the itemTypes asked for, so no count checks it."""
     owner, name = repo.split("/", 1)
     nodes: list[Any] = []
     cursor = None
-    total = None
     for _ in range(_FORCE_PUSH_PAGES):
         args = [
             "api",
@@ -3461,20 +3477,20 @@ def _force_pushed_heads(repo: str, number: int) -> list[str]:
         info = json_object(items.get("pageInfo"))
         if not is_json_array(page):
             raise RuntimeError(f"#{number} force pushes: unread")
-        total = items.get("totalCount")
         nodes.extend(page)
-        if info.get("hasNextPage") is not True:
+        more = info.get("hasNextPage")
+        if more is False:
             break
         cursor = info.get("endCursor")
-        if not isinstance(cursor, str) or not cursor:
-            raise RuntimeError(f"#{number} force pushes: unread")
+        if more is not True or not isinstance(cursor, str) or not cursor:
+            raise RuntimeError(f"#{number} force pushes: unread or incomplete")
     else:
         raise RuntimeError(f"#{number} force pushes: past {_FORCE_PUSH_PAGES} pages")
-    if total != len(nodes):
-        raise RuntimeError(f"#{number} force pushes: unread or incomplete")
     heads = []
     for node in nodes:
-        oid = json_object(json_object(node).get("beforeCommit")).get("oid")
+        if not isinstance(node, dict) or "beforeCommit" not in node:
+            raise RuntimeError(f"#{number} force pushes: unread")
+        oid = json_object(node["beforeCommit"]).get("oid")
         # GitHub leaves beforeCommit null when the old commit is gone.
         if oid is not None:
             heads.append(str(oid))

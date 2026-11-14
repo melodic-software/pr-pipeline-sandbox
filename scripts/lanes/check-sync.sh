@@ -13,6 +13,7 @@
 set -euo pipefail
 
 SYNCED=(
+  .github/actions/check-born-triaged
   .github/actions/check-kill-switch
   .github/actions/check-signed-commits
   .github/actions/check-trusted-base

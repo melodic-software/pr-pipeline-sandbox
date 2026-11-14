@@ -17,6 +17,16 @@
       "default": "auto",
       "description": "Which venue reviews a pull request, read at its base branch and honored only when that base is the default branch. auto reads each review lane's CI health and runs a local review only where CI does not cover the lane; local runs every local review step; ci skips the local review steps and leaves the review to the CI lanes; both runs the local steps and still counts the CI lanes. An unknown value falls back to auto."
     },
+    "pr_body_preview": {
+      "enum": ["post", "preview"],
+      "default": "post",
+      "description": "What /source-control:pull-request does with a PR body it is about to post, at create or when it edits one. post posts it; preview prints the body text and waits for a yes, in attended sessions only, while unattended runs always post. An unknown value falls back to post."
+    },
+    "pr_body_refresh": {
+      "type": "boolean",
+      "default": true,
+      "description": "When true, a /source-control:pull-request run, or a pr-unblock address-feedback round, that pushes a change making an open pull request's body stale (what changed, verification, the Left out: line) rewrites those sections in place, so the body describes the current head. false leaves the body as it was."
+    },
     "sync_stale_base": {
       "type": "boolean",
       "default": false,
@@ -208,7 +218,7 @@
     },
     "pre_ready": {
       "type": "array",
-      "maxItems": 5,
+      "maxItems": 6,
       "allOf": [
         {
           "contains": {
@@ -249,15 +259,24 @@
           },
           "minContains": 0,
           "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": { "step": { "const": "evidence" } },
+            "required": ["step"]
+          },
+          "minContains": 0,
+          "maxContains": 1
         }
       ],
-      "description": "Which pre-flip steps /source-control:pull-request ready runs, read at the pull request's base branch and honored only when that base is the base repository's default branch. A list of {step, enabled} mappings rather than a mapping keyed by step, so the shared YAML-subset reader reads each item by index. A step the list leaves out runs. The hold checks, the push and the flip are not steps here and always run. Each step appears at most once (the allOf maxContains entries); the reader runs every step when one repeats, names an unknown step, or the list does not parse.",
+      "description": "Which configurable steps /source-control:pull-request ready runs, read at the pull request's base branch and honored only when that base is the base repository's default branch. A list of {step, enabled} mappings rather than a mapping keyed by step, so the shared YAML-subset reader reads each item by index. A step the list leaves out runs. The hold checks, the push and the flip are not steps here and always run. Each step appears at most once (the allOf maxContains entries); the reader runs every step when one repeats, names an unknown step, or the list does not parse.",
       "default": [
         { "step": "base-merge", "enabled": true },
         { "step": "plan-evidence", "enabled": true },
         { "step": "code-review", "enabled": true },
         { "step": "security-review", "enabled": true },
-        { "step": "verify", "enabled": true }
+        { "step": "verify", "enabled": true },
+        { "step": "evidence", "enabled": true }
       ],
       "items": {
         "type": "object",
@@ -270,15 +289,78 @@
               "plan-evidence",
               "code-review",
               "security-review",
-              "verify"
+              "verify",
+              "evidence"
             ],
-            "description": "base-merge: update the branch from its base, by the method the shared branch update decision chooses. plan-evidence: gather the review evidence a plan's Review: value asks for. code-review and security-review: the fresh-context reviews of the pull request's diff. verify: the verify gate on the updated head."
+            "description": "base-merge: update the branch from its base, by the method the shared branch update decision chooses. plan-evidence: gather the review evidence a plan's Review: value asks for. code-review and security-review: the fresh-context reviews of the pull request's diff. verify: the verify gate on the updated head. evidence: after the flip, post the evidence comment for a confirmed head that has an evidence file."
           },
           "enabled": {
             "type": "boolean",
             "description": "false skips the step and reports it as disabled by pre_ready at the base branch, never as passing."
           }
         }
+      }
+    },
+    "prep_audits": {
+      "type": "array",
+      "maxItems": 5,
+      "allOf": [
+        {
+          "contains": { "properties": { "class": { "const": "markdown" } }, "required": ["class"] },
+          "minContains": 0,
+          "maxContains": 1
+        },
+        {
+          "contains": { "properties": { "class": { "const": "renames" } }, "required": ["class"] },
+          "minContains": 0,
+          "maxContains": 1
+        },
+        {
+          "contains": { "properties": { "class": { "const": "skills" } }, "required": ["class"] },
+          "minContains": 0,
+          "maxContains": 1
+        },
+        {
+          "contains": { "properties": { "class": { "const": "rules" } }, "required": ["class"] },
+          "minContains": 0,
+          "maxContains": 1
+        },
+        {
+          "contains": { "properties": { "class": { "const": "tests" } }, "required": ["class"] },
+          "minContains": 0,
+          "maxContains": 1
+        }
+      ],
+      "description": "Which audit /source-control:pull-request prep runs for each change class, read at the default branch and honored only when the pull request targets it. A list of {class, enabled, skill} mappings, shaped like pre_ready. A class the list leaves out runs its default audit. Each class appears at most once; the reader runs every default audit when one repeats, names an unknown class, or the list does not parse.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["class", "enabled"],
+        "properties": {
+          "class": {
+            "enum": ["markdown", "renames", "skills", "rules", "tests"],
+            "description": "markdown: the prose audits over changed .md files. renames: the rename-reference audit. skills: the skill check over changed skills and agents. rules: the check over changed .claude/rules files. tests: the judge pass over changed tests, which can be turned off but not replaced."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "false runs no audit for the class and reports it as off by prep_audits at the default branch, never as passing."
+          },
+          "skill": {
+            "type": "string",
+            "pattern": "^/[a-z0-9]+(-[a-z0-9]+)*(:[a-z0-9]+(-[a-z0-9]+)*)?$",
+            "description": "A skill run in place of the class's default audit, with the class's changed files as its arguments. A skill name only: no arguments and no shell command."
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "class": { "const": "tests" } }, "required": ["class"] },
+            "then": { "not": { "required": ["skill"] } }
+          },
+          {
+            "if": { "properties": { "enabled": { "const": false } }, "required": ["enabled"] },
+            "then": { "not": { "required": ["skill"] } }
+          }
+        ]
       }
     }
   }

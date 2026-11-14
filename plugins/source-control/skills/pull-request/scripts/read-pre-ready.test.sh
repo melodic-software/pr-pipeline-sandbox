@@ -14,7 +14,7 @@ trap 'rm -rf "$TEST_TMPDIR"' EXIT
 # shellcheck source=../../../scripts/test-helpers.sh
 source "$SCRIPT_DIR/../../../scripts/test-helpers.sh"
 
-ALL_ON=$'base-merge\tenabled\nplan-evidence\tenabled\ncode-review\tenabled\nsecurity-review\tenabled\nverify\tenabled'
+ALL_ON=$'base-merge\tenabled\nplan-evidence\tenabled\ncode-review\tenabled\nsecurity-review\tenabled\nverify\tenabled\nevidence\tenabled'
 
 ON_DEFAULT=(--base main --default-branch main)
 read_doc() { printf '%s' "$1" | bash "$SCRIPT" "${ON_DEFAULT[@]}" - 2>/dev/null; }
@@ -30,7 +30,11 @@ assert_eq "an empty list runs every step by default" $'source\tdefault\n'"$ALL_O
 
 out=$(read_doc $'pre_ready:\n  - step: base-merge\n    enabled: true\n  - step: code-review\n    enabled: false\n  - step: verify\n    enabled: true\n')
 assert_eq "a disabled step is off and every other step stays on" \
-  $'source\tconfig\nbase-merge\tenabled\nplan-evidence\tenabled\ncode-review\tdisabled\nsecurity-review\tenabled\nverify\tenabled' "$out"
+  $'source\tconfig\nbase-merge\tenabled\nplan-evidence\tenabled\ncode-review\tdisabled\nsecurity-review\tenabled\nverify\tenabled\nevidence\tenabled' "$out"
+
+out=$(read_doc $'pre_ready:\n  - step: evidence\n    enabled: false\n')
+assert_eq "the evidence step can be disabled" \
+  $'source\tconfig\nbase-merge\tenabled\nplan-evidence\tenabled\ncode-review\tenabled\nsecurity-review\tenabled\nverify\tenabled\nevidence\tdisabled' "$out"
 
 # Each untrusted shape: the source line fails closed with a reason, and every step is on.
 check_fail_closed() {
@@ -78,6 +82,35 @@ check_fail_closed "a nested list item" \
   $'pre_ready:\n  -\n    - verify\n' "pre_ready item 0 is not a {step, enabled} mapping"
 check_fail_closed "a repeated pre_ready key" \
   $'pre_ready: []\npre_ready:\n  - step: verify\n    enabled: false\n' "pre_ready appears more than once"
+# The parser emits no record for an empty value or an empty item, so these are found in the text.
+check_fail_closed "an empty flow list as a value" \
+  $'pre_ready:\n  - step: verify\n    enabled: false\n    why: []\n' "pre_ready item has a key with no value"
+check_fail_closed "an unknown key with an empty value" \
+  $'pre_ready:\n  - step: verify\n    enabled: false\n    note:\n' "pre_ready item has a key with no value"
+check_fail_closed "a trailing empty list item" \
+  $'pre_ready:\n  - step: verify\n    enabled: false\n  -\n' "pre_ready holds an empty item"
+check_fail_closed "an only, empty list item" \
+  $'pre_ready:\n  -\n' "pre_ready holds an empty item"
+
+# The parser accepts a uniform base indent and a byte-order mark, so the text scan must too.
+VERIFY_ONLY_OFF=$'source\tconfig\nbase-merge\tenabled\nplan-evidence\tenabled\ncode-review\tenabled\nsecurity-review\tenabled\nverify\tdisabled\nevidence\tenabled'
+out=$(read_doc $'  pr_open_state: ready\n  pre_ready:\n    - step: verify\n      enabled: false\n  other: 1\n')
+assert_eq "a document indented two spaces is read" "$VERIFY_ONLY_OFF" "$out"
+out=$(read_doc $'\xef\xbb\xbfpre_ready:\n  - step: verify\n    enabled: false\n')
+assert_eq "a byte-order mark before the key is read" "$VERIFY_ONLY_OFF" "$out"
+check_fail_closed "a trailing empty item under a two-space base indent" \
+  $'  pre_ready:\n    - step: verify\n      enabled: false\n    -\n' "pre_ready holds an empty item"
+check_fail_closed "an empty value under a two-space base indent" \
+  $'  pre_ready:\n    - step: verify\n      enabled: false\n      why: []\n' "pre_ready item has a key with no value"
+
+# Names the reader uses inside must not be read from the environment it inherits.
+out=$(printf 'pre_ready:\n  - step: verify\n' | env item_0_enabled=false bash "$SCRIPT" "${ON_DEFAULT[@]}" - 2>/dev/null)
+assert_eq "an inherited item_0_enabled does not fill a missing enabled value" \
+  $'source\tfail-closed\tstep \'verify\' has no enabled value in pre_ready\n'"$ALL_ON" "$out"
+out=$(printf 'pre_ready:\n  - enabled: false\n' | env item_0_step=verify bash "$SCRIPT" "${ON_DEFAULT[@]}" - 2>/dev/null)
+assert_eq "an inherited item_0_step does not fill a missing step" \
+  $'source\tfail-closed\tpre_ready item 0 has no step\n'"$ALL_ON" "$out"
+
 check_fail_closed "a repeated key inside an item" \
   $'pre_ready:\n  - step: verify\n    enabled: false\n    step: code-review\n' "docs/conventions/source-control.yaml does not parse: line 4: duplicate key \`pre_ready.0.step\` (first at line 2)"
 
@@ -86,7 +119,7 @@ read_response() { printf '%s' "$1" | bash "$SCRIPT" "${ON_DEFAULT[@]}" --http-re
 
 out=$(read_response $'HTTP/2.0 200 OK\r\nContent-Type: application/vnd.github.raw\r\n\r\npre_ready:\n  - step: verify\n    enabled: false\n')
 assert_eq "a 200 response is read as the document" \
-  $'source\tconfig\nbase-merge\tenabled\nplan-evidence\tenabled\ncode-review\tenabled\nsecurity-review\tenabled\nverify\tdisabled' "$out"
+  $'source\tconfig\nbase-merge\tenabled\nplan-evidence\tenabled\ncode-review\tenabled\nsecurity-review\tenabled\nverify\tdisabled\nevidence\tenabled' "$out"
 out=$(read_response $'HTTP/2.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{"message":"Not Found"}')
 assert_eq "a 404 response runs every step by default" $'source\tdefault\n'"$ALL_ON" "$out"
 out=$(read_response $'HTTP/2.0 502 Bad Gateway\r\n\r\n')
