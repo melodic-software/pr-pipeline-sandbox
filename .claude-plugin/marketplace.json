@@ -12,7 +12,7 @@
     {
       "name": "source-control",
       "source": "./plugins/source-control",
-      "description": "Copy of claude-code-plugins' source-control plugin, for the pr-unblock lane's resolve-conflicts skill."
+      "description": "Copy of claude-code-plugins' source-control plugin, for the pr-unblock lane's pull-request skill."
     },
     {
       "name": "work-items",
@@ -22,7 +22,7 @@
     {
       "name": "ai-slop",
       "source": "./plugins/ai-slop",
-      "description": "Copy of claude-code-plugins' ai-slop plugin, for the pr-refine lane's fix-docs skill."
+      "description": "Copy of claude-code-plugins' ai-slop plugin, for the pr-refine lane's fix-docs activity, which runs its audit skill."
     }
   ]
 }
