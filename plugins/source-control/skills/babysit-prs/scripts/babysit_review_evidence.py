@@ -54,15 +54,23 @@ from babysit_risk import Floor, LONG_LINE_BYTES, LaneEvidence, glob_match
 # is the whole caller-qualified job name: pr-review-cli.yml names both lanes'
 # status jobs `review-status`, under the caller's display name first; the
 # lower-case caller is a head tested before the rename, or a repository whose
-# caller job has no display name. The last is the name ci-workflows'
-# pr-review.yml and pr-review-security.yml give it.
+# caller job has no display name. The last two are the names ci-workflows'
+# pr-review.yml and pr-review-security.yml give it, under the caller's display
+# name and its job id. The Title Case names ci-workflows gives the same jobs
+# (`Status`, `Claude`) follow; the first name stays an old one, since
+# babysit_gh.py keys its lane-run cache on its last segment.
 LANES: dict[str, tuple[str, tuple[str, ...]]] = {
     "claude-review": (
         ".github/workflows/pr-review-hosted.yml",
         (
             "PR Review / review-status",
             "pr-review / review-status",
+            "PR Review / claude-review-status",
             "pr-review / claude-review-status",
+            "PR Review / Status",
+            "pr-review / Status",
+            "PR Review / Claude",
+            "pr-review / Claude",
         ),
     ),
     "claude-security-review": (
@@ -70,9 +78,22 @@ LANES: dict[str, tuple[str, tuple[str, ...]]] = {
         (
             "PR Review Security / review-status",
             "pr-review-security / review-status",
+            "PR Review Security / security-review",
             "pr-review-security / security-review",
+            "PR Review Security / Status",
+            "pr-review-security / Status",
+            "PR Review Security / Claude",
+            "pr-review-security / Claude",
         ),
     ),
+}
+
+
+# Lane id -> the names of the caller job that calls the lane's reusable
+# workflow: the part of each status job name in LANES before ` / `.
+CALLER_JOBS: dict[str, frozenset[str]] = {
+    lane: frozenset(name.split(" / ", 1)[0] for name in jobs)
+    for lane, (_, jobs) in LANES.items()
 }
 
 
@@ -1478,6 +1499,24 @@ def _lost_before_lane_job(lane: str, attempt: Mapping[str, Any]) -> bool:
     )
 
 
+def _caller_skipped(lane: str, attempt: Mapping[str, Any]) -> bool:
+    """Whether this attempt succeeded with the lane's caller job skipped and
+    no lane job: the caller job never ran, so the attempt has no record. Wait
+    Refine skips it, for one, when the head moved while it waited."""
+    jobs = attempt.get("jobs")
+    return (
+        attempt.get("conclusion") == "success"
+        and isinstance(jobs, list | tuple)
+        and not _has_lane_job(lane, jobs)
+        and any(
+            isinstance(job, Mapping)
+            and job.get("name") in CALLER_JOBS[lane]
+            and job.get("conclusion") == "skipped"
+            for job in jobs
+        )
+    )
+
+
 def _poster(comments: Any, threads: Any) -> Poster:
     """`lane_posted` over this pull request's comments and threads."""
     return lambda lane, head, since, until: lane_posted(
@@ -1797,7 +1836,11 @@ def _open_findings(
     for item in lane_runs:
         for attempt in _attempts(item).values():
             # A draft-skipped, kill-switched or upstream-stopped run reviewed
-            # nothing, nor did a lost one that never reached its lane job.
+            # nothing, nor did a lost one that never reached its lane job, nor
+            # a successful one whose caller job was skipped: that job never
+            # ran, so the attempt has no record (Wait Refine skips it when the
+            # head moved while it waited). At the pinned head such a run still
+            # unbinds (`_bound_record`).
             if (
                 attempt.get("status") != "completed"
                 or attempt.get("conclusion") == "skipped"
@@ -1807,6 +1850,7 @@ def _open_findings(
                     and _upstream_stopped(lane, item["id"], attempt)
                 )
                 or _lost_before_lane_job(lane, attempt)
+                or _caller_skipped(lane, attempt)
             ):
                 continue
             job = _lane_job(lane, item["id"], attempt)

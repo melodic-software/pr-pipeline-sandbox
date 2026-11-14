@@ -25,7 +25,8 @@ binding, skip the offer and, if the user asks for a container anyway, surface th
 coordination provider instead of publishing a spec that cannot travel.
 
 **Publish. Container first.** On approval, create the container before any item so item
-`create-item` calls can carry `--parent`:
+`create-item` calls can carry `--parent`. When the source is a tracker item, the container's own
+`create-item` carries `--parent "<source-item-id>"` (SKILL.md Step 4):
 
 - **Body**: the Brief **verbatim** (TLDR / Problem / Goal with its Intent, Vision,
   When-goals-conflict and Finish line lines / Constraints / Acceptance criteria / Captured assumptions /
@@ -86,12 +87,13 @@ coordination provider instead of publishing a spec that cannot travel.
     the `**Execution shape:**` line, so the shape line and its sibling stay last for
     `/work-items:ship` to read back. Found nothing: emit nothing, no heading and no placeholder.
 - **Labels**: the container label resolved from the binding (`config.container_label`, default
-  `work-map`. [`reference/label-taxonomy.md`](../../../reference/label-taxonomy.md)
+  `spec-container`. [`reference/label-taxonomy.md`](../../../reference/label-taxonomy.md)
   "Container label") plus the human-gated role label: a container is never claimable and never
   its own frontier item (`<plugin-root>/tools/work-item-tracker/CONTRACT.md` "Containers
   and state").
 - **Items**: publish per Step 4 with `--parent "<container-id>"`; blockers-first ordering,
-  born-triaged, and the `## Parent` body section (`Refs #<container>`) are unchanged.
+  born-triaged, and the `## Parent` body section (`Refs #<container>`, then the container's title
+  linked to its URL, per Step 4's Links rule) are unchanged.
   `list-frontier --parent <container-id>` then scopes the workable frontier to this container.
 - **Record the pointer**: immediately after creating the container, write its reference back
   into the source document, a `**Spec container:** <qualified-id>` line directly under the
@@ -100,8 +102,8 @@ coordination provider instead of publishing a spec that cannot travel.
   fresh session, this recorded line is what its presence gate reads; in-session memory does
   not survive to it. The fallback discovery path (no line found) is a tracker query for an
   open item carrying the binding-resolved container label whose body cites the topic slug and
-  carries the `**Execution shape:**` line this skill appends to every container (wayfind maps
-  share the label but never write it). A labeled item without that line is skipped and named
+  carries the `**Execution shape:**` line this skill appends to every container (a wayfind map
+  that also carries the label never writes it). A labeled item without that line is skipped and named
   in the report, never adopted.
 
 **Ship ritual, close at ship, archival by closure.** `/work-items:ship` is the macro router

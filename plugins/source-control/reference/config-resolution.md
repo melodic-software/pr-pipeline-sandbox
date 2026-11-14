@@ -202,6 +202,22 @@ reads the file itself, through a script where the key names one below.
   turns local reviews off. `skills/pull-request/scripts/read-review-venue.sh` resolves it. A value
   other than the four at the level that supplied it resolves to `auto`, with a notice naming the
   level. A repository level the reader cannot read or trust is skipped with a notice.
+- `pr_body_preview`: `post` or `preview`, what `/source-control:pull-request` does with a body it
+  is about to post, at create or when it edits one
+  ([create.md](../skills/pull-request/reference/create.md#243-create-pr) §2.4.3, "Preview the
+  body"). `preview` applies to attended runs only; an unattended run always posts.
+- `pr_body_refresh`: `true` or `false`, whether a run that pushes to an open pull request rewrites
+  the body sections the push made stale
+  ([monitor.md](../skills/pull-request/reference/monitor.md#332-phase-b-fix-all-valid-findings-batch-then-single-push)
+  §3.3.2). The pr-unblock lane's `address-feedback` rounds read only the key in the base's
+  `docs/conventions/source-control.yaml`, where unset is `true`
+  ([comments-ci.md](../skills/pull-request/reference/comments-ci.md#body-sections)).
+
+  Both resolve lowest first: the default (`post`; `true`), the `userConfig` value of the same
+  name, then the key in `docs/conventions/source-control.yaml`, read with `lib/convention-key.sh`
+  when git tracks the file, as `pr_body_required_sections` is. Neither is read at the home
+  directory or outside a git working tree. An unknown value at a level is reported, naming the
+  level, and the default applies.
 - `sync_stale_base`: `true` or `false`, whether
   [`push-branch.sh`](../skills/pull-request/scripts/push-branch.sh) merges the pull request's
   base into a branch behind it on overlapping paths just before it pushes (the script header
@@ -226,14 +242,36 @@ reads the file itself, through a script where the key names one below.
   `posix-ere`. No skill here reads it. The guardrails enforcement resolver does, and any other value
   turns its enforcement off with a diagnostic; see the
   [commit-convention enforcement README](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/docs/contracts/commit-convention/README.md).
-- `pre_ready`: which pre-flip steps `/source-control:pull-request ready` runs, a list of
-  `{step, enabled}` mappings over `base-merge`, `plan-evidence`, `code-review`, `security-review`
-  and `verify`; a step the list leaves out runs. Team level only, with no `userConfig` option: a
+- `pre_ready`: which configurable steps `/source-control:pull-request ready` runs, a list of
+  `{step, enabled}` mappings over `base-merge`, `plan-evidence`, `code-review`, `security-review`,
+  `verify` and `evidence`; a step the list leaves out runs. Team level only, with no `userConfig` option: a
   person cannot switch off a repository's gates. Read at the pull request's base branch, never the
   head, by `skills/pull-request/scripts/read-pre-ready.sh`, and honored only when that base is
   the base repository's default branch. The reader runs every step when the key is missing, the
   base is another branch, or the list cannot be trusted. Semantics and the report:
   [ready-for-review.md](../skills/pull-request/reference/ready-for-review.md#read-which-pre-flip-steps-run).
+- `prep_audits`: which audit `/source-control:pull-request prep` runs for each change class, a
+  list of `{class, enabled, skill}` mappings over `markdown`, `renames`, `skills`, `rules` and
+  `tests`; a class the list leaves out runs its default audit. `enabled: false` runs no audit for
+  the class. `enabled: true` with `skill: /<plugin>:<skill>` (or a project skill, `/<skill>`) runs
+  that skill in place of the default, with the class's changed files as its arguments; for
+  `markdown` it replaces both prose audits. `skill` is a skill name only, never arguments or a
+  shell command: a setting must not choose a script to run. Team level only, with no `userConfig`
+  option or flag, so neither a person nor an unattended run can change it per run. Read at the
+  default branch as the clone last fetched it, never the working tree or the head, by
+  `skills/pull-request/scripts/read-prep-audits.sh`, and honored only when the pull request
+  targets the default branch. The reader runs every default audit when the key is missing, the
+  base is another branch, or the list cannot be trusted (an unknown or repeated class, a missing
+  or non-boolean `enabled`, a `skill` that is not a bare skill name, on an off class, or on
+  `tests`). Three audits are not replaceable here:
+  - `tests` can be turned off but not replaced, because prep step 1.3 reads its judge verdicts.
+  - The comment pass is not listed, because it is a `code`-class step whose staged report and
+    `--pipeline --added-since` scope later prep steps read.
+  - `security` is not listed, because it runs in `ready`, where `pre_ready`'s `security-review`
+    step already governs it.
+
+  A quoted `enabled` anywhere in the file also makes `pre_ready` fail closed. Semantics and the
+  report: [prep.md](../skills/pull-request/reference/prep.md#121-the-other-classes-audits).
 - `dossier_branch_prefix`: the prefix of a dossier branch, default `dossier/`. A dossier branch
   holds an owning work item's docs, exploration notes and draft plan. Its shape is
   `dossier/<key>-<slug>`: `<key>` is the bound tracker adapter's `branch_ref` for the item (`42` on
@@ -412,7 +450,7 @@ whose value is empty, non-scalar or unknown.
 | `babysit_loop_escalation` | tier name for dimension 7 (escalation posture); the escalation *surface* is fixed by the loop-lane convention, never by config | preset value |
 | `babysit_loop_grace_window_minutes` | positive integer, the concurrency-safety activity grace window | `30` |
 | `babysit_loop_cycle_budget` | positive integer, cycles per session before the budget-hit stop | none, meaning no per-session budget |
-| `babysit_loop_no_progress_threshold` | positive integer, consecutive no-progress cycles (open PRs in view, none merged, materially changed, or escalated; cycles held by the rate-limit guard are not counted) before the lane raises its stall escalation; it escalates and keeps looping, never stops | `3` |
+| `babysit_loop_no_progress_threshold` | positive integer, consecutive no-progress cycles (open PRs in view, none merged, materially changed, or escalated; cycles held by the rate-limits floor are not counted) before the lane raises its stall escalation; it escalates and keeps looping, never stops | `3` |
 | `babysit_loop_trusted_internal_bot_logins` | a YAML sequence (in an H2, a flat bullet list, `- <login>` per line) of exact GitHub App bot logins the repository attests as its own internal automation, the C5 trust test's reviewed internal-bot trust signal; **honored in the team-tracked layer only** ("the C5 trust test's one reviewed widening" below) | none, the empty set: the trust test accepts `OWNER`/`MEMBER` only |
 
 No key, `babysit_loop_merge` included, sets an approval count: how many approving reviews a merge needs comes from the repository

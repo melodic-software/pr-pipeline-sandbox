@@ -1436,6 +1436,35 @@ class AutoMergeArming(unittest.TestCase):
             result["autoMerge"]["blockers"],
         )
 
+    def test_display_named_security_caller_check_satisfies_the_security_lane(
+        self,
+    ) -> None:
+        result = self._evaluate(
+            [
+                _check("ci-status", None),
+                _check("PR Review / claude-review-status", "SUCCESS"),
+                _check("PR Review Security / security-review", "SUCCESS"),
+            ],
+            mergeStateStatus="BLOCKED",
+        )
+        self.assertTrue(result["autoMerge"]["ready"], result["autoMerge"])
+
+    def test_failing_display_named_security_caller_check_holds(self) -> None:
+        result = self._evaluate(
+            [
+                _check("ci-status", None),
+                _check("PR Review / claude-review-status", "SUCCESS"),
+                _check("PR Review Security / security-review", "FAILURE"),
+            ],
+            mergeStateStatus="BLOCKED",
+        )
+        self.assertFalse(result["autoMerge"]["ready"], result["autoMerge"])
+        self.assertIn(
+            "AI review check 'claude-security-review-status' has not "
+            "succeeded on the live head",
+            result["autoMerge"]["blockers"],
+        )
+
     def test_pr_review_cli_review_status_checks_satisfy_both_lanes(self) -> None:
         result = self._evaluate(
             [
@@ -1500,6 +1529,70 @@ class AutoMergeArming(unittest.TestCase):
             mergeStateStatus="BLOCKED",
         )
         self.assertEqual(len(result["autoMerge"]["blockers"]), 2, result["autoMerge"])
+
+    def test_title_case_job_names_satisfy_both_lanes_under_each_caller(self) -> None:
+        for code, security in (
+            ("PR Review / Status", "PR Review Security / Status"),
+            ("pr-review / Status", "pr-review-security / Status"),
+            ("PR Review / Claude", "PR Review Security / Claude"),
+            ("pr-review / Claude", "pr-review-security / Claude"),
+            ("pr-review-no-bots / Claude", "pr-review-security / Claude"),
+        ):
+            with self.subTest(code=code, security=security):
+                result = self._evaluate(
+                    [
+                        _check("ci-status", None),
+                        _check(code, "SUCCESS"),
+                        _check(security, "SUCCESS"),
+                    ],
+                    mergeStateStatus="BLOCKED",
+                )
+                self.assertTrue(result["autoMerge"]["ready"], result["autoMerge"])
+
+    def test_title_case_job_names_count_only_under_their_own_lanes_callers(
+        self,
+    ) -> None:
+        hold = "AI review check {!r} has not succeeded on the live head"
+        for names, held in (
+            (("Claude", "Status"), ("claude-review-status", "claude-security-review-status")),
+            (("other / Claude", "other / Status"), ("claude-review-status", "claude-security-review-status")),
+            (("PR Review Security / Claude", "PR Review Security / Status"), ("claude-review-status",)),
+            (("PR Review / Claude", "pr-review / Status"), ("claude-security-review-status",)),
+        ):
+            with self.subTest(names=names):
+                result = self._evaluate(
+                    [
+                        _check("ci-status", None),
+                        *(_check(name, "SUCCESS") for name in names),
+                    ],
+                    mergeStateStatus="BLOCKED",
+                )
+                blockers = result["autoMerge"]["blockers"]
+                for lane in held:
+                    self.assertIn(hold.format(lane), blockers)
+
+    def test_a_failing_title_case_check_holds_its_lane_beside_a_green_old_name(
+        self,
+    ) -> None:
+        result = self._evaluate(
+            [
+                _check("ci-status", None),
+                _check("PR Review / review-status", "SUCCESS"),
+                _check("PR Review / Status", "FAILURE"),
+                _check("PR Review Security / Status", "SUCCESS"),
+            ],
+            mergeStateStatus="BLOCKED",
+        )
+        blockers = result["autoMerge"]["blockers"]
+        self.assertIn(
+            "AI review check 'claude-review-status' has not succeeded on the live head",
+            blockers,
+        )
+        self.assertNotIn(
+            "AI review check 'claude-security-review-status' has not succeeded "
+            "on the live head",
+            blockers,
+        )
 
     def test_other_callers_security_review_job_does_not_satisfy_renamed_lane(
         self,
@@ -2853,24 +2946,16 @@ class ForcePushedHeadsTests(unittest.TestCase):
     hold, read across pages; a listing that is not whole raises."""
 
     @staticmethod
-    def page(total: int, oids: list[Any], cursor: str | None = None) -> dict:
+    def answer(items: dict) -> dict:
+        return {"data": {"repository": {"pullRequest": {"timelineItems": items}}}}
+
+    @classmethod
+    def page(cls, oids: list[Any], cursor: str | None = None) -> dict:
         nodes = [
             {"beforeCommit": None if oid is None else {"oid": oid}} for oid in oids
         ]
         info = {"hasNextPage": cursor is not None, "endCursor": cursor}
-        return {
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "timelineItems": {
-                            "totalCount": total,
-                            "pageInfo": info,
-                            "nodes": nodes,
-                        }
-                    }
-                }
-            }
-        }
+        return cls.answer({"pageInfo": info, "nodes": nodes})
 
     def heads(self, *pages: dict) -> tuple[list[str], mock.MagicMock]:
         with mock.patch.object(
@@ -2879,29 +2964,107 @@ class ForcePushedHeadsTests(unittest.TestCase):
             return merge._force_pushed_heads("owner/repo", 5), read
 
     def test_names_each_replaced_head(self) -> None:
-        heads, _ = self.heads(self.page(3, ["a" * 40, None, "b" * 40]))
+        heads, _ = self.heads(self.page(["a" * 40, None, "b" * 40]))
         self.assertEqual(heads, ["a" * 40, "b" * 40])
 
     def test_reads_every_page_by_its_cursor(self) -> None:
         heads, read = self.heads(
-            self.page(101, ["a" * 40] * 100, cursor="next"),
-            self.page(101, ["b" * 40]),
+            self.page(["a" * 40] * 100, cursor="next"),
+            self.page(["b" * 40]),
         )
         self.assertEqual(heads, ["a" * 40] * 100 + ["b" * 40])
         self.assertNotIn("c=next", read.call_args_list[0].args[0])
         self.assertIn("c=next", read.call_args_list[1].args[0])
 
-    def test_a_count_the_pages_do_not_reach_raises(self) -> None:
-        with self.assertRaises(RuntimeError):
-            self.heads(self.page(101, ["a" * 40]))
+    # Recorded GitHub answers to the gate's query with totalCount,
+    # filteredCount and pageCount added: totalCount counts every timeline
+    # item, whatever itemTypes names. Nine items, none a force push:
+    NO_FORCE_PUSH = {
+        "totalCount": 9,
+        "filteredCount": 0,
+        "pageCount": 0,
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [],
+    }
+    # Nine items, one a force push:
+    ONE_FORCE_PUSH = {
+        "totalCount": 9,
+        "filteredCount": 1,
+        "pageCount": 1,
+        "pageInfo": {
+            "hasNextPage": False,
+            "endCursor": "Y3Vyc29yOnYyOpPPAAABodNjVagBqzM1OTk2MjA1Njc1",
+        },
+        "nodes": [
+            {
+                "__typename": "HeadRefForcePushedEvent",
+                "beforeCommit": {"oid": "aa6d0971946598e912086838a6af2b21785cf3ec"},
+            }
+        ],
+    }
+
+    def test_other_timeline_items_and_no_force_push_read_as_none(self) -> None:
+        heads, _ = self.heads(self.answer(self.NO_FORCE_PUSH))
+        self.assertEqual(
+            heads, [], "pull request 15846's recorded answer: no head replaced"
+        )
+
+    def test_a_force_push_among_other_items_names_its_head(self) -> None:
+        heads, _ = self.heads(self.answer(self.ONE_FORCE_PUSH))
+        self.assertEqual(
+            heads,
+            ["aa6d0971946598e912086838a6af2b21785cf3ec"],
+            "pull request 15860's recorded answer: one force push replaced aa6d0971",
+        )
+
+    def test_a_page_that_is_not_an_array_raises(self) -> None:
+        for nodes in (None, {}, "nodes"):
+            info = {"hasNextPage": False, "endCursor": None}
+            with (
+                self.subTest(nodes=nodes),
+                self.assertRaises(RuntimeError, msg="a page of nodes not read"),
+            ):
+                self.heads(self.answer({"pageInfo": info, "nodes": nodes}))
+
+    def test_a_malformed_node_raises(self) -> None:
+        for node in (None, {}, "node"):
+            with (
+                self.subTest(node=node),
+                self.assertRaises(RuntimeError, msg="a force push not read"),
+            ):
+                self.heads(
+                    self.answer(
+                        {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [node],
+                        }
+                    )
+                )
+
+    def test_a_force_push_whose_old_commit_is_gone_names_no_head(self) -> None:
+        heads, _ = self.heads(self.page([None]))
+        self.assertEqual(heads, [], "beforeCommit null: no head to name")
+
+    def test_a_page_with_no_pagination_answer_raises(self) -> None:
+        # A totalCount equal to the nodes proves nothing: only a pagination
+        # answer says the listing is whole.
+        for info in (None, {}, {"hasNextPage": None, "endCursor": None}):
+            items = {"totalCount": 1, "nodes": [{"beforeCommit": {"oid": "a" * 40}}]}
+            if info is not None:
+                items["pageInfo"] = info
+            with (
+                self.subTest(pageInfo=info),
+                self.assertRaises(RuntimeError, msg="whether a next page exists"),
+            ):
+                self.heads(self.answer(items))
 
     def test_a_next_page_with_no_cursor_raises(self) -> None:
         with self.assertRaises(RuntimeError):
-            self.heads(self.page(200, ["a" * 40], cursor=""))
+            self.heads(self.page(["a" * 40], cursor=""))
 
     def test_a_listing_past_the_page_cap_raises(self) -> None:
         pages = [
-            self.page(9999, ["a" * 40], cursor=f"c{i}")
+            self.page(["a" * 40], cursor=f"c{i}")
             for i in range(merge._FORCE_PUSH_PAGES)
         ]
         with self.assertRaises(RuntimeError):
