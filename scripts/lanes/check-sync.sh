@@ -56,7 +56,7 @@ SYNCED=(
   .github/standards/github-actions-conventions
   .github/standards/runner-policy
   .github/standards/trusted-actors
-  .github/workflows/pr-feedback-dispatch.yml
+  .github/workflows/pr-dispatch-feedback.yml
   .github/workflows/pr-merge.yml
   .github/workflows/pr-run-activity-read.yml
   .github/workflows/pr-run-activity-write.yml
