@@ -141,6 +141,20 @@ test("an App-set needs-human whose workflow-staged reason cleared comes off with
   assert.deepEqual(removal, { method: "DELETE", path: `/repos/${REPO}/issues/7/labels/needs-human`, body: undefined });
 });
 
+test("main's tip the job resolved with git ls-remote (MAIN_TIP_SHA) is used, not read again; any other value reads it", async () => {
+  const tipReads = (w) => w.calls.filter((call) => call.method === "GET" && call.path === `/repos/${REPO}/git/ref/heads/main`).length;
+  const given = world({ timeline: [labeled(BOT, "2026-10-18T10:00:00Z"), escalated()] });
+  assert.equal((await run(given, { MAIN_TIP_SHA: MAIN })).code, 0);
+  assert.equal(tipReads(given), 0, "no REST read of main's tip when the job passed it in");
+  assert.equal(given.writes().length, 2, "the same comment and label removal as with the read");
+  assert.ok(given.calls.some((call) => call.path === `/repos/${REPO}/compare/${HEAD}...${MAIN}`), "the compare names the tip passed in");
+  for (const value of [undefined, "", "main", MAIN.slice(1)]) {
+    const w = world({ timeline: [labeled(BOT, "2026-10-18T10:00:00Z"), escalated()] });
+    assert.equal((await run(w, { MAIN_TIP_SHA: value })).code, 0);
+    assert.equal(tipReads(w), 1, `MAIN_TIP_SHA=${value} falls back to one read of main's tip`);
+  }
+});
+
 test("an App-set needs-human on an item flagged security: outside-actor is never removed", async () => {
   const flagged = ["needs-human", "security: outside-actor"];
   for (const [listed, labels] of [
@@ -1251,6 +1265,9 @@ const PRE_RENAME_STATUS_JOBS = { "claude-review": "pr-review / review-status", "
 // pr-review-cli.yml's Title Case status job, under the callers' display names and ids.
 const TITLE_STATUS_JOBS = { "claude-review": "PR Review / Status", "claude-security-review": "PR Review Security / Status" };
 const TITLE_ID_STATUS_JOBS = { "claude-review": "pr-review / Status", "claude-security-review": "pr-review-security / Status" };
+// Its planned name `Publish Review`, under the same two.
+const PLANNED_STATUS_JOBS = { "claude-review": "PR Review / Publish Review", "claude-security-review": "PR Review Security / Publish Review" };
+const PLANNED_ID_STATUS_JOBS = { "claude-review": "pr-review / Publish Review", "claude-security-review": "pr-review-security / Publish Review" };
 // The status job names pr-review-cli.yml gave before it named both review-status.
 const RETIRED_STATUS_JOBS = { "claude-review": "pr-review / claude-review-status", "claude-security-review": "pr-review-security / security-review" };
 function laneReader({ pushes = [pushedBy(APP_ACTOR)], scopes = { "claude-review": "incremental since=" + KEY, "claude-security-review": "whole" }, runStatus = "completed", jobs = STATUS_JOBS } = {}) {
@@ -1290,6 +1307,8 @@ test("feedback-not-landed comes off after a lanes App push once both review lane
     ["severity: SUGGESTION", PRE_RENAME_STATUS_JOBS],
     ["severity: SUGGESTION", TITLE_STATUS_JOBS],
     ["severity: SUGGESTION", TITLE_ID_STATUS_JOBS],
+    ["severity: SUGGESTION", PLANNED_STATUS_JOBS],
+    ["severity: SUGGESTION", PLANNED_ID_STATUS_JOBS],
   ]) {
     const label = `${severity} ${jobs["claude-review"]}`;
     const w = world({ timeline: notLandedTimeline(), reader: laneReader({ jobs }), reviewThreads: () => threadPage([reviewThread(true, [LANE_AUTHOR]), severityThread(severity)]) });
@@ -1311,6 +1330,8 @@ test("feedback-not-landed stays after a lanes App push while the review lanes ha
     ["the other lane's status job name", laneReader({ jobs: { ...STATUS_JOBS, "claude-security-review": "PR Review / review-status" } }), notLandedTimeline()],
     ["the other lane's Title Case status job name", laneReader({ jobs: { ...STATUS_JOBS, "claude-security-review": "PR Review / Status" } }), notLandedTimeline()],
     ["the Title Case status job under another caller job", laneReader({ jobs: { ...STATUS_JOBS, "claude-review": "other / Status" } }), notLandedTimeline()],
+    ["the other lane's planned status job name", laneReader({ jobs: { ...STATUS_JOBS, "claude-security-review": "PR Review / Publish Review" } }), notLandedTimeline()],
+    ["the planned status job under another caller job", laneReader({ jobs: { ...STATUS_JOBS, "claude-review": "other / Publish Review" } }), notLandedTimeline()],
     ["pr-review.yml's Title Case job", laneReader({ jobs: { ...STATUS_JOBS, "claude-review": "pr-review / Claude" } }), notLandedTimeline()],
     ["the review status job's retired name", laneReader({ jobs: { ...STATUS_JOBS, "claude-review": RETIRED_STATUS_JOBS["claude-review"] } }), notLandedTimeline()],
     ["the security status job's retired name", laneReader({ jobs: { ...STATUS_JOBS, "claude-security-review": RETIRED_STATUS_JOBS["claude-security-review"] } }), notLandedTimeline()],

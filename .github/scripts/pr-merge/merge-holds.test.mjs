@@ -706,10 +706,18 @@ test("the decided head is the newest cost notice a lane's status job recorded be
     ["pr-review-hosted.yml", "pr-review / Status"],
     ["pr-review-security-hosted.yml", "PR Review Security / Status"],
     ["pr-review-security-hosted.yml", "pr-review-security / Status"],
+    // Its planned name.
+    ["pr-review-hosted.yml", "PR Review / Publish Review"],
+    ["pr-review-hosted.yml", "pr-review / Publish Review"],
+    ["pr-review-security-hosted.yml", "PR Review Security / Publish Review"],
+    ["pr-review-security-hosted.yml", "pr-review-security / Publish Review"],
   ]) {
     assert.equal((await runs(laneRun(HEAD, "2026-10-22T11:30:00Z", { lane, job }))).link, LINK, job);
   }
   for (const [name, extra] of Object.entries({
+    "the other lane's planned status job name": laneRun(HEAD, "2026-10-22T11:30:00Z", { job: "PR Review Security / Publish Review" }),
+    "the planned status job's bare name": laneRun(HEAD, "2026-10-22T11:30:00Z", { job: "Publish Review" }),
+    "the planned status job under another caller job": laneRun(HEAD, "2026-10-22T11:30:00Z", { job: "other / Publish Review" }),
     "the other lane's Title Case status job name": laneRun(HEAD, "2026-10-22T11:30:00Z", { job: "PR Review Security / Status" }),
     "the Title Case status job's bare name": laneRun(HEAD, "2026-10-22T11:30:00Z", { job: "Status" }),
     "the Title Case status job under another caller job": laneRun(HEAD, "2026-10-22T11:30:00Z", { job: "other / Status" }),
@@ -1272,6 +1280,23 @@ test("an approval of an earlier head lifts a hold path over a later base merge, 
     assert.equal(world.reads.filter((path) => path.includes("/git/ref/")).length, 1, name);
     assert.ok(world.reads.includes(`/repos/owner/repo/compare/${TIP}...${OLD}`) && world.reads.includes(`/repos/owner/repo/compare/${MAIN}...${TIP}`), world.reads.join(" "));
     assert.ok(!world.reads.some((path) => /\/compare\/(main\.\.\.|.*\.\.\.main$)/.test(path)), world.reads.join(" "));
+  }
+});
+
+test("liftersOf takes main's tip the caller already resolved, and reads it only for another base or no tip", async () => {
+  const humans = new Set([5]);
+  const tipReads = (world) => world.reads.filter((path) => path.includes("/git/ref/")).length;
+  const given = liftWorld({});
+  assert.deepEqual(await holdsModule.liftersOf(given.github, REPO, 99, HEAD, humans, undefined, { mainTip: TIP }), { lifters: ["owner-person"] });
+  assert.equal(tipReads(given), 0, "no REST read of main's tip when the caller passed it in");
+  assert.ok(given.reads.includes(`/repos/owner/repo/compare/${TIP}...${OLD}`), given.reads.join(" "));
+  for (const [name, world, mainTip] of [
+    ["no tip", liftWorld({}), undefined],
+    ["a tip that is not a commit SHA", liftWorld({}), "main"],
+    ["a base other than main", liftWorld({ base: "release", defaultBranch: "release" }), TIP],
+  ]) {
+    assert.deepEqual(await holdsModule.liftersOf(world.github, REPO, 99, HEAD, humans, undefined, { mainTip }), { lifters: ["owner-person"] }, name);
+    assert.equal(tipReads(world), 1, `${name}: one read of the base's tip`);
   }
 });
 

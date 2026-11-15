@@ -499,19 +499,26 @@ async function checksHeld(read, repo, head) {
 // `Require both review lanes on this head` step names them: the workflow, the
 // lane its completion record names, its status job's names (as pr-review-cli.yml
 // names it, under the caller's display name first; the lower-case caller is a
-// head tested before the rename, and `Status` its Title Case job name), and
-// whether only a whole review counts.
+// head tested before the rename, `Status` its Title Case job name and
+// `Publish Review` its planned one), and whether only a whole review counts.
 const LANE_RECORDS = Object.freeze([
   {
     file: "pr-review-hosted.yml",
     lane: "claude-review",
-    jobs: ["PR Review / review-status", "pr-review / review-status", "PR Review / Status", "pr-review / Status"],
+    jobs: ["PR Review / review-status", "pr-review / review-status", "PR Review / Status", "pr-review / Status", "PR Review / Publish Review", "pr-review / Publish Review"],
     whole: false,
   },
   {
     file: "pr-review-security-hosted.yml",
     lane: "claude-security-review",
-    jobs: ["PR Review Security / review-status", "pr-review-security / review-status", "PR Review Security / Status", "pr-review-security / Status"],
+    jobs: [
+      "PR Review Security / review-status",
+      "pr-review-security / review-status",
+      "PR Review Security / Status",
+      "pr-review-security / Status",
+      "PR Review Security / Publish Review",
+      "pr-review-security / Publish Review",
+    ],
     whole: true,
   },
 ]);
@@ -1847,8 +1854,9 @@ export async function main({ env = process.env, github, checks, verify, reader, 
     // trusted move.
     reader = env.BABYSIT_VERIFY_GH_TOKEN ? (reader ?? client(env.BABYSIT_VERIFY_GH_TOKEN)) : null;
     const trusted = trustedIds(env.TRUSTED_ACTORS_PATH || ".base/.github/standards/trusted-actors/trusted-actors.json");
-    const tip = await github("GET", `/repos/${repo}/git/ref/heads/main`);
-    const mainSha = tip?.ref === "refs/heads/main" ? tip.object?.sha : undefined;
+    // MAIN_TIP_SHA is the step's git ls-remote of refs/heads/main.
+    const tip = SHA.test(env.MAIN_TIP_SHA ?? "") ? null : await github("GET", `/repos/${repo}/git/ref/heads/main`);
+    const mainSha = tip === null ? env.MAIN_TIP_SHA : tip?.ref === "refs/heads/main" ? tip.object?.sha : undefined;
     if (!SHA.test(String(mainSha))) {
       throw new Error("main's tip has no commit SHA");
     }

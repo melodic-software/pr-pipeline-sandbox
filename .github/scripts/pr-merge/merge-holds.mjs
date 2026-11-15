@@ -472,16 +472,14 @@ export const HOLD_PATH_CLASSES = Object.freeze([
   ["docs/conventions/untrusted-content/**", "gate"],
   ["docs/standards/**", "gate"],
   ["docs/review/**", "gate"],
-  [".github/workflows/dependabot-fragments.yml", "gate"],
-  [".github/workflows/eval-browser-dispatch.yml", "gate"],
-  [".github/workflows/eval-hill-climb-pass.yml", "gate"],
   [".github/workflows/intake-reenter.yml", "gate"],
   [".github/workflows/intake-triage.yml", "gate"],
   [".github/workflows/maintenance-audit-lane-runs.yml", "gate"],
+  [".github/workflows/maintenance-measure-skill-edit-pass.yml", "gate"],
   [".github/workflows/maintenance-measure-skill-edit.yml", "gate"],
   [".github/workflows/maintenance-reconcile-lost-runs.yml", "gate"],
   [".github/workflows/maintenance-tidy-code-upkeep.yml", "gate"],
-  [".github/workflows/post-merge-demotion-alert.yml", "gate"],
+  [".github/workflows/post-merge-file-demotion-issues.yml", "gate"],
   [".github/workflows/post-merge-test-mutation.yml", "gate"],
   [".github/workflows/pr-dispatch-feedback.yml", "gate"],
   [".github/workflows/pr-merge.yml", "gate"],
@@ -495,10 +493,12 @@ export const HOLD_PATH_CLASSES = Object.freeze([
   [".github/workflows/pr-review-security-hosted.yml", "gate"],
   [".github/workflows/pr-run-activity-read.yml", "gate"],
   [".github/workflows/pr-run-activity-write.yml", "gate"],
+  [".github/workflows/pr-run-plugin-evals.yml", "gate"],
   [".github/workflows/pr-unblock-dispatch.yml", "gate"],
   [".github/workflows/pr-unblock.yml", "gate"],
   [".github/workflows/pr-verify-capture.yml", "gate"],
   [".github/workflows/pr-verify.yml", "gate"],
+  [".github/workflows/release-generate-dependabot-changelog-fragments.yml", "gate"],
   [".github/workflows/release-publish-plugins.yml", "gate"],
   [".github/workflows/upstream-apply-changelog.yml", "gate"],
   [".github/workflows/work-resolve-issue.yml", "gate"],
@@ -751,13 +751,21 @@ export function namesPull(text, number) {
 // [workflow file, status job names] (ci-status's cost-hold step reads the same
 // two), as pr-review-cli.yml names it, under the caller's display name first;
 // the lower-case caller is a head tested before the rename. The `Status` names
-// are pr-review-cli.yml's Title Case job name. The notice's head and criteria,
+// are pr-review-cli.yml's Title Case job name, the `Publish Review` names its
+// planned one. The notice's head and criteria,
 // and the base branch name a compare takes, as the hold step reads it.
 export const REVIEW_LANES = [
-  ["pr-review-hosted.yml", ["PR Review / review-status", "pr-review / review-status", "PR Review / Status", "pr-review / Status"]],
+  ["pr-review-hosted.yml", ["PR Review / review-status", "pr-review / review-status", "PR Review / Status", "pr-review / Status", "PR Review / Publish Review", "pr-review / Publish Review"]],
   [
     "pr-review-security-hosted.yml",
-    ["PR Review Security / review-status", "pr-review-security / review-status", "PR Review Security / Status", "pr-review-security / Status"],
+    [
+      "PR Review Security / review-status",
+      "pr-review-security / review-status",
+      "PR Review Security / Status",
+      "pr-review-security / Status",
+      "PR Review Security / Publish Review",
+      "pr-review-security / Publish Review",
+    ],
   ],
 ];
 const HOLD_NOTICE = /^claude-lane-hold lane=[a-z-]+ sha=([0-9a-f]{40}) criteria=([a-z,-]+) label=/;
@@ -1074,7 +1082,7 @@ export function approvalCarry(then, now, from, inBase, merges, based, dismissal 
 // lanes still judge it. babysit_merge_policy.CARRY_REFUSES is the same list.
 // The trusted-actor list and the pipeline config are read too: a widening the
 // approver never saw is lifted by the same approval (actorsHold).
-export const CARRY_REFUSES = Object.freeze([".github/workflows/**", ".github/actions/**", ".github/scripts/**", ".github/standards/**", "docs/conventions/pr-pipeline/**", "scripts/**", "lib/**", "plugins/source-control/skills/babysit-prs/scripts/**", "plugins/performance/scripts/**", "plugins/harness-ops/skills/inventory/scripts/**", "plugins/ai-briefing/skills/generate/scripts/**", "plugins/harness-config/skills/audit-permission-state/scripts/**", "plugins/knowledge/skills/course-digest/scripts/**", "plugins/knowledge/skills/video-digest/scripts/**", "plugins/skill-quality/scripts/**", "plugins/source-control/scripts/**", "plugins/testing/skills/check-visual-parity/scripts/**", ".github/recurring-schedule.json", "plugins/evals/skills/validate/scripts/**", "plugins/evals/skills/plugin-eval/scripts/**", "plugins/testing/evals/browser-probe/**", "plugins/work-items/scripts/**", "plugins/work-items/tools/work-item-tracker/**", "plugins/harness-ops/skills/changelog/scripts/**", "plugins/instruction-placement/scripts/**"]);
+export const CARRY_REFUSES = Object.freeze([".github/workflows/**", ".github/actions/**", ".github/scripts/**", ".github/standards/**", "docs/conventions/pr-pipeline/**", "scripts/**", "lib/**", "plugins/source-control/skills/babysit-prs/scripts/**", "plugins/performance/scripts/**", "plugins/harness-ops/skills/inventory/scripts/**", "plugins/ai-briefing/skills/generate/scripts/**", "plugins/harness-config/skills/audit-permission-state/scripts/**", "plugins/knowledge/skills/course-digest/scripts/**", "plugins/knowledge/skills/video-digest/scripts/**", "plugins/skill-quality/scripts/**", "plugins/source-control/scripts/**", "plugins/testing/skills/check-visual-parity/scripts/**", ".github/recurring-schedule.json", "plugins/evals/skills/validate/scripts/**", "plugins/evals/skills/plugin-eval/scripts/**", "plugins/testing/evals/browser-probe/**", "plugins/work-items/scripts/**", "plugins/work-items/tools/work-item-tracker/**", "plugins/harness-ops/skills/changelog/scripts/**", "plugins/instruction-placement/scripts/**", "plugins/app-control/scripts/**"]);
 
 // Whether the compare from...H' `merges` touches no hold path and no file a
 // hold path loads, old paths of renames included: pathHold with `holdPaths`
@@ -1137,8 +1145,10 @@ export async function baseParents(compare, tip, then, now) {
 
 // The tip commit of the base branch `base`, read once by its full ref so no
 // tag or other ref of the same name stands in for it; a throw when it does
-// not read as a commit SHA.
-export async function baseTip(github, repo, base) {
+// not read as a commit SHA. `mainTip`, main's tip the caller already
+// resolved, answers for `main` with no read.
+export async function baseTip(github, repo, base, mainTip = undefined) {
+  if (base === "main" && isSha(mainTip)) return mainTip;
   const sha = (await github("GET", `/repos/${repo}/git/ref/heads/${base}`))?.object?.sha;
   if (!isSha(sha)) throw new Error(`the base branch ${base} did not resolve`);
   return sha;
@@ -1181,8 +1191,8 @@ export function liftsOf(reviews, humans, dismissed = new Map()) {
 // the net change differs, H...H', the range between the two merge bases and
 // the recursive trees of H' and M' (exactBaseCarry). A read that fails lifts nothing (a timeline that does not
 // read restores no dismissed approval): the caller keeps the exact-head
-// approvals it read (pathLifters).
-export async function liftersOf(github, repo, number, head, humans, holdPaths = undefined) {
+// approvals it read (pathLifters). `mainTip` goes to baseTip.
+export async function liftersOf(github, repo, number, head, humans, holdPaths = undefined, { mainTip } = {}) {
   try {
     const pull = await github("GET", `/repos/${repo}/pulls/${number}`);
     const base = pull?.base?.ref;
@@ -1195,7 +1205,7 @@ export async function liftersOf(github, repo, number, head, humans, holdPaths = 
     // A carry runs only into the repository's default branch: another base
     // may be non-linear, with criss-cross merge bases.
     const carrying = lifts.some(({ sha }) => sha !== head) && (await github("GET", `/repos/${repo}`))?.default_branch === base;
-    const tip = carrying ? await baseTip(github, repo, base) : null;
+    const tip = carrying ? await baseTip(github, repo, base, mainTip) : null;
     const compares = new Map();
     const compare = async (range) => {
       if (!compares.has(range)) compares.set(range, await github("GET", `/repos/${repo}/compare/${range}`));
@@ -1642,7 +1652,7 @@ export function humanGatedLabel(tracker) {
   return typeof label === "string" && label.trim() ? label.trim() : "needs-human";
 }
 
-// The label security-outside-actor.yml puts on an item someone outside the
+// The label intake-label-outside-actor-activity.yml puts on an item someone outside the
 // organization wrote on. It holds wherever the human-gated label holds, and
 // only a person removes it: no lane or sweep takes it off.
 export const OUTSIDE_ACTOR_LABEL = "security: outside-actor";
