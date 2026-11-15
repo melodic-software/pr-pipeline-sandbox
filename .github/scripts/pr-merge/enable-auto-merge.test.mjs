@@ -2020,6 +2020,12 @@ test("an approval before a base merge, or its stale dismissal, lifts the hold pa
   const lifted = await run([pull(60, { files: HELD, rest: rest(60, [held]) })], trustedKyle());
   assert.deepEqual(lifted.writes, [{ mutation: "arm", id: "PR_60", head: HEAD }]);
   assert.deepEqual(lifted.notes, []);
+  // main's tip the job resolved (MAIN_TIP_SHA) stands in for the ref read.
+  const tipReads = (calls) => calls.filter(({ path }) => path === `${P}/git/ref/heads/main`).length;
+  assert.equal(tipReads(lifted.calls), 1, "with no MAIN_TIP_SHA the carry reads main's tip");
+  const given = await run([pull(65, { files: HELD, rest: rest(65, [held]) })], { ...trustedKyle(), MAIN_TIP_SHA: TIP });
+  assert.deepEqual(given.writes, [{ mutation: "arm", id: "PR_65", head: HEAD }], "the same arm");
+  assert.equal(tipReads(given.calls), 0, "no REST read of main's tip when the job passed it in");
   const evil = await run([pull(61, { files: HELD, rest: rest(61, [{ ...held, patch: "@@ -1 +1 @@\n-a\n+evil" }]) })], trustedKyle());
   assert.deepEqual(evil.writes, []);
   assert.deepEqual(evil.notes.map(({ path }) => path), [`${ISSUES}/61/comments`, `${ISSUES}/61/labels`]);
@@ -4368,6 +4374,14 @@ test("the Merge-Risk record reads the comments the arm already read, lists none 
   // No comment list was read beyond the one discussion read.
   assert.equal(calls.filter(({ body }) => body?.query === DETAIL_QUERY).length, 1);
   assert.equal(calls.filter(({ body }) => body?.query === DISCUSSION_PAGE_QUERIES.comments).length, 0);
+});
+
+test("the Merge-Risk record names the lane run the pull request's branch names", async () => {
+  const writer = riskWriter();
+  const mergeRisk = (target, comments) => recordMergeRisk({ bot: LANES.login, pull: target, comments, repository: "o/r", actions: () => new Promise(() => {}), github: writer.github, download: () => "", readMs: 20 });
+  const { code } = await run([pull(1, { headRefName: "work-resolve-issue/issue-5-43643331000-1" })], {}, { mergeRisk });
+  assert.equal(code, 0);
+  assert.deepEqual(writer.sent.map((call) => call.payload.body), [`<!-- merge-risk-line head=${HEAD} lane=work-resolve-issue run=43643331000 -->\n${unratedLine("over-budget")}`]);
 });
 
 test("a merge-risk step that throws outright still arms", async () => {

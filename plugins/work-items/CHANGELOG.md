@@ -3,6 +3,49 @@
 All notable changes to the `work-items` plugin are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this plugin uses semantic versioning.
 
+## [15.3.1] - 2026-11-15
+
+### Fixed
+
+The charge words no longer read "seat the guard" and similar lines, where the verb "seat" opens a line or follows a word such as "then" or "to" and takes a thing as its object, as a paid seat, so intake admission stops holding such issues for a cost decision; every other "seat" and every "seats" still counts.
+
+## [15.3.0] - 2026-11-15
+
+### Added
+
+- Seam verb `wayfind-labels` and the `/work-items:track wayfind-labels` action print the wayfind
+  label prefix and the human-gated label the binding sets, each with its source. They refuse, with
+  nothing on stdout, when the convention-home pointer is broken or declined, when no home applies,
+  or when the binding is invalid.
+
+### Changed
+
+- `/work-items:work-loop`'s tier-label note names security-surface work, rather than
+  security-surface classes, as what still routes to the frontier dispatch tier; the routing is
+  unchanged.
+
+## [15.2.0] - 2026-11-15
+
+### Added
+
+- `/work-items:measure-delivery --merge-risk` counts, per merge-risk `demote` group, the rated
+  merges and those later met by a post-merge demotion record, a silent-revert canary record or a
+  revert on the default branch, with a per-lane breakdown where the rating names the lane run. It
+  prints "not enough failures to compare" in place of a rate while either group has fewer than 5
+  failures, reads the forge only on GitHub, and writes nothing.
+
+## [15.1.3] - 2026-11-15
+
+### Changed
+
+- The work-class label references say work class in place of risk class, `work` says attended queue in place of human queue, and the pipeline-shape reference says recheck trigger.
+
+## [15.1.2] - 2026-11-14
+
+### Changed
+
+- The verification level reader now reads the team file through the shared default-branch reader, `lib/default-branch-file.sh`, which this plugin now carries; levels and messages are unchanged.
+
 ## [15.1.1] - 2026-11-14
 
 ### Fixed

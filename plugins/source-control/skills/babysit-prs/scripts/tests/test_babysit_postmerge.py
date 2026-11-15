@@ -53,7 +53,7 @@ OTHER_SHA = "5" * 40
 FORK_SHA = "f" * 40
 TIP_SHA = "a" * 40
 RUN_URL = f"https://github.com/{REPO}/actions/runs"
-# Phase 12's failure note (post-merge-demotion-alert.yml `again=`).
+# Phase 12's failure note (post-merge-file-demotion-issues.yml `again=`).
 AGAIN = "The post-merge check found this failure again: "
 
 
@@ -2025,7 +2025,7 @@ class LaneDispatch(CheckCase):
 
 class LaneAlerted(CheckCase):
     """pr-merge.yml's alert step skips a red full run only when its own
-    post-merge-dispatch on main recorded the send (`pr-merge-alerted-<id>`):
+    dispatch-post-merge-runs on main recorded the send (`pr-merge-alerted-<id>`):
     the same sender rule as the dispatch and re-run records. A same-name
     artifact any other run uploaded is no record (review finding on #10491)."""
 
@@ -2055,7 +2055,7 @@ class LaneAlerted(CheckCase):
         with contextlib.redirect_stderr(io.StringIO()):
             return pm.main(["--repo", REPO, "--branch", "main", "--lane-alerted", "11"])
 
-    def test_a_record_from_post_merge_dispatch_on_main_counts(self) -> None:
+    def test_a_record_from_dispatch_post_merge_runs_on_main_counts(self) -> None:
         for event in ("schedule", "workflow_dispatch"):
             self.alerted(event=event)
             self.assertEqual(self.cli(), 0, event)
@@ -2398,7 +2398,7 @@ class UnlistedRecordRecovery(CheckCase):
 
 class LaneRerun(LaneDispatch):
     """The owner's decision on #8399 (option B): pr-merge.yml's
-    post-merge-dispatch job starts the one re-run of a red lane-dispatched full
+    dispatch-post-merge-runs job starts the one re-run of a red lane-dispatched full
     run under GITHUB_TOKEN and records it as `pr-merge-rerun-<id>-attempt-2`.
     That github-actions[bot] attempt 2 counts only with the record, uploaded by
     a pr-merge.yml run on main; a person's attempt 2 still reads red."""
@@ -2860,7 +2860,7 @@ class Baseline(CheckCase):
 
 
 class AlertRerun(CheckCase):
-    """post-merge-demotion-alert.yml re-runs a red full run once under
+    """post-merge-file-demotion-issues.yml re-runs a red full run once under
     GITHUB_TOKEN, so attempt 2's triggering actor is github-actions[bot]. That
     one re-run is judged like the wrapper's; a re-run of a run the bot itself
     started, like a person's, still cannot clear attempt 1."""
@@ -3254,6 +3254,14 @@ class SharedCompare(CheckCase):
             self.gh.main_tip = LATER_SHA
             self.assertEqual(self.process()._branch_tip(), LATER_SHA)
         self.assertEqual(self.reads(f"repos/{REPO}/git/ref/heads/main"), 2)
+
+    def test_the_tip_the_step_resolved_is_used_and_not_read(self) -> None:
+        with mock.patch.dict(os.environ, {"MAIN_TIP_SHA": LATER_SHA, "GITHUB_REPOSITORY": REPO}):
+            self.assertEqual(self.process()._branch_tip(), LATER_SHA)
+        self.assertEqual(self.reads(f"repos/{REPO}/git/ref/heads/main"), 0)
+        with mock.patch.dict(os.environ, {"MAIN_TIP_SHA": LATER_SHA, "GITHUB_REPOSITORY": "o/other"}):
+            self.assertEqual(self.process()._branch_tip(), TIP_SHA)
+        self.assertEqual(self.reads(f"repos/{REPO}/git/ref/heads/main"), 1, "another repository's tip is read")
 
     def test_a_shared_compare_spends_the_settle_budget_as_a_read_would(self) -> None:
         def budget_left(env: str) -> int:
@@ -5321,7 +5329,7 @@ ANCHOR_NOW = datetime(2026, 10, 12, 11, 0, tzinfo=UTC)
 
 
 def anchor_zip(**overrides: Any) -> bytes:
-    """An anchor artifact's zip as post-merge-dispatch uploads it."""
+    """An anchor artifact's zip as dispatch-post-merge-runs uploads it."""
     data: dict[str, Any] = {
         "version": 1,
         "repo": REPO,
@@ -5339,7 +5347,7 @@ def anchor_zip(**overrides: Any) -> bytes:
 
 
 def anchor_run(run_id: int, **overrides: Any) -> dict[str, Any]:
-    """A run of main's own pr-merge.yml post-merge-dispatch job."""
+    """A run of main's own pr-merge.yml dispatch-post-merge-runs job."""
     record: dict[str, Any] = {
         "id": run_id,
         "path": pm.LANE_DISPATCH_WORKFLOW,
@@ -5380,7 +5388,7 @@ def lane_verdict(*states: pm.MergeState) -> pm.PostMergeVerdict:
 
 class LaneFloorAnchor(CheckCase):
     """#7336: the lane check's floor moves past merges a trusted run judged
-    final, read back from an artifact only main's post-merge-dispatch uploads."""
+    final, read back from an artifact only main's dispatch-post-merge-runs uploads."""
 
     def publish(
         self,
@@ -5410,7 +5418,7 @@ class LaneFloorAnchor(CheckCase):
     def anchor_reads(self) -> list[list[str]]:
         return [c for c in self.gh.calls if not any("graphql" == a for a in c)]
 
-    def test_an_anchor_from_post_merge_dispatch_moves_the_lane_floor(self) -> None:
+    def test_an_anchor_from_dispatch_post_merge_runs_moves_the_lane_floor(self) -> None:
         self.publish(passed=[7002])
         self.assertEqual(self.read(), pm.Anchor(ANCHOR_AT, frozenset({7002})))
         pm._anchor_cache.clear()
@@ -5637,7 +5645,7 @@ class LaneFloorAnchor(CheckCase):
 
 
 class AnchorUpload(unittest.TestCase):
-    """Only pr-merge.yml's post-merge-dispatch job uploads the anchor, kept
+    """Only pr-merge.yml's dispatch-post-merge-runs job uploads the anchor, kept
     seven days, and that job gains no check or status write, no lane App
     token and no model step."""
 
@@ -5648,7 +5656,7 @@ class AnchorUpload(unittest.TestCase):
         parts = re.split(r"(?m)^  ([A-Za-z0-9_-]+):\n", body)
         return dict(zip(parts[1::2], parts[2::2], strict=True))
 
-    def test_only_post_merge_dispatch_uploads_it(self) -> None:
+    def test_only_dispatch_post_merge_runs_uploads_it(self) -> None:
         uploaders = []
         for path in sorted(self.WORKFLOWS.glob("*.y*ml")):
             text = path.read_text(encoding="utf-8")
@@ -5657,7 +5665,7 @@ class AnchorUpload(unittest.TestCase):
             for job, body in self.jobs(text).items():
                 if f"name: {pm.ANCHOR_ARTIFACT}" in body:
                     uploaders.append((path.name, job, body))
-        self.assertEqual([(p, j) for p, j, _ in uploaders], [("pr-merge.yml", "post-merge-dispatch")])
+        self.assertEqual([(p, j) for p, j, _ in uploaders], [("pr-merge.yml", "dispatch-post-merge-runs")])
         body = uploaders[0][2]
         upload = body.split(f"name: {pm.ANCHOR_ARTIFACT}", 1)[1]
         self.assertIn("retention-days: 7\n", upload.split("- name:", 1)[0])

@@ -140,7 +140,7 @@ BODY_MERGE_HOLD_RE = re.compile(
 # autopilot merge tier is engaged. `--block-labels` only adds to it.
 # `pr-verify-failed` is pr-verify's FAIL on a person's pull request, which
 # ci-status enforces only in the merge queue: held here, it is never queued.
-# `security: outside-actor` is security-outside-actor.yml's flag on an item
+# `security: outside-actor` is intake-label-outside-actor-activity.yml's flag on an item
 # someone outside the organization wrote on, which only a person removes.
 MERGE_HOLD_LABELS = (
     "do-not-merge",
@@ -910,7 +910,7 @@ class PipelineConfig:
     # default branch stop demoting (`babysit_postmerge`). Absent, or anything
     # but a whole number from 1 to `MAX_QUARANTINE_DAYS`, is `QUARANTINE_DAYS`.
     quarantine_days: int = QUARANTINE_DAYS
-    # `red-main.confirm-wait-minutes`: minutes post-merge-demotion-alert.yml
+    # `red-main.confirm-wait-minutes`: minutes post-merge-file-demotion-issues.yml
     # waits for the re-run of a red full run pr-merge dispatched
     # (`babysit_postmerge`). Absent, or anything but a whole number from 0 to
     # `MAX_CONFIRM_WAIT_MINUTES`, is `CONFIRM_WAIT_MINUTES`.
@@ -2226,7 +2226,10 @@ class _GreenMain:
         return sha == tip or self.ahead(sha, tip)
 
     def main_tip(self) -> str:
-        """main's tip, read once by heads/main."""
+        """main's tip, the step's (`passed_main_tip`) or read once by
+        heads/main."""
+        if self.tip is None:
+            self.tip = passed_main_tip(self.owner, self.name)
         if self.tip is None:
             answer = self._read(f"repos/{self.owner}/{self.name}/git/ref/heads/main")
             tip = str(json_object(json_object(answer).get("object")).get("sha") or "")
@@ -4093,6 +4096,7 @@ CARRY_REFUSES: tuple[str, ...] = (
     "plugins/work-items/tools/work-item-tracker/**",
     _skill_scripts("harness-ops:changelog"),
     "plugins/instruction-placement/scripts/**",
+    "plugins/app-control/scripts/**",
 )
 
 
@@ -4246,6 +4250,34 @@ def base_tip(owner: str, name: str, base: str) -> str:
     return sha
 
 
+MAIN_TIP_ENV = "MAIN_TIP_SHA"
+
+
+def passed_main_tip(owner: str, name: str) -> str | None:
+    """main's tip as a pr-merge.yml step resolved it with `git ls-remote`
+    (`MAIN_TIP_ENV`), for that run's own repository only, else None."""
+    sha = os.environ.get(MAIN_TIP_ENV, "")
+    own = os.environ.get("GITHUB_REPOSITORY", "").casefold() == f"{owner}/{name}".casefold()
+    return sha if own and SHA_RE.fullmatch(sha) else None
+
+
+def carry_base_tip(owner: str, name: str, base: str) -> str:
+    """`base_tip` for an approval or decision carry, whose older tip only
+    refuses more: main's is the step's (`passed_main_tip`) when it has one.
+    Inside `base_tips_remembered` a tip already read answers first, and the
+    passed tip is remembered, so one judgment sees one tip."""
+    key = f"{owner}/{name}@{base}"
+    known = (_BASE_TIPS or {}).get(key)
+    if known:
+        return known
+    passed = base == "main" and passed_main_tip(owner, name)
+    if not passed:
+        return base_tip(owner, name, base)
+    if _BASE_TIPS is not None:
+        _BASE_TIPS[key] = passed
+    return passed
+
+
 # Each branch tip `base_tip` read inside `base_tips_remembered`; None outside.
 _BASE_TIPS: dict[str, str] | None = None
 
@@ -4393,7 +4425,7 @@ def carried_lifters(
         # A carry runs only into the repository's default branch: another
         # base may be non-linear, with criss-cross merge bases.
         carrying = any(s != sha for _, s, _ in lifts) and _default_branch(repo) == base
-        tip = base_tip(owner, name, base) if carrying else ""
+        tip = carry_base_tip(owner, name, base) if carrying else ""
         for login, lifted, dismissal in lifts:
             if lifted == sha:
                 if dismissal is None:
@@ -4464,7 +4496,7 @@ def _carries(repo: str, pr: Mapping[str, Any], comment: Mapping[str, Any]) -> bo
         return False
     owner, name = _split_repo(repo)
     try:
-        tip = base_tip(owner, name, base)
+        tip = carry_base_tip(owner, name, base)
         decided = _noticed_head(owner, name, branch, tip, comment.get("created_at"))
     except PolicyReadError:
         return False
@@ -5510,7 +5542,8 @@ def dependabot_eligibility(
     or tier `review` with the lanes App's `verdict=merge` round marker at the
     current head (`merge_verdict`) and, under `hold_majors`
     (`merge.dependabot.majors: hold`), no major or unreadable update, where a diff beyond the manifests, lock
-    files and `uses:` repins Dependabot manages also makes the tier `review`;
+    files and `uses:` repins Dependabot manages, or a lanes App commit, also
+    makes the tier `review`;
     every commit Dependabot's (plus, after a review, the lanes App's
     `[dependabot skip]` fixes) and every push Dependabot's (or that commit's
     pusher's), never demoted, always refused; a green `ci-status` on
@@ -5576,7 +5609,10 @@ def dependabot_eligibility(
         # A dependency the standards policy lists as review-only goes to review
         # whatever its version change; an unreadable policy sends every one.
         listed = _review_only(owner, name, pr, tier.updates, paths, main_sha)
-        added = tuple(r for r in (content, *listed) if r)
+        # A lanes App fix commit, admitted above, goes to review: it merges
+        # only on a verdict at this head, as in pr-unblock's classifier.
+        lane_fix = dependabot.commits_refusal(commits)
+        added = tuple(r for r in (lane_fix, content, *listed) if r)
         # A release whose registry provenance changed goes to review; only a
         # pull request still tier `auto` spends the registry reads.
         if not added and tier.tier == dependabot.AUTO:
@@ -7915,7 +7951,7 @@ def settle_shared(
     is read again with `post_merge` (`_recompute_shared`), or with none
     refuses. Without `code_unchanged` (`check_code_unchanged`), `shared` came
     from other check code: `code-changed`, never reused or kept. One rule for
-    the lane room and the merge job's reuse of post-merge-dispatch's report.
+    the lane room and the merge job's reuse of dispatch-post-merge-runs's report.
 
     `outcome`, when given, is filled with how it settled: `answer` is
     `reused`, `kept`, `recomputed` or `refused`, `reason` the
