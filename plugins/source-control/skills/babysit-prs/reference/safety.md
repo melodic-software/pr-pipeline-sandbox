@@ -849,7 +849,9 @@ segment under any caller, e.g. `review /` or `pr-review /`) and the security lan
 `pr-review-security / security-review` (matched by its
 whole name, never by the job segment alone; every name holds while old and new callers coexist),
 plus any `claude-security-review-status` check the rollup carries. ci-workflows' Title Case job
-names count too, each only as a whole name, since both lanes share the segment: the review lane's
+names count too, each only as a whole name, since both lanes share the segment, as do the status
+job's planned names (`PR Review / Publish Review`, `PR Review Security / Publish Review`, under
+the caller's display name or its id): the review lane's
 `PR Review / Status`, `pr-review / Status`, `PR Review / Claude`, `pr-review / Claude` or
 `pr-review-no-bots / Claude`, and the security lane's `PR Review Security / Status`,
 `pr-review-security / Status`, `PR Review Security / Claude` or `pr-review-security / Claude`.
@@ -892,11 +894,11 @@ second attempt after the lane's own `<lane>: failure-class=auth:` failure line (
 credential, which left no verdict), but the gate never starts that rerun: a person or session reruns
 it once the secret is fixed, since a rerun before then would spend the one attempt. A spent key
 already reports as `rate-limit`. It also binds a second attempt after a kill switch stopped the
-first: the caller's `kill-switch` job succeeded with its lane's `a kill switch stops this review (`
+first: the caller's `check-kill-switch` job succeeded with its lane's `a kill switch stops this review (`
 (or `security review (`) notice, and the first attempt has no lane job, so the review never
 started. The gate never starts that rerun either, since it cannot read the switch: ci-status asks a
 person to rerun the run once the switch is off. The same holds after the upstream-status gate
-stopped the first attempt (class `upstream-degraded`): the caller's `kill-switch` job failed with
+stopped the first attempt (class `upstream-degraded`): the caller's `check-kill-switch` job failed with
 its lane's `an upstream outage stops this review (` (or `security review (`) error and the first
 attempt has no lane job. The gate never starts that rerun; the lost-run reconciler reruns the
 run's failed jobs once GitHub Actions is operational and the upstream gate would let it run. A first

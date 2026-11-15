@@ -21,7 +21,7 @@ const answer = (status, headers = {}, body) =>
   [`HTTP/2.0 ${status}`, ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`), "", body === undefined ? "" : JSON.stringify(body)].join("\r\n");
 const listing = (...jobs) => ({ total_count: jobs.length, jobs });
 
-const BROKER = { name: "Fix Docs / Broker Check", conclusion: "success", steps: [] };
+const BROKER = { name: "Fix Docs / Check Broker", conclusion: "success", steps: [] };
 // A report job the listing shows before its steps, then with them.
 const UNLISTED = { name: "Fix Docs / Report", conclusion: "success", steps: [] };
 const POSTED = { name: "Fix Docs / Report", conclusion: "success", steps: [{ name: "Post the check run", conclusion: "success" }] };
@@ -101,6 +101,26 @@ test("a run started before the rename is read by its job ids", () => {
   const out = run([[answer("200 OK", {}, listing({ ...POSTED, name: "fix-docs / report" })), 0]]);
   assert.equal(out.status, 0, out.stdout + out.stderr);
   assert.equal(out.output, "posted=true\n");
+});
+
+// The broker allow job alone answers `allowed`; with it absent, the broker
+// check job answers through its broker step. Each is read under its name and
+// its id, current and from before the rename.
+test("the broker jobs are read under their current and earlier names and ids", () => {
+  const ask = [{ name: "Ask the broker whether the lane may run", conclusion: "success" }];
+  for (const [check, allow] of [
+    ["Fix Docs / Broker Check", "Fix Docs / Broker Allowed"],
+    ["fix-docs / broker-check", "fix-docs / broker-allowed"],
+    ["Fix Docs / Check Broker", "Fix Docs / Record Broker Allow"],
+    ["fix-docs / check-broker", "fix-docs / record-broker-allow"],
+  ]) {
+    const allowed = run([[answer("200 OK", {}, listing({ name: allow, conclusion: "success", steps: [] })), 0]], "0", { facts: ["allowed"] });
+    assert.equal(allowed.output, "allowed=true\n", `${allow}: ${allowed.stdout}`);
+    const checked = run([[answer("200 OK", {}, listing({ name: check, conclusion: "success", steps: ask })), 0]], "0", { facts: ["allowed"] });
+    assert.equal(checked.output, "allowed=true\n", `${check}: ${checked.stdout}`);
+  }
+  const other = run([[answer("200 OK", {}, listing({ name: "Fix Docs / Check Brokers", conclusion: "success", steps: ask })), 0]], "0", { facts: ["allowed"] });
+  assert.equal(other.output, "allowed=false\n", "a job of another name is no broker check");
 });
 
 // Each CALLS id a workflow passes, in Title Case, is the display name of that
