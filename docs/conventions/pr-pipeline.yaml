@@ -138,7 +138,7 @@ activities:
     # reply for each one. It posts nothing and holds no write token: the read
     # runner turns its uncommitted fixes into a patch that
     # apply-feedback-patch pushes, and hands its replies to publish-feedback.
-    # pr-feedback-dispatch.yml starts it only on pull requests the lanes App
+    # pr-dispatch-feedback.yml starts it only on pull requests the lanes App
     # opened; a trusted person may also dispatch it by hand.
     skill: source-control:pull-request
     # The skill's CI mode for review comments: edits only files a finding
@@ -513,7 +513,7 @@ lanes:
       # merge commit, with or without the model's patch.
       - activity: apply-conflict-patch
         needs: [resolve-conflicts]
-      # Started by pr-feedback-dispatch.yml after both review lanes reviewed
+      # Started by pr-dispatch-feedback.yml after both review lanes reviewed
       # the head.
       - activity: address-feedback
       # Run after address-feedback, each in its own job with its own token:

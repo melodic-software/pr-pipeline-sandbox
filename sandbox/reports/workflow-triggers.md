@@ -5,7 +5,7 @@
 | maintenance-delete-stale-branches.yml | schedule, workflow_dispatch |
 | pr-check-managed-files-hosted.yml | pull_request |
 | pr-check-managed-files.yml | pull_request, merge_group |
-| pr-feedback-dispatch.yml | workflow_run |
+| pr-dispatch-feedback.yml | workflow_run |
 | pr-merge.yml | workflow_run, pull_request_target, workflow_dispatch, schedule |
 | pr-refine.yml | pull_request, workflow_dispatch |
 | pr-require-checks.yml | pull_request, merge_group, workflow_dispatch |
