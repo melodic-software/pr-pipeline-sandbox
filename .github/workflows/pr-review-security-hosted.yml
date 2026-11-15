@@ -18,8 +18,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  kill-switch:
-    name: Kill Switch
+  check-kill-switch:
+    name: Check Kill Switch
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -62,8 +62,8 @@ jobs:
 
   pr-review-security:
     name: PR Review Security
-    needs: [kill-switch]
-    if: ${{ !cancelled() && github.event.pull_request.draft == false && needs.kill-switch.outputs.proceed == 'true' }}
+    needs: [check-kill-switch]
+    if: ${{ !cancelled() && github.event.pull_request.draft == false && needs.check-kill-switch.outputs.proceed == 'true' }}
     permissions:
       actions: read # the reusable's check-key-credit job reads this workflow's
                     # runs for the key's recent credit stop, and its status
