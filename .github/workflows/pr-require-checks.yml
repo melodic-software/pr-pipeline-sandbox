@@ -1,6 +1,7 @@
 name: PR Require Checks
 
-# Emits the `ci-status` check the merge-queue and ci-gate rulesets require.
+# Emits the `CI Status` check, and until the require-ci-status ruleset names
+# it, the same result under the old context `ci-status` (job report-ci-status).
 # The fleet's pr-require-checks.yml has the same shape: gate jobs, then one
 # `ci-status` aggregate that runs on `!cancelled()` and fails unless every
 # gate succeeded. A job that is not a reusable-workflow call reports a check
@@ -54,6 +55,7 @@ jobs:
           echo ".ci-force-red is absent."
 
   ci-status:
+    name: CI Status
     needs: [check-force-red]
     # !cancelled(), never a success guard: a failed gate must still run this
     # job so it turns red. A skipped required check reports success.
@@ -757,3 +759,21 @@ jobs:
           grep -qxF "#$pr: no member veto and no hold path." <<<"$out" || { echo "::error::merge-holds.mjs exited 0 without its verdict."; exit 1; }
           grep -qE "^#$pr: no verifier hold: " <<<"$out" || { echo "::error::merge-holds.mjs exited 0 without its verifier verdict."; exit 1; }
           grep -qE "^#$pr: no pr-verify FAIL hold: " <<<"$out" || { echo "::error::merge-holds.mjs exited 0 without its pr-verify FAIL verdict."; exit 1; }
+
+  # The require-ci-status ruleset (github-iac RepositoryRulesets) still names
+  # the context `ci-status`. This job reports the gate's result under it on
+  # every event the gate runs on, the merge queue included.
+  report-ci-status:
+    name: ci-status
+    needs: [ci-status]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions: {}
+    steps:
+      - name: Report the conclusion of `CI Status`
+        env:
+          RESULT: ${{ needs.ci-status.result }}
+        run: |
+          echo "CI Status: $RESULT"
+          [ "$RESULT" = success ]
