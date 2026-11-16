@@ -673,9 +673,9 @@ models:
           "85127655": knowable
           "85127656": unknown
     sizes:
-      # 75 turns is the cap every lane run had; a 50-minute leg covers the
-      # high factor at the 20 seconds a turn the old 75-turn, 25-minute run
-      # allowed, and the job holds 15 minutes more, for the steps around the
+      # 75 turns is the standard profile's max-turns; a 50-minute leg covers
+      # the high factor at the 20 seconds a turn a 75-turn, 25-minute run
+      # allows, and the job holds 15 minutes more, for the steps around the
       # launcher's leg (pr-run-activity-read.yml's launch step).
       small:
         base-turns: 75
@@ -688,7 +688,7 @@ models:
       # model turn, and triage sends it to /work-items:decompose.
       large: split
     complexity:
-      # Base turns as they are: a small low-complexity issue runs as before.
+      # Base turns as they are: a small low-complexity issue runs at 75 turns.
       low: 1
       # Half again, for an issue with several moving parts.
       medium: 1.5
