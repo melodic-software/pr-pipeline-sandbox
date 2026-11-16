@@ -2,8 +2,8 @@
 # (the resolve-config composite action's ajv and yaml) current with pull requests: GitHub-native,
 # no third-party app and no PAT. The other package.json files declare no dependencies, and the
 # composite actions under .github/actions use no other action, so "/" covers every `uses:` line.
-# Every entry is weekly with the org's 3-day cooldown (standards dependabot-policy) so new
-# releases settle; security-advisory updates bypass cooldown. A dependency joins the first group
+# GitHub Actions is checked daily and npm weekly, both with the org's 3-day cooldown (standards
+# dependabot-policy) so new releases settle; security-advisory updates bypass cooldown. A dependency joins the first group
 # that matches it, so majors fall through to the `github-actions` group.
 version: 2
 updates:
@@ -11,7 +11,7 @@ updates:
     directory: /
     labels: ["dependencies"]
     schedule:
-      interval: weekly
+      interval: daily
     open-pull-requests-limit: 5
     commit-message:
       prefix: build
