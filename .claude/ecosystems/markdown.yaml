@@ -1,0 +1,18 @@
+# Markdown in pr-pipeline-sandbox. Contract and schema:
+# https://github.com/melodic-software/claude-code-plugins/tree/main/docs/contracts/ecosystem-commands
+# This repository's CI runs no build, test or lint command: pr-require-checks.yml
+# has two jobs, check-force-red (a .ci-force-red file test) and ci-status (that
+# result plus the review and hold gates), and the sandbox's resolve-issue lane
+# keeps "no checks" (docs/conventions/pr-pipeline.yaml, resolve-issue entry).
+# So every command here is null, and no bundled default fills one in.
+# Keeps toolchain's bundled markdown globs; no markdownlint config is tracked here.
+enabled: true
+globs: ["*.md"]
+project-discovery: []
+build-cmd: null
+test-cmd: null
+check-cmd: null
+fix-cmd: null
+code-fix-cmd: null
+gates: []
+notes: "Null by design: CI here gates no Markdown command. Most files are copies from claude-code-plugins, linted and tested there, and scripts/lanes/check-sync.sh requires the synced ones to stay byte-identical, which a fix-cmd would break. Add a command here when a CI lane in this repository starts running one."
