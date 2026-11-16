@@ -5,8 +5,8 @@ name: PR Check Managed Files
 # checks each one's own diff. Pinned at the release claude-code-plugins uses.
 # Advisory: not in ci-status, so a red run does not block the queue.
 #
-# The sandbox is not a sync-manifest target, so `repository` names
-# claude-code-plugins to give the per-PR check a real managed-path set.
+# The sandbox is a standards sync-manifest target, so the action checks this
+# repository's own managed-path set.
 
 on:
   pull_request:
@@ -29,6 +29,4 @@ jobs:
           persist-credentials: false
           # The merge-group mode diffs base_sha...head_sha.
           fetch-depth: 0
-      - uses: melodic-software/ci-workflows/.github/actions/check-managed-files@3a2c748fdef9cfb9ceec5a66289e21842189689f # v0.55.0
-        with:
-          repository: melodic-software/claude-code-plugins
+      - uses: melodic-software/ci-workflows/.github/actions/check-managed-files@944d346c487c79eaf85dff752586fb59b0f5c539 # v0.74.0
