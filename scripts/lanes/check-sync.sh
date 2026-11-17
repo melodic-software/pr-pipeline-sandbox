@@ -38,6 +38,7 @@ SYNCED=(
   .github/scripts/apply-patch
   .github/scripts/lib
   .github/scripts/merge-base
+  .github/scripts/plugin-eval/eval-handoff.mjs
   .github/scripts/pr-merge
   .github/scripts/pr-unblock
   .github/scripts/pr-verify
