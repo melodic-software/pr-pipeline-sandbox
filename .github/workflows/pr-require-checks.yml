@@ -304,6 +304,8 @@ jobs:
           if [[ $AUTHOR_ID =~ ^[0-9]+$ && " $exempt_author_ids " == *" $AUTHOR_ID "* ]]; then
             # The callers' hold-paths, as bash patterns (`*` crosses `/`).
             hold_patterns=('.github/standards/trusted-actors/*' '.github/actions/check-trusted-trigger/*' 'CODEOWNERS' '*/CODEOWNERS' '.gitmodules' '*/.gitmodules')
+            # merge.diff-check.path-holds is false: only Dependabot stays held.
+            [ "$AUTHOR_ID" = 49699333 ] || hold_patterns=()
             if [[ ! $PR_NUMBER =~ ^[1-9][0-9]*$ ]]; then
               echo "::error::the pull request number '$PR_NUMBER' is not a number."
               exit 1
