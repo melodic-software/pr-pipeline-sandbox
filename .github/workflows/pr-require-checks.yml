@@ -333,7 +333,7 @@ jobs:
               echo "::error::#$PR_NUMBER is by an author no review lane reviews and changes trust-gate paths:${held//%/%25}. A person merges it."
               exit 1
             fi
-            echo "The author ($AUTHOR_ID) is one no review lane reviews, and no trust-gate path changed; the review lanes are not required."
+            echo "The author ($AUTHOR_ID) is one no review lane reviews, and no trust-gate path held for it changed; the review lanes are not required."
             exit 0
           fi
           failed=0
