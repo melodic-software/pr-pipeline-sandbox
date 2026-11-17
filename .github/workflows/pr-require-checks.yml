@@ -304,6 +304,8 @@ jobs:
           if [[ $AUTHOR_ID =~ ^[0-9]+$ && " $exempt_author_ids " == *" $AUTHOR_ID "* ]]; then
             # The callers' hold-paths, as bash patterns (`*` crosses `/`).
             hold_patterns=('.github/standards/trusted-actors/*' '.github/actions/check-trusted-trigger/*' 'CODEOWNERS' '*/CODEOWNERS' '.gitmodules' '*/.gitmodules')
+            # merge.diff-check.path-holds is false: only Dependabot stays held.
+            [ "$AUTHOR_ID" = 49699333 ] || hold_patterns=()
             if [[ ! $PR_NUMBER =~ ^[1-9][0-9]*$ ]]; then
               echo "::error::the pull request number '$PR_NUMBER' is not a number."
               exit 1
@@ -331,7 +333,7 @@ jobs:
               echo "::error::#$PR_NUMBER is by an author no review lane reviews and changes trust-gate paths:${held//%/%25}. A person merges it."
               exit 1
             fi
-            echo "The author ($AUTHOR_ID) is one no review lane reviews, and no trust-gate path changed; the review lanes are not required."
+            echo "The author ($AUTHOR_ID) is one no review lane reviews, and no trust-gate path held for it changed; the review lanes are not required."
             exit 0
           fi
           failed=0
