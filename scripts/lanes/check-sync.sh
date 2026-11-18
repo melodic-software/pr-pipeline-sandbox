@@ -48,6 +48,7 @@ SYNCED=(
   .github/recurring-schedule.json
   .github/scripts/intake-triage/admit.mjs
   .github/scripts/lane-run-report/post.mjs
+  .github/scripts/maintenance-monitor-signals/issues.mjs
   .github/scripts/maintenance-reconcile-lost-runs/component-status.mjs
   .github/scripts/maintenance-reconcile-lost-runs/infra-failure.mjs
   .github/scripts/pr-review-main/split-diff.py
