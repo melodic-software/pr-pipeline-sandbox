@@ -48,6 +48,7 @@ SYNCED=(
   .github/recurring-schedule.json
   .github/scripts/intake-triage/admit.mjs
   .github/scripts/lane-run-report/post.mjs
+  .github/scripts/maintenance-monitor-signals/issues.mjs
   .github/scripts/maintenance-reconcile-lost-runs/component-status.mjs
   .github/scripts/maintenance-reconcile-lost-runs/infra-failure.mjs
   .github/scripts/pr-review-main/split-diff.py
@@ -92,6 +93,8 @@ SYNCED=(
   scripts/check-affected.sh
   scripts/git-mv-rm.sh
   scripts/lib/checkout-path.sh
+  # The transcript metrics resolve-config's callers.test.mjs imports.
+  scripts/lane-transcripts/store.mjs
 )
 
 # Upstream paths under a SYNCED path this sandbox leaves out. pr-verify's probe
