@@ -47,7 +47,8 @@ import { fileURLToPath } from "node:url";
 
 export const KINDS = ["cli", "runtime", "system-lib", "python-pkg", "node-pkg", "env", "mcp"];
 export const NEEDS = ["required", "optional"];
-const ENTRY_KEYS = ["id", "kind", "need", "for", "detect", "degrade", "install", "check"];
+const ENTRY_KEYS = ["id", "kind", "need", "for", "detect", "degrade", "install", "check", "when"];
+const OPTIONAL_KEYS = ["check", "when"];
 const DETECT_KEYS = {
   cli: { required: ["any"], optional: ["local_bin", "version", "reject_store_alias"] },
   runtime: { required: ["any"], optional: ["local_bin", "version", "reject_store_alias"] },
@@ -164,7 +165,7 @@ function entryErrors(entry, where) {
   if (!isObject(entry)) return [`${where} must be an object`];
   const errors = keysErrors(entry, ENTRY_KEYS, where);
   for (const key of ENTRY_KEYS) {
-    if (!(key in entry) && key !== "check") errors.push(`${where}.${key} is required`);
+    if (!(key in entry) && !OPTIONAL_KEYS.includes(key)) errors.push(`${where}.${key} is required`);
   }
   if ("id" in entry && !matches(entry.id, ID_RE)) errors.push(`${where}.id must match ${ID_RE.source}`);
   if ("kind" in entry && !KINDS.includes(entry.kind)) errors.push(`${where}.kind must be one of ${KINDS.join(", ")}`);
@@ -197,8 +198,109 @@ function entryErrors(entry, where) {
     }
   }
   if ("check" in entry && !matches(entry.check, CHECK_RE)) errors.push(`${where}.check must name a skill, such as /<plugin>:check`);
+  if ("when" in entry) errors.push(...whenErrors(entry.when, `${where}.when`));
   return errors;
 }
+
+const NAME = "[A-Za-z0-9._-]*[A-Za-z0-9_-][A-Za-z0-9._-]*";
+const SEGMENT = "[A-Za-z0-9._*?-]*[A-Za-z0-9_*?-][A-Za-z0-9._*?-]*";
+const CONFIG_RE = new RegExp(`^(${NAME}|${SEGMENT}(/${SEGMENT})+)$`);
+const GIT_TIMEOUT_MS = 2000;
+
+function whenErrors(when, where) {
+  if (!isObject(when)) return [`${where} must be an object`];
+  const errors = keysErrors(when, ["config_any"], where);
+  const list = when.config_any;
+  if (!Array.isArray(list) || list.length === 0) return [...errors, `${where}.config_any must be a non-empty list`];
+  for (const item of list) {
+    const file = typeof item === "string" ? item : isObject(item) ? item.file : undefined;
+    if (!matches(file, CONFIG_RE)) {
+      errors.push(
+        `${where}.config_any: each item is a file name or a path from the repository root (no "..", no wildcard in a bare name), or { file, pattern }`,
+      );
+    }
+    if (isObject(item)) {
+      errors.push(...keysErrors(item, ["file", "pattern"], `${where}.config_any`));
+      if (!isText(item.pattern)) errors.push(`${where}.config_any: { file, pattern } needs a pattern`);
+      else if (patternErrors(item.pattern, `${where}.config_any pattern`, false).length) {
+        errors.push(`${where}.config_any: ${item.file}'s pattern is not a valid regular expression`);
+      }
+    }
+  }
+  return errors;
+}
+
+const configOf = (item) => (typeof item === "string" ? { file: item } : item);
+const repoGlob = (file) => (file.includes("/") ? file : `**/${file}`);
+
+function globRegExp(glob) {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const wholeSegment = glob.startsWith("**", i) && (i === 0 || glob[i - 1] === "/");
+    if (wholeSegment && i + 2 === glob.length) {
+      re += ".*";
+      i++;
+    } else if (wholeSegment && glob[i + 2] === "/") {
+      re += "(?:.*/)?";
+      i += 2;
+    } else {
+      re += glob[i] === "*" ? "[^/]*" : glob[i] === "?" ? "[^/]" : glob[i].replace(".", "\\.");
+    }
+  }
+  return new RegExp(`^${re}$`);
+}
+
+function configMatches(file, config) {
+  if (!existsSync(file)) return false;
+  if (!config.pattern) return true;
+  try {
+    return new RegExp(config.pattern, "m").test(readFileSync(file, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+function trackedConfigs(configs, top, ctx) {
+  const git = which("git", ctx.env, ctx.platform, ctx.fs);
+  if (!git) return null;
+  const specs = [...new Set(configs.map((c) => `:(top,glob)${repoGlob(c.file)}`))];
+  const r = spawnSync(path.resolve(git), ["-C", top, "ls-files", "-z", "--", ...specs], {
+    cwd: HERE,
+    encoding: "utf8",
+    env: ctx.env,
+    timeout: GIT_TIMEOUT_MS,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return r.error || r.status !== 0 ? null : r.stdout.split("\0").filter(Boolean);
+}
+
+function whenChecker(entries, ctx) {
+  const start = path.resolve(ctx.env.CLAUDE_PROJECT_DIR || ctx.cwd);
+  const dirs = [];
+  for (let dir = start; ; dir = path.dirname(dir)) {
+    dirs.push(dir);
+    if (path.dirname(dir) === dir) break;
+  }
+  const top = dirs.find((dir) => existsSync(path.join(dir, ".git")));
+  const all = entries.filter((e) => e.when).flatMap((e) => e.when.config_any.map(configOf));
+  let tracked;
+  return (entry) => {
+    if (!entry.when) return true;
+    const configs = entry.when.config_any.map(configOf);
+    const literal = configs.filter((c) => !/[*?/]/.test(c.file));
+    if (dirs.some((dir) => literal.some((c) => configMatches(path.join(dir, c.file), c)))) return true;
+    if (!top) return false;
+    if (tracked === undefined) tracked = trackedConfigs(all, top, ctx);
+    if (tracked === null) return true;
+    return configs.some((c) => {
+      const re = globRegExp(repoGlob(c.file));
+      return tracked.some((f) => re.test(f) && configMatches(path.join(top, f), c));
+    });
+  };
+}
+
+const whenText = (entry) =>
+  entry.when.config_any.map((i) => (typeof i === "string" ? i : `${i.file} matching /${i.pattern}/`)).join(" or ");
 
 // validateManifest(value) -> list of schema errors; empty means valid.
 export function validateManifest(manifest) {
@@ -596,9 +698,16 @@ function cmdCheck(opts, ctx, out) {
   }
   const local = { ...ctx, root, dataDir: opts.dataDir };
   const counts = { failed: 0, warned: 0, passed: 0 };
-  for (const entry of manifest.requires.filter((e) => inScope(e, opts.scope))) {
-    const { status, detail } = detectEntry(entry, local);
+  const entries = manifest.requires.filter((e) => inScope(e, opts.scope));
+  const needed = whenChecker(entries, local);
+  for (const entry of entries) {
     const label = `${entry.id} (${entry.kind}, ${entry.need})`;
+    if (!needed(entry)) {
+      const dir = path.resolve(local.env.CLAUDE_PROJECT_DIR || local.cwd);
+      out.stdout(`INFO  ${label}: not needed here: no ${whenText(entry)} at or above ${dir}, and none tracked in its git repository`);
+      continue;
+    }
+    const { status, detail } = detectEntry(entry, local);
     if (status === "present") {
       counts.passed++;
       out.stdout(`PASS  ${label}: ${detail}`);
@@ -665,7 +774,10 @@ function cmdProbe(opts, ctx, out) {
   }
   const session = readHookInput(ctx.stdin);
   const notices = [];
-  for (const entry of manifest.requires.filter((e) => e.for.some((s) => s.startsWith("hook:")))) {
+  const entries = manifest.requires.filter((e) => e.for.some((s) => s.startsWith("hook:")));
+  const needed = whenChecker(entries, ctx);
+  for (const entry of entries) {
+    if (!needed(entry)) continue;
     const { status, detail } = detectEntry(entry, { ...ctx, root });
     if (!isFailure(status) || !firstNoticeThisSession(plugin, entry.id, session, ctx.env)) continue;
     notices.push(userNotice(plugin, { ...entry, root }, status, detail));

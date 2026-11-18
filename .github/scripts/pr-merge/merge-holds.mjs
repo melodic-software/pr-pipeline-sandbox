@@ -33,8 +33,9 @@
 //   approval that lifts a hold path lifts it.
 // - A cost path (COST_PATHS): a changed file the gate holds for the owner's
 //   cost decision. An approval does not lift it; only the decision the gate
-//   reads does (costDecision), linked from the body: on the pull request, or
-//   on its linked issue naming it, for the head it decided or a later one
+//   reads does (costDecision), linked from the body and carrying a link to
+//   its owner-decisions row and a verbatim owner quote: on the pull request,
+//   or on its linked issue naming it, for the head it decided or a later one
 //   whose every change since is a base merge with the same net change
 //   (baseMergeCarry).
 // - No verifier pass, when a verdicts file is given (ci-status gives one in
@@ -444,6 +445,7 @@ export const HOLD_PATH_CLASSES = Object.freeze([
   [".github/recurring-schedule.json", "enforcement"],
   ["docs/upstream/**", "enforcement"],
   [".github/scripts/recurring-schedule/file-due.mjs", "enforcement"],
+  [".github/scripts/maintenance-monitor-signals/issues.mjs", "enforcement"],
   [".github/scripts/lib/github-rest.mjs", "enforcement"],
   ["plugins/work-items/scripts/charge-words.json", "enforcement"],
   [".github/scripts/pr-unblock/dependency-classify.mjs", "enforcement"],
@@ -481,6 +483,7 @@ export const HOLD_PATH_CLASSES = Object.freeze([
   [".github/workflows/maintenance-reconcile-lost-runs.yml", "gate"],
   [".github/workflows/maintenance-repin-ci-workflows.yml", "gate"],
   [".github/workflows/maintenance-tidy-code-upkeep.yml", "gate"],
+  [".github/workflows/maintenance-verify-whole-map.yml", "gate"],
   [".github/workflows/post-merge-file-demotion-issues.yml", "gate"],
   [".github/workflows/post-merge-test-mutation.yml", "gate"],
   [".github/workflows/pr-dispatch-feedback.yml", "gate"],
@@ -733,6 +736,25 @@ export async function withActorContents(github, repo, changes, base, head) {
 // babysit_merge_policy COST_DECISION_LINK, DECISION_LINE and HTML_COMMENT.
 const DECISION_LINK = /https:\/\/github\.com\/([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)\/(?:issues|pull)\/([0-9]+)#issuecomment-([0-9]+)/g;
 const DECISION_LINE = /^\*\*Decision recorded\.\*\*[ \t]+Cost:/;
+// What a cost decision comment must also carry, outside HTML comments, as
+// babysit_merge_policy DECISION_ROW and DECISION_QUOTE: a line link to a row
+// of the owner-decisions record (rows have no anchors, and the record is
+// append-only, so a line stays its row), and the owner's words quoted after
+// `verbatim:`. The gate cannot read the private record: it checks shape only.
+const DECISION_ROW =
+  /https:\/\/github\.com\/melodic-software\/architecture\/blob\/(?:main|[0-9a-f]{40})\/docs\/owner-decisions\.md(?:\?plain=1)?#L[1-9][0-9]*(?:-L[1-9][0-9]*)?/;
+const DECISION_QUOTE = /(?<![A-Za-z0-9_])verbatim:[ \t]*"[^"\n]*[^" \t\r\n][^"\n]*"/;
+const DECISION_GAPS = {
+  row: "a link to its row in the owner-decisions record (https://github.com/melodic-software/architecture/blob/<commit or main>/docs/owner-decisions.md#L<line>)",
+  quote: 'the owner\'s words quoted verbatim (`verbatim: "<his words>"`)',
+};
+
+// What cost decision comment `body` lacks of DECISION_GAPS, outside HTML
+// comments, as a list; empty when it carries both.
+export function decisionGaps(body) {
+  const text = String(body ?? "").replaceAll(HTML_COMMENT, "");
+  return [...(DECISION_ROW.test(text) ? [] : [DECISION_GAPS.row]), ...(DECISION_QUOTE.test(text) ? [] : [DECISION_GAPS.quote])];
+}
 export const PULL_OPENED_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) { createdAt baseRefName headRefName closingIssuesReferences(first: 2) { totalCount nodes { number repository { nameWithOwner } } } }
@@ -1084,7 +1106,7 @@ export function approvalCarry(then, now, from, inBase, merges, based, dismissal 
 // lanes still judge it. babysit_merge_policy.CARRY_REFUSES is the same list.
 // The trusted-actor list and the pipeline config are read too: a widening the
 // approver never saw is lifted by the same approval (actorsHold).
-export const CARRY_REFUSES = Object.freeze([".github/workflows/**", ".github/actions/**", ".github/scripts/**", ".github/standards/**", "docs/conventions/pr-pipeline/**", "scripts/**", "lib/**", "plugins/source-control/skills/babysit-prs/scripts/**", "plugins/performance/scripts/**", "plugins/harness-ops/skills/inventory/scripts/**", "plugins/ai-briefing/skills/generate/scripts/**", "plugins/harness-config/skills/audit-permission-state/scripts/**", "plugins/knowledge/skills/course-digest/scripts/**", "plugins/knowledge/skills/video-digest/scripts/**", "plugins/skill-quality/scripts/**", "plugins/source-control/scripts/**", "plugins/testing/skills/check-visual-parity/scripts/**", ".github/recurring-schedule.json", "docs/upstream/**", "plugins/evals/skills/validate/scripts/**", "plugins/evals/skills/plugin-eval/scripts/**", "plugins/testing/evals/browser-probe/**", "plugins/work-items/scripts/**", "plugins/work-items/tools/work-item-tracker/**", "plugins/harness-ops/skills/changelog/scripts/**", "plugins/instruction-placement/scripts/**", "plugins/app-control/scripts/**"]);
+export const CARRY_REFUSES = Object.freeze([".github/workflows/**", ".github/actions/**", ".github/scripts/**", ".github/standards/**", "docs/conventions/pr-pipeline/**", "scripts/**", "lib/**", "plugins/source-control/skills/babysit-prs/scripts/**", "plugins/performance/scripts/**", "plugins/harness-ops/skills/inventory/scripts/**", "plugins/ai-briefing/skills/generate/scripts/**", "plugins/harness-config/skills/audit-permission-state/scripts/**", "plugins/knowledge/skills/course-digest/scripts/**", "plugins/knowledge/skills/video-digest/scripts/**", "plugins/skill-quality/scripts/**", "plugins/source-control/scripts/**", "plugins/testing/skills/check-visual-parity/scripts/**", "plugins/testing/skills/run-e2e/scripts/**", "plugins/testing/scripts/**", ".github/recurring-schedule.json", "docs/upstream/**", "plugins/evals/skills/validate/scripts/**", "plugins/evals/skills/plugin-eval/scripts/**", "plugins/testing/evals/browser-probe/**", "plugins/work-items/scripts/**", "plugins/work-items/tools/work-item-tracker/**", "plugins/harness-ops/skills/changelog/scripts/**", "plugins/instruction-placement/scripts/**", "plugins/app-control/scripts/**", "plugins/formal-verification/scripts/**", "plugins/formal-verification/lib/**", "plugins/formal-verification/defaults.json", "plugins/formal-verification/schemas/**"]);
 
 // Whether the compare from...H' `merges` touches no hold path and no file a
 // hold path loads, old paths of renames included: pathHold with `holdPaths`
@@ -1311,14 +1333,18 @@ async function carries(github, actions, repo, comment, head, base, branch) {
 // than the pull request and naming it (namesPull); by a User, not through an
 // App; never edited; its first line `**Decision recorded.** Cost:`. Of
 // those, the decision is the newest on the pull request, else the newest on
-// the issue, as the review lanes' hold step picks it; it covers the head it
+// the issue, as the review lanes' hold step picks it. That decision must also
+// carry a row link and a verbatim owner quote (decisionGaps), else it clears
+// nothing and what it lacks goes to `missing`, when given; this makes a
+// cleared hold auditable, not provable, since sessions post as the owner and
+// write the record too. It covers the head it
 // decided and a later one only when every change since is a base merge
 // (carries, against the pull request's base branch). `github(method, path,
 // body)` reads; `actions`, the same shape, reads the lane runs, their jobs,
 // annotations and compares (it needs actions: read and checks: read). A
 // failed read of the pull request or the Refs target decides nothing, and one
 // of a comment or its edit state skips that comment.
-export async function costDecision(github, repo, number, body, humans, head, actions = github) {
+export async function costDecision(github, repo, number, body, humans, head, actions = github, missing = null) {
   const links = [...String(body ?? "").replaceAll(HTML_COMMENT, "").matchAll(DECISION_LINK)].filter(
     (link) => `${link[1]}/${link[2]}`.toLowerCase() === String(repo).toLowerCase(),
   );
@@ -1387,7 +1413,11 @@ export async function costDecision(github, repo, number, body, humans, head, act
   // The newest; of two at one time, the first linked.
   const newest = (own) => decisions.filter((d) => d.own === own).reduce((best, d) => (best === undefined || at(d) > at(best) ? d : best), undefined);
   const decision = newest(true) ?? newest(false);
-  return decision && (await carries(github, actions, repo, decision.comment, head, pull?.baseRefName, pull?.headRefName)) ? decision.link : null;
+  // The chosen decision, not a fallback, must carry both: an older complete
+  // comment never stands in for a newer one that lacks either.
+  const gaps = decision ? decisionGaps(decision.comment.body) : [];
+  missing?.push(...gaps);
+  return decision && !gaps.length && (await carries(github, actions, repo, decision.comment, head, pull?.baseRefName, pull?.headRefName)) ? decision.link : null;
 }
 
 // A GitHub REST and GraphQL reader on fetch, for costDecision.
@@ -1440,8 +1470,9 @@ export function pathLifters(items, humans, head) {
 // hold path but not an unreadable file list or hold-path list, nor a cost
 // path, which only the owner's `decision` lifts. It lifts `widened`
 // (actorsHold's reason) too. `byPerson` (personWrote) says whether the body
-// can hold; `pathHolds` false (pathHoldsOf) holds no hold path.
-export function holds(body, items, files, holdPaths, lifters = [], decision = null, byPerson = true, widened = null, pathHolds = true) {
+// can hold; `pathHolds` false (pathHoldsOf) holds no hold path. `missing`
+// (costDecision's) names what a linked decision comment lacks.
+export function holds(body, items, files, holdPaths, lifters = [], decision = null, byPerson = true, widened = null, pathHolds = true, missing = []) {
   const reasons = [];
   if (widened && !lifters.length) {
     reasons.push(`${widened}; ${APPROVAL_CARRIES}`);
@@ -1454,7 +1485,7 @@ export function holds(body, items, files, holdPaths, lifters = [], decision = nu
   const cost = costHold(files, decision);
   if (cost) {
     reasons.push(
-      `${cost}; the owner's unedited comment opening '**Decision recorded.** Cost:' on this pull request, or on its linked issue naming this pull request, linked from the body, lifts it for the head it decided and a later head that only merges the base`,
+      `${cost}; the owner's unedited comment opening '**Decision recorded.** Cost:' on this pull request, or on its linked issue naming this pull request, linked from the body and carrying a link to its row in the owner-decisions record and the owner's words quoted verbatim, lifts it for the head it decided and a later head that only merges the base${missing.length ? `; the linked decision comment lacks ${missing.join(" and ")}` : ""}`,
     );
   }
   if (bodyHolds(body, byPerson)) {
@@ -1748,7 +1779,8 @@ export async function main(argv = process.argv.slice(2), { env = process.env, gi
     const approved = pathLifters(items, humans, head);
     const body = readFileSync(bodyFile, "utf8");
     const repo = String(env.GITHUB_REPOSITORY);
-    const decision = costHold(files, null) && isRepo(repo) ? await costDecision(github, repo, Number(number), body, humans, head) : null;
+    const missing = [];
+    const decision = costHold(files, null) && isRepo(repo) ? await costDecision(github, repo, Number(number), body, humans, head, github, missing) : null;
     if (decision) {
       console.log(`#${number}: ${decision} records the owner's cost decision, which lifts its cost hold.`);
     }
@@ -1771,7 +1803,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, gi
     // veto comment holds twice: enable-auto-merge labels it `do-not-merge` on
     // its next reader run, and this read holds it until then and whenever the
     // label is off.
-    const reasons = holds("", items, files, holdPaths, lifters, decision, true, widened, pathHolds);
+    const reasons = holds("", items, files, holdPaths, lifters, decision, true, widened, pathHolds, missing);
     const how = approved.length ? "approved this head" : "approved an earlier head whose every change since is a base merge";
     if (held && lifters.length && Array.isArray(holdPaths)) {
       console.log(`#${number}: ${lifters.join(", ")} ${how}, which lifts its hold path (${escape(held)}).`);
