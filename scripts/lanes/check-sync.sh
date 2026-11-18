@@ -93,6 +93,8 @@ SYNCED=(
   scripts/check-affected.sh
   scripts/git-mv-rm.sh
   scripts/lib/checkout-path.sh
+  # The transcript metrics resolve-config's callers.test.mjs imports.
+  scripts/lane-transcripts/store.mjs
 )
 
 # Upstream paths under a SYNCED path this sandbox leaves out. pr-verify's probe
