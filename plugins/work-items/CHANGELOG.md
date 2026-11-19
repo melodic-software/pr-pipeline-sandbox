@@ -3,6 +3,37 @@
 All notable changes to the `work-items` plugin are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this plugin uses semantic versioning.
 
+## [15.6.6] - 2026-11-18
+
+### Fixed
+
+- The permission preflight reference points at the 2.1.323 changelog entry and an archived
+  capture of the manifest reference for which plugin `settings.json` keys take effect.
+
+## [15.6.5] - 2026-11-18
+
+### Changed
+
+- Skill and reference bodies across `decompose`, `track add`, `morning-brief`, `onboard-adapter`, `setup`, `work-loop` and `attend-queue` no longer restate how `gh`, GitHub, Jira, Linear, `jq`, macOS or `/loop` behave. Each passage keeps its rule and either gives the reason in this plugin's own terms or links to the upstream section. For the Jira resolution search, `providers.md` keeps the path and the rule against the deprecated endpoint, and `/work-items:setup` reads the paging and fields from the linked "Search resolutions" operation page.
+
+## [15.6.4] - 2026-11-18
+
+### Changed
+
+- The label-provenance passages in `item-content-trust.md`, `work-class-labels.md` and the tracker `CONTRACT.md` no longer restate how GitHub maps the triage and maintain roles. The two reference pages point to GitHub's role permissions table, and `CONTRACT.md` now gives the reason the adapter reads the `permission` field rather than `role_name`. `measure-delivery` says its metric table is the skill's own measure of each DORA metric, with the definitions left at the DORA pointer ([#16835](https://github.com/melodic-software/claude-code-plugins/issues/16835)).
+
+## [15.6.3] - 2026-11-18
+
+### Fixed
+
+- `/work-items:work --ci` writes no new code comment unless the repository's rule for added comments allows it and the comment lint accepts its shape, so the `work-resolve-issue` lane stops opening pull requests that lint refuses.
+
+## [15.6.2] - 2026-11-18
+
+### Changed
+
+- The tracker's `wit_newer_live_lease` names its arguments like its sibling lease functions, with no behavior change.
+
 ## [15.6.1] - 2026-11-18
 
 ### Changed

@@ -59,13 +59,6 @@ run-name: "${{ inputs.pr && format('pr-merge: arm #{0}', inputs.pr) || '' }}"
 # post-merge check also files the demotion record once it reads the run red,
 # and either filer's record is found by the other through its failing run.
 #
-# On its schedule it also gives a PR a new head, an empty commit, when a lane
-# run on its current head was refused by the token broker as
-# workflow-modified, once per version of the workflow file the broker named,
-# and takes off a needs-human label the lanes App set for a pr-unblock
-# escalation once its recorded reason no longer holds, and a do-not-merge
-# held only for eval evidence once its no-loss record names the head.
-#
 # How to keep one PR from merging: put the line `Hold: a human merges this`
 # in its body, or add the `do-not-merge` or `needs-human` label (the
 # human-gated role label). The gate refuses all of them.
@@ -185,12 +178,18 @@ jobs:
           TIP_BRANCH: main
           GIT_TERMINAL_PROMPT: "0"
         run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
+          until refs=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" refs/tags/main) &&
+              sha=$(awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }' <<<"$refs") && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
             ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
             sleep "$((RANDOM % (2 * i + 1)))"
           done
           echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          # The onMain readers' tip (head-ref-map.mjs PR_MERGE_MAIN_TIP), only
+          # while no tag is named main, which they refuse: with it, no reader
+          # process reads git/ref/tags/main or git/ref/heads/main again.
+          if ! awk '$2 == "refs/tags/main" || $2 == "refs/tags/main^{}" { found = 1 } END { exit !found }' <<<"$refs"; then
+            echo "carry-tip=$sha" >>"$GITHUB_OUTPUT"
+          fi
       - name: Check out the default branch tip
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -264,6 +263,7 @@ jobs:
         if: steps.mode.outputs.live == 'true'
         continue-on-error: true
         env:
+          PR_MERGE_MAIN_TIP: ${{ steps.tip.outputs.carry-tip }}
           ACTIONS_TOKEN: ${{ github.token }}
           LANE_RECORDS_PATH: ${{ runner.temp }}/lane-records.json
           PR_MERGE_READS_PATH: ${{ runner.temp }}/pr-merge-reads.json
@@ -280,6 +280,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         env:
+          PR_MERGE_MAIN_TIP: ${{ steps.tip.outputs.carry-tip }}
           ACTIONS_TOKEN: ${{ github.token }}
           LAST_REPORT_DIR: ${{ runner.temp }}/post-merge-last
           PR_MERGE_READS_PATH: ${{ runner.temp }}/pr-merge-reads.json
@@ -1016,6 +1017,7 @@ jobs:
       # true; the summary says what would have been started. An earlier lane
       # merge that still needs a full run is the dispatch-post-merge-runs job's.
       dispatch: ${{ steps.mode.outputs.live == 'true' && steps.gate.outputs.dispatch == 'true' }}
+      mended-heads: ${{ steps.clear.outputs.mended-heads }}
       eval-released: ${{ steps.release-eval.outputs.released }}
     steps:
       # A rate limit stopped dispatch-post-merge-runs's GITHUB_TOKEN calls, which
@@ -1039,12 +1041,18 @@ jobs:
           TIP_BRANCH: main
           GIT_TERMINAL_PROMPT: "0"
         run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
+          until refs=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" refs/tags/main) &&
+              sha=$(awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }' <<<"$refs") && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
             ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
             sleep "$((RANDOM % (2 * i + 1)))"
           done
           echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          # The onMain readers' tip (head-ref-map.mjs PR_MERGE_MAIN_TIP), only
+          # while no tag is named main, which they refuse: with it, no reader
+          # process reads git/ref/tags/main or git/ref/heads/main again.
+          if ! awk '$2 == "refs/tags/main" || $2 == "refs/tags/main^{}" { found = 1 } END { exit !found }' <<<"$refs"; then
+            echo "carry-tip=$sha" >>"$GITHUB_OUTPUT"
+          fi
 
       # Everything below runs from main as it is right now, never from a PR.
       # Full history: the gate reads the pipeline config's history from this
@@ -1425,6 +1433,7 @@ jobs:
         if: steps.candidates.outputs.listed == 'true'
         continue-on-error: true
         env:
+          PR_MERGE_MAIN_TIP: ${{ steps.tip.outputs.carry-tip }}
           API_BUDGET_TOKEN: github-token
           ACTIONS_TOKEN: ${{ github.token }}
           HEAD_REFS_PATH: ${{ runner.temp }}/head-refs-in.json
@@ -1449,6 +1458,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         env:
+          PR_MERGE_MAIN_TIP: ${{ steps.tip.outputs.carry-tip }}
           API_BUDGET_TOKEN: github-token
           ACTIONS_TOKEN: ${{ github.token }}
           CARRY_TO: ${{ runner.temp }}/pr-merge-carried.json
@@ -1472,6 +1482,7 @@ jobs:
         if: steps.lane-token.outputs.token != '' && steps.candidates.outputs.listed == 'true'
         continue-on-error: true
         env:
+          PR_MERGE_MAIN_TIP: ${{ steps.tip.outputs.carry-tip }}
           API_BUDGET_TOKEN: github-token
           ACTIONS_TOKEN: ${{ github.token }}
           LANE_RECORDS_PATH: ${{ runner.temp }}/lane-records.json
@@ -1532,6 +1543,9 @@ jobs:
           kept=$RUNNER_TEMP/post-merge-kept
           scripts=.base/plugins/source-control/skills/babysit-prs/scripts
           code=
+          # Copied whether or not the report is reused: the merge gate reads
+          # this file too.
+          [ ! -f "$kept/attempts.json" ] || cp "$kept/attempts.json" "$BABYSIT_POSTMERGE_ATTEMPTS"
           if [ -f "$kept/post-merge.json" ] && [ -f "$kept/post-merge-code" ]; then
             kept_code=$(cat "$kept/post-merge-code")
             kept_sha=$(cat "$kept/post-merge-code-sha" 2>/dev/null || true)
@@ -1548,7 +1562,6 @@ jobs:
             fi
           fi
           if [ -z "$code" ]; then
-            [ ! -f "$kept/attempts.json" ] || cp "$kept/attempts.json" "$BABYSIT_POSTMERGE_ATTEMPTS"
             identity=$(yq '.merge."agent-identity" // ""' .base/docs/conventions/pr-pipeline.yaml)
             code=0
             python3 "$scripts/babysit_postmerge.py" \
@@ -1759,6 +1772,7 @@ jobs:
           # The lane records read and added to above, for a gate that checks
           # earlier lane merges again.
           BABYSIT_POSTMERGE_LANE_RECORDS: ${{ runner.temp }}/lane-records.json
+          BABYSIT_POSTMERGE_ATTEMPTS: ${{ runner.temp }}/post-merge-attempts.json
           # Reads that are the same for every candidate (acting login,
           # credential pass, permissions, trusted list, run heads on main,
           # FAIL run records, default branch, base rules, the queued entries
@@ -2246,6 +2260,7 @@ jobs:
       # five pull requests a run.
       # Rules: .github/scripts/pr-merge/clear-escalations.mjs.
       - name: Clear escalations whose reason no longer holds
+        id: clear
         if: >-
           always() && github.event_name == 'schedule'
           && steps.lane-token.outputs.token != ''
@@ -2271,15 +2286,11 @@ jobs:
           TRUSTED_ACTORS_PATH: .base/.github/standards/trusted-actors/trusted-actors.json
         run: node .base/.github/scripts/pr-merge/clear-escalations.mjs
 
-      # Takes do-not-merge off a pull request held only for eval evidence
-      # (`<!-- pr-hold reason=eval -->`) once a listed human posts the VALID
-      # no-loss eval-pair record for its current head, after a comment naming
-      # the record and the head. At most five a run, under the same gate as
-      # the escalation clear. Rules: .github/scripts/pr-merge/release-eval-hold.mjs.
       - name: Release eval holds whose record matches the head
         id: release-eval
         if: >-
-          always() && github.event_name == 'schedule'
+          always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+          && !inputs.pr
           && steps.lane-token.outputs.token != ''
           && steps.mode.outputs.report-only == 'false'
           && steps.gate.outputs.rate-limited != 'true'
@@ -2452,12 +2463,18 @@ jobs:
           TIP_BRANCH: main
           GIT_TERMINAL_PROMPT: "0"
         run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
+          until refs=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" refs/tags/main) &&
+              sha=$(awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }' <<<"$refs") && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
             ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
             sleep "$((RANDOM % (2 * i + 1)))"
           done
           echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          # The onMain readers' tip (head-ref-map.mjs PR_MERGE_MAIN_TIP), only
+          # while no tag is named main, which they refuse: with it, no reader
+          # process reads git/ref/tags/main or git/ref/heads/main again.
+          if ! awk '$2 == "refs/tags/main" || $2 == "refs/tags/main^{}" { found = 1 } END { exit !found }' <<<"$refs"; then
+            echo "carry-tip=$sha" >>"$GITHUB_OUTPUT"
+          fi
 
       - name: Check out the default branch tip
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2622,6 +2639,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         env:
+          PR_MERGE_MAIN_TIP: ${{ steps.tip.outputs.carry-tip }}
           API_BUDGET_TOKEN: github-token
           API_BUDGET_SCRIPT: last-report
           ACTIONS_TOKEN: ${{ github.token }}
@@ -2661,6 +2679,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         env:
+          PR_MERGE_MAIN_TIP: ${{ steps.tip.outputs.carry-tip }}
           API_BUDGET_TOKEN: github-token
           API_BUDGET_SCRIPT: carry-run-cache
           ACTIONS_TOKEN: ${{ github.token }}
@@ -2711,6 +2730,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         env:
+          PR_MERGE_MAIN_TIP: ${{ steps.tip.outputs.carry-tip }}
           API_BUDGET_TOKEN: github-token
           API_BUDGET_SCRIPT: lane-records
           ACTIONS_TOKEN: ${{ github.token }}
@@ -2841,6 +2861,7 @@ jobs:
           && (!inputs.pr || steps.keep-report.outputs.stands == 'true')
         continue-on-error: true
         env:
+          PR_MERGE_MAIN_TIP: ${{ steps.tip.outputs.carry-tip }}
           API_BUDGET_TOKEN: github-token
           API_BUDGET_SCRIPT: head-ref-map
           ACTIONS_TOKEN: ${{ github.token }}
@@ -2859,6 +2880,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         env:
+          PR_MERGE_MAIN_TIP: ${{ steps.tip.outputs.carry-tip }}
           API_BUDGET_TOKEN: github-token
           API_BUDGET_SCRIPT: verify-answers
           ACTIONS_TOKEN: ${{ github.token }}
@@ -3099,8 +3121,8 @@ jobs:
   # Not on a PR-scoped dispatch: the next sweep posts what that run would.
   report-unarmed-status:
     name: Report Unarmed Status
-    needs: [enable-auto-merge]
-    if: ${{ !cancelled() && !inputs.pr && needs.enable-auto-merge.outputs.unarmed-statuses != '' }}
+    needs: [merge, enable-auto-merge]
+    if: ${{ !cancelled() && !inputs.pr && (needs.enable-auto-merge.outputs.unarmed-statuses != '' || needs.merge.outputs.mended-heads != '') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -3134,11 +3156,26 @@ jobs:
           node-version-file: .base/.node-version
 
       - name: Post the pr-merge/unarmed statuses
+        if: needs.enable-auto-merge.outputs.unarmed-statuses != ''
         timeout-minutes: 3
         env:
           GH_TOKEN: ${{ github.token }}
           STATUSES: ${{ needs.enable-auto-merge.outputs.unarmed-statuses }}
         run: node .base/.github/scripts/pr-merge/post-unarmed-status.mjs
+
+      - name: Clear the address-feedback stops pr-verify settled
+        if: ${{ !cancelled() && needs.merge.outputs.mended-heads != '' }}
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MENDED_HEADS: ${{ needs.merge.outputs.mended-heads }}
+          ACTIVITY: address-feedback
+          CLEAR_DESCRIPTION: pr-verify passed this head after a trusted body edit; the stop is settled
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          for head in $MENDED_HEADS; do
+            HEAD_SHA=$head bash .base/.github/scripts/pr-unblock/report-escalation.sh clear
+          done
 
       - name: Log the API budget at the end
         if: always()

@@ -136,6 +136,15 @@ on:
         required: false
         type: string
         default: ""
+      human-pull:
+        description: >-
+          Issue mode, report-outcome: the listed human's open pull request
+          for the issue that kept apply-issue-patch from pushing (the
+          caller's check-human-pull job), which the blocked-by-pr stop waits
+          on. Exported to the script as HUMAN_PULL. Empty otherwise.
+        required: false
+        type: string
+        default: ""
       lease-comment-id:
         description: >-
           Issue mode: the lane lease comment id the read runner's check-broker
@@ -504,8 +513,8 @@ on:
           patch-prepare merge-base, unresolved-conflict, workflow-staged,
           unexpected-path-staged, conflict-patch-invalid,
           conflict-patch-not-applied or conflict-patch-protected-path; for
-          apply-patch under patch-prepare install-script-pin,
-          dependency-pin-invalid, dependency-pin-not-applied or
+          apply-patch under patch-prepare install-script-pin or
+          dependency-relock, dependency-pin-invalid, dependency-pin-not-applied or
           dependency-pin-protected-path; empty otherwise. Set only by runner
           steps and the base's reply and verdict scripts.
         value: ${{ jobs.run.outputs.escalation-reason }}
@@ -622,6 +631,7 @@ jobs:
           PATCH_RESUME_TIP: ${{ inputs.patch-resume-tip }}
           DIMENSION_SKIP: ${{ inputs.dimension-skip }}
           VERIFY_CLOSE: ${{ inputs.verify-close }}
+          HUMAN_PULL: ${{ inputs.human-pull }}
           PATCH_PREPARE: ${{ inputs.patch-prepare }}
           PATCH_MERGE_BASE_SHA: ${{ inputs.patch-merge-base-sha }}
           PATCH_MERGE_STATE: ${{ inputs.patch-merge-state }}
@@ -675,6 +685,10 @@ jobs:
             echo "::error::verify-close must be comma-joined issue numbers, in issue mode"
             exit 1
           fi
+          if [ -n "$HUMAN_PULL" ] && { [ -z "$ISSUE_NUMBER" ] || ! [[ $HUMAN_PULL =~ ^[1-9][0-9]{0,9}$ ]]; }; then
+            echo "::error::human-pull must be a pull request number, in issue mode"
+            exit 1
+          fi
           if ! [[ $APP_SENDER_ID =~ ^[1-9][0-9]*$ ]]; then
             echo "::error::the AUTOMATION_LANES_APP_SENDER_ID variable must hold the lanes App bot's numeric user id"
             exit 1
@@ -685,6 +699,7 @@ jobs:
           fi
           case $ESCALATION_REASON in
             "" | protected-path-conflict | workflow-staged | unexpected-path-staged | repeat-cap | unresolved-conflict) ;;
+            superseded-by-main) ;;
             feedback-protected-path | feedback-round-cap | feedback-not-converging | feedback-uncertain | feedback-not-landed | feedback-invalid) ;;
             feedback-partial | feedback-incomplete | feedback-disputed) ;;
             feedback-round-cap-security | feedback-uncertain-security | feedback-disputed-security) ;;
@@ -1615,6 +1630,7 @@ jobs:
           DIMENSION_SKIP: ${{ inputs.dimension-skip }}
           # Checked as issue numbers by the job's first step.
           VERIFY_CLOSE: ${{ inputs.verify-close }}
+          HUMAN_PULL: ${{ inputs.human-pull }}
           # Issue mode only; report-outcome counts only `true`.
           COLLECT_REFUSED: ${{ inputs.issue-number != '' && inputs.collect-refused || '' }}
           LANE_HOLD_MARKER: ${{ inputs.hold-marker && format('{0}/lane-hold/{1}', runner.temp, inputs.lane) || '' }}
@@ -1729,11 +1745,12 @@ jobs:
             # apply-patch under the merge-base, install-script-pin and
             # shared-copies rows gives that row's own reasons alone.
             case "$PREPARE:$PATCH_PREPARE" in
-              apply-patch:merge-base | apply-patch:install-script-pin | apply-patch:shared-copies)
+              apply-patch:merge-base | apply-patch:install-script-pin | apply-patch:dependency-relock | apply-patch:shared-copies)
                 case "$PATCH_PREPARE:$escalation" in
                   merge-base:unresolved-conflict | merge-base:workflow-staged | merge-base:unexpected-path-staged) ;;
                   merge-base:conflict-patch-invalid | merge-base:conflict-patch-not-applied | merge-base:conflict-patch-protected-path) ;;
                   install-script-pin:dependency-pin-invalid | install-script-pin:dependency-pin-not-applied | install-script-pin:dependency-pin-protected-path) ;;
+                  dependency-relock:dependency-pin-invalid | dependency-relock:dependency-pin-not-applied | dependency-relock:dependency-pin-protected-path) ;;
                   shared-copies:shared-copy-workflow-staged | shared-copies:shared-copy-unexpected-path-staged) ;;
                   shared-copies:shared-copy-patch-invalid | shared-copies:shared-copy-patch-not-applied | shared-copies:shared-copy-patch-protected-path) ;;
                   *) echo "::error::the escalation reason file holds no reason this script may give"; exit 1 ;;
