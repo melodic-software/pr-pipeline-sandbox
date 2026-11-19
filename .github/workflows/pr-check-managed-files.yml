@@ -29,4 +29,4 @@ jobs:
           persist-credentials: false
           # The merge-group mode diffs base_sha...head_sha.
           fetch-depth: 0
-      - uses: melodic-software/ci-workflows/.github/actions/check-managed-files@24067add42f5fa04743c587c6a22aa7d4059e7b8 # v0.75.0
+      - uses: melodic-software/ci-workflows/.github/actions/check-managed-files@9c5bedfbfdbdfe733b9ce4cd7ca80c1574bd4cb8 # v0.76.3
