@@ -46,6 +46,7 @@ SYNCED=(
   .github/scripts/work-resolve-issue
   # Modules the synced scripts and tests import from outside those folders.
   .github/recurring-schedule.json
+  .github/requirements-relock.txt
   .github/scripts/intake-triage/admit.mjs
   .github/scripts/lane-run-report/post.mjs
   .github/scripts/maintenance-monitor-signals/issues.mjs
