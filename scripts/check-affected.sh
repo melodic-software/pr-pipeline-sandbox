@@ -681,6 +681,9 @@ else
   run_check machine-specific-paths "scripts/check-affected.sh --base $base" machine_paths_check
 fi
 
+run_check size-check "bash plugins/code-metrics/skills/audit/scripts/audit-size.sh --check --base $base" \
+  env -u CLAUDE_PLUGIN_ROOT bash "$tools/plugins/code-metrics/skills/audit/scripts/audit-size.sh" --check --base "$base"
+
 run_check spoke-plugin-root "scripts/check-spoke-plugin-root.sh --check" \
   "$tools/scripts/check-spoke-plugin-root.sh" --check
 
@@ -739,8 +742,12 @@ elif ((${#plugins[@]} == 0)); then
 elif ! command -v claude >/dev/null 2>&1; then
   skip validate-plugins "claude CLI not installed"
 else
+  contracts_skip=
+  if ((foreign && !snapshot)) && grep -qxE 'scripts/validate-plugin-contracts\.(mjs|test\.sh)' <<<"$all_raw"; then
+    contracts_skip="the branch changes the validator; CI runs the branch's copy"
+  fi
   run_check validate-plugins "scripts/validate-plugins.sh --only \"${plugins[*]}\"" \
-    "$tools/scripts/validate-plugins.sh" --only "${plugins[*]}"
+    env CHECK_SKIP_CONTRACTS="$contracts_skip" "$tools/scripts/validate-plugins.sh" --only "${plugins[*]}"
 fi
 
 if ((halt)); then

@@ -2288,6 +2288,7 @@ const childNode = ({ child }) => ({
   lastEditedAt: child.last_edited_at,
   author: actorOf(child.author),
   editor: actorOf(child.editor),
+  labels: { nodes: (child.labels ?? []).map((name) => ({ name })) },
 });
 const parentNode = ({ child, parent }) =>
   child.parent === null
@@ -2307,9 +2308,32 @@ for (const vector of VECTORS.cases) {
   test(`split-child vector: ${vector.name}`, async () => {
     const appId = "app_id" in vector ? vector.app_id : VECTORS.app_id;
     const body = await specBody(childNode(vector), parentNode(vector), appId === null ? {} : { laneAppId: appId });
-    assert.deepEqual(body, [[8, vector.expect.trusted ? vector.child.body : null]], vector.expect.reason);
+    const { child } = vector;
+    const ownAgent =
+      (child.labels ?? []).filter((name) => /^source:/i.test(name)).length === 1 &&
+      appId !== null && child.author.type === "Bot" && child.author.id === appId && !child.body.startsWith("<!-- intake-triage size-split child -->") && (child.last_edited_at === null || child.editor?.id === appId);
+    assert.deepEqual(body, [[8, vector.expect.trusted || ownAgent ? child.body : null]], vector.expect.reason);
   });
 }
+
+test("an own-agent filing's body is spec only while no other account edited it, it carries one source label, and only the lanes App's", async () => {
+  const BODY = "## Done when\n\n- [ ] Line 3 says nineteen.";
+  const bot = (id) => ({ type: "Bot", id });
+  const node = (author, editor = null, labels = ["source: improvement-find"]) => childNode({ child: { body: BODY, last_edited_at: editor ? "2026-11-17T00:00:00Z" : null, author, editor, labels } });
+  const app = bot(VECTORS.app_id);
+  for (const [name, issue, expected] of [
+    ["unedited", node(app), BODY],
+    ["edited by itself", node(app, app), BODY],
+    ["edited by a listed human", node(app, { type: "User", id: VECTORS.humans[0] }), null],
+    ["edited by another bot", node(app, bot(41898282)), null],
+    ["github-actions[bot] off the drift shape", node(bot(41898282)), null],
+    ["a bot not on the list", node(bot(99)), null],
+    ["no source label", node(app, null, []), null],
+    ["two source labels", node(app, null, ["source: improvement-find", "source: upstream"]), null],
+  ]) {
+    assert.deepEqual(await specBody(issue, null), [[8, expected]], name);
+  }
+});
 
 // A trusted target-subset part carries its Scope line's targets as `scope`,
 // which narrows its criteria; any other entry carries none.
@@ -2376,26 +2400,23 @@ test("each path through the resolver makes a pinned number of API calls", async 
     // As above; the head commit's time is weighed against the relink fields
     // the spec read carries (9 calls when the relink was a read of its own).
     ["an unjudged head with its commit time", committed(), "ok", 8],
-    // run, commit pulls, the run's jobs, the FAIL name, its run and compare,
-    // the head's checks runs, the spec (9 with the relink read).
-    ["a FAIL named without issues", counted(`pr-verify-41-${HEAD}-fail`), "already-judged", 8],
-    // As above, but the PR links no issue now: the spec's relink fields serve
-    // only the body-edit rule (9 with the relink read).
-    ["a FAIL named without issues, no issue linked", { ...counted(`pr-verify-41-${HEAD}-fail`), issues: [] }, "already-judged", 8],
-    // run, commit pulls, the run's jobs, three names, the spec, the -i7 name,
-    // the FAIL's run and compare, the head's checks runs (12 with the relink read).
-    ["a FAIL named with the PR's issues", counted(`pr-verify-41-${HEAD}-fail-i7`), "already-judged", 11],
-    // run, commit pulls, the run's jobs, three names, the pass's run and compare, the spec.
-    ["a pass with the spec unchanged", counted(`pr-verify-41-${HEAD}-pass`), "already-judged", 9],
+    ["a FAIL named without issues: run, commit pulls, the FAIL name, its run and compare, the head's checks runs, the spec", counted(`pr-verify-41-${HEAD}-fail`), "already-judged", 7],
+    ["a FAIL named without issues, no issue linked: the spec's relink fields serve only the body-edit rule", { ...counted(`pr-verify-41-${HEAD}-fail`), issues: [] }, "already-judged", 7],
+    ["a FAIL named with the PR's issues: run, commit pulls, three names, the spec, the -i7 name, the FAIL's run and compare, the head's checks runs", counted(`pr-verify-41-${HEAD}-fail-i7`), "already-judged", 10],
+    ["a pass with the spec unchanged: run, commit pulls, three names, the pass's run and compare, the spec", counted(`pr-verify-41-${HEAD}-pass`), "already-judged", 8],
     // As above, then the FAIL name with issues.
     ["a pass the spec changed after", counted(`pr-verify-41-${HEAD}-pass`, "2026-10-19T00:00:00Z"), "spec-changed", 10],
   ];
   const edited = { ...ISSUE, lastEditedAt: "2026-10-20T00:00:00Z", editor: { __typename: "User", login: "maintainer", databaseId: 100 } };
+  const jobsPath = `/repos/${REPO}/actions/runs/${RUN}/jobs?filter=latest&per_page=100`;
   for (const [label, setup, expected, count] of cases) {
     const { reason: got, paths } = await calls({ issues: [edited], ...setup });
     assert.equal(got, expected, label);
     assert.equal(paths.length, count, `${label}:\n${paths.join("\n")}`);
+    assert.equal(paths.filter((p) => p === jobsPath).length, expected === "already-judged" ? 0 : 1, `${label}: the run's jobs are read only for a run that proceeds`);
   }
+  assert.equal((await calls({ issues: [edited], jobs: DRAFT_JOBS })).reason, "draft-run", "a draft-started run at an unjudged head skips as draft-run");
+  assert.equal((await calls({ issues: [edited], jobs: DRAFT_JOBS, ...counted(`pr-verify-41-${HEAD}-fail`) })).reason, "already-judged", "a draft-started run at a judged head skips as already-judged");
   // A run red only on a hold: run, commit pulls, the run's jobs once for
   // heldOnly and draftRun, ci-status's log, three names, the spec, the -i7
   // name (10 when draftRun read the jobs again).
