@@ -241,11 +241,16 @@ for synced in "${SYNCED[@]}"; do
 done
 
 pin_re='melodic-software/ci-workflows/[^@ ]+@[0-9a-f]{40}'
-want_pin=$(git -C "$repo" grep -h -o -E "$pin_re" "$ref" -- .github/workflows | sed 's/.*@//' | sort -u)
-[ "$(wc -l <<<"$want_pin")" = 1 ] || differ "$ref carries more than one ci-workflows pin: ${want_pin//$'\n'/ }"
-while IFS=: read -r file line pin; do
-  [ "${pin##*@}" = "$want_pin" ] || differ "$file:$line pins ${pin##*@}, want $want_pin"
-done < <(git -C "$root" grep -n -o -E "$pin_re" -- .github/workflows)
+want_pin=$(git -C "$repo" grep -h -o -E "$pin_re" "$ref" -- .github/workflows | sed 's/.*@//' | sort -u || true)
+if [ -z "$want_pin" ]; then
+  differ "$ref carries no ci-workflows pin under .github/workflows"
+elif [ "$(wc -l <<<"$want_pin")" != 1 ]; then
+  differ "$ref carries more than one ci-workflows pin: ${want_pin//$'\n'/ }"
+else
+  while IFS=: read -r file line pin; do
+    [ "${pin##*@}" = "$want_pin" ] || differ "$file:$line pins ${pin##*@}, want $want_pin"
+  done < <(git -C "$root" grep -n -o -E "$pin_re" -- .github/workflows)
+fi
 
 if [ "$fail" = 0 ]; then
   echo "check-sync: every synced file matches claude-code-plugins $ref"
