@@ -7,7 +7,7 @@ name: PR Refine
 # fix-docs-dispatch.mjs reads this title to skip a second dispatch while one
 # for the same activity and PR is still queued or going. Quoted: unquoted,
 # " #" would start a YAML comment and drop the PR number.
-run-name: "${{ github.event_name == 'workflow_dispatch' && format('pr-refine {0} #{1}', inputs.activity, inputs.pr-number) || 'pr-refine' }}"
+run-name: "${{ github.event_name == 'workflow_dispatch' && format('PR Refine {0} #{1}', inputs.activity, inputs.pr-number) || 'PR Refine' }}"
 
 on:
   workflow_dispatch:
