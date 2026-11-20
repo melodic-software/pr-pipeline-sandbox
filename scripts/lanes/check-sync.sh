@@ -56,6 +56,9 @@ SYNCED=(
   .github/scripts/pr-review-main/split-diff.py
   .github/scripts/pr-review-main/write-verdict.mjs
   .github/scripts/recurring-schedule/file-due.mjs
+  # The source-control trust settings the synced workflows' drop-in step
+  # reads from the base; without it that step fails.
+  .github/source-control-settings.json
   .github/standards/dependabot-policy
   .github/standards/github-actions-conventions
   .github/standards/runner-policy
