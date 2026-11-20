@@ -178,6 +178,13 @@
 // `pull_request: edited` run delays the queue. Whatever happens, the arm goes
 // on, and no rule here or in ci-status reads the record. It logs a
 // `merge-risk` notice per arm and adds its token to the step summary.
+// A layer of a native stack into main is never armed, since GitHub refuses
+// native auto-merge for stacks (stackPlace). Only the bottom layer, with no
+// open layer below it, reads on; every rule above judges it alike. Where it
+// would arm, it is merged instead through the async merge, pinned to the head
+// read, once its newest CI Status run there passed; a layer above the bottom is
+// left. A merge GitHub refuses leaves it unmerged with a person's refusal
+// comment, and the lane adds no credential (owner decision on #15410).
 //
 // Environment:
 //   GH_TOKEN             the lane App token (contents and pull-requests write)
@@ -283,9 +290,6 @@ const MAX_PAGES = 10;
 const MAX_FILE_PAGES = 3;
 const VERIFY_SCRIPT = ".base/plugins/source-control/skills/babysit-prs/scripts/babysit_verify_evidence.py";
 const WHOLE_REVIEW_SCRIPT = ".base/plugins/source-control/skills/babysit-prs/scripts/babysit_whole_review.py";
-const EVIDENCE_SCRIPT = ".base/plugins/source-control/skills/babysit-prs/scripts/babysit_evidence_comment.py";
-// Two Actions reads per candidate artifact and one comment write.
-const EVIDENCE_TIMEOUT_MS = 60_000;
 
 // Into main, by name: the gate reads the default branch live
 // (babysit_merge_policy._base_refusal), while this assumes it is main.
@@ -295,6 +299,7 @@ export const PULLS_QUERY = `query($owner: String!, $name: String!, $after: Strin
       pageInfo { hasNextPage endCursor }
       nodes {
         id number isDraft isCrossRepository headRefName headRefOid baseRefOid body updatedAt mergeStateStatus
+        stack { baseRefName entries(first: 100) { totalCount nodes { position pullRequest { number state } } } }
         author { __typename login }
         userContentEdits(first: 100) { totalCount nodes { editor { __typename login } } }
         labels(first: 100) { totalCount nodes { name } }
@@ -349,6 +354,59 @@ export const DISARM_MUTATION = `mutation($id: ID!) {
 export const AUTO_MERGE_STATE_QUERY = `query($id: ID!) {
   node(id: $id) { ... on PullRequest { state headRefOid autoMergeRequest { enabledAt } } }
 }`;
+
+// Native stack layers (owner decision on #15410, option B). GitHub refuses
+// native auto-merge for every stack member ("Auto-merge is not supported for
+// stacked pull requests", pr-pipeline-sandbox run 44776470784), so the lane
+// lands only a stack's bottom layer, and through the async merge
+// (https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#merge-a-pull-request-asynchronously),
+// which "includes all open downstack pull requests": the bottom has none, so
+// it lands alone, after its own holds. Into a merge queue, GitHub refuses the
+// lanes App's async merge too ("Enqueuer is not authorized to merge",
+// pr-pipeline-sandbox run 44680029102), so there the layer goes to a person
+// through the refusal comment.
+export const STACK_BOTTOM = "bottom";
+export function stackPlace(pull) {
+  const stack = pull.stack;
+  if (stack == null) {
+    return null;
+  }
+  const entries = stack.entries;
+  if (!Array.isArray(entries?.nodes) || !(entries.totalCount <= entries.nodes.length)) {
+    return "its stack's layers could not all be read";
+  }
+  const own = entries.nodes.find((entry) => entry?.pullRequest?.number === pull.number);
+  if (stack.baseRefName !== "main" || own === undefined) {
+    return "it is a layer of a stack that does not target main";
+  }
+  const below = entries.nodes.filter((entry) => entry?.position < own.position && entry.pullRequest?.state === "OPEN");
+  return below.length === 0 ? STACK_BOTTOM : `it is a layer above the bottom of its stack (open below it: ${below.map((entry) => `#${entry.pullRequest.number}`).join(", ")}), and only the bottom layer is merged`;
+}
+export const CI_CHECK = "CI Status";
+export async function ciStatusAt(actions, repo, head) {
+  const runs = (await actions("GET", `/repos/${repo}/commits/${head}/check-runs?check_name=${encodeURIComponent(CI_CHECK)}&filter=latest&per_page=100`))?.check_runs;
+  if (!Array.isArray(runs)) {
+    throw new Error("its check runs did not read");
+  }
+  const newest = runs.toSorted((a, b) => Number(a?.id) - Number(b?.id)).at(-1);
+  return newest === undefined ? "missing" : newest.status === "completed" ? String(newest.conclusion) : String(newest.status);
+}
+export const ciWait = (status) => `its ${CI_CHECK} at the head is ${status ?? "unread"}, not success, and a stack layer is merged only once it passes`;
+export const MERGE_QUEUE_QUERY = `query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) { mergeQueue(branch: "main") { id } }
+}`;
+export const mergeAsyncBody = (head, queued) =>
+  queued ? { sha: head, merge_action: "merge_queue", bypass_rules: false } : { sha: head, merge_action: "direct_merge", merge_method: "squash", bypass_rules: false };
+export const mergeRefused = (error, limited = false) => error instanceof GitHubError && !limited && error.status >= 400 && error.status < 500 && ![401, 409, 429].includes(error.status);
+export const mergeRefusedReason = (cause, said) =>
+  `GitHub refused the async merge of this stack layer (${cause}${said ? `: ${escapeCommand(said)}` : ""}), so it stays unmerged; the lane adds no credential, and a person merges it or clears the cause`;
+export const STACK_QUEUED = "its async merge already put it in main's merge queue";
+// A 202 is only accepted: the merge runs in the background and can still end
+// "failed" (https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#get-the-result-of-an-asynchronous-merge),
+// so its result is read this many times, MERGE_RESULT_WAIT_MS apart. One still
+// pending after them is left: the next run's send answers 409 while it is.
+export const MERGE_RESULT_READS = 6;
+export const MERGE_RESULT_WAIT_MS = 5_000;
 
 const escapeCommand = (text) => String(text).replaceAll(/[\r\n%]/g, " ");
 const firstLine = (body) => bodyLines(body)[0];
@@ -667,6 +725,10 @@ async function changedFiles(github, slug, number) {
 // A listing past MAX_FILE_PAGES: no lane can ever judge its hold and cost
 // paths, so a person clears it.
 export const FILES_CAPPED_REASON = `it changes more than ${MAX_FILE_PAGES * 100} files, so its hold and cost paths cannot all be checked`;
+export const EMPTY_DIFF_REASON = "its diff against main is empty, so its changes are already on main";
+export const EMPTY_DIFF_REOPENED_REASON = `${EMPTY_DIFF_REASON}, and it was reopened after the lane closed it at this head, so a person decides it`;
+export const emptyDiffNote = (head) =>
+  `Unattended merge: closed at head \`${head}\`. ${EMPTY_DIFF_REASON[0].toUpperCase()}${EMPTY_DIFF_REASON.slice(1)}: the base...head diff lists no file, so closing loses no work, and no fresh attempt starts. Reopen it to reverse this.`;
 
 // The verifier refusals that never clear for the pull request
 // (babysit_verify_evidence.py VERIFY_FINAL): the FAIL cap. decide closes
@@ -745,6 +807,7 @@ export function verifyClears(evidence, head) {
 // babysit_merge.queue_ejection_refusal: merge.max-queue-ejections failed-check
 // removals since the head changed), with the gate's marked comment when the
 // count was read, or null under the cap. An answer not of that shape holds.
+export const EJECTION_HOLD = "pr-merge's gate would not enqueue it again (";
 export function ejectionHold(evidence) {
   const queue = evidence?.queue;
   if (queue === null || typeof queue !== "object" || !(queue.refusal === null || typeof queue.refusal === "string")) {
@@ -752,7 +815,7 @@ export function ejectionHold(evidence) {
   }
   return queue.refusal === null
     ? null
-    : { reason: `pr-merge's gate would not enqueue it again (${escapeCommand(queue.refusal)})`, comment: typeof queue.comment === "string" ? queue.comment : null };
+    : { reason: `${EJECTION_HOLD}${escapeCommand(queue.refusal)})`, comment: typeof queue.comment === "string" ? queue.comment : null };
 }
 
 // The refusal comment on a lanes App pull request the run leaves unarmed:
@@ -997,8 +1060,12 @@ function renderRefusal(fence, person, reason, head, label, since, partial, recor
 // owes the read-back no pin; any other rung leaves it unnamed (babysit_merge.py).
 // PIN_RE is merge-holds.mjs's, whose pinHold holds a queued head no pin names.
 export { PIN_RE };
-export const pinBody = (sha, rung) =>
-  `<!-- babysit-merge-pin sha=${sha}${rung === "C2" || rung === "C3" ? ` rung=${rung}` : ""} -->\nThe unattended merge path is about to arm native auto-merge at head \`${sha}\`, the head its arming checks judged. The arm fails if the head moves first.`;
+export const pinBody = (sha, rung, stacked = false) =>
+  `<!-- babysit-merge-pin sha=${sha}${rung === "C2" || rung === "C3" ? ` rung=${rung}` : ""} -->\n${
+    stacked
+      ? `The unattended merge path is about to ask GitHub to merge this stack layer through the async merge at head \`${sha}\`, the head its checks judged. GitHub can still refuse it after accepting the request.`
+      : `The unattended merge path is about to arm native auto-merge at head \`${sha}\`, the head its arming checks judged. The arm fails if the head moves first.`
+  }`;
 
 // The lanes App's newest pin in `comments` (DETAIL_QUERY's), or undefined.
 const newestPin = (comments, bot) => newestAppComment(comments, bot, (c) => PIN_RE.test(firstLine(c.body)));
@@ -1097,6 +1164,14 @@ const STATUS_DESCRIPTION_CHARS = 140;
 // merge.risk-escalation-minutes' default (babysit_merge_policy.RISK_ESCALATION_MINUTES).
 export const RISK_ESCALATION_MINUTES = 60;
 
+function laneBegan(pull, comments, comment, bot) {
+  if (typeof comment !== "string") {
+    return sinceAt(priorRefusal(comments, bot)?.body, pull.headRefOid);
+  }
+  const marked = priorRefusal(comments, bot, comment.split("\n", 1)[0]);
+  return marked?.body === comment ? (marked.updatedAt ?? marked.createdAt) : undefined;
+}
+
 // The failing `pr-merge/unarmed` status for a refusal the lanes clear
 // (`clears` lane) whose comment has stood unchanged at the head for
 // `minutes`: the next scheduled runs judge it again until then, and past it
@@ -1106,12 +1181,7 @@ export function unarmedStatus(pull, comments, { clears, reason, comment }, { bot
   if (clears !== "lane") {
     return null;
   }
-  // The gate's own marked comment is timed from its last change; the lane
-  // comment from the first lane refusal at the head (LANE_SINCE).
-  const marked = typeof comment === "string" ? priorRefusal(comments, bot, comment.split("\n", 1)[0]) : null;
-  const began =
-    typeof comment === "string" ? (marked?.body === comment ? (marked.updatedAt ?? marked.createdAt) : undefined) : sinceAt(priorRefusal(comments, bot)?.body, pull.headRefOid);
-  if (!(now - Date.parse(String(began)) >= minutes * 60_000)) {
+  if (!(now - Date.parse(String(laneBegan(pull, comments, comment, bot))) >= minutes * 60_000)) {
     return null;
   }
   return { sha: pull.headRefOid, state: "failure", description: Array.from(String(reason).replaceAll(/\s+/g, " ")).slice(0, STATUS_DESCRIPTION_CHARS).join("") };
@@ -1308,23 +1378,6 @@ export function pythonRoom(env, spawn = spawnSync) {
 // stderr.
 const lastLine = (text) => String(text).trim().split("\n").at(-1);
 
-// The verification evidence comment for a head about to arm
-// (babysit_evidence_comment.py `post`): it links the head's pr-capture
-// artifact when the capture workflow left one, and posts nothing otherwise.
-// Its Actions reads run under BABYSIT_VERIFY_GH_TOKEN, its comment write
-// under GH_TOKEN, the lanes App token. Returns the script's outcome; throws
-// when it exits non-zero.
-export function pythonEvidence(env, spawn = spawnSync) {
-  return ({ number, headRefOid: head }, login) => {
-    const args = [env.EVIDENCE_COMMENT_SCRIPT || EVIDENCE_SCRIPT, "post", "--repo", env.GITHUB_REPOSITORY, "--pr", String(number), "--head", head, "--identity", login];
-    const done = spawn("python3", args, { encoding: "utf8", env, timeout: EVIDENCE_TIMEOUT_MS });
-    if (done.status !== 0) {
-      throw new Error(`babysit_evidence_comment.py exited ${done.status ?? done.signal}: ${lastLine(done.stderr ?? "")}`);
-    }
-    return JSON.parse(lastLine(done.stdout)).outcome;
-  };
-}
-
 // The close of a pull request decide answers `close` for: the reader's
 // `capped-close` (babysit_verify_evidence.py capped_close), which judges the
 // head again, posts the FAIL findings on the pull request and its issue,
@@ -1495,6 +1548,10 @@ export function decide(pull, { bot, humanGated, holdPaths = null, pathHolds = tr
     return { action: "none", reason: "not the lanes App's" };
   }
   const armed = pull.autoMergeRequest != null;
+  const place = stackPlace(pull);
+  if (place !== null && place !== STACK_BOTTOM) {
+    return { action: armed ? "disarm" : "none", reason: place };
+  }
   const held =
     pull.isDraft !== false
       ? "it is a draft"
@@ -1530,6 +1587,16 @@ export function decide(pull, { bot, humanGated, holdPaths = null, pathHolds = tr
   }
   if (detail.filesCapped === true) {
     return { action: armed ? "disarm" : "none", reason: FILES_CAPPED_REASON, clears: "person" };
+  }
+  if (Array.isArray(detail.files) && detail.files.length === 0) {
+    const vetoed = discussionHold(detail);
+    if (vetoed !== null) {
+      return { action: armed ? "disarm" : "none", reason: vetoed, withdraw: true };
+    }
+    if (newestAppComment(detail.comments?.nodes, bot, (c) => c.body === emptyDiffNote(pull.headRefOid)) !== undefined) {
+      return { action: armed ? "disarm" : "none", reason: EMPTY_DIFF_REOPENED_REASON, clears: "person" };
+    }
+    return { action: "close-empty", reason: EMPTY_DIFF_REASON };
   }
   // A head a pr-unblock lane stopped is never queued: only this job reads the
   // stop. A status list that did not read holds it too.
@@ -1602,6 +1669,9 @@ export function decide(pull, { bot, humanGated, holdPaths = null, pathHolds = tr
     // A push resets the count: the lanes clear it, with the gate's comment.
     return { action: "none", reason: ejected.reason, ...(ejected.comment ? { clears: "lane", comment: ejected.comment } : {}) };
   }
+  if (!armed && place === STACK_BOTTOM && detail.ciStatus !== "success") {
+    return { action: "none", reason: ciWait(detail.ciStatus) };
+  }
   return armed ? { action: "none", reason: "already armed" } : { action: "arm", reason: "no hold" };
 }
 
@@ -1620,7 +1690,7 @@ export function decide(pull, { bot, humanGated, holdPaths = null, pathHolds = tr
 // records ride in the pr-merge-verify-answers artifact (EAM_SKIP_IN, _OUT;
 // verify-answers.mjs reads them back).
 export const SKIP_VERSION = 1;
-export const SKIPPABLE = Object.freeze([READER_HOLDS.risk, "a pr-unblock lane stopped its head ("]);
+export const SKIPPABLE = Object.freeze([READER_HOLDS.risk, "a pr-unblock lane stopped its head (", `${EJECTION_HOLD}queue-ejected:`]);
 // merge.skip-unchanged's defaults (babysit_merge_skip.py).
 export const SKIP_MAX_MINUTES = 60;
 export const SKIP_MAX_SKIPS = 3;
@@ -1749,7 +1819,7 @@ async function listPulls(github, owner, name) {
   throw new ListingFull(`more than ${MAX_PAGES * 100} open pull requests into main`);
 }
 
-export async function main({ env = process.env, github, actions, laneReads, verify, room, close, whole, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), random, latch, now = Date.now, mainInputs, mergeRisk, evidence } = {}) {
+export async function main({ env = process.env, github, actions, laneReads, verify, room, close, whole, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), random, latch, now = Date.now, mainInputs, mergeRisk } = {}) {
   try {
     const repo = REPO.exec(env.GITHUB_REPOSITORY ?? "");
     if (!repo) {
@@ -1864,9 +1934,6 @@ export async function main({ env = process.env, github, actions, laneReads, veri
             download: ghDownloadArtifact({ repo: repo[0], token: env.BABYSIT_VERIFY_GH_TOKEN || env.GH_TOKEN, dir: env.RUNNER_TEMP || ".", name: ARTIFACT_PREFIX, file: RATING_FILE, env, timeout: 8000 }),
           });
         };
-    // The evidence comment's reads and write; a test that injects GitHub
-    // posts none unless it injects this too.
-    evidence ??= injected ? null : pythonEvidence(env);
     const riskTokens = [];
     const appendSummary = (text) => {
       if (!env.GITHUB_STEP_SUMMARY) {
@@ -2312,7 +2379,15 @@ export async function main({ env = process.env, github, actions, laneReads, veri
             } catch (error) {
               console.log(`enable-auto-merge: #${pull.number} head statuses did not read: ${describe(error)}`);
             }
-            detail = { ...detail, files, filesCapped: capped, costDecision: decision, lifters, unblockStops: stops };
+            let ciStatus = null;
+            if (stackPlace(pull) === STACK_BOTTOM) {
+              try {
+                ciStatus = await ciStatusAt(actions, repo[0], pull.headRefOid);
+              } catch (error) {
+                console.log(`enable-auto-merge: #${pull.number} ${CI_CHECK} did not read: ${describe(error)}`);
+              }
+            }
+            detail = { ...detail, files, filesCapped: capped, costDecision: decision, lifters, unblockStops: stops, ciStatus };
             // A hold-path escalation a trusted person's approval of the head
             // lifts: the lane takes its label off, which re-runs ci-status at
             // the head (pr-require-checks.yml runs on unlabeled), and judges
@@ -2421,6 +2496,26 @@ export async function main({ env = process.env, github, actions, laneReads, veri
               ? { action: "none", reason: standing.join("\n"), clears: "person", comment: undefined, withdraw: undefined, partial: true }
               : { action: "none", reason: labelHold, clears: undefined, comment: undefined, withdraw: undefined, partial: undefined });
       }
+      if (action === "close-empty") {
+        leave(pull, `refused: ${reason}`);
+        if (!write) {
+          console.log(`enable-auto-merge: #${pull.number} would close, its diff against main empty (report-only)`);
+          continue;
+        }
+        try {
+          if (pull.autoMergeRequest != null) {
+            await sendSettled("disarm", pull);
+          }
+          const issue = `/repos/${repo[0]}/issues/${pull.number}`;
+          await github("PATCH", issue, { state: "closed" });
+          await github("POST", `${issue}/comments`, { body: emptyDiffNote(pull.headRefOid) });
+          console.log(`enable-auto-merge: #${pull.number} closed: ${escapeCommand(reason)}`);
+        } catch (error) {
+          failed += 1;
+          console.log(`::error title=enable-auto-merge::#${pull.number} empty-diff close: ${describe(error)}`);
+        }
+        continue;
+      }
       // A pull request the verifier refuses for good closes for a fresh
       // attempt; a failed close leaves it for the next run, which finds what
       // this one wrote.
@@ -2460,6 +2555,19 @@ export async function main({ env = process.env, github, actions, laneReads, veri
       if (action === "verify") {
         ({ action, reason, clears, comment, withdraw } = { action: "none", reason: "its verifier verdict is not read yet" });
       }
+      if (action === "arm" && stackPlace(pull) === STACK_BOTTOM) {
+        let queued;
+        try {
+          queued = (await github("POST", "/graphql", { query: QUEUE_ENTRY_QUERY, variables: { owner: repo[1], name: repo[2], pr: pull.number } }))?.data?.repository?.pullRequest;
+        } catch (error) {
+          console.log(`enable-auto-merge: #${pull.number} merge queue entry did not read: ${describe(error)}`);
+        }
+        if (typeof queued?.id !== "string") {
+          ({ action, reason } = { action: "none", reason: "its merge queue entry did not read, so its async merge is not sent this run" });
+        } else if (queued.mergeQueueEntry != null) {
+          ({ action, reason } = { action: "none", reason: STACK_QUEUED });
+        }
+      }
       // A pull request armed earlier in this run counts toward the cap.
       const full = action === "arm" ? roomHold(pull) : null;
       if (full !== null) {
@@ -2486,8 +2594,8 @@ export async function main({ env = process.env, github, actions, laneReads, veri
         await note(pull, detail, { clears, reason, comment, partial, answered, wholeReview });
         // Kept only when this run wrote nothing for it, so the key read
         // before it still stands.
-        if (key !== null && detail != null && sent === sentBefore && failed === failedBefore && stopped === null && clears === "lane" && typeof comment !== "string" && wholeReview !== true && SKIPPABLE.some((prefix) => String(reason).startsWith(prefix))) {
-          const since = sinceAt(priorRefusal(detail.comments?.nodes, slug)?.body, pull.headRefOid);
+        if (key !== null && detail != null && sent === sentBefore && failed === failedBefore && stopped === null && clears === "lane" && wholeReview !== true && SKIPPABLE.some((prefix) => String(reason).startsWith(prefix))) {
+          const since = laneBegan(pull, detail.comments?.nodes, comment, slug);
           const at = now();
           const escalated = unarmedStatus(pull, detail.comments?.nodes, { clears, reason, comment }, { bot: slug, now: at, minutes }) !== null;
           const until = Math.min(at + skips.maxMinutes * 60_000, escalated ? Number.POSITIVE_INFINITY : Date.parse(String(since)) + minutes * 60_000);
@@ -2509,7 +2617,7 @@ export async function main({ env = process.env, github, actions, laneReads, veri
       }
       if (action === "arm" && !pinned(detail?.comments?.nodes, slug, pull.headRefOid, lane?.rung)) {
         try {
-          await github("POST", `/repos/${repo[0]}/issues/${pull.number}/comments`, { body: pinBody(pull.headRefOid, lane?.rung) });
+          await github("POST", `/repos/${repo[0]}/issues/${pull.number}/comments`, { body: pinBody(pull.headRefOid, lane?.rung, stackPlace(pull) === STACK_BOTTOM) });
           console.log(`enable-auto-merge: #${pull.number} pinned at ${pull.headRefOid}`);
         } catch (error) {
           // No pin, no arm: an immediate enqueue would have no read-back.
@@ -2517,15 +2625,6 @@ export async function main({ env = process.env, github, actions, laneReads, veri
           console.log(`::error title=enable-auto-merge::#${pull.number} pin, so not armed: ${describe(error)}`);
           leave(pull, "refused: its pin comment did not post");
           continue;
-        }
-      }
-      // An arm follows a passing verifier verdict at this head, so its
-      // evidence comment goes up first. Whatever it meets, the arm goes on.
-      if (action === "arm" && evidence) {
-        try {
-          console.log(`enable-auto-merge: #${pull.number} evidence comment: ${escapeCommand(String(await evidence(pull, `${slug}[bot]`)))}`);
-        } catch (error) {
-          console.log(`enable-auto-merge: #${pull.number} evidence comment not posted: ${describe(error)}`);
         }
       }
       // The report-only Merge-Risk record for the head about to arm
@@ -2540,6 +2639,60 @@ export async function main({ env = process.env, github, actions, laneReads, veri
         } catch (error) {
           console.log(`enable-auto-merge: #${pull.number} merge-risk line not written: ${describe(error)}`);
         }
+      }
+      if (action === "arm" && stackPlace(pull) === STACK_BOTTOM) {
+        leave(pull, "refused: its async merge failed");
+        let queue;
+        try {
+          queue = (await github("POST", "/graphql", { query: MERGE_QUEUE_QUERY, variables: { owner: repo[1], name: repo[2] } }))?.data?.repository;
+        } catch (error) {
+          console.log(`enable-auto-merge: #${pull.number} main's merge queue did not read: ${describe(error)}`);
+        }
+        if (queue == null) {
+          failed += 1;
+          console.log(`::error title=enable-auto-merge::#${pull.number} async merge not sent: main's merge queue did not read`);
+          continue;
+        }
+        try {
+          let result = await github("PUT", `/repos/${repo[0]}/pulls/${pull.number}/merge-async`, mergeAsyncBody(pull.headRefOid, queue.mergeQueue != null));
+          const uuid = result?.details?.uuid;
+          for (let read = 0; result?.status === "pending" && typeof uuid === "string" && read < MERGE_RESULT_READS; read += 1) {
+            await sleep(MERGE_RESULT_WAIT_MS);
+            try {
+              result = await github("GET", `/repos/${repo[0]}/pulls/${pull.number}/merge-async/${encodeURIComponent(uuid)}`);
+            } catch (error) {
+              console.log(`enable-auto-merge: #${pull.number} async merge result did not read: ${describe(error)}`);
+              break;
+            }
+          }
+          if (result?.status === "failed") {
+            inFlight -= 1;
+            const why = mergeRefusedReason("its result: failed", result.details?.message);
+            console.log(`::warning title=enable-auto-merge::#${pull.number} ${escapeCommand(why)}`);
+            leave(pull, `refused: ${why}`);
+            await note(pull, detail, { clears: "person", reason: why });
+            continue;
+          }
+          leave(pull, "merge requested");
+          console.log(`enable-auto-merge: #${pull.number} stack bottom layer: async merge requested at ${pull.headRefOid} (${escapeCommand(result?.status ?? "no status")})`);
+          statuses.push({ sha: pull.headRefOid, state: "success", description: "async merge requested for its stack's bottom layer" });
+        } catch (error) {
+          if (error instanceof GitHubError && error.status === 409) {
+            leave(pull, "merge requested");
+            console.log(`enable-auto-merge: #${pull.number} stack bottom layer: an async merge is already pending`);
+          } else if (mergeRefused(error, answer?.limited)) {
+            inFlight -= 1;
+            const { said } = answer === null ? { said: "" } : await answerBody(answer.text);
+            const why = mergeRefusedReason(`status ${error.status}`, said);
+            console.log(`::warning title=enable-auto-merge::#${pull.number} ${escapeCommand(why)}`);
+            leave(pull, `refused: ${why}`);
+            await note(pull, detail, { clears: "person", reason: why });
+          } else {
+            failed += 1;
+            console.log(`::error title=enable-auto-merge::#${pull.number} async merge: ${describe(error)}`);
+          }
+        }
+        continue;
       }
       if (action === "disarm" && disarmStop() !== null) {
         failed += 1;
