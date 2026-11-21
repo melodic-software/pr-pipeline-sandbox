@@ -1,5 +1,722 @@
 # Changelog: discovery plugin
 
+## [2.2.4] - 2026-11-19
+
+### Changed
+
+- The research discipline's download recipe gives its reason for putting the random part of a
+  `mktemp` template in the directory in its own words, and points to the FreeBSD `mktemp(1)` page
+  instead of quoting it with a fetch date.
+
+## [2.2.3] - 2026-11-18
+
+### Fixed
+
+- The parent contract's pointer for the keys a plugin's settings may set names the 2.1.323
+  changelog entry and an archived capture of the manifest reference, in place of the
+  `settings` section the live page no longer has.
+
+## [2.2.2] - 2026-11-18
+
+### Changed
+
+- The WebFetch truncation hook's header comment points at the hooks page's PostToolUse input section instead of quoting it ([#16834](https://github.com/melodic-software/claude-code-plugins/issues/16834)).
+
+## [2.2.1] - 2026-11-17
+
+### Fixed
+
+- Explore no longer probes MCP servers or other live systems, matching its description. The stage that needs a live system's current state reads it directly through the system's CLI or MCP tool.
+
+## [2.2.0] - 2026-11-17
+
+### Changed
+
+- `/discovery:explore` no longer ships a per-ecosystem fallback table of test globs, build files, import tokens and version commands. It resolves each from the repository it explores through the plugin's new copy of the ecosystem resolution steps (`reference/ecosystem-resolution.md`, version 1.1.0), still composing `/toolchain:check` when that plugin is enabled. A fact that does not resolve becomes a gap in the artifact instead of a shipped default.
+- `/discovery:research` names no particular package registries in its source categories, and the `EXPLORE.md` sidecar header example uses placeholders in place of a stack-specific test command.
+
+## [2.1.9] - 2026-11-17
+
+### Fixed
+
+- `check-restatement-labels.py --sub-slice` now grades a fan-out whose sub-slices reuse a claim ID instead of exiting 2. Each sub-slice's IDs are namespaced by its directory name: a root line may cite `<sub-slice>/X2` for one sub-slice's claim, and a bare `X2` must carry the label of every claim declaring it. An ID declared twice in one sub-slice, a root claim that reuses a sub-slice ID, and two sub-slices sharing a directory name still exit 2. The research dispatch reference and the research verifier no longer describe the verifier fallback for a cross-sub-slice ID collision.
+
+## [2.1.8] - 2026-11-17
+
+### Changed
+
+- The `explorer` agent's record of how a subagent loads instruction files is now a plain pointer to the probe in [#4157](https://github.com/melodic-software/claude-code-plugins/pull/4157), with no as-of date or recheck trigger. The dropped trigger named Claude Code 2.1.268, a version CI has since moved past ([#16200](https://github.com/melodic-software/claude-code-plugins/issues/16200)).
+
+## [2.1.7] - 2026-11-17
+
+### Changed
+
+- The bundled prerequisites checker's `when` also counts a config git tracks anywhere in the project directory's repository, from one `git ls-files` per run, so a repository whose only config sits in a subdirectory gets its probe line. A `config_any` item may now be a path from the repository root with `*`, `?` and `**` wildcards; `..`, `.` and absolute paths are rejected. When git is missing, fails or runs past two seconds, the entry counts as needed.
+
+## [2.1.6] - 2026-11-17
+
+### Changed
+
+- The bundled prerequisites checker honors an entry's optional `when` (`config_any`: file names, or a file and a pattern its text must match): the SessionStart probe stays silent about the entry unless one of those configs sits in the project directory or above it, and `check` reports it INFO there.
+
+- The shared config cascade copy now exports its `fileState` and `escapes` path guards, so a script that reads other repository files can refuse a symlink or a path outside the checkout the same way. Nothing that already used the cascade changes.
+
+## [2.1.5] - 2026-11-16
+
+### Changed
+
+- The bundled prerequisites stubs' node notice names the plugin whose hook printed it, and names a check skill of another plugin with the condition that that plugin is enabled.
+
+## [2.1.4] - 2026-11-16
+
+### Changed
+
+- Optional calls to another plugin's skills are gated on that plugin being enabled, so a plugin that is installed but switched off takes the documented fallback, per the seam-phrasing contract.
+
+## [2.1.3] - 2026-11-15
+
+### Changed
+
+- The explore, research and blindspot instructions drop capital-letter emphasis, settle rules that disagreed between files, and correct stale section names and minimums.
+
+## [2.1.2] - 2026-11-15
+
+### Changed
+
+- The parent contract points at the plugin philosophy's "Capability tiers" section by its new name.
+
+## [2.1.1] - 2026-11-14
+
+### Changed
+
+- The verification level reader now reads the team file through the shared default-branch reader, `lib/default-branch-file.sh`, which this plugin now carries; levels and messages are unchanged.
+
+## [2.1.0] - 2026-11-14
+
+### Added
+
+- **Discovery agent models are configurable.** With the `multi-agent` plugin enabled, a model a `multi-agent` config layer sets for an agent's role now replaces that agent's pin on the spawn: `retrieval` for `explorer`, `worker` for `researcher` and `intent-tracer`, `verifier` for `research-verifier`. Set it on the `research` workload to move these agents and the `research-sweep` stages without moving other plugins' agents in that role. With no such layer, or without `multi-agent`, each agent keeps its pinned model. How to set it: the README's "Agent models".
+
+## [2.0.0] - 2026-11-13
+
+### Changed
+
+- **Breaking:** the `verification` level now defaults to `light` when the default branch sets no `verification` key or cannot be read: verifier dispatches are skipped and the skip line is written. An invalid value or a team file that does not parse still resolves `standard`, naming the error. Set `verification: standard` (or `strict`), or `verification_skills.<skill>`, in the team file on the default branch to raise it.
+
+## [1.7.13] - 2026-11-13
+
+### Changed
+
+- The vendored prerequisites checker's usage and schema errors give `EXAMPLE_ENABLED` as the sample option name, one that names no plugin.
+
+## [1.7.12] - 2026-11-12
+
+### Changed
+
+- Internal restructuring, no behavior change.
+
+## [1.7.11] - 2026-11-12
+
+### Changed
+
+- Pointer records no longer carry an as-of date or recheck trigger; stored values keep theirs.
+
+## [1.7.10] - 2026-11-12
+
+### Changed
+
+- Pointer records no longer carry an as-of date or recheck trigger; stored values keep theirs.
+
+## [1.7.9] - 2026-11-11
+
+### Fixed
+
+- The `explore` skill no longer says the Bash tool returns a command's complete output into context. The rule
+  stands (the pipe is the bound, so it belongs in the command); the reason now points at the Output
+  limits section of the Claude Code tools reference for what a result returns inline.
+
+## [1.7.8] - 2026-11-11
+
+### Changed
+
+- The README options reference lists its upstream documentation as pointers only, with no as-of date or recheck trigger.
+
+## [1.7.7] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [1.7.6] - 2026-11-11
+
+### Changed
+
+- The report skill keeps its rule that `preload_token` is the only evidence a preloaded skill reached the agent, and points at the subagents page's "Preload skills into subagents" section for what happens to a `skills:` entry that does not load instead of restating it. Its Agent-result basis link now names the "Subagent output scanning" section. No behavior change.
+- The parent contract's preload record ("Harness facts the dispatch design rests on") now states our decision, that only the liveness token shows a preload loaded, instead of restating harness behavior, and is re-dated. The explorer, researcher and intent-tracer agents, the explore and trace-intent skills, and both dispatch references keep their one-sentence rule and cite that record by heading instead of saying a failed preload is skipped silently or carrying their own docs pointer. No behavior change.
+
+## [1.7.5] - 2026-11-11
+
+### Changed
+
+- The `blindspot` view template names user-interface's `typography.measure_ch` beside its 65ch reading column. No rendered value changes.
+
+## [1.7.4] - 2026-11-11
+
+### Changed
+
+- The `blindspot` and `explore` skills now cite the gather-block convention record, "The pre-compute block runs as one shell
+  invocation", instead of restating how the harness runs the pre-compute block. No behavior
+  change.
+
+## [1.7.3] - 2026-11-11
+
+### Changed
+
+- Skill bodies point at the live upstream sections for facts they used to restate (subagent
+  resume, the concurrent subagent limit, curl's `--globoff`) and drop restated detail beside the
+  parent-contract records (the preload-miss debug log, a WebFetch error string). The `setup` skill
+  and README no longer say `apply` writes only `docs/conventions/discovery.yaml`: on an explicit
+  yes it also writes the convention-home region and the `.gitignore` line, as its step 5 and the
+  script already did. No behavior change.
+
+## [1.7.2] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [1.7.1] - 2026-11-10
+
+### Changed
+
+- `/discovery:explore` reads the glossary through `/domain-driven-design:ubiquitous-language lookup` when that plugin is installed.
+
+## [1.7.0] - 2026-11-09
+
+### Added
+
+- **`setup --check` validates list keys.** A list key and its items are checked against the schema (type, length, required keys, allowed keys, patterns, key names) instead of being reported unchecked; a list key using a keyword the checker does not implement stays reported as unchecked. List keys are never written from the command line.
+
+## [1.6.9] - 2026-11-09
+
+### Changed
+
+- Simplified the shared HTML escape helper and the slice index regeneration script without changing their output.
+
+## [1.6.8] - 2026-11-09
+
+### Changed
+
+- Internal simplification of the shared view helpers this plugin carries, no behavior change.
+
+- Simplified the shared yaml-subset parser copies; behavior is unchanged.
+
+- Simplified the internals of the docs fetcher script; its behavior is unchanged.
+
+## [1.6.7] - 2026-11-09
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [1.6.6] - 2026-11-09
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [1.6.5] - 2026-11-09
+
+### Changed
+
+- Simplified the shared resolve-convention-home.sh, resolve-convention-pattern.sh and rewrite-guard.sh copies; behavior is unchanged.
+
+- Simplified the shared setup-apply.mjs, spawn_noise.py and state-key.sh library copies; behavior is unchanged.
+
+- Simplified `docs-cache.sh`: one routine now warns on a bad summary or note file, and the UTC formatter picks its format once. Outputs, exit codes and messages are unchanged.
+
+## [1.6.4] - 2026-11-09
+
+### Changed
+
+- Repaired a stale data-shape pointer in build-view.mjs and dropped an always-true guard from the coverage-ledger gate and its Python twin; behavior is unchanged.
+
+## [1.6.3] - 2026-11-08
+
+### Changed
+
+- explore's dispatch reference no longer says the marketplace's `docs/official-docs.md` indexes the subagents page; that file no longer holds a page index.
+
+## [1.6.2] - 2026-11-07
+
+### Fixed
+
+- `/discovery:blindspot`'s medium resolver command takes `--option "<option>"` in place of the `${user_config.medium}` token, and the skill passes `""` when the `medium` option reads empty or unsubstituted ([#13955](https://github.com/melodic-software/claude-code-plugins/issues/13955)).
+
+## [1.6.1] - 2026-11-07
+
+### Fixed
+
+- state the hand-back size in four agents and the research brief
+
+## [1.6.0] - 2026-11-06
+
+### Added
+
+- `/discovery:research`: the per-claim corroborator floor (`research_corroborators`, default 2) and the recency-gate windows (`research_recency_active_days`, `research_recency_standard_days`, `research_recency_guide_days`, defaults 14, 30 and 90 days) are settings, read from the plugin option and `docs/conventions/discovery.yaml`. With nothing set, research behaves as before.
+
+## [1.5.0] - 2026-11-06
+
+### Added
+
+- A `verification` level (`off`, `light`, `standard`, `strict`) and per-skill `verification_skills` in `docs/conventions/discovery.yaml`, read from the default branch by `lib/read-verification.sh`. Under `light` and `off`, `/discovery:research`, `/discovery:explore` and `/discovery:trace-intent` dispatch no sibling verifier and write `verification: skipped (<level>)`, two new terminal values; under `strict`, research grades every row and claim and gives a FAIL row its rework round at every budget.
+
+## [1.4.14] - 2026-11-05
+
+### Changed
+
+- aim dispatched-agent reports at 3,400 bytes under the 4,096 cap
+
+  Over the 48 h after the cap shipped, capped implementer reports had a
+  median body of 4,059 bytes and a p90 of 4,764: half still exceeded
+  4,096. Agents aim at the stated number and overshoot it, so the
+  contract now states a 3,400-byte aim and keeps 4,096 as the limit.
+
+  Refs: #12469
+
+## [1.4.13] - 2026-11-05
+
+### Changed
+
+- Shared `view-builder.mjs` and `rendered-view.md` synced where this plugin carries them ([#13437](https://github.com/melodic-software/claude-code-plugins/issues/13437)): the planning plan view now reads PLAN.md; no other change to this plugin.
+
+## [1.4.12] - 2026-11-04
+
+### Changed
+
+- Shared `view-runtime.js`, `view-builder.mjs` and `reference/rendered-view.md` synced
+  ([#12656](https://github.com/melodic-software/claude-code-plugins/issues/12656)). The runtime
+  gains a copy binding for planning's page-input block, and the reference's Planning section gains
+  the Reader input procedure. The blindspot view and its steps are unchanged.
+
+## [1.4.11] - 2026-11-04
+
+### Changed
+
+- The config reference and the `explore` and `setup` skills now call the config cascade's
+  gitignored `*.local.*` layer the personal override, the marketplace's name for it (#13192).
+  Behavior is unchanged.
+
+## [1.4.10] - 2026-11-04
+
+### Fixed
+
+- `fetch-docs.sh --profile generic`: a `text/plain` answer to a URL whose path ends in `.md` is
+  read as markdown on the first request, so a host that serves `.md` files as `text/plain` no
+  longer leaves the page unread `unexpected-content-type`
+  ([#13354](https://github.com/melodic-software/claude-code-plugins/issues/13354)). A `text/plain`
+  answer for any other path is still refused.
+
+## [1.4.9] - 2026-11-04
+
+### Fixed
+
+- **`research`: the verifier's row 12 also owns a sentence that restates a claim without its ID.**
+  The restatement check finds a claim only by its ID, so a sidecar sentence that restates one claim
+  on a line that cites another passed it. `artifact-shape.md` and the `research-verifier` agent now
+  name that case beside ID-less table rows
+  ([#13200](https://github.com/melodic-software/claude-code-plugins/issues/13200)).
+
+## [1.4.8] - 2026-11-04
+
+### Fixed
+
+- **`research`: a sidecar abstract must quote one of its claims, and the index must mirror it
+  unchanged.** An abstract that named no claim ID escaped the restatement check, so a seed abstract
+  could drop its claim's exception in both the sidecar and its index copy. Now
+  `scripts/check-restatement-labels.py` fails a sidecar that declares a claim with an `id:` but
+  whose abstract quotes none of its claims as `M1: "<claim>"`, and fails an index abstract bullet,
+  `- <section>: <abstract>`, that is missing or differs from the sidecar's value byte for byte.
+  Table rows that restate a claim with no ID, and index lead-ins whose scope outruns their
+  pointers, stay with the verifier under row 12
+  ([#13200](https://github.com/melodic-software/claude-code-plugins/issues/13200)).
+
+## [1.4.7] - 2026-11-04
+
+### Changed
+
+- Shared config-cascade library synced: the personal layer is now called the personal override in comments and in view-settings' warnings, and `overlayApplies` is `personalOverrideApplies` (#13187). Behavior is unchanged.
+
+## [1.4.6] - 2026-11-04
+
+### Changed
+
+- `reference/rendered-view.md` step 3 lists discovery with the lanes that take `medium` from the shared resolver, matching what `/discovery:blindspot` already does, and no longer lists `~/.claude/rendered-views.md`, `.claude/rendered-views.md` and `.claude/rendered-views.local.md` as files to read. The "Discovery: blindspot" section names its resolver lane, `--lane discovery:blindspot`.
+
+## [1.4.5] - 2026-11-04
+
+### Fixed
+
+- Shared `view-registry.mjs` synced where this plugin carries it: the architecture lane now declares that its plugin ships a `medium` option, which #13027 added; no other change to this plugin.
+
+## [1.4.4] - 2026-11-04
+
+### Changed
+
+- Shared `view-runtime.js` and `view-builder.mjs` synced where this plugin carries them: the theme toggle binding (`data-rv-theme`, system by default) and the redraw binding (`data-rv-shows` with `data-rv-example`, client-only) (#12654). The shared `reference/rendered-view.md` copy names the planning views' reply text `notes.comment`; no other change to this plugin.
+
+- The shared `reference/rendered-view.md` now lists `architecture` as a medium-resolver lane beside `planning`; the blindspot view still reads the rendered-views cascade itself.
+
+## [1.4.3] - 2026-11-04
+
+### Fixed
+
+- **`research`: a sidecar line that cites a claim must quote it verbatim.** The restatement check
+  read sweep words on the index only, so sidecar decision bullets, table cells, conflict notes and
+  abstracts could drop a condition or turn "prefer" into a rule and still pass. Now each sidecar
+  line that names a claim's ID quotes its `claim:` text as `M1 (HIGH (single source)): "<claim>"`,
+  and `scripts/check-restatement-labels.py` fails a line that cites a claim without the quote, or
+  whose quote does not match the claim byte for byte. Its summary line now reports `quoted=<n>`
+  ([#12902](https://github.com/melodic-software/claude-code-plugins/issues/12902)).
+
+## [1.4.2] - 2026-11-04
+
+### Changed
+
+- **The shared view registry records whether each lane's plugin ships a `medium` option.** `lib/view-registry.mjs` gains `hasMediumOption` on every lane registration, and the retired `~/.claude/rendered-views.md` notice names the plugin's `medium` option only for a lane where it is set; this plugin's notices are unchanged.
+
+### Fixed
+
+- The `check` line for a missing node no longer prints a literal `<plugin root>` in the registration probe command. It now says to run `bash scripts/check-hook-registration.sh` from the plugin root, the directory passed to `prerequisites.mjs check`, so the command runs as written.
+
+## [1.4.1] - 2026-11-04
+
+### Changed
+
+- Shared `reference/rendered-view.md` synced where this plugin carries it ([#12732](https://github.com/melodic-software/claude-code-plugins/issues/12732)): it now lists debugging as a resolver lane beside planning; no other change to this plugin.
+
+## [1.4.0] - 2026-11-04
+
+### Added
+
+- A `medium` option: the per-user choice of where the `/discovery:blindspot` view goes (#12741).
+
+### Changed
+
+- `/discovery:blindspot` resolves the view's medium through the shared resolver (`lib/view-settings.mjs resolve --lane discovery:blindspot`) and prints its report line, in place of reading the `rendered-views` files itself (#12741). `~/.claude/rendered-views.md` and `.claude/rendered-views*.md` now give a retirement notice and never a publishing value; set the medium in the `medium` option or `docs/conventions/rendered-views.yaml` and its `.local.yaml` override instead.
+
+## [1.3.6] - 2026-11-04
+
+### Changed
+
+- Shared `view-builder.mjs`, `view-settings.mjs` and `view-registry.mjs` synced where this plugin carries them: the view-kind registry and `render(laneId, kind, record)`, the planning lane's design kind and shipped `artifact` default, and the resolver output's `page` and `publishes` fields (#12650). The shared `reference/rendered-view.md` copy carries the planning section's one-call build and design view; no other change to this plugin.
+
+### Fixed
+
+- Shared `fetch-docs.sh` synced where this plugin carries it ([#12945](https://github.com/melodic-software/claude-code-plugins/issues/12945)): with `--profile generic`, an x.com or twitter.com page that is X's logged-out shell (`redirect_after_login` links and no article text) is now `unread` with reason `login-wall` instead of `read`, whether fetched or served from the cache or a fixture, and is never cached; no other change to this plugin.
+
+## [1.3.5] - 2026-11-04
+
+### Fixed
+
+- Shared `view-settings.mjs` synced where this plugin carries it ([#12646](https://github.com/melodic-software/claude-code-plugins/issues/12646)): a `terminal` or `file` value in a retired `rendered-views.md` file keeps the view local when no scope sets one, instead of falling to a publishing default; no other change to this plugin.
+
+## [1.3.4] - 2026-11-03
+
+### Changed
+
+- The shared medium resolver modules (`view-settings.mjs` and the modules it loads) ship under `lib/` ([#12667](https://github.com/melodic-software/claude-code-plugins/issues/12667)); no skill changes how it resolves the medium yet.
+
+## [1.3.3] - 2026-11-03
+
+### Changed
+
+- The rendered-view reference is now a synced copy of the one shared rendered-view procedure ([#12667](https://github.com/melodic-software/claude-code-plugins/issues/12667)); no skill changes how it resolves the medium yet.
+
+- `/discovery:blindspot` also triggers on "blind spot pass", the name Anthropic's field guide to Claude Fable gives this practice.
+
+## [1.3.2] - 2026-11-03
+
+### Fixed
+
+- **The docs lookup removes its output directory.** The reading procedure's step 1 makes the
+  `--out` directory with `mktemp -d`; it now tells the reader to remove that directory by its
+  literal path when the lookup ends. Each lookup used to leave one `tmp.*` directory, up to
+  1.2 MB, in the OS temp folder
+  ([#9571](https://github.com/melodic-software/claude-code-plugins/issues/9571)).
+
+## [1.3.1] - 2026-11-03
+
+### Changed
+
+- move the research skill's practitioner test out of its hub
+
+  The /discovery:research SKILL.md body drops from 45,165 to 43,646
+  bytes (frontmatter stripped). The proof-of-shipped-work test and the
+  untrusted-profile paragraph move verbatim to
+  skills/research/reference/practitioner-test.md, which the hub points at
+  before a person is weighed as a recognized author. Two eval cases cover
+  the moved text.
+
+## [1.3.0] - 2026-11-03
+
+### Added
+
+- `/discovery:trace-intent` sources record `author_kind: owner-quote | agent-relay`, who wrote the words rather than whose login posted them, and `check-author-kind.py` rejects a `Direct` claim with no `owner-quote` source. The intent tracer runs it before hand-back and the parent re-runs it in the acceptance gate. `/discovery:setup check` prints its two allow rules, so paste the twelve rules it prints (#12517).
+
+## [1.2.2] - 2026-11-03
+
+### Changed
+
+- `discovery:researcher` and `discovery:intent-tracer` no longer restate Claude Code's own behavior for skill preloading, inherited tools, MCP allowlists, the turn limit and resume. Each keeps its own rule (confirm the skill body is present, omit the `tools:` allowlist, write to disk first) and links the subagents docs section that owns the behavior, with an as-of date and a recheck trigger.
+- `/discovery:research`, `/discovery:trace-intent` and `/discovery:explore`: the topic-substitution, pre-compute, bundled `deep-research`, instruction-file loading, turn-limit, `llms.txt` and sitemap passages link the upstream section instead of restating it. The contract test no longer requires trace-intent's dispatch notes to repeat the partial-output wording.
+
+## [1.2.1] - 2026-11-03
+
+### Changed
+
+- `/discovery:research`: the sentence saying the Effort row caps discipline 8 now sits in the Disciplines intro, ahead of the numbered list, instead of opening "Effort, source breadth". It now ends at about byte 15,200, well inside the first 20,000 bytes that compaction re-attaches. The paragraph on grading each sub-slice of an N-topic fan-out moved under "The deep tier", and acceptance gate step 2 points to it there.
+
+- The return contract (`/discovery:report`) caps a dispatched agent's whole final message at 4,096 bytes; detail that does not fit goes in the agent's artifact.
+
+## [1.2.0] - 2026-11-03
+
+### Changed
+
+- `/discovery:explore` no longer asks before looking into a file that is missing from disk. It first runs `git status` and `git log` on that path, both read-only. A staged or committed delete counts as intentional: the run skips it and lists it in the output as an intentionally deleted file. A file deleted only in the working tree is investigated. The run asks only when neither command names the path or a command fails. A dispatched run records that question in `open_questions`.
+
+## [1.1.0] - 2026-11-03
+
+### Added
+
+- `check-claim-eligibility.py` checks each claim's `claim_kind:` and `source_owner:`, the single-source flag's eligibility, and the tier mix behind `HIGH` before hand-back (#12517).
+
+### Changed
+
+- The restatement check fails closed and flags `every`, `all`, `none` and `only` on index lines that cite a claim ID. The researcher, or on the deep tier the session writing the artifact, runs it and the eligibility check until both exit 0, and the parent re-runs both as acceptance-gate step 5 (#12517).
+- Under `Evidence use: internal`, the verifier grades rows 4, 7 and 12 only for the claims a stated decision cites, and no rework round runs (#12517).
+- A slice-root synthesis that adds no claims and cites by ID needs no verifier. The restatement check takes a repeatable `--sub-slice <dir>`, which grades the root's pointers against each sub-slice's declared IDs and labels; on exit 0, and once the parent has checked the root's `accepted:` count, the root records `verification: skipped (cost)` (#12517).
+
+## [1.0.0] - 2026-11-03
+
+### Removed
+
+- `/discovery:check` is gone, with its probe file. To check this plugin's prerequisites, run `node "<plugin root>/lib/prerequisites.mjs" check "<plugin root>"`, the command the hook notices already print. The hook registration probe moved to `scripts/check-hook-registration.sh`, which runs after the checker.
+
+## [0.45.4] - 2026-11-02
+
+### Changed
+
+- Hook notices name the bundled checker command; `check` is optional (#12485).
+
+## [0.45.3] - 2026-11-02
+
+### Changed
+
+- The `SessionStart` node-notice row is gone (#6633): harness-ops' row reports a missing `node` for the whole fleet, once per session. Without harness-ops, no session-start notice says `node` is missing.
+- Shared `prerequisites.mjs` synced where this plugin carries it (#6633): a manifest may declare an optional `session_probe`, which opts the plugin into harness-ops' session-start probe.
+
+## [0.45.2] - 2026-11-02
+
+### Fixed
+
+- `setup` reads the unset fork-mode default from the docs instead of a stale copy
+
+  The check's fork-availability row no longer states that fork mode is off by default in `claude -p` and the SDK. It reads the default for the observed version and session kind from the sub-agents page's "Turn fork mode off" section, recorded with an as-of date and recheck trigger. A new eval case, `su-fork-default-print-mode`, asks the check for that default in `-p` runs.
+
+## [0.45.1] - 2026-11-02
+
+### Changed
+
+- the docs-fetcher gate loads less on every main-thread Bash call
+
+  The `PreToolUse` `Bash` gate now loads `node:fs` and `node:crypto` only when it records the docs-fetcher agent's one allowed call. Every other Bash call, in the main thread and in other agents, skips them. On a WSL2 host this cut the gate's main-thread time from about 7.5 ms above a bare `node -e 0` to about 4 ms (3 rounds of 30 interleaved runs). What the gate allows and denies is unchanged.
+
+## [0.45.0] - 2026-11-01
+
+### Added
+
+- The bundled view builder (`lib/view-builder.mjs`) takes an optional `title` and writes it into the page's `<title>` as escaped plain text, with whitespace collapsed and the text cut to 80 characters (rendered-views rule 5). Pages built without one keep their template's title.
+
+- The bundled setup writer, `lib/setup-apply.mjs`, takes `--state`, which prints the repository's state (`init`, `migrate` or `configure`) and the path that shows it, and writes nothing. It can also migrate values from a retired settings file that a `retirements.yaml` record names, printing any value it cannot carry and leaving that file in place. This plugin's setup names no such record yet, so its own writes are unchanged.
+
+### Changed
+
+- `/discovery:research` and `/discovery:explore`: when dispatched work returns after open questions were shown and before the user answers, the next message that presents anything ends with every open question in full, per `docs/contracts/async-round-presentation/README.md` in the marketplace.
+
+## [0.44.1] - 2026-11-01
+
+### Fixed
+
+- The parent contract's deny-rule pointer now names the sub-agents section on disabling specific
+  subagents, and `discovery:researcher`'s `high` pin points at the section that says what overrides
+  it. The explorer agent points at where the built-in `Explore` model is stated instead of asserting it, the deep tier says
+  its `maxConcurrent` clamp is the plugin's own cap, and `setup` no longer says every env var waits
+  for the next session, and points at where a settings-file `env` value's timing is stated
+  ([#6916](https://github.com/melodic-software/claude-code-plugins/issues/6916)).
+
+## [0.44.0] - 2026-11-01
+
+### Added
+
+- `setup` now records `written_against` and a per-key `provenance:` map in the settings file it
+  writes. `apply` takes `--default <key>` for a value left at the plugin default. When the plugin
+  changes a default, `check` lists it, and a write updates a `default` value and keeps a `chosen`
+  one. The schema declares both keys.
+
+### Changed
+
+- An older version of this plugin cannot read a settings file that holds these keys: its `check`
+  exits 1 with no PASS line, its `apply` refuses the file, and skills reading a setting through
+  `check` drop the whole repository layer. Update everyone sharing a repository before anyone
+  writes the file.
+
+## [0.43.1] - 2026-10-31
+
+### Changed
+
+- `/discovery:research` judges a practitioner source by proof of shipped work (something they built that people use), falls back to a hard-to-join employer, and never treats followers or likes as authority.
+
+## [0.43.0] - 2026-10-31
+
+### Added
+
+- `/discovery:research` takes an optional `--unattended` modifier, accepted anywhere in its arguments, which is not part of the topic. With it, the run records the `/deep-research` offer in its output instead of asking, and dispatches; without it, the run asks. The argument hint lists it.
+
+## [0.42.0] - 2026-10-31
+
+### Changed
+
+- `/discovery:read-docs`: its description now routes a quick question about a Claude Code feature to the bundled `claude-code-docs` skill when that skill resolves in the session, and keeps this skill for an answer that must rest on a named page's own text. A new `## Boundary` section states the split and the mutation gate, and `reference/bundled-claude-code-docs.md` records the basis. ([#9105](https://github.com/melodic-software/claude-code-plugins/issues/9105))
+
+- `research` offers `/deep-research` as a suggest sentence, `If /deep-research is available in your session (<gate basis>), ...`, so the marketplace's native-overlap self-check fails when the offer is deleted or reworded.
+
+## [0.41.1] - 2026-10-31
+
+### Fixed
+
+- `/discovery:setup` `apply` shows the operator the convention-home offer the settings script
+  prints on exit 0, or the refusal printed in its place, and asks whether to add the pointer
+  region and the overlay ignore line: a yes re-runs with `--yes`, a no records the decline with
+  `--decline`.
+
+## [0.41.0] - 2026-10-31
+
+### Changed
+
+- `/discovery:research`: "paper P reports X under conditions Y" now counts as a first-party content claim, accepted at `HIGH (single source)`, when P comes from the publisher authoritative on its topic: the publisher owns the product or system the result measures, such as an Anthropic paper on how Claude or its agents behave. The `single_source:` reason also names the publisher and the product it owns that P measured, so the verifier can grade it. A paper whose publisher does not own what it measured gets no flag: it is one source for X, which still needs two independent corroborators. X stated as a fact about the publisher or its product is a separate claim: the behavior-claim split and the single-publisher MEDIUM cap still apply to it. Two outcome-gate eval cases cover an authoritative paper's reports-claim, which is accepted, and a non-authoritative paper's, which is not. ([#7652](https://github.com/melodic-software/claude-code-plugins/issues/7652))
+
+### Fixed
+
+- The convention-home resolver refuses a pointer that names `.git` or a path inside it, and a
+  working-tree home reached through a symlink: both exit 3.
+
+## [0.40.3] - 2026-10-30
+
+### Changed
+
+- The generated plugin-options block in this plugin's docs now links `docs/contracts/<name>/` instead of the old `docs/conventions/<name>/` stub.
+
+- Shared copies synced: links and paths to marketplace plugin contracts now name `docs/contracts/<name>/`, where the contracts moved from `docs/conventions/<name>/`. The old paths keep a stub with every section heading.
+
+- Shared copies synced: links and paths to marketplace plugin contracts now name `docs/contracts/<name>/`, where the contracts moved from `docs/conventions/<name>/`. The old paths keep a stub with every section heading.
+
+## [0.40.2] - 2026-10-30
+
+### Changed
+
+- Links and paths to marketplace plugin contracts now name `docs/contracts/<name>/`, where the contracts moved from `docs/conventions/<name>/`. The old paths keep a stub with every section heading.
+
+## [0.40.1] - 2026-10-30
+
+### Changed
+
+- Setup reads `docs/conventions/<plugin>.yaml` with the bundled `yaml-subset.mjs` instead of running `yaml-subset.awk`. It accepts and refuses the same files, and parse errors now use `yaml-subset.mjs` wording, for example `line 2: duplicate key "x"` (#10131).
+
+## [0.40.0] - 2026-10-30
+
+### Changed
+
+- The `docs-fetcher` gate's `PreToolUse` `Bash` row sets `"onFailure": "block"`, so on Claude Code 2.1.295 or later a gate that cannot start because `node` is missing, or that reaches its 10 s timeout, denies the call instead of leaving `discovery:docs-fetcher` with an unchecked `Bash` ([#9982](https://github.com/melodic-software/claude-code-plugins/issues/9982)). The row matches every `Bash` call, so on such a host the main thread's `Bash` is denied too. An older client ignores the key.
+
+## [0.39.8] - 2026-10-29
+
+### Changed
+
+- The generated README "How to set these" block names `claude plugin configure <plugin>@<marketplace> --values-stdin` as the preferred headless route, per the plugin-reconfiguration convention, and keeps the `claude plugin install --config` rerun only as its fallback.
+
+## [0.39.7] - 2026-10-29
+
+### Changed
+
+- `setup-apply.mjs` no longer has its own `is a flow map` warning for an object key. The YAML parser already refuses a flow mapping with a parse error, so that warning never printed (#10130).
+
+## [0.39.6] - 2026-10-29
+
+### Changed
+
+- Synced the shared `yaml-subset.awk` parser, which now refuses what `yaml-subset.mjs` refuses: a key repeated in one mapping (before, only under `-v STRICT=1`), an unknown backslash escape in a double-quoted string, a nested flow sequence such as `a: [[1, 2]]`, a `%` directive line (before, skipped), and a sequence-item map whose later keys sit more than two columns past the dash. A config file holding one of these is now a parse error, so `setup-apply --check` names a key set twice as `duplicate key` at its second line, and apply refuses the file.
+
+## [0.39.5] - 2026-10-29
+
+### Changed
+
+- **`blindspot`, `explore`, `research` and `trace-intent` cite the gather-block convention.** The
+  dated record for why git reads stay out of the pre-compute block now links the repository's
+  gather-block convention, at the same heading, instead of a reference file inside the
+  source-control plugin's worktree skill.
+
+### Fixed
+
+- **`research-sweep` holds `applies_to` to the grammar criterion 13 parses.** Every `applies_to`
+  field in the read, consolidate and synthesis schemas now carries the grammar as a `pattern`, and
+  the workflow checks each surviving finding and source against the same grammar as
+  `check-source-applicability.py`. For a free-text value, the workflow asks the synthesizer once
+  more and names the grammar. A value that still fails is recorded `unstated`, and its text goes to
+  the finding's qualifiers, so free text no longer reaches the artifact.
+
+## [0.39.4] - 2026-10-27
+
+### Changed
+
+- The README's generated "How to set these" block no longer restates Claude Code CLI and settings behavior as fact. Each upstream specific is now a link to the docs section that owns it (`/plugin` in a session, what an uninstall deletes and keeps, `pluginConfigs`), and what this repository measured stays in the plugin-reconfiguration convention.
+
+## [0.39.3] - 2026-10-27
+
+### Security
+
+- Shared `setup-apply.mjs` synced: it runs `git`, `bash`, `awk` and `diff` from the library's own directory and names the repository to `git` with `-C`, so on Windows, where Node looks for a bare command in the working directory before `PATH`, a same-named `.exe` or `.com` committed to the repository is never run. Without `--root` it still resolves the repository it is run from.
+- Shared `prerequisites.mjs` synced: each dependency probe runs from the library's own directory, so a probed tool never starts with the user's repository as its working directory.
+
+## [0.39.2] - 2026-10-27
+
+### Added
+
+- Outcome eval cases for `blindspot`, `check`, `explore`, `read-docs`, `research` and `trace-intent`, and held-out triggering probes under `probes/` ([#6557](https://github.com/melodic-software/claude-code-plugins/issues/6557)).
+
+### Changed
+
+- **`blindspot`, `explore`, `trace-intent`:** shorter skill bodies with the same directives, measured against the previous text on Opus and Sonnet with no loss beyond the 0.05 margin ([#6557](https://github.com/melodic-software/claude-code-plugins/issues/6557)).
+
+## [0.39.1] - 2026-10-25
+
+### Changed
+
+- The parent contract points at `/harness-config:audit` for the operator's sandbox configuration instead of linking a file inside that plugin's skill folder.
+
+## [0.39.0] - 2026-10-25
+
+### Added
+
+- **`research`:** restatements cite a claim ID instead of restating the claim. Each sidecar claim carries an `id:` (`M1`, `CI-02`), and the index Summary, the Settled list and the rest of the handoff, catalog and table cells, and sidecar abstracts cite it; a line naming a claim at `HIGH (single source)`, `MEDIUM` or `LOW` carries that label on the same line. The researcher writes to the rule, and the research verifier grades restatements under row 12, or row 7 for a `MEDIUM` or `LOW` claim ([#6070](https://github.com/melodic-software/claude-code-plugins/issues/6070)).
+- **`research`:** `scripts/check-restatement-labels.py` reports every line of a research slice that names a labeled claim's ID without its label. The parent runs it after the acceptance gate and hands what it reports to the verifier; it is advisory, so no exit halts the run ([#6070](https://github.com/melodic-software/claude-code-plugins/issues/6070)).
+
+### Changed
+
+- Shared `prerequisites.mjs` synced where this plugin carries it (#9684): `detect.version` accepts an exclusive `below` bound; no other change to this plugin.
+
+- **`research`:** the outcome gate's result line points at "Effort, source breadth" for its rework bounds instead of saying run-owned rows have no iteration limit ([#6070](https://github.com/melodic-software/claude-code-plugins/issues/6070)).
+
 ## [0.38.0] - 2026-10-24
 
 ### Added

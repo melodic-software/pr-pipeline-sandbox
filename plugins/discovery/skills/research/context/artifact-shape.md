@@ -19,7 +19,7 @@ wants. A planning step chasing one settled fact should read one sidecar, not the
 
 Always the entry point. A consumer handed that filename must get a readable document.
 
-The index opens with a YAML frontmatter block carrying at least `abstract:` (ONE unwrapped line
+The index opens with a YAML frontmatter block carrying at least `abstract:` (one unwrapped line
 naming what the run covered; the same one-line rule the sidecar headers already follow). This is the
 indexable-artifact hook: a slice whose sole artifact is this index
 is an index-less leaf, and the parent slice's `INDEX.md` regeneration mirrors this header's abstract
@@ -44,7 +44,8 @@ Conflicts entry lowers the count to match.
 **`verification:` takes one of the values** defined in
 [`../../../reference/parent-contract.md`](../../../reference/parent-contract.md),
 "The `verification:` values": `pending`, `pass (research-verifier, <date>)`,
-`fail rows <n>[,<n>…] (research-verifier, <date>)`, `skipped (cost)`, `unverified (none, <date>)`.
+`fail rows <n>[,<n>…] (research-verifier, <date>)`, `skipped (cost)`, `skipped (light)`,
+`skipped (off)`, `unverified (none, <date>)`.
 The run writes `pending` in its first write, because it may not grade the verifier rows itself; the
 parent replaces it when it closes the post-dispatch boundary. `pending` left in place after that is
 the one wrong value: a later reader cannot tell it from a run still waiting. The acceptance gate
@@ -53,12 +54,65 @@ prints this value as `verification=<value>` after a usable verdict.
 Body sections, after the frontmatter:
 
 1. **Task restatement**: what was asked, in the run's own words.
-2. **One-line abstract per sidecar**, copied verbatim from that sidecar's `abstract` header field.
+2. **One-line abstract per sidecar**, copied verbatim from that sidecar's `abstract` header field,
+   as one bullet per sidecar: `- <section>: <abstract>`, where `<section>` is the sidecar's
+   filename between `RESEARCH-` and `.md` and `<abstract>` is the header's value, unquoted.
    Verbatim matters: an abstract paraphrased into the index drifts from the sidecar it describes, and
    the reader picks a file on the strength of a summary that no longer matches its contents.
 3. **Section → file + anchor table**, so an abstract that looks relevant resolves to a path without
    opening anything.
 4. **Next-stage-handoff**: settled facts vs. open decisions for the planning step.
+
+**Restatements cite; they do not restate.** The verbatim rule for abstracts extends to every other
+place the artifact repeats an accepted claim: the index Summary, the Settled list and the rest of the
+Next-stage-handoff, and any catalog or table cell that draws on a claim. Each cites the claim's `id:`
+(`M1`) and does not restate its figures, qualifiers or attribution; the claim's header entry and its
+sidecar section say those once. A claim restated in a second place drifts there: it drops its flag,
+its attribution or a qualifier, or states a page's content as product behavior. Each fresh verifier
+samples a different restatement, so rework that adds text fails somewhere new, while rework that
+shrinks the restatement to a pointer converges. The one thing a pointer repeats is a confidence
+label: a line that names a claim at `HIGH (single source)`, `MEDIUM` or `LOW` carries that label
+verbatim on the same line, as in `(M1, HIGH (single source))`, and so does any cell that does
+restate a claim. The flag stays visible wherever the claim goes (`discipline.md`, "Single-source
+first-party content claims"), and a Gap never reads as a finding.
+
+So the Summary, the Settled list and the rest of the handoff are ID pointers with their labels and
+nothing else from the claim: `Settled: M1 (HIGH (single source)), K9.` A line of `RESEARCH.md`
+that names a claim's ID carries no sweep word (`every`, `all`, `none`, `only`), because a sweep
+word on a pointer widens the claim it names.
+
+**A sidecar line that cites a claim quotes it verbatim.** A paraphrase in a decision or evidence
+bullet, a process table cell, a conflict note or a sidecar abstract can drop a condition or turn
+"prefer" into a rule with no sweep word and no missing label to show it.
+So every sidecar line outside the `claims:` header that names a claim's ID carries the claim's
+`claim:` text in one form: the ID, its label in parentheses when the line carries one there, a
+colon, and the text in double quotes, `M1 (HIGH (single source)): "<claim>"` or `K9: "<claim>"`.
+The quote matches the `claim:` value byte for byte, and the line's own words go outside it. A
+sidecar that declares a claim with an `id:` quotes at least one of its own claims in its abstract,
+in this form: an abstract that names no ID escapes every rule here, and a seed abstract that drops
+its claim's exception carries the drift into the index with it. That abstract is a quoted YAML
+scalar, read as its unquoted value, as in
+`abstract: 'SD2: "Prefer one phase per concern unless the phase mixes independent concerns"'`, and
+the index mirrors that value byte for byte. A quote in this form on an index line must match too,
+and its words, the claim's own, are not read as sweep words.
+
+`scripts/check-restatement-labels.py` reports every line of the index and the sidecars, outside the
+`claims:` headers and the fetch log, that names a labeled claim's ID without its label, every
+index line that names any claim's ID beside a sweep word, every sidecar line that names a claim's
+ID without quoting it, every quote that does not match its claim, every sidecar declaring a claim with an
+`id:` whose abstract quotes none of its claims, and, for each such sidecar, an index abstract
+bullet that is missing or differs from its abstract. A sidecar whose claims carry no `id:` has no claim
+to cite, so its abstract bullet is not checked.
+It fails closed: the researcher runs it before hand-back and fixes each reported line until it
+exits 0, and the parent re-runs it in the acceptance gate ([`dispatch.md`](dispatch.md), "The
+restatement and eligibility checks").
+
+The check finds a claim only by its ID, so two cases stay with the verifier under row 12: a table
+row or sentence that restates a claim without its ID or a quote of it, even on a line that cites
+another claim, which the check cannot tie to the claim it restates and cannot tell from a process
+or source line that restates none; and an index lead-in whose scope
+outruns the claims it points at, where a cited claim's qualifier rules the sentence out. The
+verifier, not the check, grades both.
 
 ## The sidecars: `RESEARCH-<section>.md`
 
@@ -66,7 +120,7 @@ Siblings of the index, inside the same slice directory. Each carries the Output 
 one section, opening with a machine-readable YAML header so a consumer can grep headers rather than
 prose.
 
-**The filename is keyed on the SECTION, not the topic or scope.** A run has exactly one topic and
+**The filename is keyed on the section, not the topic or scope.** A run has exactly one topic and
 many sections, so a topic-keyed name gives every sidecar in the run the same filename: later sections
 silently overwrite earlier ones, or the worker invents an undocumented name and the index's
 section → file table stops resolving. Use the same stable kebab-case id that the header's `section`
@@ -77,11 +131,14 @@ that have to be kept in agreement.
 ---
 topic: <topic-slug>
 section: <stable kebab-case id, matches the index anchor>
-abstract: <one line, mirrored verbatim into the index>
+abstract: '<one line quoting one of its claims, M1: "<claim>">'   # mirrored verbatim into the index
 claims:
   - claim: "<one-line claim>"
+    id: M1                    # the claim ID every restatement cites; unique in the slice
     confidence: HIGH          # HIGH | HIGH (single source) | MEDIUM | LOW
-    single_source: "<why only one publisher exists>"   # only at HIGH (single source); omit otherwise
+    claim_kind: behavior      # content | behavior: what a page says, or what a product does
+    source_owner: "<publisher that owns the artifact or product the claim is about>"
+    single_source: "<why only one publisher exists; for a paper's reports-claim, also the paper's publisher and the product it owns that the paper measured>"   # only at HIGH (single source); omit otherwise
     tiers: [0, 1]             # source tiers backing this claim
     applies_to: "<product> <version range>"   # the claim's target, or version-independent
     subject_pool: "<publisher>"   # single-publisher claims only: equals the one pool their Tier 0/1 sources share
@@ -104,15 +161,36 @@ produced_by: <phase id>
 The vocabulary is reused, never reinvented: `HIGH | HIGH (single source) | MEDIUM | LOW` and
 `Tier 0..3` are the research skill's own, defined in `discipline.md`.
 
+**`id:` is the claim's handle.** It follows `claim:` in each entry: one or more capital letters, an
+optional hyphen, digits, and an optional lowercase letter (`M1`, `CI-02`, `S2a`), unique across the
+slice's sidecars. The index cites a claim by it, so a restatement there is a pointer that resolves
+to one header entry; a sidecar line cites it beside the verbatim quote. A claim with no `id:` cannot be cited, and the restatement check
+never looks for it.
+
+**`claim_kind:` and `source_owner:` are declared on every claim, so a script can check the flag
+and the tier mix before a verifier sees them.** `claim_kind` is `content` (what an artifact says: a page, file, changelog, help text, or
+what a paper reports) or `behavior` (what a product does when it runs), split as `discipline.md`'s
+"A behavior claim is not a content claim" says. `source_owner` names the publisher that owns the
+artifact or product the claim is about, written as that publisher's `pool` is written.
+`scripts/check-claim-eligibility.py` fails a claim missing either. It also fails a
+`HIGH (single source)` claim that is not `content`, has no `single_source:` reason, or whose
+primary's `pool` is not its `source_owner` (a third-party report about someone else's product);
+a `HIGH` claim with fewer than three `current` Tier 0/1 sources in distinct pools (two Tier 1 and
+one Tier 2 is `MEDIUM`, per `discipline.md`'s "Confidence calibration"); and a `subject_pool`
+claim above `MEDIUM`. The researcher runs it before hand-back until it exits 0, and the parent
+re-runs it in the acceptance gate. Whether the declared kind and the `single_source:` reason are
+true stays with the verifier.
+
 **`single_source:` is the flag's reason, and criterion 4 grades it.** A claim at
 `HIGH (single source)` carries it; no other claim does. It states why only one publisher of the
 claim's content exists, so a verifier that never saw the run can judge that reason instead of
-counting corroborators the claim cannot have. A claim at that level without the field fails
+counting corroborators the claim cannot have. For a paper's reports-claim ("paper P reports X under
+conditions Y"), the reason also names P's publisher and the product it owns that P measured. A claim at that level without the field fails
 criterion 4. A repost of the primary is recorded under the primary's `pool`, so it never reads as a
 second source. Definition and limits: `discipline.md`'s "Single-source first-party content claims".
 
-**`sources[]` is not redundant with `tiers[]`.** It is what lets outcome-gate criterion 4, "≥2
-INDEPENDENT corroborators, not two cites of one upstream pool", be graded **by a verifier that never
+**`sources[]` is not redundant with `tiers[]`.** It is what lets outcome-gate criterion 4, "≥`research_corroborators`
+independent corroborators, not two cites of one upstream pool", be graded **by a verifier that never
 saw the run**. Independence is a property of the publishing pools behind a claim; a bare tier list
 encodes neither the URL nor the pool, so without `sources[]` the verifier can only take the run's
 word for the one criterion the whole discipline rests on. Two entries sharing a `pool` are one
@@ -136,7 +214,7 @@ check".
 entry in `sources[]`; every other entry is a `corroborator`. The primary is the source criterion
 12's variable and population checks run against, so a verifier reads it off the header instead of
 guessing which source the run leaned on. A corroborator that does not measure the claim's variable
-is recorded and not counted toward criterion 4's two independent corroborators.
+is recorded and not counted toward criterion 4's independent corroborators.
 
 **`published:`, `applies_to:`, and `standing:` make criterion 13 gradeable by a script.** A quote
 can sit at its link word for word and still come from a book written for a runtime ten majors
@@ -201,19 +279,19 @@ confirms the method on the page it cites and records the result in `measures:`.
 because it is a **schema a verifier parses**, not a narrative, and because two outcome values that
 look interchangeable are not.
 
-**One entry per fetch, PER CLAIM:** `Claim | URL or command | artifact-ladder rung | tool used |
+**One entry per fetch, per claim:** `Claim | URL or command | artifact-ladder rung | tool used |
 outcome`. The claim key is not decoration. Criterion 9 is evaluated per accepted claim, and one
 artifact routinely carries claim A while lacking claim B, so an unkeyed outcome cannot show which
 claim it answers.
 
-**Each accepted claim carries the entry for the rung it came from AND one for every rung above it.**
+**Each accepted claim carries the entry for the rung it came from and one for every rung above it.**
 Each of those states its outcome as exactly one of five:
 
 | Outcome | Means | Earned by |
 |---|---|---|
 | carries the claim | the claim came from this rung | the fetch |
 | **does not exist** for this claim class | the normal result for rung 1 | the full first-party surface sweep criterion 9 specifies, never one clean surface |
-| **unresolved** | the sweep fell short, so absence is unproven | this is the **DEFAULT** whenever the sweep was not completed. A Gap row naming surfaces checked and unchecked, and never a license to source from below the rung |
+| **unresolved** | the sweep fell short, so absence is unproven | this is the **default** whenever the sweep was not completed. A Gap row naming surfaces checked and unchecked, and never a license to source from below the rung |
 | fetched and searched, does not carry the claim | settled only by the fetch | the artifact itself retrieved and searched, never a title, index entry, or snippet standing in for it |
 | unreachable after escalation | also a Gap row | the escalation ladder in `discipline.md` walked and failed |
 
@@ -296,12 +374,12 @@ findings:
     verified: read         # read | ran | grep | inferred — see below
     paths:                 # repo-relative, never absolute; the outcome gate checks this
       - "src/payments/rounding.ts:112-140"
-  - finding: "tests/payments/test_rounding.py passes"
+  - finding: "<test file> passes"
     verified: ran
-    command: "python -m pytest tests/payments/test_rounding.py -q"   # only with verified: ran
-    result: "4 passed"     # the observed output, quoted, not a reading of it
+    command: "<the command that was run, verbatim>"   # only with verified: ran
+    result: "<observed output>"   # the observed output, quoted, not a reading of it
     paths:
-      - "tests/payments/test_rounding.py"
+      - "<test file path>"
 produced_by: <phase or dimension id>
 ---
 ```

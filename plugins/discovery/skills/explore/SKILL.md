@@ -20,17 +20,15 @@ invocation:
 - Project root, `git rev-parse --show-toplevel`
 
 The pipe is the bound and belongs in the command. A read-time cap ("read only the first 20 entries")
-bounds nothing: the Bash tool returns the command's complete output into context before there is
-anything to decide about.
+comes too late for whatever the command has already returned inline. What a result returns inline,
+and when it arrives as a saved file instead, is [Tools reference § Output
+limits](https://code.claude.com/docs/en/tools-reference#output-limits).
 
 Treat a failure (not a repository, git unavailable) as an unknown value and carry on. Keep these as
-separate body Bash calls rather than pre-compute lines: the harness runs a skill's whole pre-compute
-block as one shell invocation, and a worktree-isolated session refuses a compound command that
-contains git. The dated record for that composition claim is the worktree skill's
-[reference/gather-block.md](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/plugins/source-control/skills/worktree/reference/gather-block.md),
-"The pre-compute block runs as one shell invocation".
+separate body Bash calls rather than pre-compute lines ([gather-block convention](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/gather-block/README.md#the-pre-compute-block-runs-as-one-shell-invocation),
+"The pre-compute block runs as one shell invocation").
 
-These values orient this session only. The project root is an absolute machine path. Use it to resolve files while working, but never echo it into `EXPLORE.md`; the handoff artifact records relative paths (see the outcome gate below).
+These values orient this session only. Resolve files against the project root, an absolute machine path, but never echo it into `EXPLORE.md`; the handoff artifact records relative paths (outcome gate below).
 
 ## Reply shape: `explore_output`
 
@@ -45,7 +43,7 @@ sidecars are written the same way under every value. Lowest layer first, a later
 4. an `--output change-prep` or `--output explain` argument on this invocation.
 
 Read the file with the Read tool; a missing file or key leaves that layer unset, and the file does
-not apply when the project root is unknown. No `~/.claude` file, `.claude/` file or local overlay
+not apply when the project root is unknown. No `~/.claude` file, `.claude/` file or personal override
 sets this key. A value other than `auto`, `change-prep` or
 `explain` in any layer (or an `--output` value other than the two) is named in the reply, with the
 file or `userConfig` that held it, the key, and the value, and that layer is dropped. A valid
@@ -79,6 +77,9 @@ The two shapes:
 
 **From the main conversation, this skill dispatches the `discovery:explorer` subagent.** Exploration reads many files; keeping that out of the orchestrator's context window is the point. The agent loads the project's path-scoped rules, runs the six dimensions, writes the artifact set, and returns a bounded summary plus a file pointer, not the reads. The parent resolves the **pre-dispatch envelope** first, six fields (scope, reason, memory-slice path, memory root, budget, capability flags), written into the dispatch prompt as the labeled template in [`${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md`](${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md), not as prose the agent has to parse, and owns the **post-dispatch boundary** after: re-surfacing `open_questions` to the user, dispatching the sibling verifier, and **writing its verdict back into `EXPLORE.md`** (which agent, its prompt, the literal `verification:` line, and what to write when no verifier can run: [`${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md`](${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md), "The sibling verifier, stated once"), the explorer always returns `verification: pending` because it may not grade its own work, so an artifact left saying `pending` after the parent verified it cannot be told apart from one whose verifier never ran, and this artifact is the whole handoff a fresh session resumes from.
 
+**The spawn's `model`** follows the parent contract's "The worker's model is the parent's call":
+pass one only when a multi-agent config layer moves the explorer's role off its pin.
+
 **The dispatch prompt also carries `Output: change-prep` or `Output: explain`**, the concrete shape
 resolved under Reply shape above, never `auto`: the explorer cannot see the request or who made it.
 After the acceptance gate passes, the reply to the person (or the calling skill) is the explorer's
@@ -101,9 +102,9 @@ prose in that shape plus the `explore_output:` line.
 
 Each NO above is a harness denial, not a preference, and the four are recorded once with their basis in [`${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md`](${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md), "The built-in Explore agent cannot hold this plugin's contract". Read it before arguing with a test; do not restate the denials anywhere else.
 
-Built-in Explore is therefore a **scout under a worker, never the worker**. Where it earns its place: the locate-tier legwork inside a larger exploration, per the fan-out rules below. When dispatching one, pass a thoroughness level (`quick`, `medium`, `very thorough`) and restate any convention that bounds the search, because it arrives convention-blind.
+Built-in Explore is therefore a **scout under a worker, never the worker**. Where it earns its place: the locate-tier legwork inside a larger exploration, per the fan-out rules below. When dispatching one, pass a thoroughness level (the values are [subagents: built-in subagents](https://code.claude.com/docs/en/sub-agents#built-in-subagents)'s to state) and restate any convention that bounds the search, because it arrives convention-blind.
 
-**Preload-liveness sentinel.** A dispatched agent receives this body through its `skills:` preload, and a preload that fails to resolve is skipped **silently**. Logged to the debug log and nowhere else. The dated record for that harness behavior is [`${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md`](${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md), "Harness facts the dispatch design rests on". A dispatched run therefore echoes this token verbatim as `preload_token` in its return payload. The disk fallback Reads this same file, so a matching `preload_token` is file-identity, **not** proof that preload fired:
+**Preload-liveness sentinel.** A dispatched agent receives this body through its `skills:` preload, and we never count on the harness to tell the agent when that preload does not load. The record for that harness behavior is [`${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md`](${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md), "Harness facts the dispatch design rests on". A dispatched run therefore echoes this token verbatim as `preload_token` in its return payload. The disk fallback Reads this same file, so a matching `preload_token` is file-identity, **not** proof that preload fired:
 
 ```text
 discovery-explore-preload-8e2b7d
@@ -134,6 +135,8 @@ A missing or mismatched token is a **hard failure: the parent discards the run**
 
    **The `index=` path in that output is authoritative** downstream: the verifier's target and the handoff pointer both come from it, not from `artifact:`. `pointer=mismatch` means the payload named a file this gate never graded, a defect in the payload, not a naming preference to reconcile.
 
+   Before the sibling verifier, run `bash "${CLAUDE_PLUGIN_ROOT}/lib/read-verification.sh" --plugin discovery --skill explore --file docs/conventions/discovery.yaml` and report its line: `light` and `off` skip that verifier and write `verification: skipped (<level>)`, as the [parent contract](${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md) "The sibling verifier, stated once" says.
+
 **Any non-zero exit halts the workflow, and a gate that could not run at all is a FAIL, never a skip.** An invocation above that is denied, prompts and is declined, or errors out halts exactly as a non-zero exit does; do not fall back to reading the directory. Do **not** proceed to research, planning, or an edit on the strength of an exploration that did not happen. Proceeding is the damage a silently-empty return actually causes; the missing artifact is only how it starts. Recovery ladder, and why a resume beats a re-dispatch: [`${CLAUDE_PLUGIN_ROOT}/skills/explore/reference/dispatch.md`](${CLAUDE_PLUGIN_ROOT}/skills/explore/reference/dispatch.md).
 
 **One named exception, and it is an exception to the halt, not to the gate.** Exit 1 with `persistence: by-value` in the payload means the agent finished and its environment refused every write, the one failure where a re-dispatch pays full price to reproduce the same refusal. There the parent **writes the slice itself** from the artifact bodies the payload carries verbatim, into the memory-slice path it resolved before dispatch (on that path the payload's `artifact:` value is a *destination* the agent names, never the anchor), and then **re-runs the identical gate command above**. The workflow proceeds only on a subsequent exit 0. If the second run is non-zero, the halt stands and the ladder resumes at the rung it was on. The freshness check needs nothing special: the parent writes after its own pre-dispatch `touch`, so the index is strictly newer than the baseline.
@@ -142,9 +145,9 @@ Read the by-value rung before performing that write: [`${CLAUDE_PLUGIN_ROOT}/ski
 
 **Coverage discipline** when fanning out: (1) write a numbered gap-list before any deepen pass; (2) fan out by disjoint area, never split the six dimensions across agents; (3) whoever holds the workflow writes `EXPLORE.md`. `discovery:explorer` writes its own, while built-in Explore agents cannot write one at all, so their caller does.
 
-**When to fan out, and to what.** Fan-out is the worker's, not the parent's: the parent dispatches **one** `discovery:explorer`, which scales inside its own run. Two triggers, either one: the scope names **two or more disjoint areas**, or the numbered gap-list after the first pass carries **four or more** entries in areas that share no files. Below that, go sequential; a scout costs a spawn and returns a pointer, which a single-area scope does not need. The worker type is the **built-in Explore scout** described above, one per disjoint area, each told what it owns and what it must not wander into. **Spawn at most a dozen scouts at once.** That is this plugin's own ceiling, not the session's: the harness enforces a separate concurrency limit whose value this body does not restate and which a consumer can configure *below* a dozen, so a wave of twelve is not guaranteed to fit. Treat a refused spawn as an area **deferred, not dropped**: hold it and re-spawn it in the next wave, and let the gap-list rather than the first wave decide when coverage is done. The scout is locate-tier: its hits are pointers, and the worker Reads the file itself before any sidecar records `verified: read`.
+**When to fan out, and to what.** Fan-out is the worker's, not the parent's: the parent dispatches **one** `discovery:explorer`, which scales inside its own run. Two triggers, either one: the scope names **two or more disjoint areas**, or the numbered gap-list after the first pass carries **four or more** entries in areas that share no files. Below that, go sequential; a scout costs a spawn and returns a pointer, which a single-area scope does not need. The worker type is the **built-in Explore scout** described above, one per disjoint area, each told what it owns and what it must not wander into. **Spawn at most a dozen scouts at once.** That is this plugin's own ceiling, not the session's, which [subagents: concurrent subagent limit](https://code.claude.com/docs/en/sub-agents#concurrent-subagent-limit) governs, so a wave of twelve is not guaranteed to fit. Treat a refused spawn as an area **deferred, not dropped**: hold it and re-spawn it in the next wave, and let the gap-list rather than the first wave decide when coverage is done. The scout is locate-tier: its hits are pointers, and the worker Reads the file itself before any sidecar records `verified: read`.
 
-**One `EXPLORE.md`, one worker.** Fanning the six dimensions across *parent-side* explorers, the shape the `/discovery:research` deep tier uses for N independent topics, is deliberately not done here. Research topics are independent; codebase areas share a dependency graph, and dimension 3 is the one a parent-side split severs. Revisit only when an ask arrives as N genuinely separable modules with no cross-area dependency; then the sub-slice machinery this plugin already has applies unchanged.
+**One `EXPLORE.md`, one worker.** Do not fan the six dimensions across *parent-side* explorers, the shape the `/discovery:research` deep tier uses for N independent topics: codebase areas share a dependency graph, and a parent-side split severs dimension 3. Revisit only when an ask arrives as N genuinely separable modules with no cross-area dependency; then the sub-slice machinery this plugin already has applies unchanged.
 
 ## Worker procedure
 
@@ -155,12 +158,14 @@ Load [reference/workflow.md](reference/workflow.md) when you are the worker (inl
 Before writing EXPLORE.md (or returning the summary), check the artifact against **binary criteria read off it**, not a "did I explore enough?" recap. Any FAIL → return to the named dimension and fix before handoff:
 
 - **Every Output-format section populated with specifics**. Each of the 7 sections carries concrete findings, not placeholders or "TBD".
-- **Every load-bearing area covered OR listed as a numbered gap**. Nothing the task plausibly depends on is silently unexplored.
+- **Every load-bearing area covered or listed as a numbered gap**. Nothing the task plausibly depends on is silently unexplored.
 - **Conclusion-driving claims are Read-verified, not inferred from a filename or grep hit**. Anything a downstream decision rests on came from reading the file or code.
 - **A pass/fail claim was run, not read**. Every claim that a test or check passes, fails or builds carries `verified: ran` with its `command:` and observed `result:`; a test that was only opened supports no such claim.
 - **The index pins and lists what it cites**. Its frontmatter `repos:` carries each explored repository's `sha` and `dirty` flag, its `## Code references` section opens with `coverage: exhaustive` or `coverage: key-files` followed by the staleness-check line, and every abstract states a finding rather than naming what was covered.
 - **Paths are machine-agnostic**. No finding in the artifact echoes an absolute machine path (notably the project root gathered above); every path it records is written relative to the repo root, or, when there is no repo root, to the current working directory, so the handoff stays portable across machines.
 - **Open questions handed off, never dropped**. Surfaced to the user inline, or carried in the payload's `open_questions` for the parent to surface under dispatch. Each with a recommended default.
+
+When dispatched work returns after you presented open questions and before the user answers, the next message that presents anything ends with every open question in full: `docs/contracts/async-round-presentation/README.md` in the marketplace.
 
 ## Scope
 
@@ -178,15 +183,15 @@ Write the exploration output to `<memory_dir>/<slug>/EXPLORE.md`, a memory-tier 
 
 This file is the authoritative stage summary, a fresh session must be able to resume external research or planning reading only this artifact.
 
-**`EXPLORE.md` is always an INDEX**, at every size, not only past an overflow threshold. It carries a task restatement, a one-line abstract per sidecar copied verbatim from that sidecar's header, a section → file + anchor table, a `## Code references` listing with its `coverage:` and staleness-check lines, and the closing Next-stage-handoff naming what external research (`/discovery:research`) or planning needs. The 7-point Output format's content lives in sibling `EXPLORE-<section>.md` sidecars in the same directory, each opening with a machine-readable YAML header so a consumer can grep headers and read exactly one file. Schema, the `repos:` commit pin, and the two load-bearing placement rules. Sidecars stay inside `<memory_dir>/<slug>/`, and `EXPLORE.md` stays the entry point: [`${CLAUDE_PLUGIN_ROOT}/skills/research/context/artifact-shape.md`](${CLAUDE_PLUGIN_ROOT}/skills/research/context/artifact-shape.md).
+**`EXPLORE.md` is always an index**, at every size, not only past an overflow threshold. It carries a task restatement, a one-line abstract per sidecar copied verbatim from that sidecar's header, a section → file + anchor table, a `## Code references` listing with its `coverage:` and staleness-check lines, and the closing Next-stage-handoff naming what external research (`/discovery:research`) or planning needs. The 7-point Output format's content lives in sibling `EXPLORE-<section>.md` sidecars in the same directory, each opening with a machine-readable YAML header so a consumer can grep headers and read exactly one file. Schema, the `repos:` commit pin, and the two load-bearing placement rules. Sidecars stay inside `<memory_dir>/<slug>/`, and `EXPLORE.md` stays the entry point: [`${CLAUDE_PLUGIN_ROOT}/skills/research/context/artifact-shape.md`](${CLAUDE_PLUGIN_ROOT}/skills/research/context/artifact-shape.md).
 
-**Sidecar bodies match their length to what the section needs**. Cover the substance, but do not pad with filler sections, redundant summaries, or boilerplate; the index's one-line abstracts and the outcome gate's specifics are the floor, not an invitation to narrate.
+**Sidecar bodies match their length to what the section needs**: cover the substance, with no filler sections, redundant summaries, or boilerplate. The index's one-line abstracts and the outcome gate's specifics are the floor.
 
-**Sidecar filenames are keyed on the SECTION, not the scope**, a run has one scope and many sections, so a scope-keyed name gives every sidecar the same filename and later sections overwrite earlier ones. Use the same stable id the header's `section` field and the index anchor carry.
+**Sidecar filenames are keyed on the section, not the scope**, a run has one scope and many sections, so a scope-keyed name gives every sidecar the same filename and later sections overwrite earlier ones. Use the same stable id the header's `section` field and the index anchor carry.
 
-**Sidecar headers use the EXPLORE schema, not the research one.** Local evidence is a repository path and whether the file was actually Read. `verified: read | ran | grep | inferred`, not a URL, a source tier, and a publishing pool. Handed the research header, a run either fabricates fields it has no values for or improvises a shape no consumer can parse; the fabrication is worse, because it launders a grep hit into the field a fetched primary would occupy. Schema and why `verified` is load-bearing: the artifact-shape spoke's "EXPLORE.md sidecar header" section.
+**Sidecar headers use the EXPLORE schema, not the research one.** Local evidence is a repository path and whether the file was actually Read. `verified: read | ran | grep | inferred`, not a URL, a source tier, and a publishing pool. Handed the research header, a run either fabricates fields it has no values for or improvises a shape no consumer can parse; never borrow a research field, because filling one launders a grep hit into the field a fetched primary would occupy. Schema and why `verified` is load-bearing: the artifact-shape spoke's "EXPLORE.md sidecar header" section.
 
-**If an unrelated `EXPLORE.md` already exists** in that slice, do not clobber it, and do not rename the index to dodge it, since `EXPLORE-*.md` is the sidecar pattern and a renamed index collides with its own sidecars. Occupancy is the PARENT's to resolve, before any write: stat the slice root pre-dispatch, and when it is occupied assign a sub-slice `<memory_dir>/<slug>/<scope-slug>/` as the envelope's slice path, so the whole artifact set is written there under its normal names. A worker never picks a sub-slice itself, and on an inline run this session is the parent and applies the same check before writing. A prior exploration lost to a filename collision is silent and unrecoverable.
+**If an unrelated `EXPLORE.md` already exists** in that slice, do not clobber it, and do not rename the index to dodge it, since `EXPLORE-*.md` is the sidecar pattern and a renamed index collides with its own sidecars. Occupancy is the parent's to resolve, before any write: stat the slice root pre-dispatch, and when it is occupied assign a sub-slice `<memory_dir>/<slug>/<scope-slug>/` as the envelope's slice path, so the whole artifact set is written there under its normal names. A worker never picks a sub-slice itself, and on an inline run this session is the parent and applies the same check before writing. A prior exploration lost to a filename collision is silent and unrecoverable.
 
 ## Boundary, the built-in `Explore` agent
 
@@ -194,7 +199,8 @@ Both answer "what is in this codebase", so a request to explore can route to eit
 
 - **`Explore` (built-in subagent)**: a one-shot locator that returns excerpts to its caller and
   skips CLAUDE.md. It mutates nothing: it cannot write files. It is reached through the Agent
-  tool's `subagent_type`.
+  tool's `subagent_type`. Record: [`${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md`](${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md),
+  "Harness facts the dispatch design rests on".
 - **This skill (marketplace plugin)**: the full exploration: six dimensions, the project's rules
   loaded, and a persisted, verified `EXPLORE.md` a cleared session resumes from.
 
@@ -211,6 +217,7 @@ The four-part records live in [reference/native-explore.md](reference/native-exp
 ## Next
 
 - Findings raise a question about current external practice: `/discovery:research <topic>`.
+- A question turns on what a live system holds now (a database, a tracker, a service): read it through that system's CLI or MCP tool from the stage that asks.
 - The picture is enough, no contract is locked, and the diff will not be quick to review and cheap to retry: `/planning:interview`.
 - The contract is locked and the work adds types, contracts, or module boundaries: `/planning:design`.
 - Unsure where this leaves the work, or arrived mid-flow: `/session-flow:workflow`.
@@ -219,13 +226,12 @@ The four-part records live in [reference/native-explore.md](reference/native-exp
 
 - **Fan-out without a numbered gap-list**. Dispatching subagents before writing gaps produces duplicate reads and missed areas. The gap-list is the coverage-discipline gate.
 - **Handing off with placeholder sections**. Every Output-format section needs specifics or an explicit numbered gap. "TBD" fails the outcome gate.
-- **Inferring from filenames without Read**. Grep hits are discovery only; conclusion-driving claims need Read verification.
-- **Investigating deleted files without asking**, when `git status` shows intentional deletes, ask before archaeology.
+- **Inferring from filenames or git log without Read**. Grep hits are discovery only; conclusion-driving claims need Read verification. When uncertain, Read the file.
+- **Asking about a deleted file the git probe can settle**. Before archaeology on a referenced file that is not on disk, run the `git status` and `git log` probe in [reference/workflow.md](reference/workflow.md) dimension 2. A staged or committed delete is intentional: note it in the output and skip it. Investigate an unexplained one, and ask only when the probe does not settle which it is.
 
-## What this skill does NOT do
+## What this skill does not do
 
 - **Does not research externally**. That's `/discovery:research`. This skill reads local code, git, and file system only
 - **Does not make changes**. It explores. Execution is a separate step
-- **Does not make decisions**. It presents what IS. The planning step decides what SHOULD BE
+- **Does not make decisions**. It presents what is. The planning step decides what should be
 - **Does not skip dimensions for "simple" tasks**, a quick bug fix still benefits from reading the surrounding code and checking for tests
-- **Does not substitute for reading**, when uncertain, Read the file. Don't infer from file names or git log alone

@@ -16,7 +16,7 @@
 # to thousands of rows, which is script work, not prose work.
 #
 # The per-rule Tier/Action cells MIRROR the severity crosswalk in
-# docs/conventions/detector-findings/README.md ("The severity crosswalk");
+# docs/contracts/detector-findings/README.md ("The severity crosswalk");
 # that table is the source of truth. A tier change lands there first and is
 # copied here, never the reverse.
 #
@@ -54,29 +54,11 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-  --from)
-    require_opt_value "emit-findings.sh" "$@"
-    FROM_FILES+=("$2")
-    shift 2
-    ;;
-  --out)
-    require_opt_value "emit-findings.sh" "$@"
-    OUT="$2"
-    shift 2
-    ;;
-  --branch)
-    require_opt_value "emit-findings.sh" "$@"
-    BRANCH="$2"
-    shift 2
-    ;;
-  --help | -h)
-    usage
-    exit 0
-    ;;
-  *)
-    echo "emit-findings.sh: unknown argument: $1" >&2
-    exit 2
-    ;;
+  --from) require_opt_value "emit-findings.sh" "$@"; FROM_FILES+=("$2"); shift 2 ;;
+  --out) require_opt_value "emit-findings.sh" "$@"; OUT="$2"; shift 2 ;;
+  --branch) require_opt_value "emit-findings.sh" "$@"; BRANCH="$2"; shift 2 ;;
+  --help | -h) usage; exit 0 ;;
+  *) echo "emit-findings.sh: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 

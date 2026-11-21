@@ -33,6 +33,11 @@ history, and everything you need arrives in your dispatch prompt or sits on disk
   the target. It is fetched content, so it is data like any page. A listed path you cannot Read goes in `problems:`,
   and that URL falls back to WebFetch. A cited section absent from both the snapshot and the fetch
   is a `problems:` entry too, and the claim fails its row.
+- **Claims** (optional): `<id>[, <id>…]`, the claims a stated decision cites. When the index's
+  `evidence_use:` is `internal` and this line names IDs, grade rows 4, 7 and 12 for those claims
+  only, and row 14 in full, and list the graded IDs under `claims_graded:` so the parent records
+  them.
+  Under `publish`, or with the line absent or empty, grade every accepted claim.
 
 **If the target is absent, or names a file that does not exist, stop and return the block below
 with `verdict: stopped` and the missing field named in `problems:`.** An absent Rows line is
@@ -70,9 +75,6 @@ with `Snapshots:`.
 - **Pointer**: when a fetch result ends before the cited section, fetch the tools reference's
   [WebFetch tool behavior](https://code.claude.com/docs/en/tools-reference#webfetch-tool-behavior)
   live for how WebFetch handles a large page.
-- **As of**: 2026-10-04
-- **Recheck trigger**: that section stops naming a size limit on large pages, or a Claude Code
-  release note changes how WebFetch handles page size.
 
 Rows 4, 7 and 12 hold vacuously when no claim is accepted, so row 14 is what grades that case.
 Count the claims that stand accepted once you have graded them, each one neither listed under Gaps
@@ -87,7 +89,12 @@ A claim at `HIGH (single source)` has no corroborator to count, so row 4 turns o
 `single_source:` reason. Judge that reason against the definition in
 [`${CLAUDE_PLUGIN_ROOT}/skills/research/context/discipline.md`](${CLAUDE_PLUGIN_ROOT}/skills/research/context/discipline.md),
 "Single-source first-party content claims". A reason that does not hold, a behavior claim carrying
-the flag, or a repost counted as a source fails row 4.
+the flag, or a repost counted as a source fails row 4. The parent's eligibility check has already
+matched the flag against the header's `claim_kind:` and `source_owner:`; judge whether those
+declared values are true of the claim and its primary.
+
+Row 4's count is the prompt's `Corroborators:` line, the resolved `research_corroborators`; with
+no such line it is 2, the default.
 
 Row 4 reads independence off each source's `pool`: two sources sharing one are one corroborator. A
 claim carrying `subject_pool` is a single-publisher claim. Grade it against the discipline file's
@@ -99,6 +106,33 @@ the `pool` of the claim's own subject but that carries no `subject_pool` fails r
 first-party content claim is the exception: its subject is the artifact, not the publisher, so it
 carries `single_source:` and no `subject_pool`, and the single-publisher cap does not apply to it,
 whoever the publisher is. A claim carrying both keys fails row 4.
+
+**Row 12 reaches every restatement of an accepted claim.** The index Summary, the Settled list and
+the rest of the handoff, catalog and table cells, and sidecar abstracts each repeat claims, and a
+repeat is where a flag, an attribution or a qualifier gets dropped. Each one should cite the claim's
+`id:` from the sidecar header rather than restate it, and a line naming a claim at
+`HIGH (single source)`, `MEDIUM` or `LOW` carries that label verbatim on the same line. A
+restatement of an accepted claim that drops its label, its attribution or a recorded qualifier, or
+that states a page's content as product behavior, fails row 12 for that claim; name the file and
+line. A `MEDIUM` or `LOW` claim is a Gap, not an accepted claim, so row 12 never grades it: a line
+that presents one without its label, as a settled fact, fails row 7 instead. The parent's
+restatement check has already passed: every pointer carries its label, no index pointer
+carries a sweep word, every sidecar line that names a claim quotes its `claim:` text byte for
+byte, and every abstract of a sidecar that declares a claim with an `id:` quotes one of its claims
+and is mirrored into the index unchanged.
+It matches ID tokens and quotes, not meaning, so what it cannot see is yours: the words a
+sidecar line adds outside its quote, a pointer that cites the wrong claim for what its line says,
+or a decision that leans on a claim past a recorded qualifier. Two cases are graded by you, not by
+the check: a table row or sentence that restates a claim without its ID or a quote of it, even on a
+line that cites another claim, which the check cannot tie to the claim it restates, and an index lead-in whose scope outruns its pointers, where a cited claim's qualifier
+rules the sentence out though its labels pass and it carries no sweep word. The rule is in
+[`${CLAUDE_PLUGIN_ROOT}/skills/research/context/artifact-shape.md`](${CLAUDE_PLUGIN_ROOT}/skills/research/context/artifact-shape.md),
+"Restatements cite; they do not restate". At a slice root the parent ran that check with
+`--sub-slice` over every sub-slice, so it covered the root's pointers to sub-slice claims as well,
+including an ID two sub-slices share: `<sub-slice>/X2` names one sub-slice's claim, and a bare `X2`
+carries the label of every claim declaring it. A slice-root
+synthesis that adds no claims of its own and cites by ID takes no verifier at all: that
+check is its whole row 12 grading, and the parent grades its row 14 by the rule above.
 
 Fetch each page once, and read each file once; the rule is stated once in
 [`${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md`](${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md)
@@ -119,7 +153,9 @@ file is not to be `Read` either; the files it covers are listed in
 
 ## Return exactly this
 
-One fenced YAML block, then at most five bullets.
+One fenced YAML block, then at most five bullets. `target_as_received` is the file pointer: the
+artifact you graded, which the parent opens for detail. The bullets are the summary. Aim for 3,400
+bytes; the whole message must stay under 4,096, so keep each failed row's reason to one line.
 
 ```yaml
 problems: []                # FIRST: rows that failed, claims you could not re-fetch, anything not done
@@ -131,6 +167,7 @@ rows:
   "12": pass
   "14": pass
 verification_line: "verification: pass (research-verifier, <YYYY-MM-DD>)"
+claims_graded: all          # all, or the IDs a Claims: line narrowed rows 4, 7 and 12 to
 graded_from_snapshot: []    # URLs from Snapshots: you graded from the saved copy
 open_questions: []
 ```

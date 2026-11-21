@@ -26,12 +26,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-fails=0
-pass() { printf 'ok   - %s\n' "$1"; }
-fail() {
-  printf 'FAIL - %s\n' "$1" >&2
-  fails=$((fails + 1))
-}
+# shellcheck source=../lib/test-helpers.sh
+source "$SCRIPT_DIR/../lib/test-helpers.sh"
 
 # surface — every shipped instruction file in the plugin, minus the changelog.
 # Content lives in markdown and in the evals JSON; both are read by a model, so
@@ -270,16 +266,14 @@ assert_absent_in 'setup has no step that writes the gate allow rules to user set
   'skills/setup/SKILL.md' 'Offer the gate allow rules'
 assert_absent 'no file says setup apply offers the gate allow rules' \
   'setup apply` (offers|writes) (the )?(gate|allow|permission)|setup apply.{0,40}allow rules'
-# Two grants are sanctioned: research's deep-tier launch of this plugin's own
-# workflow by name (never bare Workflow), and the check skill's read-only
-# check.sh, which takes no arguments. Neither grants a gate script.
+# One grant is sanctioned: research's deep-tier launch of this plugin's own
+# workflow by name (never bare Workflow). It grants no gate script.
 frontmatter_grants="$(surface | xargs grep -nEI '^allowed-tools:' 2>/dev/null |
-  grep -vE '/skills/research/SKILL\.md:[0-9]+:allowed-tools: \["Workflow\(discovery:research-sweep\)"\]$' |
-  grep -vE '/skills/check/SKILL\.md:[0-9]+:allowed-tools: \["Bash\(\$\{CLAUDE_SKILL_DIR\}/scripts/check\.sh:\*\)"\]$')"
+  grep -vE '/skills/research/SKILL\.md:[0-9]+:allowed-tools: \["Workflow\(discovery:research-sweep\)"\]$')"
 if [[ -z "$frontmatter_grants" ]]; then
-  pass 'no skill declares allowed-tools beyond the research-sweep launch and the check script (the un-run case is stated instead)'
+  pass 'no skill declares allowed-tools beyond the research-sweep launch (the un-run case is stated instead)'
 else
-  fail 'no skill declares allowed-tools beyond the research-sweep launch and the check script (the un-run case is stated instead)'
+  fail 'no skill declares allowed-tools beyond the research-sweep launch (the un-run case is stated instead)'
   printf '%s\n' "$frontmatter_grants" >&2
 fi
 assert_present 'research grants only the named research-sweep workflow' \
@@ -388,6 +382,12 @@ assert_in_slice 'research effort ceiling heading is inside the re-attach slice' 
   'skills/research/SKILL.md' '### Effort, source breadth'
 assert_in_slice 'research effort ceiling sentence is inside the re-attach slice' \
   'skills/research/SKILL.md' 'The Effort row is the ceiling over discipline 8'
+# #12631 asks for 2,000 bytes of headroom, so the whole sentence ends by byte 18,000.
+if [[ "$(head -c 18000 "$PLUGIN_ROOT/skills/research/SKILL.md")" == *'The Effort row is the ceiling over discipline 8: "Effort, source breadth" below.'* ]]; then
+  pass 'research effort ceiling sentence keeps 2,000 bytes of headroom'
+else
+  fail 'research effort ceiling sentence keeps 2,000 bytes of headroom'
+fi
 assert_in_slice 'research topic slot is inside the re-attach slice' \
   'skills/research/SKILL.md' 'Research the following topic: $ARGUMENTS'
 if grep -q '^## Phase 0:' "$PLUGIN_ROOT/skills/research/context/phases.md" \
@@ -683,7 +683,7 @@ assert_present 'the joint-inference check ties the primary to role: primary' \
 assert_absent 'no file says the sub-agents page has no partial-return semantics' \
   'partial-return semantics'
 for file in skills/explore/reference/dispatch.md skills/research/context/dispatch.md \
-  skills/trace-intent/context/dispatch.md reference/parent-contract.md; do
+  reference/parent-contract.md; do
   assert_present "$file quotes the current partial-marking behavior" \
     "$file" 'returns its output marked as partial'
 done
@@ -784,8 +784,12 @@ assert_present 'the recency gate says it dates claims, not sources' \
   'skills/research/context/discipline.md' 'This gate dates claims, not sources'
 assert_present 'the parent contract ships an Evidence use line' \
   'reference/parent-contract.md' '^Evidence use: <internal\|publish>$'
-assert_present 'the parent contract counts two research-only lines' \
-  'reference/parent-contract.md' 'Research adds two more labeled lines'
+assert_present 'the parent contract ships a Research config line' \
+  'reference/parent-contract.md' '^Research config: corroborators=<n> recency=<active>/<standard>/<guide>$'
+assert_present 'the researcher input contract names the Research config line' \
+  'agents/researcher.md' '^- \*\*Research config\*\*: `corroborators=<n> recency='
+assert_present 'the parent contract counts three research-only lines' \
+  'reference/parent-contract.md' 'Research adds three more labeled lines'
 assert_absent 'no file says research adds only one envelope line' \
   'Research adds one more labeled line'
 assert_present 'the research parent-obligation table carries an Evidence use row' \
@@ -1079,8 +1083,8 @@ done
 # ---------------------------------------------------------------------------
 for agent in explorer researcher intent-tracer research-verifier; do
   file="agents/$agent.md"
-  if awk 'NR == 1 && $0 == "---" { on = 1; next } on && $0 == "---" { exit } on' "$PLUGIN_ROOT/$file" |
-    grep -qE "^skills:.*report|^[[:space:]]+-[[:space:]]*[\"']?(discovery:)?report[\"']?[[:space:]]*$"; then
+  if grep -qE "^skills:.*report|^[[:space:]]+-[[:space:]]*[\"']?(discovery:)?report[\"']?[[:space:]]*$" \
+    < <(awk 'NR == 1 && $0 == "---" { on = 1; next } on && $0 == "---" { exit } on' "$PLUGIN_ROOT/$file"); then
     fail "$file does not preload the report return contract"
   else
     pass "$file does not preload the report return contract"
@@ -1128,6 +1132,8 @@ assert_present 'discipline.md defines the HIGH (single source) level' \
   'skills/research/context/discipline.md' '^- \*\*HIGH \(single source\)\*\*'
 assert_present 'discipline.md lets a flagged claim ground a code edit with the flag carried' \
   'skills/research/context/discipline.md' 'may ground a code edit'
+assert_present 'an authoritative paper'"'"'s reported result can carry the flag' \
+  'skills/research/context/discipline.md' '^\*\*A paper'"'"'s reported result can be a content claim\.\*\*.*authoritative on its topic'
 assert_present 'discipline.md keeps behavior claims at two corroborators' \
   'skills/research/context/discipline.md' '^\*\*A behavior claim is not a content claim\.\*\*'
 assert_present 'the corroboration rule points at the exception' \
@@ -1146,7 +1152,7 @@ assert_present 'gotchas name the repost trap' \
   'skills/research/context/gotchas.md' '^- \*\*Counting a repost as the second source\.\*\*'
 assert_present 'the deep tier keeps the flag through the synthesis' \
   'skills/research/context/deep-tier.md' 'keeps its `single source` flag'
-for name in single-source-content-claim-passes-flagged non-anthropic-first-party-content-claim-passes-flagged behavior-claim-from-one-page-is-a-gap; do
+for name in single-source-content-claim-passes-flagged non-anthropic-first-party-content-claim-passes-flagged behavior-claim-from-one-page-is-a-gap authoritative-paper-reports-claim-passes-flagged non-authoritative-paper-reports-claim-is-a-gap; do
   assert_present "research evals grade $name" 'skills/research/evals/evals.json' "\"name\": \"$name\""
 done
 single_owners="$(surface | xargs grep -lE -- "^$single_heading$" 2>/dev/null | wc -l | tr -d ' ')"
@@ -1155,7 +1161,8 @@ if [[ "$single_owners" -eq 1 ]]; then
 else
   fail "the single-source definition has exactly one owner — $single_owners files carry the heading"
 fi
-recbasis="$PLUGIN_ROOT/../../docs/conventions/recommendation-basis/README.md"
+recbasis="$PLUGIN_ROOT/../../docs/contracts/recommendation-basis/README.md"
+[[ -f "$recbasis" ]] || recbasis="$PLUGIN_ROOT/../../docs/conventions/recommendation-basis/README.md"
 if [[ ! -f "$recbasis" ]]; then
   pass 'recommendation-basis carry-forward not checked outside the monorepo'
 elif grep -qE 'Basis: verified \(single source\)' "$recbasis"; then
@@ -1223,13 +1230,13 @@ assert_present 'the deep-tier fan-out says a sub-slice is not named git' \
 # at zero an inconclusive line, which passes rather than fails.
 # ---------------------------------------------------------------------------
 assert_present 'gate row 4 is quantified over accepted claims' \
-  'skills/research/SKILL.md' '^\| 4 \| Every accepted claim has ≥2 INDEPENDENT'
+  'skills/research/SKILL.md' '^\| 4 \| Every accepted claim has ≥`research_corroborators` \(default 2\) INDEPENDENT'
 assert_absent 'no gate row 4 quantified over every claim' \
   '^\| 4 \| Every claim has'
 assert_present 'gate row 14 grades the accepted count and the inconclusive line, owned by the verifier' \
   'skills/research/SKILL.md' '^\| 14 \|.*`accepted:`.*`Inconclusive: no claim accepted\.`.*A zero with that line passes.*\| \*\*verifier\*\* \|'
 assert_present 'the verifier dispatch block names row 14' \
-  'skills/research/SKILL.md' '^ +Rows: 4, 7, 12, 14"$'
+  'skills/research/SKILL.md' '^ +Rows: 4, 7, 12, 14$'
 assert_present 'the Summary opens with the inconclusive line at zero accepted' \
   'skills/research/SKILL.md' '^1\. \*\*Summary\*\*.*`Inconclusive: no claim accepted\.`'
 assert_present 'the index frontmatter carries accepted:' \
@@ -1308,6 +1315,187 @@ assert_present 'the dispatch brief re-dispatches the verifier with a Snapshots: 
   'skills/research/context/dispatch.md' '^   Snapshots: <url> -> <absolute path of the saved copy>$'
 assert_present 'the dispatch brief keeps snapshots where the verifier Read reaches them' \
   'skills/research/context/dispatch.md' 'permissions#working-directories'
+
+# ---------------------------------------------------------------------------
+# 24. Restatements cite a claim ID and keep its label (#6070)
+#
+# A fan-out's verifier rounds kept failing on restatements of accepted claims
+# (Summary, Settled, handoff, catalog cells, abstracts) that dropped a flag, an
+# attribution or a qualifier. The rule extends the verbatim-abstract rule, the
+# header gives each claim an id: to cite, and a script reports a line that
+# names a labeled claim without its label.
+# ---------------------------------------------------------------------------
+assert_present 'artifact-shape states the cite-not-restate rule' \
+  'skills/research/context/artifact-shape.md' '^\*\*Restatements cite; they do not restate\.\*\* The verbatim rule for abstracts extends'
+assert_present 'artifact-shape gives each claim an id: after claim:' \
+  'skills/research/context/artifact-shape.md' '^ {4}id: M1 +# the claim ID every restatement cites'
+assert_present 'artifact-shape names the restatement checker' \
+  'skills/research/context/artifact-shape.md' 'scripts/check-restatement-labels\.py'
+assert_present 'dispatch.md runs the restatement check and reads its exit status' \
+  'skills/research/context/dispatch.md' '^"<plugin-root>/scripts/check-restatement-labels\.py" <that index.s directory>$'
+assert_present 'the researcher cites claim IDs in restatements' \
+  'agents/researcher.md' '^\*\*Restatements cite; they do not restate\.\*\*'
+assert_present 'the verifier grades restatements under row 12' \
+  'agents/research-verifier.md' '^\*\*Row 12 reaches every restatement of an accepted claim\.\*\*'
+assert_present 'the hub points the gate result line at the rework bounds' \
+  'skills/research/SKILL.md' 'what you re-ran\); rework bounds: "Effort, source breadth"'
+assert_absent 'no file leaves run-owned rows unbounded' \
+  'no limit on iterations'
+if [[ -f "$PLUGIN_ROOT/scripts/check-restatement-labels.py" ]]; then
+  pass 'the restatement checker ships'
+else
+  fail 'the restatement checker ships'
+fi
+
+# ---------------------------------------------------------------------------
+# 25. Format and calibration rules are checked at write time (#12517)
+#
+# A six-topic fan-out spent about two thirds of each topic's time in verify,
+# rework and re-verify, and no verifier pass converged: the failures were
+# restatement drift (row 12), single-source flag eligibility (row 4) and the
+# tier mix behind HIGH (row 7). Scripts now catch those before hand-back, and
+# verification scales to the evidence use.
+# ---------------------------------------------------------------------------
+assert_present 'artifact-shape makes handoff lines ID pointers with labels only' \
+  'skills/research/context/artifact-shape.md' '^So the Summary, the Settled list and the rest of the handoff are ID pointers with their labels'
+assert_present 'artifact-shape bans sweep words on index lines that name a claim ID' \
+  'skills/research/context/artifact-shape.md' 'carries no sweep word \(`every`, `all`, `none`, `only`\)'
+assert_present 'artifact-shape runs the restatement check fail-closed at the researcher' \
+  'skills/research/context/artifact-shape.md' '^It fails closed: the researcher runs it before hand-back'
+assert_absent 'no file calls the restatement check advisory' \
+  'restatement check (is|stays) advisory|advisory for now'
+assert_present 'artifact-shape declares claim_kind in the claim header' \
+  'skills/research/context/artifact-shape.md' '^ {4}claim_kind: behavior +# content \| behavior'
+assert_present 'artifact-shape declares source_owner in the claim header' \
+  'skills/research/context/artifact-shape.md' '^ {4}source_owner: '
+assert_present 'artifact-shape names the eligibility checker' \
+  'skills/research/context/artifact-shape.md' 'scripts/check-claim-eligibility\.py` fails a claim missing either'
+assert_present 'dispatch.md runs both checks fail-closed at the researcher' \
+  'skills/research/context/dispatch.md' '^\*\*They fail closed at the researcher\.\*\*'
+assert_present 'dispatch.md runs the eligibility check as one plain command' \
+  'skills/research/context/dispatch.md' '^python3 "<plugin-root>/scripts/check-claim-eligibility\.py" <that index.s directory>$'
+assert_present 'the hub runs both checks as acceptance-gate step 5' \
+  'skills/research/SKILL.md' '^5\. \*\*Restatements and claim eligibility are graded by script'
+assert_present 'the researcher requires both checks to exit 0 before hand-back' \
+  'agents/researcher.md' '^\*\*Both write-time checks exit 0 before you hand back\.\*\*'
+assert_present 'the researcher fixes and re-runs on a non-zero exit' \
+  'agents/researcher.md' '^A non-zero exit means fix and re-run'
+assert_present 'the hub scales verification to the evidence use' \
+  'skills/research/SKILL.md' '^\*\*Verification scales to the evidence use\.\*\* Under `Evidence use: internal`, the verifier grades rows 4, 7 and 12 only for the claims a stated decision cites'
+assert_present 'the hub runs no rework round under internal' \
+  'skills/research/SKILL.md' 'At `low`, and at any budget under `Evidence use: internal`, a verifier FAIL'
+assert_present 'the hub keeps one rework round under publish' \
+  'skills/research/SKILL.md' 'Under `publish`, medium and above return a FAIL row to its phase'
+assert_present 'dispatch.md scales the verifier brief to the evidence use' \
+  'skills/research/context/dispatch.md' '^   \*\*Scale it to the evidence use\.\*\* Under `Evidence use: internal`'
+assert_present 'dispatch.md names the decision claims on a Claims: line' \
+  'skills/research/context/dispatch.md' '^   Claims: <id>\[, <id>…\]$'
+assert_present 'dispatch.md runs no rework round under internal' \
+  'skills/research/context/dispatch.md' '^   No rework round runs under `internal`'
+assert_present 'the verifier contract documents an optional Claims: field' \
+  'agents/research-verifier.md' '^- \*\*Claims\*\* \(optional\):'
+assert_present 'the verifier returns the claims it graded' \
+  'agents/research-verifier.md' '^claims_graded: all '
+assert_present 'parent-contract skips rework under internal' \
+  'reference/parent-contract.md' '^`evidence_use: internal`, which does not resume the researcher'
+assert_present 'dispatch.md exempts a claim-free, ID-only synthesis from the verifier' \
+  'skills/research/context/dispatch.md' '^\*\*A slice-root synthesis that adds no claims and cites by ID needs no verifier\.\*\*'
+assert_present 'dispatch.md checks a claim-free root against its sub-slices by script' \
+  'skills/research/context/dispatch.md' '^"<plugin-root>/scripts/check-restatement-labels\.py" <slice root> --sub-slice <sub-slice>'
+assert_present 'dispatch.md records skipped (cost) on an exempt root' \
+  'skills/research/context/dispatch.md' 'On exit 0, write `verification: skipped \(cost\)` into the root index,$'
+assert_present 'the hub exempts a claim-free, ID-only synthesis from the verifier' \
+  'skills/research/SKILL.md' 'A slice-root synthesis that adds no claims and cites by ID needs no verifier'
+assert_absent 'no file sends a claim-free synthesis to the verifier on row 12 alone' \
+  'takes the verifier on row 12 only|for row 12 alone when it adds no claims'
+assert_present 'setup prints the eligibility checker allow rule' \
+  'skills/setup/SKILL.md' 'Bash\(python3 "\$\{CLAUDE_PLUGIN_ROOT\}/scripts/check-claim-eligibility\.py" \*\)'
+assert_present 'parent-contract lists the eligibility checker allow rule' \
+  'reference/parent-contract.md' 'check-claim-eligibility\.py'
+assert_present 'research evals cover internal-tier verification' \
+  'skills/research/evals/evals.json' '"name": "internal-evidence-use-verifies-decision-claims-without-rework"'
+assert_present 'research evals cover the claim-free synthesis exemption' \
+  'skills/research/evals/evals.json' '"name": "claim-free-synthesis-needs-no-verifier"'
+for script in check-claim-eligibility.py check-claim-eligibility.test.sh; do
+  if [[ -f "$PLUGIN_ROOT/scripts/$script" ]]; then
+    pass "$script ships"
+  else
+    fail "$script ships"
+  fi
+done
+# A re-run still failed row 12: the drift moved into sidecar decision bullets,
+# table cells, conflict notes and abstracts, which dropped a condition or turned
+# "prefer" into a rule with no sweep word and no missing label (#12902).
+assert_present 'artifact-shape makes a sidecar line quote the claim it cites' \
+  'skills/research/context/artifact-shape.md' '^\*\*A sidecar line that cites a claim quotes it verbatim\.\*\*'
+assert_present 'artifact-shape gives the one quote form' \
+  'skills/research/context/artifact-shape.md' '`M1 \(HIGH \(single source\)\): "<claim>"`'
+assert_present 'the checker matches each quote against its claim' \
+  'scripts/check-restatement-labels.py' '<id> quote does not match its claim$'
+assert_present 'the checker fails a sidecar line that cites a claim unquoted' \
+  'scripts/check-restatement-labels.py' '<id> cited without its claim quoted verbatim$'
+assert_present 'the researcher quotes claims in sidecar lines' \
+  'agents/researcher.md' 'A sidecar line that names a claim.s ID quotes its `claim:` text'
+# A seed abstract that named no ID dropped its claim's exception in both the
+# sidecar and its index copy, and no rule reached it (#13200).
+assert_present 'the checker fails an abstract that quotes none of its claims' \
+  'scripts/check-restatement-labels.py' '<sidecar>:<line>: abstract quotes none of its claims$'
+assert_present 'the checker fails an index abstract line that differs from its sidecar' \
+  'scripts/check-restatement-labels.py' "<index>:<line>: abstract line differs from <sidecar name>'s abstract$"
+assert_present 'artifact-shape gives the index abstract bullet form' \
+  'skills/research/context/artifact-shape.md' 'as one bullet per sidecar: `- <section>: <abstract>`'
+assert_present 'the verifier grades ID-less table rows and lead-in scope' \
+  'agents/research-verifier.md' 'Two cases are graded by you, not by'
+assert_absent 'no file exempts sidecar bodies from the restatement check' \
+  'Sidecar bodies are where a claim is said in full'
+
+# ---------------------------------------------------------------------------
+# 26. A Direct claim rests on a person's own words (#12517)
+#
+# Trace-intent verification looped on comments under a person's login that
+# agents wrote. The tracer tags each source at write time, a script rejects a
+# Direct claim with only agent relays behind it, and the allow rules keep that
+# script from being denied where nobody can answer a prompt.
+# ---------------------------------------------------------------------------
+assert_present 'the intent header declares author_kind on a source' \
+  'skills/trace-intent/context/artifact-shape.md' '^ {8}author_kind: owner-quote +# owner-quote \| agent-relay$'
+assert_present 'artifact-shape says author_kind is who wrote the words' \
+  'skills/trace-intent/context/artifact-shape.md' '^## `author_kind` says who wrote the words$'
+assert_present 'artifact-shape treats a source it cannot tell about as an agent relay' \
+  'skills/trace-intent/context/artifact-shape.md' '^- \*\*You cannot tell\*\*: `agent-relay`'
+assert_present 'artifact-shape makes Direct need an owner-quote source' \
+  'skills/trace-intent/context/artifact-shape.md' '^\*\*A `Direct` claim needs at least one `owner-quote` source\.\*\*'
+assert_present 'the tracer tags each source with who wrote its words' \
+  'agents/intent-tracer.md' '^\*\*Tag each source with who wrote its words'
+assert_present 'the tracer requires the check to exit 0 before hand-back' \
+  'agents/intent-tracer.md' '^\*\*The author-kind check exits 0 before you hand back\.\*\*'
+assert_present 'the tracer runs the check as one plain command' \
+  'agents/intent-tracer.md' '^"\$\{CLAUDE_PLUGIN_ROOT\}/scripts/check-author-kind\.py" <memory-slice path>$'
+assert_present 'the outcome gate covers an inline trace' \
+  'skills/trace-intent/SKILL.md' '^- `"\$\{CLAUDE_PLUGIN_ROOT\}/scripts/check-author-kind\.py" <the slice>` exits 0\.$'
+assert_present 'the acceptance gate re-runs the check as a step' \
+  'skills/trace-intent/context/dispatch.md' '^3\. \*\*The author-kind check re-runs on disk\.\*\*'
+assert_present 'the acceptance gate runs the check as one plain command' \
+  'skills/trace-intent/context/dispatch.md' '^ +"<plugin-root>/scripts/check-author-kind\.py" <the retained memory-slice path>$'
+assert_present 'the by-value rung re-runs the check too' \
+  'skills/trace-intent/context/dispatch.md' '^steps 2 and 3 above'
+assert_present 'setup prints the quoted author-kind allow rule' \
+  'skills/setup/SKILL.md' '^ +Bash\("\$\{CLAUDE_PLUGIN_ROOT\}/scripts/check-author-kind\.py" \*\)$'
+assert_present 'setup prints the unquoted author-kind allow rule' \
+  'skills/setup/SKILL.md' '^ +Bash\(\$\{CLAUDE_PLUGIN_ROOT\}/scripts/check-author-kind\.py \*\)$'
+assert_present 'setup counts twelve gate allow rules' \
+  'skills/setup/SKILL.md' 'compare it with these twelve rules'
+assert_present 'parent-contract lists the quoted author-kind allow rule' \
+  'reference/parent-contract.md' '"Bash\(\\"<plugin root>/scripts/check-author-kind\.py\\" \*\)",$'
+assert_present 'parent-contract lists the unquoted author-kind allow rule' \
+  'reference/parent-contract.md' '"Bash\(<plugin root>/scripts/check-author-kind\.py \*\)",$'
+for script in check-author-kind.py check-author-kind.test.sh; do
+  if [[ -f "$PLUGIN_ROOT/scripts/$script" ]]; then
+    pass "$script ships"
+  else
+    fail "$script ships"
+  fi
+done
 
 printf '\n'
 if [[ "$fails" -eq 0 ]]; then

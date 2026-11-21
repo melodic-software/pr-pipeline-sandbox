@@ -6,6 +6,7 @@
 set -uo pipefail
 
 unset GIT_DIR GIT_WORK_TREE GIT_CONFIG
+export GIT_CONFIG_GLOBAL="${GIT_CONFIG_GLOBAL:-/dev/null}" GIT_CONFIG_NOSYSTEM=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CROSS="$SCRIPT_DIR/cross-check.sh"
@@ -16,40 +17,10 @@ export HOME="$TEST_TMPDIR/home"
 export CLAUDE_PROJECT_DIR="$TEST_TMPDIR/noconfig"
 mkdir -p "$HOME" "$CLAUDE_PROJECT_DIR"
 
-FAILED=0
-CASE_NUM=0
-SKIPPED=0
+# shellcheck source=lib/test-helpers.sh
+source "$SCRIPT_DIR/lib/test-helpers.sh"
 # PASS + FAIL + SKIP when every case runs; see detect.test.sh for the contract.
 EXPECTED_CASES=26
-
-pass() {
-  CASE_NUM=$((CASE_NUM + 1))
-  printf 'PASS: %s\n' "$1"
-}
-skip() {
-  SKIPPED=$((SKIPPED + 1))
-  printf 'SKIP (host: %s): %s\n' "$2" "$1"
-}
-fail() {
-  CASE_NUM=$((CASE_NUM + 1))
-  FAILED=$((FAILED + 1))
-  printf 'FAIL: %s\n  expected: %s\n  actual:   %s\n' "$1" "$2" "$3" >&2
-}
-assert_exit() {
-  if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1" "exit $2" "exit $3"; fi
-}
-assert_contains() {
-  case "$2" in
-  *"$3"*) pass "$1" ;;
-  *) fail "$1" "contains: $3" "$2" ;;
-  esac
-}
-assert_not_contains() {
-  case "$2" in
-  *"$3"*) fail "$1" "absent: $3" "present" ;;
-  *) pass "$1" ;;
-  esac
-}
 
 EM=$'\xe2\x80\x94'
 F="$TEST_TMPDIR/docs"
@@ -160,28 +131,21 @@ assert_contains "disagree: a file marker resets the line set" "$out" \
 
 # --- config: allowed paths and a disabled rule ---------------------------------------
 
-if command -v jq >/dev/null 2>&1; then
-  A="$TEST_TMPDIR/allowcfg"
-  mkdir -p "$A/.claude"
-  git init -q "$A" >/dev/null 2>&1
-  printf '%s\n' '{ "rule_allowed_paths": { "rule-em-dash": ["plain.*"] } }' >"$A/.claude/ai-slop.json"
-  out="$(CLAUDE_PROJECT_DIR="$A" bash "$CROSS" --targets "$T" --detector "$D" 2>&1)"
-  assert_contains "allowed: a rule_allowed_paths file is skipped" "$out" "CrossCheck: file=plain.md skipped=rule-allowed"
-  assert_not_contains "allowed: and never compared" "$out" "Disagree: file=plain.md"
+A="$TEST_TMPDIR/allowcfg"
+mkdir -p "$A/docs/conventions"
+git init -q "$A" >/dev/null 2>&1
+printf '%s\n' 'rule_allowed_paths:' '  rule-em-dash: ["plain.*"]' >"$A/docs/conventions/ai-slop.yaml"
+out="$(CLAUDE_PROJECT_DIR="$A" bash "$CROSS" --targets "$T" --detector "$D" 2>&1)"
+assert_contains "allowed: a rule_allowed_paths file is skipped" "$out" "CrossCheck: file=plain.md skipped=rule-allowed"
+assert_not_contains "allowed: and never compared" "$out" "Disagree: file=plain.md"
 
-  X="$TEST_TMPDIR/disabledcfg"
-  mkdir -p "$X/.claude"
-  git init -q "$X" >/dev/null 2>&1
-  printf '%s\n' '{ "disabled_rules": ["rule-em-dash"] }' >"$X/.claude/ai-slop.json"
-  out="$(CLAUDE_PROJECT_DIR="$X" bash "$CROSS" --targets "$T" --detector "$D" 2>&1)"
-  assert_contains "disabled: the comparison is skipped" "$out" "CrossCheck: comparison skipped: rule-em-dash disabled"
-  assert_not_contains "disabled: no file rows" "$out" "CrossCheck: file="
-else
-  for c in "allowed: a rule_allowed_paths file is skipped" "allowed: and never compared" \
-    "disabled: the comparison is skipped" "disabled: no file rows"; do
-    skip "$c" "jq not on PATH, config unread"
-  done
-fi
+X="$TEST_TMPDIR/disabledcfg"
+mkdir -p "$X/docs/conventions"
+git init -q "$X" >/dev/null 2>&1
+printf '%s\n' 'disabled_rules: ["rule-em-dash"]' >"$X/docs/conventions/ai-slop.yaml"
+out="$(CLAUDE_PROJECT_DIR="$X" bash "$CROSS" --targets "$T" --detector "$D" 2>&1)"
+assert_contains "disabled: the comparison is skipped" "$out" "CrossCheck: comparison skipped: rule-em-dash disabled"
+assert_not_contains "disabled: no file rows" "$out" "CrossCheck: file="
 
 # --- the real detector over the same fixtures ----------------------------------------
 

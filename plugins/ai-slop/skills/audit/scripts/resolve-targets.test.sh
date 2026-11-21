@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# One suite for every target-resolution entry form. Assertion helpers are local.
+# One suite for every target-resolution entry form.
 # shellcheck disable=SC2154,SC2034
 set -uo pipefail
 export LC_ALL=C
 unset GIT_DIR GIT_WORK_TREE GIT_CONFIG
+export GIT_CONFIG_GLOBAL="${GIT_CONFIG_GLOBAL:-/dev/null}" GIT_CONFIG_NOSYSTEM=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/resolve-targets.sh
@@ -11,19 +12,8 @@ source "$SCRIPT_DIR/lib/resolve-targets.sh"
 
 TEST_TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_TMPDIR"' EXIT
-FAILED=0
-SKIPPED=0
-pass() { printf 'PASS: %s\n' "$1"; }
-# A case whose subject this host cannot build is neither a pass nor a failure:
-# it prints its own visible line and never routes through pass().
-skip() {
-  SKIPPED=$((SKIPPED + 1))
-  printf 'SKIP (host: %s): %s\n' "$2" "$1"
-}
-fail() {
-  FAILED=$((FAILED + 1))
-  printf 'FAIL: %s\n  expected: %s\n  actual:   %s\n' "$1" "$2" "$3" >&2
-}
+# shellcheck source=lib/test-helpers.sh
+source "$SCRIPT_DIR/lib/test-helpers.sh"
 assert_eq() {
   if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1" "$3" "$2"; fi
 }
@@ -69,6 +59,17 @@ bare_text="$(join_lines bare)"
 assert_eq "explicit files match the bare list" "$(join_lines explicit)" "$bare_text"
 assert_eq "a directory matches the bare list" "$(join_lines directory)" "$bare_text"
 assert_eq "a paths file matches the bare list" "$(join_lines from_file)" "$bare_text"
+# `read` returns nonzero on an unterminated last line; the entry must still count.
+pf_nonl="$TEST_TMPDIR/paths-no-newline"
+printf '%s\n%s' "$REPO/a.md" "$REPO/nested/notes-é.md" >"$pf_nonl"
+declare -a no_newline=() one_entry=()
+resolve_targets no_newline "$REPO" "$pf_nonl" 0 0 0
+assert_eq "a paths file without a trailing newline keeps its last entry" "$(join_lines no_newline)" "$bare_text"
+pf_one="$TEST_TMPDIR/paths-one"
+printf '%s' "$REPO/a.md" >"$pf_one"
+resolve_targets one_entry "$REPO" "$pf_one" 0 0 0
+assert_eq "a one-entry paths file without a trailing newline lists that entry" "$(join_lines one_entry)" "$REPO/a.md"
+
 assert_eq "the non-ASCII tracked name is in the bare list" "$(printf '%s\n' "${bare[@]}" | grep -c 'notes-é.md' || true)" "1"
 assert_eq "untracked markdown is not in the bare list" "$(printf '%s\n' "${bare[@]}" | grep -c 'loose.md' || true)" "0"
 
@@ -172,6 +173,20 @@ else
     skip "$name" 'ln -s copies here, so a git-less PATH cannot be built out of the real binaries'
   done
 fi
+
+# A target repository's own core.fsmonitor never runs: CI audits head
+# directories, and a nested .git there is the PR author's config.
+FSM="$TEST_TMPDIR/fsmonitor-repo"
+git init -q "$FSM"
+printf '# A\n' >"$FSM/a.md"
+git -C "$FSM" -c user.name=t -c user.email=t@invalid add a.md
+git -C "$FSM" -c user.name=t -c user.email=t@invalid commit -qm t
+printf '#!/bin/sh\ntouch %q\n' "$TEST_TMPDIR/fsmonitor-ran" >"$TEST_TMPDIR/fsmonitor.sh"
+chmod +x "$TEST_TMPDIR/fsmonitor.sh"
+git -C "$FSM" config core.fsmonitor "$TEST_TMPDIR/fsmonitor.sh"
+declare -a fsm_list=()
+resolve_targets fsm_list "$TEST_TMPDIR" "" 0 0 0 "$FSM" 2>/dev/null
+assert_eq "a target repository's core.fsmonitor does not run" "$([[ -e "$TEST_TMPDIR/fsmonitor-ran" ]] && echo ran || echo not-run)" "not-run"
 
 if [[ "$FAILED" -ne 0 ]]; then
   printf 'Result: %s failed, %s host skip(s)\n' "$FAILED" "$SKIPPED" >&2

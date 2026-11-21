@@ -2,7 +2,7 @@
 // GENERATED from lib/prerequisites.mjs by scripts/sync-shared-copies.sh. Do not edit this copy:
 // edit the canonical source, then rerun the script.
 // Read a plugin's prerequisites.json and report which declared dependencies resolve.
-// The contract is docs/conventions/prerequisites/README.md; the schema sits beside it.
+// The contract is docs/contracts/prerequisites/README.md; the schema sits beside it.
 //
 //   prerequisites.mjs report --plugin-root <dir> [--plugin-root <dir>...]
 //   prerequisites.mjs check <plugin-root> [--for <scope>] [--data-dir <dir>]
@@ -13,7 +13,8 @@
 //         --for keeps the entries scoped to that skill, hook or MCP server, plus
 //         the plugin-wide ones. --data-dir is the plugin data directory, for a
 //         caller whose environment lacks it (see expandPluginPath).
-// probe   A SessionStart hook. Notifies the user (systemMessage) once per session
+// probe   Run at SessionStart by plugin-diagnostics' prerequisites-fleet.mjs for each plugin
+//         whose manifest declares session_probe. Notifies the user (systemMessage) once per session
 //         for each missing entry a hook needs; the model hears of it when the hook
 //         first skips. Always exits 0 on a valid manifest, for the reason the
 //         node-notice header in prerequisites.sh records. A plugin with
@@ -46,7 +47,8 @@ import { fileURLToPath } from "node:url";
 
 export const KINDS = ["cli", "runtime", "system-lib", "python-pkg", "node-pkg", "env", "mcp"];
 export const NEEDS = ["required", "optional"];
-const ENTRY_KEYS = ["id", "kind", "need", "for", "detect", "degrade", "install", "check"];
+const ENTRY_KEYS = ["id", "kind", "need", "for", "detect", "degrade", "install", "check", "when"];
+const OPTIONAL_KEYS = ["check", "when"];
 const DETECT_KEYS = {
   cli: { required: ["any"], optional: ["local_bin", "version", "reject_store_alias"] },
   runtime: { required: ["any"], optional: ["local_bin", "version", "reject_store_alias"] },
@@ -67,11 +69,15 @@ const OPTION_RE = /^[A-Z0-9_]+$/;
 const SERVER_RE = /^[A-Za-z0-9._-]+$/;
 const MANAGER_RE = /^[a-z][a-z0-9-]*$/;
 const PROBE_TIMEOUT_MS = 20000;
+// This file's directory: the working directory of every probe, so a same-named
+// executable in the caller's directory is never the one run.
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOCAL_BIN_DEPTH = 8;
 
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const isText = (v) => typeof v === "string" && v.trim() !== "";
 const isTextList = (v) => Array.isArray(v) && v.length > 0 && v.every(isText);
+const matches = (v, re) => typeof v === "string" && re.test(v);
 
 function keysErrors(obj, allowed, where) {
   return Object.keys(obj)
@@ -115,13 +121,19 @@ function detectErrors(kind, detect, where) {
     if (!isObject(v)) {
       errors.push(`${vw} must be an object`);
     } else {
-      errors.push(...keysErrors(v, ["args", "pattern", "min"], vw));
+      errors.push(...keysErrors(v, ["args", "pattern", "min", "below"], vw));
       if (!Array.isArray(v.args) || !v.args.every((a) => typeof a === "string")) {
         errors.push(`${vw}.args must be a list of strings`);
       }
       errors.push(...patternErrors(v.pattern, vw, true));
-      if (typeof v.min !== "string" || !MIN_RE.test(v.min))
-        errors.push(`${vw}.min must be a dotted number such as 2.94.0`);
+      if (!matches(v.min, MIN_RE)) errors.push(`${vw}.min must be a dotted number such as 2.94.0`);
+      if ("below" in v) {
+        if (!matches(v.below, MIN_RE)) {
+          errors.push(`${vw}.below must be a dotted number such as 3.0.0`);
+        } else if (matches(v.min, MIN_RE) && compareVersions(v.below, v.min) <= 0) {
+          errors.push(`${vw}.below must be greater than ${vw}.min`);
+        }
+      }
     }
   }
   if ("probe" in detect) {
@@ -135,12 +147,8 @@ function detectErrors(kind, detect, where) {
       errors.push(...patternErrors(p.pattern, pw, false));
     }
   }
-  if ("import" in detect && !(typeof detect.import === "string" && MODULE_RE.test(detect.import))) {
-    errors.push(`${where}.import must be a Python module name`);
-  }
-  if ("module" in detect && !(typeof detect.module === "string" && NPM_RE.test(detect.module))) {
-    errors.push(`${where}.module must be an npm package name`);
-  }
+  if ("import" in detect && !matches(detect.import, MODULE_RE)) errors.push(`${where}.import must be a Python module name`);
+  if ("module" in detect && !matches(detect.module, NPM_RE)) errors.push(`${where}.module must be an npm package name`);
   if ("paths" in detect) {
     // A path is relative to the plugin root, or starts with ${CLAUDE_PLUGIN_ROOT} or ${CLAUDE_PLUGIN_DATA}.
     const strip = (p) => (typeof p === "string" ? p.replace(/^\$\{CLAUDE_PLUGIN_(DATA|ROOT)\}\/?/, "") || "." : p);
@@ -148,12 +156,8 @@ function detectErrors(kind, detect, where) {
       ...relativePathErrors(Array.isArray(detect.paths) ? detect.paths.map(strip) : detect.paths, `${where}.paths`),
     );
   }
-  if ("name" in detect && !(typeof detect.name === "string" && ENV_RE.test(detect.name))) {
-    errors.push(`${where}.name must be an environment variable name`);
-  }
-  if ("server" in detect && !(typeof detect.server === "string" && SERVER_RE.test(detect.server))) {
-    errors.push(`${where}.server must be an MCP server name`);
-  }
+  if ("name" in detect && !matches(detect.name, ENV_RE)) errors.push(`${where}.name must be an environment variable name`);
+  if ("server" in detect && !matches(detect.server, SERVER_RE)) errors.push(`${where}.server must be an MCP server name`);
   return errors;
 }
 
@@ -161,11 +165,9 @@ function entryErrors(entry, where) {
   if (!isObject(entry)) return [`${where} must be an object`];
   const errors = keysErrors(entry, ENTRY_KEYS, where);
   for (const key of ENTRY_KEYS) {
-    if (!(key in entry)) errors.push(`${where}.${key} is required`);
+    if (!(key in entry) && !OPTIONAL_KEYS.includes(key)) errors.push(`${where}.${key} is required`);
   }
-  if ("id" in entry && !(typeof entry.id === "string" && ID_RE.test(entry.id))) {
-    errors.push(`${where}.id must match ${ID_RE.source}`);
-  }
+  if ("id" in entry && !matches(entry.id, ID_RE)) errors.push(`${where}.id must match ${ID_RE.source}`);
   if ("kind" in entry && !KINDS.includes(entry.kind)) errors.push(`${where}.kind must be one of ${KINDS.join(", ")}`);
   if ("need" in entry && !NEEDS.includes(entry.need)) errors.push(`${where}.need must be one of ${NEEDS.join(", ")}`);
   if ("for" in entry) {
@@ -174,7 +176,7 @@ function entryErrors(entry, where) {
       errors.push(`${where}.for must be a non-empty list`);
     } else {
       for (const s of scopes) {
-        if (typeof s !== "string" || !FOR_RE.test(s)) {
+        if (!matches(s, FOR_RE)) {
           errors.push(`${where}.for: "${s}" must be plugin, skill:<name>, hook:<script> or mcp:<server>`);
         }
       }
@@ -195,17 +197,127 @@ function entryErrors(entry, where) {
       }
     }
   }
-  if ("check" in entry && !(typeof entry.check === "string" && CHECK_RE.test(entry.check))) {
-    errors.push(`${where}.check must name a skill, such as /<plugin>:check`);
+  if ("check" in entry && !matches(entry.check, CHECK_RE)) errors.push(`${where}.check must name a skill, such as /<plugin>:check`);
+  if ("when" in entry) errors.push(...whenErrors(entry.when, `${where}.when`));
+  return errors;
+}
+
+const NAME = "[A-Za-z0-9._-]*[A-Za-z0-9_-][A-Za-z0-9._-]*";
+const SEGMENT = "[A-Za-z0-9._*?-]*[A-Za-z0-9_*?-][A-Za-z0-9._*?-]*";
+const CONFIG_RE = new RegExp(`^(${NAME}|${SEGMENT}(/${SEGMENT})+)$`);
+const GIT_TIMEOUT_MS = 2000;
+
+function whenErrors(when, where) {
+  if (!isObject(when)) return [`${where} must be an object`];
+  const errors = keysErrors(when, ["config_any"], where);
+  const list = when.config_any;
+  if (!Array.isArray(list) || list.length === 0) return [...errors, `${where}.config_any must be a non-empty list`];
+  for (const item of list) {
+    const file = typeof item === "string" ? item : isObject(item) ? item.file : undefined;
+    if (!matches(file, CONFIG_RE)) {
+      errors.push(
+        `${where}.config_any: each item is a file name or a path from the repository root (no "..", no wildcard in a bare name), or { file, pattern }`,
+      );
+    }
+    if (isObject(item)) {
+      errors.push(...keysErrors(item, ["file", "pattern"], `${where}.config_any`));
+      if (!isText(item.pattern)) errors.push(`${where}.config_any: { file, pattern } needs a pattern`);
+      else if (patternErrors(item.pattern, `${where}.config_any pattern`, false).length) {
+        errors.push(`${where}.config_any: ${item.file}'s pattern is not a valid regular expression`);
+      }
+    }
   }
   return errors;
 }
 
+const configOf = (item) => (typeof item === "string" ? { file: item } : item);
+const repoGlob = (file) => (file.includes("/") ? file : `**/${file}`);
+
+function globRegExp(glob) {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const wholeSegment = glob.startsWith("**", i) && (i === 0 || glob[i - 1] === "/");
+    if (wholeSegment && i + 2 === glob.length) {
+      re += ".*";
+      i++;
+    } else if (wholeSegment && glob[i + 2] === "/") {
+      re += "(?:.*/)?";
+      i += 2;
+    } else {
+      re += glob[i] === "*" ? "[^/]*" : glob[i] === "?" ? "[^/]" : glob[i].replace(".", "\\.");
+    }
+  }
+  return new RegExp(`^${re}$`);
+}
+
+function configMatches(file, config) {
+  if (!existsSync(file)) return false;
+  if (!config.pattern) return true;
+  try {
+    return new RegExp(config.pattern, "m").test(readFileSync(file, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+function trackedConfigs(configs, top, ctx) {
+  const git = which("git", ctx.env, ctx.platform, ctx.fs);
+  if (!git) return null;
+  const specs = [...new Set(configs.map((c) => `:(top,glob)${repoGlob(c.file)}`))];
+  const r = spawnSync(path.resolve(git), ["-C", top, "ls-files", "-z", "--", ...specs], {
+    cwd: HERE,
+    encoding: "utf8",
+    env: ctx.env,
+    timeout: GIT_TIMEOUT_MS,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return r.error || r.status !== 0 ? null : r.stdout.split("\0").filter(Boolean);
+}
+
+function whenChecker(entries, ctx) {
+  const start = path.resolve(ctx.env.CLAUDE_PROJECT_DIR || ctx.cwd);
+  const dirs = [];
+  for (let dir = start; ; dir = path.dirname(dir)) {
+    dirs.push(dir);
+    if (path.dirname(dir) === dir) break;
+  }
+  const top = dirs.find((dir) => existsSync(path.join(dir, ".git")));
+  const all = entries.filter((e) => e.when).flatMap((e) => e.when.config_any.map(configOf));
+  let tracked;
+  return (entry) => {
+    if (!entry.when) return true;
+    const configs = entry.when.config_any.map(configOf);
+    const literal = configs.filter((c) => !/[*?/]/.test(c.file));
+    if (dirs.some((dir) => literal.some((c) => configMatches(path.join(dir, c.file), c)))) return true;
+    if (!top) return false;
+    if (tracked === undefined) tracked = trackedConfigs(all, top, ctx);
+    if (tracked === null) return true;
+    return configs.some((c) => {
+      const re = globRegExp(repoGlob(c.file));
+      return tracked.some((f) => re.test(f) && configMatches(path.join(top, f), c));
+    });
+  };
+}
+
+const whenText = (entry) =>
+  entry.when.config_any.map((i) => (typeof i === "string" ? i : `${i.file} matching /${i.pattern}/`)).join(" or ");
+
 // validateManifest(value) -> list of schema errors; empty means valid.
 export function validateManifest(manifest) {
   if (!isObject(manifest)) return ["the manifest must be a JSON object"];
-  const errors = keysErrors(manifest, ["$schema", "requires"], "manifest");
+  const errors = keysErrors(manifest, ["$schema", "session_probe", "requires"], "manifest");
   if ("$schema" in manifest && typeof manifest.$schema !== "string") errors.push("manifest.$schema must be a string");
+  if ("session_probe" in manifest) {
+    const sp = manifest.session_probe;
+    if (!isObject(sp)) {
+      errors.push("manifest.session_probe must be an object");
+    } else {
+      errors.push(...keysErrors(sp, ["run_if_unset_or_true"], "session_probe"));
+      if ("run_if_unset_or_true" in sp && !matches(sp.run_if_unset_or_true, OPTION_RE)) {
+        errors.push("session_probe.run_if_unset_or_true must be an option name in capitals, such as EXAMPLE_ENABLED");
+      }
+    }
+  }
   if (!Array.isArray(manifest.requires) || manifest.requires.length === 0) {
     errors.push("manifest.requires must be a non-empty list");
     return errors;
@@ -325,8 +437,11 @@ function findLocalBin(rels, cwd, platform, fs) {
   return null;
 }
 
+// file is resolved against the caller's directory first, where which() found it
+// (a relative PATH entry gives a relative match), since the probe runs from HERE.
 function run(file, args, env) {
-  const r = spawnSync(file, args, {
+  const r = spawnSync(path.resolve(file), args, {
+    cwd: HERE,
     encoding: "utf8",
     timeout: PROBE_TIMEOUT_MS,
     stdio: ["ignore", "pipe", "pipe"],
@@ -346,9 +461,8 @@ function firstOnPath(names, ctx, rejectStoreAlias = false) {
 // The data directory comes from --data-dir, else the environment. A hook reads
 // CLAUDE_PLUGIN_DATA from its environment and a skill passes
 // --data-dir "${CLAUDE_PLUGIN_DATA}", per which processes receive the variable:
-// https://code.claude.com/docs/en/plugins/manifest-reference#where-each-variable-resolves
-// (as of 2026-10-11; recheck when that section changes which processes get
-// CLAUDE_PLUGIN_DATA in their environment). The rule is the plugins' own
+// https://code.claude.com/docs/en/plugins/manifest-reference#where-each-variable-resolves.
+// The rule is the plugins' own
 // launchers' (plugins/speech/scripts/pydeps.py data_dir): a literal "${...}"
 // value is unset, and the environment's value counts only when its last path
 // segment is the plugin's name or starts with "<plugin>-", so another plugin's
@@ -374,7 +488,7 @@ function expandPluginPath(p, ctx) {
 
 // A plugin that commits requirements.txt installs its Python packages into the
 // plugin data directory, at <data>/python/<first 12 hex of the lock's sha256>-<the
-// interpreter's sys.implementation.cache_tag>/ (docs/conventions/on-demand-dependencies,
+// interpreter's sys.implementation.cache_tag>/ (docs/contracts/on-demand-dependencies,
 // Rule P3). pluginPythonSet -> null when the plugin has no lock or the interpreter's
 // cache tag cannot be read, { dir: null } when the data directory is unknown here,
 // else { dir } for that interpreter.
@@ -391,7 +505,7 @@ function pluginPythonSet(python, ctx) {
 }
 
 // detectEntry(entry, ctx) -> { status, detail }. status is present, missing,
-// outdated (below the version floor), unverified (the version could not be
+// outdated (below the version floor or at or above its exclusive ceiling), unverified (the version could not be
 // read) or agent-check (an MCP server only the agent can see).
 export function detectEntry(entry, ctx) {
   const d = entry.detect;
@@ -410,6 +524,12 @@ export function detectEntry(entry, ctx) {
       }
       if (compareVersions(match[1], d.version.min) < 0) {
         return { status: "outdated", detail: `${found} is ${match[1]}; ${d.version.min} or newer is needed` };
+      }
+      if (d.version.below !== undefined && compareVersions(match[1], d.version.below) >= 0) {
+        return {
+          status: "outdated",
+          detail: `${found} is ${match[1]}; the supported range is >= ${d.version.min}, < ${d.version.below}`,
+        };
       }
       return { status: "present", detail: `${found} ${match[1]}` };
     }
@@ -488,12 +608,14 @@ function installText(entry) {
 }
 
 function remediation(entry) {
-  return `${entry.degrade} Install (${installText(entry)}). Then run ${entry.check}.`;
+  return `${entry.degrade} Install (${installText(entry)}). Then run ${entry.check ?? "this check again"}.`;
 }
 
 function inScope(entry, scope) {
   return !scope || entry.for.includes("plugin") || entry.for.includes(scope);
 }
+
+const schemaFailure = (plugin, errors) => `${plugin}: prerequisites.json fails the schema:\n  ${errors.join("\n  ")}`;
 
 const USAGE = [
   "usage: prerequisites.mjs report --plugin-root <dir> [--plugin-root <dir>...]",
@@ -521,7 +643,7 @@ function parseArgs(argv) {
       opts.dataDir = rest[++i];
     } else if (arg === "--run-if-unset-or-true" && mode === "probe") {
       if (!rest[i + 1] || !OPTION_RE.test(rest[i + 1])) {
-        throw new UsageError("--run-if-unset-or-true needs the option name in capitals, such as BIOME_FORMAT_ENABLED");
+        throw new UsageError("--run-if-unset-or-true needs the option name in capitals, such as EXAMPLE_ENABLED");
       }
       opts.gate = rest[++i];
     } else if (!arg.startsWith("--") && mode !== "report" && opts.roots.length === 0) {
@@ -571,14 +693,21 @@ function cmdCheck(opts, ctx, out) {
     return 0;
   }
   if (errors.length) {
-    out.stderr(`${plugin}: prerequisites.json fails the schema:\n  ${errors.join("\n  ")}`);
+    out.stderr(schemaFailure(plugin, errors));
     return 2;
   }
   const local = { ...ctx, root, dataDir: opts.dataDir };
   const counts = { failed: 0, warned: 0, passed: 0 };
-  for (const entry of manifest.requires.filter((e) => inScope(e, opts.scope))) {
-    const { status, detail } = detectEntry(entry, local);
+  const entries = manifest.requires.filter((e) => inScope(e, opts.scope));
+  const needed = whenChecker(entries, local);
+  for (const entry of entries) {
     const label = `${entry.id} (${entry.kind}, ${entry.need})`;
+    if (!needed(entry)) {
+      const dir = path.resolve(local.env.CLAUDE_PROJECT_DIR || local.cwd);
+      out.stdout(`INFO  ${label}: not needed here: no ${whenText(entry)} at or above ${dir}, and none tracked in its git repository`);
+      continue;
+    }
+    const { status, detail } = detectEntry(entry, local);
     if (status === "present") {
       counts.passed++;
       out.stdout(`PASS  ${label}: ${detail}`);
@@ -612,7 +741,7 @@ export function report(roots, ctx, out) {
     if (absent) continue;
     if (errors.length) {
       invalid = true;
-      out.stderr(`${plugin}: prerequisites.json fails the schema:\n  ${errors.join("\n  ")}`);
+      out.stderr(schemaFailure(plugin, errors));
       continue;
     }
     for (const entry of manifest.requires) {
@@ -631,10 +760,6 @@ export function report(roots, ctx, out) {
   return requiredMissing ? 1 : 0;
 }
 
-function cmdReport(opts, ctx, out) {
-  return report(opts.roots, ctx, out);
-}
-
 function cmdProbe(opts, ctx, out) {
   if (opts.gate) {
     const value = ctx.env[`CLAUDE_PLUGIN_OPTION_${opts.gate}`];
@@ -644,15 +769,18 @@ function cmdProbe(opts, ctx, out) {
   const { plugin, manifest, errors, absent } = loadManifest(root);
   if (absent) return 0;
   if (errors.length) {
-    out.stderr(`${plugin}: prerequisites.json fails the schema:\n  ${errors.join("\n  ")}`);
+    out.stderr(schemaFailure(plugin, errors));
     return 2;
   }
   const session = readHookInput(ctx.stdin);
   const notices = [];
-  for (const entry of manifest.requires.filter((e) => e.for.some((s) => s.startsWith("hook:")))) {
+  const entries = manifest.requires.filter((e) => e.for.some((s) => s.startsWith("hook:")));
+  const needed = whenChecker(entries, ctx);
+  for (const entry of entries) {
+    if (!needed(entry)) continue;
     const { status, detail } = detectEntry(entry, { ...ctx, root });
     if (!isFailure(status) || !firstNoticeThisSession(plugin, entry.id, session, ctx.env)) continue;
-    notices.push(userNotice(plugin, entry, status, detail));
+    notices.push(userNotice(plugin, { ...entry, root }, status, detail));
   }
   const drift = gitHookDrift(root, ctx);
   if (drift.length && firstNoticeThisSession(plugin, "git-hooks", session, ctx.env)) notices.push(...drift);
@@ -666,7 +794,7 @@ function cmdProbe(opts, ctx, out) {
 // installer sits beside this file only in plugins that carry it, so it runs as
 // a child process rather than an import.
 function gitHookDrift(root, ctx) {
-  const installer = path.join(path.dirname(fileURLToPath(import.meta.url)), "git-hooks", "install.mjs");
+  const installer = path.join(HERE, "git-hooks", "install.mjs");
   if (!existsSync(path.join(root, "git-hooks", "entries.json")) || !existsSync(installer)) return [];
   const repo = ctx.env.CLAUDE_PROJECT_DIR || ctx.cwd;
   const r = spawnSync(process.execPath, [installer, "verify", "--quiet", "--repo", repo, "--plugin-root", root], {
@@ -687,7 +815,7 @@ function userNotice(plugin, entry, status, detail) {
   const what = onPath ? `${entry.id} not on the hook PATH${local}` : detail;
   return (
     `${plugin}: ${what}. ${entry.degrade} Install (${installText(entry)}). ` +
-    `Hooks read Claude Code's PATH, not your shell profile. No further notice this session; ${entry.check} diagnoses.`
+    `Hooks read Claude Code's PATH, not your shell profile. No further notice this session; diagnose with: node "${entry.root}/lib/prerequisites.mjs" check "${entry.root}"`
   );
 }
 
@@ -709,7 +837,7 @@ export function main(argv, ctx = {}, out = {}) {
     io.stderr(`prerequisites.mjs: ${err.message}\n${USAGE}`);
     return 2;
   }
-  if (opts.mode === "report") return cmdReport(opts, context, io);
+  if (opts.mode === "report") return report(opts.roots, context, io);
   if (opts.mode === "check") return cmdCheck(opts, context, io);
   return cmdProbe(opts, context, io);
 }

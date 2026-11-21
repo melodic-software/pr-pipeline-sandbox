@@ -1,5 +1,5 @@
 ---
-description: "Configure the ai-slop plugin for a consumer repository: exemption paths for documents that legitimately need em dashes, excluded paths, AI-vocabulary word-list tuning, and per-rule thresholds, written to the team layer .claude/ai-slop.json with the user's confirmation. Use when: 'set up ai-slop', 'configure slop detection', 'exempt this doc from the em-dash rule', 'tune the slop thresholds'."
+description: "Configure the ai-slop plugin for a consumer repository: exemption paths for documents that legitimately need em dashes, excluded paths, AI-vocabulary word-list tuning, and per-rule thresholds, written to the team layer docs/conventions/ai-slop.yaml with the user's confirmation. Use when: 'set up ai-slop', 'configure slop detection', 'exempt this doc from the em-dash rule', 'tune the slop thresholds'."
 argument-hint: "[check|apply]"
 user-invocable: true
 disable-model-invocation: true
@@ -16,12 +16,26 @@ layer supplying each effective value; `(detector unavailable)` means it did not 
 When it reads `(detector unavailable)` or `[shell command execution disabled by policy]`, run the
 detector's `--show-config` via Bash or read the three layers directly.
 
+- **Pointer**: for the placeholder a skipped load-time command leaves, fetch
+  [skills § Inject dynamic context](https://code.claude.com/docs/en/skills#inject-dynamic-context)
+  live.
+- **As of**: 2026-11-11
+- **Recheck trigger**: the placeholder text changes.
+
 ## Purpose
 
 The ai-slop detector ships neutral defaults. A consumer repo declares its own exemptions and
-tuning in `.claude/ai-slop.json`, resolved per the config-cascade convention: user-global
-(`~/.claude/ai-slop.json`), team (`.claude/ai-slop.json`, tracked), local overlay
-(`.claude/ai-slop.local.json`, gitignored). Later layers refine earlier ones per key.
+tuning in `<home>/ai-slop.yaml`, resolved per the config-cascade convention: team
+(`<home>/ai-slop.yaml`, tracked) and personal override (`<home>/ai-slop.local.yaml`, gitignored),
+where `<home>` is the convention home the repository binds in its instruction file
+(`docs/conventions` by default). The file is validated by the plugin's
+`schemas/ai-slop.schema.json`. Later layers refine earlier ones per key.
+
+The audit does not read the older JSON files (the same names with a `.json` extension, in
+`.claude/`) that a repository may still keep. `apply` writes the YAML: when the repository has the
+JSON team file and no YAML, offer to carry its values into
+`<home>/ai-slop.yaml` (the JSON `_comment` text becomes YAML comments) and leave the JSON file
+for the repository to delete.
 
 ## Keys
 
@@ -35,7 +49,13 @@ tuning in `.claude/ai-slop.json`, resolved per the config-cascade convention: us
 | `phrase_remove` | ERE fragment list | Removals from the shipped phrase roster, matched verbatim against the shipped fragments |
 | `disabled_rules` | rule slugs | Rules the audit skips entirely (reported as disabled) |
 | `thresholds` | map | Per-rule density thresholds: `ai_vocabulary`, `copulative_avoidance` (matches per 1000 words; density rules also need at least 3 matches) |
-| `_comment` | string | Free-text rationale for the choices in this file. Read by nobody; JSON has no comment syntax, and a config that disables a rule without recording why is the drift this skill exists to catch. Not drift, so do not flag it as an unknown key |
+| `rule_allowed_paths` | map of rule slug to glob list | Files that decline that one rule |
+| `verification` | `off`, `light`, `standard`, `strict` | How much independent checking `/ai-slop:audit` runs; team file only, read from the default branch by `lib/read-verification.sh`, never by `--show-config` ([levels](../../../../docs/contracts/verification-level/README.md)) |
+| `verification_skills` | map of skill name to level | A per-skill `verification` level that beats the plugin value; same reader and layer |
+
+Record the rationale for a choice as a YAML comment above the key: a config that disables a rule
+without recording why is the drift this skill exists to catch. A legacy JSON file carries it as a
+`_comment` string key, which is not drift, so do not flag it as an unknown key.
 
 ## check (default, read-only)
 
@@ -57,12 +77,12 @@ Everything `check` does, then the confirmed write:
 
 1. Interview the user for what they want changed. For em-dash exemptions, ask for the documents
    that genuinely require em dashes; the default posture is that most work does not.
-2. Write ONLY the team layer (`.claude/ai-slop.json`), showing the diff and getting explicit
-   confirmation before writing. Never write the user-global or overlay layers on the user's
-   behalf; name them as options the user edits themselves.
+2. Write only the team layer (`<home>/ai-slop.yaml`), showing the diff and getting explicit
+   confirmation before writing. Never write the personal override on the user's behalf; name it
+   as an option the user edits themselves.
 3. Re-run `--show-config` via Bash (the pre-computed output predates the write) and report the
    new effective state. Then run the tracked-file pair on
-   the written team file: `git check-ignore -v .claude/ai-slop.json` reports no match (a match is
-   FAIL with the pattern) AND `git ls-files --error-unmatch .claude/ai-slop.json` exits 0
+   the written team file: `git check-ignore -v <home>/ai-slop.yaml` reports no match (a match is
+   FAIL with the pattern) and `git ls-files --error-unmatch <home>/ai-slop.yaml` exits 0
    (non-zero right after a fresh write means "written but untracked: commit it to share with the
    team", never success).

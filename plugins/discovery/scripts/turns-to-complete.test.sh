@@ -11,12 +11,8 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 ROOT="$WORK/projects"
 
-fails=0
-pass() { printf 'ok   - %s\n' "$1"; }
-fail() {
-  printf 'FAIL - %s\n' "$1" >&2
-  fails=$((fails + 1))
-}
+# shellcheck source=../lib/test-helpers.sh
+source "$SCRIPT_DIR/../lib/test-helpers.sh"
 
 # mkagent <name> <agentType> <date> <turns> [parallel] [running]
 # Writes <turns> assistant turns; with "parallel" each turn is three records
@@ -65,7 +61,7 @@ expect() {
 expect_absent() {
   local label="$1" pattern="$2"
   shift 2
-  if python3 "$SUT" "$@" 2>&1 | grep -Eq -- "$pattern"; then
+  if grep -Eq -- "$pattern" < <(python3 "$SUT" "$@" 2>&1); then
     fail "$label: output unexpectedly matches /$pattern/"
   else
     pass "$label"

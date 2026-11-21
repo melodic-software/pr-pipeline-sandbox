@@ -6,6 +6,7 @@
 - [Discipline liveness: why a token at all](#discipline-liveness-why-a-token-at-all)
 - [The acceptance gate: why it grades the slice path, not the payload](#the-acceptance-gate-why-it-grades-the-slice-path-not-the-payload)
 - [The coverage ledger is graded separately, and its freshness is not bound](#the-coverage-ledger-is-graded-separately-and-its-freshness-is-not-bound)
+- [The restatement and eligibility checks](#the-restatement-and-eligibility-checks)
 - [Recovery ladder](#recovery-ladder)
 - [Truncation](#truncation)
 - [What dispatch does and does not buy](#what-dispatch-does-and-does-not-buy)
@@ -42,6 +43,7 @@ also owes `Source breadth:` and `Evidence use:`. This table says why each is the
 | Budget | How much depth was authorized is the caller's decision, never the worker's. Carried on two lines: `Budget:` for depth, as a word from the parent contract's `Budget:` vocabulary, and `Turn budget:` for the turn by which the worker stops gathering (degradable; absent, the worker uses its own default) |
 | Source breadth | The caller effort that scales the phase table. The researcher lane is pinned `high` for reasoning, so the worker's own `${CLAUDE_EFFORT}` is the pin (or a literal placeholder on disk fallback). The parent writes this line from its own load |
 | Evidence use | Only the parent knows where the answer goes. `publish` when it will be quoted outside this session (a pull-request review reply, an issue, a design document, a message to a third party), else `internal`. Degradable: absent, the worker records `internal` and says so. The worker copies the value into the index as `evidence_use:`, because the verifier holds no envelope, and the parent passes the same value to the applicability gate as `--expect-evidence-use`, so an index that dropped it fails rather than grading under the weaker rules |
+| Research config | The corroborator floor and recency windows resolve from `userConfig`, which substitutes only into the parent's skill load. Degradable: absent, the worker resolves them from the repository file and the defaults. The parent passes the same corroborator count to the verifier as `Corroborators:` |
 | Capability flags | Whether nested spawning is available is a session property the parent probed. It is the only flag, because the agent's own **write** capability is not probeable before dispatch, and the parent's `mkdir`/baseline proves only that the parent can write there. That question is answered afterwards by `persistence:` in the payload |
 
 The agent **refuses to guess** any of these rather than inventing one, memory root excepted above,
@@ -53,7 +55,7 @@ none delegable (the gate runs first: every one of them acts on an artifact, so a
 against a run that produced none):
 
 1. **Re-surface `open_questions`.** `AskUserQuestion` is filtered out of every non-fork subagent, so
-   the agent returns questions as text. The dated record for that harness behavior is
+   the agent returns questions as text. The record for that harness behavior is
    [`../../../reference/parent-contract.md`](../../../reference/parent-contract.md),
    "Harness facts the dispatch design rests on". If the parent does not surface them, the anti-pattern the
    skill guards against, silent downstream resolution, happens anyway, one level up.
@@ -88,6 +90,35 @@ against a run that produced none):
    and a serve-time header's exclusion are in
    [`artifact-shape.md`](artifact-shape.md), "Dating an undated living doc".
 
+   **Scale it to the evidence use.** Under `Evidence use: internal`, the verifier grades rows 4, 7
+   and 12 only for the claims a stated decision cites: the claim IDs the decision this research
+   feeds (the envelope's `Reason:`) rests on. Name them on one prompt line:
+
+   ```text
+   Claims: <id>[, <id>…]
+   ```
+
+   Row 14 is still graded in full. An absent or empty `Claims:` line grades every accepted claim.
+   No rework round runs under `internal`: a FAIL row is recorded as a Gap or Conflicts entry,
+   lowering `accepted:` to match (criterion 14), or left as the named `verification: fail rows`
+   value, and the result is presented with that caveat, the same bound `Budget: low` takes. Record
+   the graded IDs in the index's outcome-gate result, so a later reader knows which claims a
+   `pass` covers. Under `publish` the verifier grades every accepted claim and the full loop runs:
+   one rework round and one re-verify ("Effort, source breadth" in `SKILL.md`).
+
+   **The verification level.** `SKILL.md` resolves it before this dispatch. `standard` is this
+   section. Under `light`, and `off`, which acts as `light` here, dispatch no verifier and write
+   `verification: skipped (<level>)` ([`../../../reference/parent-contract.md`](../../../reference/parent-contract.md),
+   "The sibling verifier, stated once"). `strict` rules out `skipped (cost)` and grades as `publish` does at every evidence use and
+   budget: no `Claims:` line, and a FAIL row gets its one rework round and one re-verify, even at
+   `Budget: low` or under `internal`.
+
+   **Brief it on restatements.** Row 12 reaches every place the artifact restates an accepted
+   claim: the Summary, the Settled list and the rest of the handoff, catalog and table cells, and
+   sidecar abstracts. The restatement check ("The restatement and eligibility checks" below)
+   exits 0 before the verifier is dispatched, so the verifier grades meaning, not labels: whether a
+   pointer cites the right claim for what the line says.
+
    **Hand it full copies of the pages its fetch cut short.** The verifier has no `Bash`, by design,
    so it cannot run the docs lookup itself. When its `problems:` names a `truncated primary: <url>`,
    save that page into a `scratch-snapshots` directory inside the slice. An upstream docs page goes
@@ -95,7 +126,7 @@ against a run that produced none):
    [`docs-raw.sh`](../../../scripts/docs-raw.sh) as `bash "<path>/docs-raw.sh" '<url>'` and, when it
    prints `kind=map`, again with the ids of the cited sections after the URL. The URL came from a
    web page, so it is data: percent-encode any `'` in it as `%27` before it goes inside the single
-   quotes, per "The URL is DATA" in [`discipline.md`](discipline.md). It runs
+   quotes, per "The URL is data" in [`discipline.md`](discipline.md). It runs
    `fetch-docs.sh --cache --max-age 0`, so it asks the server every time, and prints raw bytes,
    never a summary or note (section 6 of
    [`../../../reference/docs-lookup-procedure.md`](../../../reference/docs-lookup-procedure.md)).
@@ -104,7 +135,7 @@ against a run that produced none):
    recipe under "A size failure is the same trigger" in [`discipline.md`](discipline.md), with
    `<scratch>` set to `scratch-snapshots`; create that directory first, because the recipe's
    `mktemp -d` makes only the final path component. The docs lookup is rung 1 of the
-   [upstream-drift read ladder](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/upstream-drift/README.md#the-rungs),
+   [upstream-drift read ladder](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/contracts/upstream-drift/README.md#the-rungs),
    which owns the raw-markdown channel. Then dispatch a fresh verifier with one more prompt line per
    page:
 
@@ -124,10 +155,6 @@ against a run that produced none):
      tools reference's
      [WebFetch tool behavior](https://code.claude.com/docs/en/tools-reference#webfetch-tool-behavior)
      live.
-   - **As of**: 2026-10-04
-   - **Recheck trigger**: the tools reference stops marking `Read` as prompting for paths outside
-     the working directories, its WebFetch section stops naming a size limit, or a verifier reports
-     a `Snapshots:` path it could not Read.
 3. **Apply project fit.** The consuming project's conventions and stated direction live with the
    parent; a fresh worker has no access to them.
 4. **Write both results back into the artifact.** This is the obligation easiest to drop, and
@@ -155,8 +182,7 @@ against a run that produced none):
 
 ## Discipline liveness: why a token at all
 
-A `skills:` entry that is missing or disabled is **skipped silently**: the harness logs a warning to
-the debug log and starts the agent regardless. The dated record for that harness behavior is
+We never count on the harness to fail a dispatch, or to tell the agent, when a `skills:` entry does not load. The record for that harness behavior is
 [`../../../reference/parent-contract.md`](../../../reference/parent-contract.md),
 "Harness facts the dispatch design rests on". The resulting run has no disciplines, no phase
 structure, and no gate, and it still writes an artifact, still returns a payload, and still reports
@@ -180,7 +206,7 @@ agent definition, the same class as a missing `topic_as_received`.
 
 ## The acceptance gate: why it grades the slice path, not the payload
 
-`SKILL.md` carries the gate's three steps. This is why each is shaped the way it is.
+`SKILL.md` carries the gate's steps. This is why each is shaped the way it is.
 
 The failure it catches is a dispatched agent returning `status: complete` with a mid-stream narration
 line as its whole payload: no `preload_token`, no summary, no artifact path. Nothing in that shape is
@@ -229,6 +255,46 @@ accepted nothing records `accepted: 0` and opens its Summary with
 `Inconclusive: no claim accepted.` Any failure sends the synthesis back for rewriting, not the
 sub-slice for re-dispatch.
 
+**A slice-root synthesis that adds no claims and cites by ID needs no verifier.** When the
+slice-root index writes no claim of its own (no `RESEARCH-*.md` sidecar at the root, or only
+`claims: []`) and cites each sub-slice claim by its `id:` with that claim's label, every claim it
+carries already has its sub-slice's verdict, so neither row 4 nor row 7 has anything of the
+root's own to grade. Two things are left. Row 14 is the root's own: its `accepted:` count and, at zero, its
+Summary are written by the synthesis, not inherited. Its pointers are the other: a Settled line
+that drops a `HIGH (single source)` label, or widens a claim with a sweep word, is the drift row 12
+exists to catch. A script covers the pointers. Run the restatement check on the root with one
+`--sub-slice` per sub-slice:
+
+```bash
+"<plugin-root>/scripts/check-restatement-labels.py" <slice root> --sub-slice <sub-slice> [--sub-slice <sub-slice>]...
+```
+
+It takes each sub-slice's declared IDs and labels, reads only the root's own index and sidecars
+for lines, and fails a root pointer that drops its claim's label or carries a sweep word, and a
+root sidecar line that cites a claim without its verbatim quote. Each researcher numbers its claims
+alone, so two sub-slices may declare the same ID: the check namespaces each sub-slice's IDs by its
+directory name. A root pointer written `<sub-slice>/X2` names that sub-slice's claim, and a bare
+`X2` names every claim declaring it, so its line carries each one's label. Without
+`--sub-slice` it would find no ID to look for at a `claims: []` root and pass without reading a
+pointer, and it exits 2 at a root with no sidecar, so the flag is not optional here. Cite its exit
+status as acceptance-gate step 5 for the root; the eligibility check has no claim of the root's to
+read and is not run there. Then grade row 14 on the root by the verifier's own rule
+([`../../../agents/research-verifier.md`](../../../agents/research-verifier.md), the paragraph that
+opens "Rows 4, 7 and 12 hold vacuously"): count the distinct sub-slice claims the root's index
+carries that their sub-slice accepted, one per `<sub-slice>/<id>`, so a bare ID two sub-slices
+share counts once for each sub-slice that accepted its claim, and compare with the root's `accepted:`; at zero, the
+Summary opens with `Inconclusive: no claim accepted.` A missing field, a different number or a
+zero that reads as an answer sends the synthesis back for rewriting. Once row 14 passes, act on
+the exit status. On exit 0, write `verification: skipped (cost)` into the root index,
+dispatch no verifier, and say in its outcome-gate result that the root adds no claims, that the
+restatement check over its sub-slices passed, and that its accepted count matched. A non-zero
+exit sends the synthesis back for rewriting, like any failure above. A root that
+adds one claim, a cross-topic conclusion included, takes the verifier on every verifier-owned row
+too, and takes the same `--sub-slice` run as its step 5, so its own claims and its pointers to
+sub-slice claims are both checked before the verifier is dispatched. When that run exits 2
+because one of the root's own claims reuses a sub-slice's ID, the root renumbers that claim and
+reruns the `--sub-slice` check.
+
 ## The coverage ledger is graded separately, and its freshness is not bound
 
 Outcome-gate criterion 11 already makes the *run* cite `check-coverage-complete.sh`'s exit status
@@ -263,6 +329,39 @@ Together those mean a re-dispatch into a dirty slice can be graded against a *de
 narrowly but really: Phase 0 rewrites the ledger before any query, so the window is a re-dispatch
 whose new run recorded the corpus as unbounded (and therefore wrote no ledger) while the previous
 run's marked one is still sitting there. Hence the ladder's first move on a discard.
+
+## The restatement and eligibility checks
+
+Two scripts check, at write time, the format and calibration rules a verifier would otherwise
+fail by hand: label, sweep-word, sidecar-quote and abstract-mirror drift in restatements (row 12), single-source
+flag eligibility (row 4), and the tier mix behind `HIGH` (row 7). Each runs on the directory of
+the index, as one plain command:
+
+```bash
+"<plugin-root>/scripts/check-restatement-labels.py" <that index's directory>
+python3 "<plugin-root>/scripts/check-claim-eligibility.py" <that index's directory>
+```
+
+The rules they check are in [`artifact-shape.md`](artifact-shape.md): "Restatements cite; they do
+not restate", and the `claim_kind:` and `source_owner:` paragraph under the sidecar header. Both
+read exit status the same way: **0** pass; **1** a violation, one stderr line per line or claim
+at fault; **2** ungradeable (a header the parser cannot read, an `id:` outside the claim-ID grammar,
+a claim with an `id:` and no `claim:` text (the restatement check), one ID declared twice, or a
+usage error). Both 1 and 2 are FAILs.
+
+**They fail closed at the researcher.** The researcher runs both before hand-back, fixes each
+reported line or claim (shrinking a restatement to a pointer in the index or to the verbatim quote
+in a sidecar, lowering a confidence, or splitting a content claim from a behavior claim), and
+re-runs until both exit 0. A label or a flag fixed there
+never reaches a verifier.
+
+**The parent re-runs them as acceptance-gate step 5**, after the source-applicability check and
+before the verifier is dispatched, for the same reason it re-runs the ledger and applicability
+scripts: the payload's word is the run's self-grade. Cite each exit status. A non-zero exit, or an
+invocation that is denied, declined or cannot find an interpreter, halts like any gate step and
+takes the recovery ladder below: resume the researcher with the reported lines. Like the
+applicability checker they ship as Python only: where `python3` does not resolve, run them with
+`python`.
 
 ## Recovery ladder
 
@@ -336,7 +435,7 @@ which is a custom subagent like `discovery:explorer`. It is pointed at rather th
 copies cannot drift apart on a harness change.
 
 **A refused resume, or exit 1 again after one: discard and re-dispatch with the same envelope, and
-CLEAR THE SLICE FIRST** (or assign the re-dispatch a fresh sub-slice). This rung is research-specific
+clear the slice first** (or assign the re-dispatch a fresh sub-slice). This rung is research-specific
 and it is the one worth remembering: a discarded run's `research-checklist.md` survives the discard,
 the artifact gate's freshness check does not cover it, and a replacement run that finds the corpus
 unbounded writes no ledger of its own, so the dead run's marks would be graded as the new run's
@@ -355,7 +454,7 @@ instead, one level up, where gate step 1 has already put the payload in the pare
 ## Truncation
 
 At the turn limit, a subagent that reaches `maxTurns` returns its output marked as partial, and
-the parent can resume it. Dated record:
+the parent can resume it. Record:
 [`../../../reference/parent-contract.md`](../../../reference/parent-contract.md),
 "A turn-limit stop returns partial output, and the parent can resume the agent".
 
@@ -395,7 +494,7 @@ in
   lists are on disk. For *process*, only as far as those artifacts capture it, which is why the fetch
   log and the gap lists are written outputs rather than working notes.
 - **Debuggability**: worse, and worth stating plainly. Background is the default execution mode, so
-  a failed run's transcript is not in the conversation at all. The dated record for that harness
+  a failed run's transcript is not in the conversation at all. The record for that harness
   behavior is
   [`../../../reference/parent-contract.md`](../../../reference/parent-contract.md),
   "Harness facts the dispatch design rests on". The artifact and the payload are the

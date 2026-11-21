@@ -22,25 +22,26 @@
 // $CLAUDE_PLUGIN_ROOT/scripts/docs-raw.sh, the root the hook process receives.
 //
 // A plugin subagent reports its plugin-scoped name as agent_type:
-// https://code.claude.com/docs/en/hooks#subagentstart (as of 2026-10-04;
-// recheck when that section changes the agent_type a plugin subagent reports).
+// https://code.claude.com/docs/en/hooks#subagentstart.
 //
 // Fail-closed inside the named agent (a command it cannot parse, an input
 // stream that fails, or an error in the gate is denied); fail-open everywhere
-// else. When node itself is missing or the hook times out, the session's
-// permission rules alone hold the agent's Bash, because the registration keeps
-// the default failure handling, which lets the call go ahead:
-// https://code.claude.com/docs/en/hooks#other-exit-codes,
-// https://code.claude.com/docs/en/hooks#timeouts and
-// https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails (as of
-// 2026-10-11; recheck when that default stops letting the call go ahead, or when
-// a registration of this gate sets onFailure).
+// else, where the gate always exits 0. When node itself is missing or the hook
+// times out, the registration's "onFailure": "block" denies the call, in every
+// agent and the main thread alike, on Claude Code 2.1.295 or later; an older
+// client lets it go ahead, leaving the agent's Bash to the session's permission
+// rules: https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails
+// (as of 2026-10-30; recheck when that section changes what counts as a
+// failure). Which rows set the key: docs/contracts/hook-budget/README.md.
 
-import { createHash } from 'node:crypto'
-import { closeSync, lstatSync, mkdirSync, openSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+
+// node:fs and node:crypto load only when a marker is written, inside the named
+// agent, so every other Bash call skips their load time.
+const require = createRequire(import.meta.url)
 
 // A public DNS name or a public dotted-quad IPv4: the same check the workflows
 // run on the URLs they hand this agent.
@@ -120,8 +121,7 @@ const UID = process.getuid?.()
 
 // Where the markers live: the plugin's data directory, which Claude Code
 // exports to hook processes and keeps under the user's home
-// (https://code.claude.com/docs/en/plugins/manifest-reference#environment-variables, as
-// of 2026-10-07; recheck when CLAUDE_PLUGIN_DATA stops reaching hooks), else a
+// (https://code.claude.com/docs/en/plugins/manifest-reference#environment-variables), else a
 // per-uid directory under the temp directory.
 export function markerDir(env = process.env) {
   if (env.CLAUDE_PLUGIN_DATA) return join(env.CLAUDE_PLUGIN_DATA, 'docs-fetcher-gate')
@@ -132,6 +132,7 @@ export function markerDir(env = process.env) {
 // owns and no one else can reach: on a shared /tmp another user could have made
 // it first, to delete markers or plant them.
 export function privateDir(dir, uid = UID) {
+  const { lstatSync, mkdirSync } = require('node:fs')
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   const s = lstatSync(dir)
   if (!s.isDirectory()) throw new Error(dir + ' is not a directory')
@@ -142,6 +143,8 @@ export function privateDir(dir, uid = UID) {
 // Records the first allowed call of one agent run: true the first time an id is
 // claimed, false after. Markers older than a day are pruned on each claim.
 export function claimOnce(id, dir = markerDir(), uid = UID) {
+  const { closeSync, openSync, readdirSync, rmSync, statSync } = require('node:fs')
+  const { createHash } = require('node:crypto')
   privateDir(dir, uid)
   for (const f of readdirSync(dir)) {
     try {

@@ -19,23 +19,19 @@ invocation:
 - Project root, `git rev-parse --show-toplevel`
 
 Treat a failure (not a repository, git unavailable) as an unknown value and carry on. Keep these as
-separate body Bash calls rather than pre-compute lines: the harness runs a skill's whole pre-compute
-block as one shell invocation, and a worktree-isolated session refuses a compound command that
-contains git. The dated record for that composition claim is the worktree skill's
-[reference/gather-block.md](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/plugins/source-control/skills/worktree/reference/gather-block.md),
-"The pre-compute block runs as one shell invocation".
+separate body Bash calls rather than pre-compute lines, one command per call, so each git read
+reaches the shell on its own. How the harness runs a skill's injected commands is
+[skills: inject dynamic context](https://code.claude.com/docs/en/skills#inject-dynamic-context)'s
+to say.
 
 ## Purpose
 
-Code records what a system does. It rarely records why anyone chose it. That lives in review
-threads, tickets, design documents, and incident timelines. Records that are partial, contradictory,
-and sometimes gone. This skill reconstructs intent from those records and is honest about the parts
-it could not recover.
-
-Third axis of this plugin. `/discovery:explore` answers **what IS**, `/discovery:research` answers
-**what SHOULD BE**, and this answers **what WAS, and why**. The failure it exists to prevent is a
-confident story built from thin evidence: a plausible narrative about a decision is worse than an
-admission of ignorance, because it is acted upon.
+Reconstruct intent from the records outside the code (review threads, tickets, design documents,
+incident timelines), which are partial, contradictory, and sometimes gone, and say plainly which
+parts could not be recovered. `/discovery:explore` answers **what IS**, `/discovery:research`
+**what SHOULD BE**, and this skill **what WAS, and why**. Never build a confident story from thin
+evidence: a plausible narrative about a decision is worse than an admission of ignorance, because
+it is acted upon.
 
 ## Routing. Dispatch by default
 
@@ -47,7 +43,12 @@ verification request, not the transcript. The parent resolves the **pre-dispatch
 flags), written into the dispatch prompt as the labeled template in the
 [parent contract](${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md), and owns the **post-dispatch
 boundary** after: re-surfacing `open_questions`, dispatching the sibling verifier for tier
-assignment, and writing that verdict back into the index.
+assignment, and writing that verdict back into the index. Before that verifier, run
+`bash "${CLAUDE_PLUGIN_ROOT}/lib/read-verification.sh" --plugin discovery --skill trace-intent --file docs/conventions/discovery.yaml` and
+report its line: `light` and `off` skip it and write `verification: skipped (<level>)`, per the
+parent contract's "The sibling verifier, stated once". The spawn's `model` follows the parent
+contract's "The worker's model is the parent's call": pass one only when a multi-agent config
+layer moves the intent-tracer's role off its pin.
 
 **Run inline instead** for tight turn-by-turn iteration, for cost, or when the invoking context is
 already a subagent, and inline runs the identical discipline; the escape hatch relaxes nothing
@@ -56,8 +57,7 @@ checker before dispatching, and a denied or errored probe **halts** rather than 
 All three reasons in full, and the halt rule: [`context/dispatch.md`](context/dispatch.md).
 
 **Discipline-liveness token.** A dispatched agent receives this body through its `skills:` preload,
-and a preload that fails to resolve is skipped **silently**. Logged to the debug log and nowhere
-else. The dated record for that harness behavior is
+and nothing else in its run shows whether that preload resolved. The record for that harness behavior is
 [`${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md`](${CLAUDE_PLUGIN_ROOT}/reference/parent-contract.md),
 "Harness facts the dispatch design rests on".
 The disk fallback Reads this same file, so a matching `preload_token` is file-identity, **not** proof that preload fired. A missing or mismatched token is a **hard failure: the parent discards the run**. Provenance is `preload: fired | fallback`; `fallback` is the accepted recovery.
@@ -73,7 +73,7 @@ are in the parent contract**. Copy the one matching this session's shell, becaus
 `touch` is not a command in PowerShell and its directory flag is a parameter error there.
 
 **Post-dispatch, the payload is graded off disk before it is believed**. `status: complete` is the
-agent's claim about its own run, and a claim is not evidence. The gate's three steps, the reason this
+agent's claim about its own run, and a claim is not evidence. The gate's four steps, the reason this
 family ships no coverage ledger, the by-value rung, and the boundary the parent still owns after the
 gate passes are in [`context/dispatch.md`](context/dispatch.md). Two things worth knowing before you
 get there: **any non-zero exit halts the workflow**, and a gate that could not run is a FAIL rather
@@ -110,21 +110,23 @@ something real about how the decision was made. Usually that it was never writte
 
 ### Source reliability rides alongside, and never routes
 
-The tier alone cannot distinguish a review comment written by the change's author from a wiki page
-four years stale. Both are `Direct`. So every citation also carries a short reliability note: who
-wrote it, how close they were to the decision, and how old it is. This is a note, not a second
-ladder. Only the tier decides which section a claim lands in.
+Every citation also carries a short reliability note: who wrote it, how close they were to the
+decision, and how old it is (a review comment by the change's author and a wiki page four years
+stale are both `Direct`). This is a note, not a second ladder. Only the tier decides which section
+a claim lands in.
+
+### `Direct` needs a person's own words
+
+Each source records `author_kind: owner-quote | agent-relay`: who wrote the words, not whose login
+posted them. When you cannot tell, it is `agent-relay`, and a claim whose sources are all
+`agent-relay` is not `Direct`. Rule and check: [`context/artifact-shape.md`](context/artifact-shape.md).
 
 ### Code shape is not intent evidence
 
-"It handles the null case because it checks for null" is mechanics, not motivation. Reading the
-implementation tells you what was built, almost never why. Code-shape inference does not get a low
-tier. It leaves the scale entirely and is recorded as a gap.
-
-Code-shape inference is excluded from the scale rather than admitted at a low tier, and the reason
-is operational rather than epistemic: code is always present and costs nothing to consult, so a
-weak-but-admissible rung for it gets filled exactly when the real record is thin, which is exactly
-when a reader most needs to be told so.
+"It handles the null case because it checks for null" is mechanics, not motivation. Code-shape
+inference does not get a low tier. It leaves the scale entirely and is recorded as a gap: code is
+always there to consult, so a low rung for it would fill exactly when the real record is thin,
+which is when a reader most needs to be told so.
 
 **Version-control behavior is not code shape.** Change coupling, churn and hotspot data are evidence
 the code alone cannot give you, and they are admissible, but they locate rather than explain: they
@@ -146,16 +148,15 @@ repository resolves, which is the normal condition for a dispatched worker rathe
 An unavailable category is reported as a gap, never skipped in silence.
 
 Repo-local git archaeology is delegated by invoking `/discovery:explore git` via the Skill tool
-when that skill is installed, rather than reimplemented here; without it, read the history directly
+when that skill is enabled, rather than reimplemented here; without it, read the history directly
 and say so. Tracker access routes through `/work-items:track`, invoked via the Skill tool, when the
-`work-items` plugin is installed, which owns the
+`work-items` plugin is enabled, which owns the
 provider-neutral seam; without it, use whatever tracker interface the session actually has, and when
 none resolves, report the tracker category as unavailable.
 
-Categories beyond these three, team chat, observability, error tracking, product analytics, carry
-real intent evidence and are **not shipped as investigators**: nothing in this marketplace reaches
-them, so four permanently-empty investigators would report the same gap forever. Extension seam:
-[`context/evidence-categories.md`](context/evidence-categories.md).
+Categories beyond these three (team chat, observability, error tracking, product analytics) carry
+real intent evidence but are **not shipped as investigators**, because nothing in this marketplace
+reaches them, so four permanently-empty investigators would report the same gap forever. Extension seam: [`context/evidence-categories.md`](context/evidence-categories.md).
 
 ## Skipping a category
 
@@ -208,6 +209,7 @@ Check these against the written output, not against recollection:
 - Every category appears in *Sources consulted*, including the ones that found nothing.
 - Every skip carries one of the two permitted reasons.
 - Hedged claims are hedged in the output, not flattened into confident prose.
+- `"${CLAUDE_PLUGIN_ROOT}/scripts/check-author-kind.py" <the slice>` exits 0.
 
 ## Spoke paths
 
@@ -217,8 +219,7 @@ never rely on a `${…}` token in a file read from disk being expanded later.
 
 - **Pointer**: when deciding whether a `${…}` reference in a supporting file resolves, fetch
   [plugin manifest reference: where each variable resolves](https://code.claude.com/docs/en/plugins/manifest-reference#where-each-variable-resolves)
-  live. **As of**: 2026-10-11. **Recheck trigger**: that table adds supporting files or the Bash
-  environment to where a `${…}` reference resolves.
+  live.
 
 ## Next
 

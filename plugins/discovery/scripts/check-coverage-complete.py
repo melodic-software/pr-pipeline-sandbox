@@ -76,9 +76,7 @@ def grade(ledger_path: Path) -> int:
         print(f"error: ledger is empty: {ledger_path}", file=sys.stderr)
         return 2
 
-    header_seen = False
-    header_cols = 0
-    header_name: dict[int, str] = {}
+    header: list[str] = []
     done_col = 0
     rows = 0
     unmarked = 0
@@ -92,25 +90,17 @@ def grade(ledger_path: Path) -> int:
         if not row_cells:
             continue
 
-        if not header_seen:
-            seen_head: dict[str, int] = {}
-            for i, cell in enumerate(row_cells, start=1):
-                header_name[i] = cell
-                h = cell.lower()
-                seen_head[h] = seen_head.get(h, 0) + 1
-                if h == "done":
-                    done_col = i
-            if not all(seen_head.get(req, 0) == 1 for req in REQUIRED):
-                done_col = 0
-                continue
-            header_cols = len(row_cells)
-            header_seen = True
+        if not header:
+            heads = [cell.lower() for cell in row_cells]
+            if all(heads.count(req) == 1 for req in REQUIRED):
+                header = row_cells
+                done_col = heads.index("done") + 1
             continue
 
-        if len(row_cells) != header_cols:
+        if len(row_cells) != len(header):
             print(
                 f"error: row {rows + 1} has {len(row_cells)} column(s), "
-                f"header has {header_cols}: {line}",
+                f"header has {len(header)}: {line}",
                 file=sys.stderr,
             )
             return 2
@@ -121,7 +111,7 @@ def grade(ledger_path: Path) -> int:
                 continue
             if cell == "":
                 print(
-                    f"error: row {rows} has an empty {header_name[i]} cell — "
+                    f"error: row {rows} has an empty {header[i - 1]} cell — "
                     f"a marked row must say what covering it meant: {line}",
                     file=sys.stderr,
                 )
@@ -132,7 +122,7 @@ def grade(ledger_path: Path) -> int:
             continue
         if UNMARKED.match(box):
             unmarked += 1
-            item = row_cells[1] if header_cols >= 2 and done_col != 2 else row_cells[0]
+            item = row_cells[1] if done_col != 2 else row_cells[0]
             print(f"unmarked: row {rows} — {item}", file=sys.stderr)
             continue
         label = "<empty>" if box == "" else box
@@ -141,7 +131,7 @@ def grade(ledger_path: Path) -> int:
         )
         return 2
 
-    if not header_seen:
+    if not header:
         print("error: no coverage table with a Done column found", file=sys.stderr)
         return 2
     if rows == 0:
