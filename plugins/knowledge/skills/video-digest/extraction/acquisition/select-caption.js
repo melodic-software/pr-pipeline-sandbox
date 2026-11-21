@@ -46,9 +46,8 @@ const PLATFORM_ASR_LADDER = /** @type {readonly CaptionRung[]} */ (
 const TLANG_TRANSLATE_PATTERN = /\.(tlang|translate)/;
 const EN_ORIG_PATTERN = /\.en-orig\.vtt$/;
 const EN_AUTO_PATTERN = /\.en\.auto\.vtt$/;
-const MANUAL_EN_PATTERN = /\.en(?:-[a-z]{2,3})?\.vtt$/;
+const EN_PATTERN = /\.en(?:-[a-z]{2,3})?\.vtt$/;
 const AUTO_TRANSLATE_EN_PATTERN = /\.en(?:-[a-z]{2,3})?\.[a-z]{2,3}\.vtt$/;
-const PLATFORM_EN_PATTERN = /\.en(?:-[a-z]{2,3})?\.vtt$/;
 const PLATFORM_UND_PATTERN = /\.und\.vtt$/;
 
 /**
@@ -81,7 +80,7 @@ function classifyManualAndAuto(name) {
     return "auto-en";
   }
 
-  if (MANUAL_EN_PATTERN.test(name) && !name.includes("en-orig")) {
+  if (EN_PATTERN.test(name) && !name.includes("en-orig")) {
     return "manual-en";
   }
 
@@ -97,7 +96,7 @@ function classifyManualAndAuto(name) {
  * @returns {CaptionRung | null}
  */
 function classifyPlatformAsr(name) {
-  if (PLATFORM_EN_PATTERN.test(name)) {
+  if (EN_PATTERN.test(name)) {
     return "platform-asr-en";
   }
   if (PLATFORM_UND_PATTERN.test(name)) {
@@ -189,7 +188,6 @@ export function selectCaptionFile(
     const filenameRung = classifyCaptionRung(filePath, captionClass);
     const rung = refineWithManualKeys(filePath, filenameRung, manualKeys);
     if (filenameRung === "manual-en" && rung === "auto-en") {
-      // Ranked after the original `.en-orig.vtt` within the auto-en rung.
       autoBareEn ??= filePath;
     } else if (rung && !byRung.has(rung)) {
       byRung.set(rung, filePath);
@@ -202,23 +200,15 @@ export function selectCaptionFile(
   for (const rung of ladder) {
     const match = byRung.get(rung);
     if (!match) continue;
-    if (match === autoBareEn) {
-      return {
-        success: true,
-        selection: {
-          path: match,
-          rung: "auto-en",
-          isAutoCaption: true,
-          provenanceNote: `${path.basename(match)} is not a manual track in info.json; treated as auto captions`,
-        },
-      };
-    }
     return {
       success: true,
       selection: {
         path: match,
         rung,
         isAutoCaption: rung !== "manual-en",
+        ...(match === autoBareEn && {
+          provenanceNote: `${path.basename(match)} is not a manual track in info.json; treated as auto captions`,
+        }),
       },
     };
   }

@@ -30,6 +30,12 @@ import re
 import sys
 from typing import NoReturn
 
+sys.dont_write_bytecode = True  # the plugin's own tree is not a cache
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, os.pardir, "lib")
+)
+from gates import headings  # noqa: E402  (the plugin's shared gate primitives)
+
 SCHEMA = "node-manifest/v1"
 EXTRACTOR_NAME = "extract_nodes.py"
 EXTRACTOR_VERSION = "1.0.0"
@@ -60,7 +66,6 @@ class Line:
     def __init__(self, start: int, end: int, raw: bytes):
         self.start = start  # byte offset of line start
         self.end = end  # byte offset just past the newline (or EOF)
-        # matching text: newline and trailing \r stripped; offsets stay raw
         self.text = raw.rstrip(b"\r\n")
 
 
@@ -79,10 +84,10 @@ def split_lines(data: bytes, base: int) -> list:
     return lines
 
 
-ATX_RE = re.compile(rb"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
-ATX_TRAIL_RE = re.compile(rb"[ \t]+#+[ \t]*$")
-FENCE_OPEN_RE = re.compile(rb"^( {0,3})(`{3,}|~{3,})(.*)$")
-SETEXT_RE = re.compile(rb"^ {0,3}(=+|-+)[ \t]*$")
+ATX_RE = headings.atx_heading(binary=True)
+ATX_TRAIL_RE = headings.closing_sequence(binary=True)
+FENCE_OPEN_RE = headings.fence(indent=headings.INDENT_COMMONMARK, binary=True)
+SETEXT_RE = headings.setext_underline(binary=True)
 
 
 def decode_title(raw: bytes) -> str:
@@ -117,70 +122,48 @@ def markdown_boundaries(data: bytes):
                 frontmatter_end = lines[j].end
                 idx = j + 1
                 break
-        # no closing marker: not frontmatter; idx stays 0
 
     boundaries = []  # (byte offset, level, title)
     in_fence = False
-    fence_char = b""
-    fence_len = 0
+    fence_run = b""
     consumed = set()  # line indexes already used as heading/underline/fence
 
-    i = idx
-    while i < len(lines):
+    for i in range(idx, len(lines)):
         line = lines[i]
         text = line.text
 
         m = FENCE_OPEN_RE.match(text)
         if in_fence:
-            if (
-                m
-                and m.group(2)[0:1] == fence_char
-                and len(m.group(2)) >= fence_len
-                and m.group(3).strip() == b""
-            ):
+            if headings.closes_fence(m, fence_run):
                 in_fence = False
             consumed.add(i)
-            i += 1
             continue
 
         if m:
             in_fence = True
-            fence_char = m.group(2)[0:1]
-            fence_len = len(m.group(2))
+            fence_run = m.group(1)
             consumed.add(i)
-            i += 1
             continue
 
         m = ATX_RE.match(text)
         if m:
-            level = len(m.group(1))
-            title_raw = m.group(2) or b""
-            title_raw = ATX_TRAIL_RE.sub(b"", title_raw)
-            boundaries.append((line.start, level, decode_title(title_raw)))
+            title_raw = ATX_TRAIL_RE.sub(b"", m.group(2) or b"")
+            boundaries.append((line.start, len(m.group(1)), decode_title(title_raw)))
             consumed.add(i)
-            i += 1
             continue
 
         m = SETEXT_RE.match(text)
         if m and i > idx:
             prev = lines[i - 1]
-            prev_usable = (
-                prev.text.strip() != b""
+            if (
+                prev.text.strip()
                 and (i - 1) not in consumed
                 and prev.start >= frontmatter_end
-            )
-            if prev_usable:
+            ):
                 level = 1 if m.group(1)[0:1] == b"=" else 2
                 boundaries.append((prev.start, level, decode_title(prev.text)))
-                consumed.add(i - 1)
-                consumed.add(i)
-                i += 1
-                continue
+                consumed.update((i - 1, i))
 
-        i += 1
-
-    # A fence left open runs to EOF; everything after its opener was consumed
-    # as fence interior — that is deterministic, so no error.
     return frontmatter_end, boundaries
 
 
@@ -191,7 +174,7 @@ HTML_MASK_RES = [
     re.compile(rb"<pre\b.*?</pre\s*>", re.DOTALL | re.IGNORECASE),
     re.compile(rb"<textarea\b.*?</textarea\s*>", re.DOTALL | re.IGNORECASE),
 ]
-HTML_HEADING_RE = re.compile(rb"<h([1-6])(\s[^>]*)?>", re.IGNORECASE)
+HTML_HEADING_RE = headings.html_heading(binary=True)
 HTML_TAG_RE = re.compile(rb"<[^>]+>")
 WS_RUN_RE = re.compile(r"\s+")
 
@@ -206,12 +189,10 @@ def html_boundaries(data: bytes):
     """
     masked = data
     for rx in HTML_MASK_RES:
-        masked = rx.sub(lambda m: b" " * (m.end() - m.start()), masked)
-    # unclosed comment: mask opener..EOF (closed ones were masked above)
-    m = masked.find(b"<!--")
-    if m != -1 and masked.find(b"-->", m) == -1:
-        masked = masked[:m] + b" " * (len(masked) - m)
-    # unclosed script/style/pre/textarea: mask opener..EOF
+        masked = rx.sub(lambda m: b" " * len(m.group()), masked)
+    comment_start = masked.find(b"<!--")
+    if comment_start != -1 and masked.find(b"-->", comment_start) == -1:
+        masked = masked[:comment_start] + b" " * (len(masked) - comment_start)
     for name in (b"script", b"style", b"pre", b"textarea"):
         rx = re.compile(rb"<" + name + rb"\b", re.IGNORECASE)
         m = rx.search(masked)
@@ -304,9 +285,6 @@ def self_check(nodes, data: bytes) -> None:
     if cursor != n:
         fail(3, f"self-check: partition ends at {cursor}, snapshot is {n} bytes")
 
-
-# Format registry: to support a new snapshot format, add a handler returning
-# (frontmatter_end, boundaries, whole_kind) and register its extensions here.
 
 
 def handle_markdown(data: bytes):

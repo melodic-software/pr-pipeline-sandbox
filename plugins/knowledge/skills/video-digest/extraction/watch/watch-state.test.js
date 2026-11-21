@@ -34,8 +34,6 @@ const sampleTalk = (overrides = {}) =>
     ...overrides,
   });
 
-// In-memory fs fakes: a Map-backed readFile/writeFile/mkdir triple, optionally
-// pre-seeded so a test can read a watch.json it never wrote.
 /** @param {Iterable<[string, string]>} [seed] */
 function memoryStore(seed = []) {
   const store = new Map(seed);
@@ -51,7 +49,6 @@ function memoryStore(seed = []) {
   return { store, readFile, writeFile, mkdir };
 }
 
-// Seeded with a fresh sample watch.json, for runMarkPhase tests.
 function seededStore() {
   const sliceDir = "/tmp/slice";
   return {
@@ -98,6 +95,17 @@ describe("watch state phase map", () => {
     expect(prompt).not.toContain("youtube-watch");
   });
 
+  it("names a ranged slice's range, and no range for a whole-video slice", () => {
+    const ranged = sampleTalk({
+      videoSlug: "talk-abc-r3600-end",
+      timeRange: { fromSec: 3600, toSec: null },
+    });
+    expect(buildContinuationPrompt(ranged)).toContain(
+      "Range: 1:00:00 to the end. Every timestamp in this slice is full-video time.",
+    );
+    expect(buildContinuationPrompt(sampleTalk())).not.toContain("Range:");
+  });
+
   it("tells a fully marked but unclosed slice to close, not to continue a phase", () => {
     let state = sampleTalk();
     for (const phase of ["acquire", "transcript", "watching", "vision", "harvest", "research", "synthesis"]) {
@@ -126,7 +134,7 @@ describe("watch state phase map", () => {
     const framing = prompt.slice(prompt.indexOf("## Video metadata"), prompt.indexOf("```text"));
     expect(framing).toContain("`source/transcript.txt`");
     expect(framing).toContain("`run-state/watch.json`");
-    expect(prompt).toContain('`docs/conventions/untrusted-content/README.md` "The framing contract"');
+    expect(prompt).toContain('`docs/contracts/untrusted-content/README.md` "The framing contract"');
     expect(prompt).toContain("source-quality red flag in `recommendations/questions.md`");
     expect(prompt).toContain(
       "```text\ntitle: Talk\nsource: https://youtube.com/watch?v=abc\n```\n",

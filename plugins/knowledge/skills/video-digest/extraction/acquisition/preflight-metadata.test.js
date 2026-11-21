@@ -7,6 +7,7 @@ import {
   escapeTableCell,
   formatChannel,
   PREFLIGHT_FIELD_SEP,
+  parsePreflightArgs,
   parsePreflightLine,
   preflightVideo,
   truncateTitle,
@@ -33,6 +34,11 @@ function spawnResult(overrides) {
 describe("escapeTableCell", () => {
   it("escapes pipes so a title cannot break the markdown table", () => {
     expect(escapeTableCell("Rust | Go | C")).toBe("Rust \\| Go \\| C");
+  });
+
+  it("escapes backslashes so a trailing one cannot escape the cell's closing pipe", () => {
+    expect(escapeTableCell("C:\\dir\\")).toBe("C:\\\\dir\\\\");
+    expect(escapeTableCell("a\\|b")).toBe("a\\\\\\|b");
   });
 
   it("collapses newlines and runs of whitespace to a single space", () => {
@@ -189,6 +195,45 @@ describe("preflightVideo", () => {
     expect(result.note).toBe("");
   });
 
+  it("caps a long title before escaping it, so the cap never leaves a dangling backslash", async () => {
+    // 58 characters then a pipe at the cap's last kept position (59 kept + the ellipsis = 60).
+    const title = `${"x".repeat(58)}|tail`;
+    const stdout = ["7zZy1QTvokM", title, "Austin Marchese", "@austin.marchese"].join(PREFLIGHT_FIELD_SEP);
+    const spawn = () => Promise.resolve(spawnResult({ success: true, code: 0, stdout }));
+    const result = await preflightVideo(DRIVER_WATCH_URL, { spawn, env });
+    expect(result.displayTitle).toBe(`${"x".repeat(58)}\\|…`);
+  });
+
+  it("enqueues a just-ended live stream as a valid link and records its live_status", async () => {
+    const stdout = [
+      "7zZy1QTvokM",
+      "Stream",
+      "Chan",
+      "@chan",
+      "D",
+      "NA",
+      "4",
+      "10",
+      "post_live",
+    ].join(PREFLIGHT_FIELD_SEP);
+    const spawn = () => Promise.resolve(spawnResult({ success: true, code: 0, stdout }));
+    const result = await preflightVideo(DRIVER_WATCH_URL, { spawn, env });
+    expect(result.action).toBe("enqueue");
+    expect(result.status).toBe("ok");
+    expect(result.liveStatus).toBe("post_live");
+    expect(result.note).toContain("captions may follow post-stream processing");
+  });
+
+  it("leaves the note empty for a video that is not live-derived", async () => {
+    const stdout = ["7zZy1QTvokM", "Talk", "Chan", "@chan", "D", "NA", "4", "10", "not_live"].join(
+      PREFLIGHT_FIELD_SEP,
+    );
+    const spawn = () => Promise.resolve(spawnResult({ success: true, code: 0, stdout }));
+    const result = await preflightVideo(DRIVER_WATCH_URL, { spawn, env });
+    expect(result.liveStatus).toBe("not_live");
+    expect(result.note).toBe("");
+  });
+
   it("rejects a permanently unavailable video", async () => {
     const spawn = () =>
       Promise.resolve(spawnResult({ stderr: "ERROR: [youtube] zzz: Video unavailable" }));
@@ -207,5 +252,82 @@ describe("preflightVideo", () => {
     expect(result.status).toBe("transient");
     expect(result.action).toBe("enqueue");
     expect(result.note).toContain("preflight");
+  });
+
+  describe("queueKey (the QUEUE.md video-id cell)", () => {
+    const stdout = ["7zZy1QTvokM", "Talk", "Chan", "@chan"].join(PREFLIGHT_FIELD_SEP);
+    const spawn = () => Promise.resolve(spawnResult({ success: true, code: 0, stdout }));
+
+    it("is the plain video id for an unranged add", async () => {
+      const result = await preflightVideo(DRIVER_WATCH_URL, { spawn, env });
+      expect(result.queueKey).toBe("7zZy1QTvokM");
+    });
+
+    it("gives two ranges of one video two different cells", async () => {
+      const first = await preflightVideo(
+        DRIVER_WATCH_URL,
+        { spawn, env },
+        { timeRange: { fromSec: 3600, toSec: 4800 } },
+      );
+      const second = await preflightVideo(
+        DRIVER_WATCH_URL,
+        { spawn, env },
+        { timeRange: { fromSec: 4800, toSec: null } },
+      );
+      expect(first.queueKey).toBe("7zZy1QTvokM-r3600-4800");
+      expect(second.queueKey).toBe("7zZy1QTvokM-r4800-end");
+      expect(first.videoId).toBe("7zZy1QTvokM");
+    });
+
+    it("carries the range suffix on a transient row too", async () => {
+      const blocked = () =>
+        Promise.resolve(spawnResult({ stderr: "Sign in to confirm you're not a bot" }));
+      const result = await preflightVideo(
+        DRIVER_WATCH_URL,
+        { spawn: blocked, env },
+        { timeRange: { fromSec: 0, toSec: 1200 } },
+      );
+      expect(result.action).toBe("enqueue");
+      expect(result.queueKey).toBe("7zZy1QTvokM-r0-1200");
+    });
+
+    it("rejects a ranged add for a source without the timeRange capability, before probing", async () => {
+      const refuse = () => Promise.reject(new Error("spawn must not run for an unsupported range"));
+      const result = await preflightVideo(
+        "https://x.com/i/web/status/1720000000000000000",
+        { spawn: refuse, env },
+        { timeRange: { fromSec: 60, toSec: 120 } },
+      );
+      expect(result.action).toBe("reject");
+      expect(result.status).toBe("invalid-url");
+      expect(result.queueKey).toBeNull();
+    });
+  });
+});
+
+describe("parsePreflightArgs", () => {
+  it("reads URLs with no range", () => {
+    expect(parsePreflightArgs([DRIVER_WATCH_URL, "https://youtu.be/abc"])).toEqual({
+      ok: true,
+      urls: [DRIVER_WATCH_URL, "https://youtu.be/abc"],
+      timeRange: null,
+    });
+  });
+
+  it("takes --from/--to and their values out of the URL list", () => {
+    expect(parsePreflightArgs([DRIVER_WATCH_URL, "--from", "1:00:00", "--to", "1:20:00"])).toEqual({
+      ok: true,
+      urls: [DRIVER_WATCH_URL],
+      timeRange: { fromSec: 3600, toSec: 4800 },
+    });
+  });
+
+  it("refuses a range over more than one URL", () => {
+    const parsed = parsePreflightArgs([DRIVER_WATCH_URL, "https://youtu.be/abc", "--from", "10"]);
+    expect(parsed.ok).toBe(false);
+  });
+
+  it("refuses a malformed time", () => {
+    expect(parsePreflightArgs([DRIVER_WATCH_URL, "--to", "soon"]).ok).toBe(false);
   });
 });

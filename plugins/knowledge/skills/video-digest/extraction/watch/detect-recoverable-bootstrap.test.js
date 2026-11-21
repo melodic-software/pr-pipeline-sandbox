@@ -126,6 +126,18 @@ describe("detectRecoverableBootstrap", () => {
     expect(detectRecoverableBootstrap(tmp).recoverable).toBe(true);
   });
 
+  it("offers recovery for a ranged slice, which re-applies the recorded offset", () => {
+    const { framesDir, sheetsDir } = makeFrameAndSheetDirs();
+    const tmp = makeSliceDir({
+      phases: {},
+      timeRange: { fromSec: 3600, toSec: 4800, offsetSec: 3600, cut: "keyframe" },
+      tempSession: { workDir: makeWorkDir("captions.vtt"), framesDir, contactSheetsDir: sheetsDir },
+    });
+
+    expect(detectRecoverableBootstrap(tmp).recoverable).toBe(true);
+    expect(formatRecoverCommand(tmp)).toContain("recover-watch-bootstrap.js");
+  });
+
   it("is not recoverable when workDir is gone even if frames+sheets survive", () => {
     const { framesDir, sheetsDir } = makeFrameAndSheetDirs();
     const tmp = makeSliceDir({

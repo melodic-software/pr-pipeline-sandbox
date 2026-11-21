@@ -15,12 +15,16 @@ import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/termin
 
 import { detectContentClass, outcomeFloors } from "../evals/check-watch-outcomes.js";
 import { LANES, lanePath } from "../lib/slice-lanes.js";
+import { resolveTempSession } from "../lib/temp-session-paths.js";
 import { readJsonFile } from "../lib/watch-frame-index.js";
-import { parseSessionsFromClaimInventory } from "../lib/watch-slice-sessions.js";
+import {
+  parseSessionsFromClaimInventory,
+  sessionsInTimeRange,
+} from "../lib/watch-slice-sessions.js";
+import { isHighVolume } from "../watching/frame-budget.js";
 import { watchStatePath } from "./watch-state.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// Bundled template — resolve relative to this script under the plugin (cache-isolated).
 const TEMPLATE_PATH = path.resolve(__dirname, "../../templates/watch-checklist.md");
 
 /**
@@ -78,7 +82,7 @@ export function buildFloorsLine(contentClass, durationHours, sessionCount, durat
     durationSec,
     typeof sessionCount === "number" ? sessionCount : 1,
   );
-  const sheetTriagePct = floorSheetTriagePct(contentClass, durationSec, sessionCount);
+  const sheetTriagePct = Math.round(floors.minSheetTriageRatio * 100);
   const densificationPct = Math.round(floors.minDensificationRatio * 100);
   return (
     `**Floors for this slice** (from \`vision-plan\` class \`${contentClass}\`, ${durationHours}h, ` +
@@ -116,34 +120,45 @@ function stampCriteriaHashes(rendered) {
     .join("\n");
 }
 
+const GENERATED_EVIDENCE_PREFIX = "  - evidence (generated): ";
+
 /**
- * Carry an existing checklist's ticks (matched by row id), the indented
+ * Carry an existing checklist's ticks (matched by row id), the agent-written
  * evidence lines under each ticked row, and its Resume notes section into a
- * freshly rendered one, so a regenerate never erases evidence. The row text
- * itself is regenerated. A tick whose stored criteria hash no longer matches the
- * regenerated row is dropped with its evidence and reported. A tick saved before
- * hashes existed has none to compare, so it is kept and gets the current hash.
+ * freshly rendered one, so a regenerate never erases agent evidence. Generated
+ * evidence lines are not carried: `applyGeneratedTicks` rewrites them from the
+ * current `watch.json` and `selection.json`, and a tick that rested only on
+ * generated evidence is carried only if the generator still proves it. The row
+ * text itself is regenerated. A tick whose stored criteria hash no longer matches
+ * the regenerated row is dropped with its evidence and reported. A tick saved
+ * before hashes existed has none to compare, so it is kept and gets the current hash.
  *
  * @param {string} rendered freshly rendered checklist, rows already hash-stamped
  * @param {string} previous checklist already on disk
  * @returns {{ text: string, dropped: string[] }} merged checklist and the row ids whose ticks were dropped
  */
 export function carryOverProgress(rendered, previous) {
-  /** @type {Map<string, { hash: string | null, evidence: string[] }>} ticked row id -> stored hash and indented evidence lines under it */
+  /**
+   * @typedef {{ hash: string | null, evidence: string[], generated: boolean }} TickedRow
+   *   stored hash, agent evidence lines, whether generated evidence stood under the row
+   */
+  /** @type {Map<string, TickedRow>} */
   const ticked = new Map();
-  /** @type {string[] | null} */
-  let evidence = null;
+  /** @type {TickedRow | null} */
+  let current = null;
   for (const line of previous.split("\n")) {
     const match = ROW_ID.exec(line);
     if (match) {
-      evidence = match[1] === " " ? null : [];
-      if (evidence) {
-        ticked.set(match[2], { hash: CRITERIA_HASH.exec(line)?.[1] ?? null, evidence });
-      }
-    } else if (evidence && /^\s+\S/.test(line)) {
-      evidence.push(line);
+      current =
+        match[1] === " "
+          ? null
+          : { hash: CRITERIA_HASH.exec(line)?.[1] ?? null, evidence: [], generated: false };
+      if (current) ticked.set(match[2], current);
+    } else if (current && /^\s+\S/.test(line)) {
+      if (line.startsWith(GENERATED_EVIDENCE_PREFIX)) current.generated = true;
+      else current.evidence.push(line);
     } else {
-      evidence = null;
+      current = null;
     }
   }
   /** @type {string[]} */
@@ -153,7 +168,7 @@ export function carryOverProgress(rendered, previous) {
     .flatMap((line) => {
       const match = ROW_ID.exec(line);
       const kept = match && ticked.get(match[2]);
-      if (!match || !kept) return [line];
+      if (!match || !kept || (kept.generated && kept.evidence.length === 0)) return [line];
       if (kept.hash !== null && kept.hash !== CRITERIA_HASH.exec(line)?.[1]) {
         dropped.push(match[2]);
         return [line];
@@ -171,9 +186,141 @@ export function carryOverProgress(rendered, previous) {
 }
 
 /**
+ * @param {string} fact what the generator read
+ * @returns {string} indented evidence line written under a generated tick
+ */
+function generatedEvidence(fact) {
+  return `${GENERATED_EVIDENCE_PREFIX}${fact}`;
+}
+
+const COMPANION_ROWS = ["0b.1", "0b.2", "0b.3", "0b.4", "0b.5"];
+const COMPANION_NA_EVIDENCE = generatedEvidence("n/a, no `source/companion-sources.md` exists");
+
+/**
+ * Tick each listed row and write its generated evidence line directly under it, above any
+ * agent-written evidence a ticked row already carries. The text holds no generated evidence
+ * lines yet: a fresh render has none and `carryOverProgress` does not carry them.
+ *
+ * @param {string} text checklist
+ * @param {Map<string, string>} ticks row id -> evidence line
+ * @returns {string}
+ */
+export function applyGeneratedTicks(text, ticks) {
+  return text
+    .split("\n")
+    .flatMap((line) => {
+      const match = ROW_ID.exec(line);
+      const evidence = match && ticks.get(match[2]);
+      return evidence ? [line.replace("- [ ]", "- [x]"), evidence] : [line];
+    })
+    .join("\n");
+}
+
+/**
+ * The rows the generator ticks from facts it reads, each with the evidence line naming the
+ * fact. Rows 0.1-0.4 and 1.2 rest on facts it cannot read and are never listed.
+ *
+ * @param {object} facts
+ * @param {string} facts.absSlice
+ * @param {any} facts.watch parsed watch.json
+ * @param {any} facts.selection parsed selection.json, or null when absent
+ * @param {boolean | undefined} facts.recordedHighVolume highVolume as recorded, undefined when unrecorded
+ * @param {number} facts.contactSheetCount
+ * @param {number} facts.densificationWindowCount
+ * @param {number} facts.durationSec
+ * @returns {Map<string, string>} row id -> evidence line
+ */
+export function generatedTicks({
+  absSlice,
+  watch,
+  selection,
+  recordedHighVolume,
+  contactSheetCount,
+  densificationWindowCount,
+  durationSec,
+}) {
+  /** @type {Map<string, string>} */
+  const ticks = new Map();
+
+  if (!fs.existsSync(lanePath(absSlice, LANES.source, "companion-sources.md"))) {
+    for (const row of COMPANION_ROWS) ticks.set(row, COMPANION_NA_EVIDENCE);
+  }
+
+  ticks.set("1.1", generatedEvidence("`run-state/watch.json` present"));
+
+  const metrics = watch.phases?.watching?.metrics ?? {};
+  const frameCount = selection?.selectedFrames?.length;
+  const sheets = selection?.contactSheets?.length;
+  const windows = selection?.densificationWindows?.length;
+  if (
+    [frameCount, sheets, windows].every((count) => count !== undefined) &&
+    frameCount === metrics.frameCount &&
+    sheets === metrics.contactSheetCount &&
+    windows === metrics.densificationWindows
+  ) {
+    ticks.set(
+      "1.3",
+      generatedEvidence(
+        `\`key-frames/selection.json\` matches \`watch.json\` watching metrics: ${frameCount} frames, ${sheets} contact sheets, ${windows} densification windows`,
+      ),
+    );
+  }
+
+  const { contactSheetsDir, framesDir } = resolveTempSession(watch.tempSession ?? {});
+  if ([contactSheetsDir, framesDir].every((dir) => dir && fs.existsSync(dir))) {
+    ticks.set(
+      "1.4",
+      generatedEvidence(
+        "`contactSheetsDir` and `framesDir` from `watch.json` `tempSession` exist on disk",
+      ),
+    );
+  }
+
+  const candidateCount = selection?.candidateCount ?? 0;
+  const targetMinFrames = selection?.targetMinFrames ?? 0;
+  const ruleHighVolume = isHighVolume({
+    candidateCount,
+    targetMinFrames,
+    contactSheetCount,
+    durationSec,
+    densificationWindowCount,
+  });
+  if (selection && recordedHighVolume === ruleHighVolume) {
+    const hours = (durationSec / 3600).toFixed(1);
+    ticks.set(
+      "1.5",
+      generatedEvidence(
+        `highVolume=${recordedHighVolume} matches \`isHighVolume\` for ${contactSheetCount} sheets, ${hours}h, ${densificationWindowCount} densification windows, ${candidateCount} candidates against targetMinFrames ${targetMinFrames}`,
+      ),
+    );
+  }
+
+  const cliPhases = ["acquire", "transcript", "watching", "harvest"];
+  if (cliPhases.every((phase) => watch.phases?.[phase]?.completedAt)) {
+    ticks.set(
+      "1.6",
+      generatedEvidence("`watch.json` phases acquire, transcript, watching and harvest complete"),
+    );
+  }
+
+  return ticks;
+}
+
+/**
+ * @param {string} filePath
+ * @returns {string} the file's text, or "" when it does not exist
+ */
+function readTextIfExists(filePath) {
+  return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+}
+
+/**
  * Write the checklist. With `force`, an existing checklist is regenerated (floors,
- * signals, per-sheet rows) and keeps its ticks and Resume notes, except ticks on rows
- * whose criteria changed: those are dropped and listed on stdout.
+ * signals, per-sheet rows) and keeps its agent-written ticks, evidence and Resume notes,
+ * except ticks on rows whose criteria changed: those are dropped and listed on stderr.
+ * Generated evidence lines are rewritten: each run ticks the rows `generatedTicks` proves
+ * now, with fresh evidence lines, and a row ticked only by an earlier generated line is
+ * unticked once the generator no longer proves it.
  *
  * @param {string} sliceDir
  * @param {{ force?: boolean }} [options]
@@ -203,31 +350,27 @@ export function initWatchChecklist(sliceDir, { force = false } = {}) {
 
   const watch = readJsonFile(watchPath);
   const selection = fs.existsSync(selectionPath) ? readJsonFile(selectionPath) : null;
+  const metrics = watch.phases?.watching?.metrics ?? {};
 
-  const durationSec = selection?.durationSec ?? watch.phases?.watching?.metrics?.durationSec ?? 0;
+  const durationSec = selection?.durationSec ?? metrics.durationSec ?? 0;
   const contactSheetCount =
     selection?.contactSheets?.length ??
     watch.artifactPaths?.contactSheetCount ??
-    watch.phases?.watching?.metrics?.contactSheetCount ??
+    metrics.contactSheetCount ??
     0;
   const densificationWindowCount =
-    selection?.densificationWindows?.length ??
-    watch.phases?.watching?.metrics?.densificationWindows ??
-    0;
-  const highVolume =
-    selection?.frameSelection?.highVolume ?? watch.phases?.watching?.metrics?.highVolume ?? false;
+    selection?.densificationWindows?.length ?? metrics.densificationWindows ?? 0;
+  const recordedHighVolume =
+    selection?.highVolume ?? selection?.frameSelection?.highVolume ?? metrics.highVolume;
+  const highVolume = recordedHighVolume ?? false;
 
-  const visionPlanBody = fs.existsSync(visionPlanPath)
-    ? fs.readFileSync(visionPlanPath, "utf8")
-    : "";
+  const visionPlanBody = readTextIfExists(visionPlanPath);
   const visionPlanPresent = visionPlanBody.length > 0;
   const contentClass = visionPlanPresent ? detectContentClass(visionPlanBody) : "pending";
 
-  const claimBody = fs.existsSync(claimInventoryPath)
-    ? fs.readFileSync(claimInventoryPath, "utf8")
-    : "";
+  const claimBody = readTextIfExists(claimInventoryPath);
   const sessions = claimBody ? parseSessionsFromClaimInventory(claimBody) : [];
-  const sessionCount = sessions.length || "TBD";
+  const sessionCount = sessionsInTimeRange(sessions, watch.timeRange).length || "TBD";
 
   const videoSlug = path.basename(absSlice);
   const durationHours = (durationSec / 3600).toFixed(1);
@@ -272,9 +415,21 @@ export function initWatchChecklist(sliceDir, { force = false } = {}) {
     const carried = carryOverProgress(template, fs.readFileSync(outPath, "utf8"));
     template = carried.text;
     if (carried.dropped.length > 0) {
-      writeStdout(`Dropped ticks (criteria changed since ticked): ${carried.dropped.join(", ")}`);
+      writeStderr(`Dropped ticks (criteria changed since ticked): ${carried.dropped.join(", ")}`);
     }
   }
+  template = applyGeneratedTicks(
+    template,
+    generatedTicks({
+      absSlice,
+      watch,
+      selection,
+      recordedHighVolume,
+      contactSheetCount,
+      densificationWindowCount,
+      durationSec,
+    }),
+  );
 
   fs.mkdirSync(lanePath(absSlice, LANES.runState), { recursive: true });
   fs.writeFileSync(outPath, template, "utf8");

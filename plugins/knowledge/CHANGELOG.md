@@ -4,6 +4,679 @@ All notable changes to the `knowledge` plugin are recorded here. The `version` i
 `.claude-plugin/plugin.json` is the delivery vehicle. A consumer receives a change
 only after that version increases.
 
+## [3.5.1] - 2026-11-20
+
+### Changed
+
+- Skill bodies point at upstream sources instead of restating them, and state their own reasons. `course-digest` points at `video-digest`'s install fallbacks for ImageMagick 7, not a distro version fact, and records its bundled-Chromium choice with a pointer to Chrome's remote-debugging post. `distill` states why each reference file holds one concept. `docpage-digest` states why escapes must land byte-exact and why Edit and Write are ruled out for them, without citing an unnamed past run, and its Monitor-wait step drops the description of the Bash tool and says why a foreground `sleep` is ruled out, with a pointer to the Monitor tool docs. `video-digest`'s X source spoke points at yt-dlp's `url`-result handling instead of describing it.
+
+## [3.5.0] - 2026-11-19
+
+### Added
+
+- `private_record_root` names the private checkout `absorb-upstream` sends a record to when its source is not public and the destination is. Unset, the skill asks for that path; it no longer names one organization's private repository.
+
+## [3.4.0] - 2026-11-19
+
+### Changed
+
+- **`/knowledge:course-digest` hands rule candidates to `/corrections:codify`** (#17175). Phase 5 and the `action-items.md` template no longer send each course rule to a named instruction file. The "CLAUDE.md / .claude/rules/ candidates" section is now "Rule candidates", and each entry names a `/corrections:codify "<the rule>"` call, which the digest runs only when asked. When codify is not available, the entry also proposes the strongest mechanism that can decide the rule and says the proposal is unproven.
+
+## [3.3.6] - 2026-11-18
+
+### Changed
+
+- **Bump playwright from 1.65.0 to 1.65.1 in /plugins/knowledge/skills/course-digest/extraction in the npm-minor-patch group** (#17115).
+  - `playwright` 1.65.0→1.65.1
+
+## [3.3.5] - 2026-11-18
+
+### Changed
+
+- `course-digest` drops five ecosystem specifics from the pages a model reads. The ZIP-only code analysis step detects project and build files, frameworks and package dependencies without naming .NET files or NuGet. The freshness check drops the NuGet example and its NuGet MCP tool. The storage schema loses its C# and .NET slug examples, and its `course.json` and transcript examples use a course with no language in its title. Frame classification no longer lists C# for the `code` category. The multimodal evaluation no longer names Whisper for audio re-transcription.
+
+### Fixed
+
+- `/knowledge:video-digest` watch checks free space in the OS temp directory before it downloads media. It asks yt-dlp for the size of the formats it will select and exits 1 before any download when the temp directory has less than twice that free, naming the directory, the space needed and the space free. When no size is known, it warns and continues. The skill's gotchas describe setting `TMPDIR` for the whole session to stage on a larger disk.
+
+## [3.3.4] - 2026-11-17
+
+### Changed
+
+- The bundled prerequisites checker's `when` also counts a config git tracks anywhere in the project directory's repository, from one `git ls-files` per run, so a repository whose only config sits in a subdirectory gets its probe line. A `config_any` item may now be a path from the repository root with `*`, `?` and `**` wildcards; `..`, `.` and absolute paths are rejected. When git is missing, fails or runs past two seconds, the entry counts as needed.
+
+## [3.3.3] - 2026-11-17
+
+### Changed
+
+- The bundled prerequisites checker honors an entry's optional `when` (`config_any`: file names, or a file and a pattern its text must match): the SessionStart probe stays silent about the entry unless one of those configs sits in the project directory or above it, and `check` reports it INFO there.
+
+## [3.3.2] - 2026-11-16
+
+### Changed
+
+- The bundled prerequisites stubs' node notice names the plugin whose hook printed it, and names a check skill of another plugin with the condition that that plugin is enabled.
+
+## [3.3.1] - 2026-11-16
+
+### Changed
+
+- Optional calls to another plugin's skills are gated on that plugin being enabled, so a plugin that is installed but switched off takes the documented fallback, per the seam-phrasing contract. `/knowledge:course-digest` gates the browser-tool rubric `/testing:run-e2e` owns and names its fallback.
+
+## [3.3.0] - 2026-11-16
+
+### Changed
+
+`/knowledge:video-digest watch --from/--to`: a ranged slice's key gets the range as a suffix,
+`-r<fromSec>-<toSec>` (`end` for an open `--to`), so each range of one video is its own slice
+instead of sharing the whole video's directory. `run-watch.js --recover` now recovers a ranged
+slice: it plans in the ranged media's time and adds the recorded range start back, where it used
+to refuse. `resume` names the range in the continuation prompt. Given a video id, or a ranged
+`<id>-r<from>-<to>` key, instead of a slug, it resumes the one slice that matches, or lists the
+slugs when a bare id matches several. `QUEUE.md` dedupes on video id plus range: a ranged row's
+`video-id` cell carries the same suffix, and `watch <n>` passes it back as `--from`/`--to`. A
+ranged slice made before this release keeps its unsuffixed slug; resume or recover it by that
+slug, since re-running the same range writes a new suffixed slice.
+
+## [3.2.1] - 2026-11-15
+
+### Changed
+
+- `course-digest` invokes `/discovery:explore` and `/discovery:research` before integrating an action item when each is among the available skills, not when the `discovery` plugin is merely installed, so a plugin that is installed but disabled takes the stated fallback.
+
+## [3.2.0] - 2026-11-15
+
+### Changed
+
+`/knowledge:video-digest watch --from/--to`: the transcript keeps only the caption cues that overlap
+the range, in full-video time, and watching gets the same cut. A ranged run of a live-derived video
+with no captions skips the caption wait when ASR is detected, so the `asr` rung transcribes the
+ranged media; the acquire phase's `captionWait` note in `watch.json` records the skip. Without ASR,
+or with an explicit caption `--transcript-strategy`, the wait holds as before.
+
+### Fixed
+
+- `video-digest`: a ranged watch (`--from`/`--to`) now grades its session floors on the range alone. `check-watch-outcomes.js` and the floors line `init-watch-checklist.js` writes count only the claim-inventory sessions that overlap `watch.json` `timeRange`, and a ranged slice with no overlapping session fails both session gates with a message that names `watch.json` `timeRange` as the cause. A new test shows that a ranged run's gap-fill frames all land inside the range in full-video time.
+
+## [3.1.6] - 2026-11-15
+
+### Changed
+
+- Remove history, provenance and migration-relative wording and as-of dates on plain pointers from skill and reference text, lower-case emphasis markers, and correct stale facts.
+
+## [3.1.5] - 2026-11-15
+
+### Changed
+
+- Restore the earlier skill wording a prompt audit cut without eval evidence, pending eval evidence of no loss.
+
+## [3.1.4] - 2026-11-15
+
+### Changed
+
+- The plugin reconfiguration reference opening is reworded: setup skills cite it rather than restate it, and its version record lives only there.
+
+## [3.1.3] - 2026-11-15
+
+### Changed
+
+- Skill instructions for course-digest, distill, docpage-digest, map-corpus and video-digest use
+  plain emphasis instead of capital letters, and drop notes about how a rule came about.
+- Corrected facts the instructions had wrong: the screenshot file names and folders the
+  extractor writes, the referer header it sends, where key-frame images live, and the claim-inventory
+  phase number. Version-dependent tool facts (Chrome remote debugging, ffmpeg `-ss` and its
+  `whisper` filter, the plugin variables) now point at their upstream pages.
+
+## [3.1.2] - 2026-11-14
+
+### Changed
+
+- The shipped copy of the plugin-reconfiguration convention, `reference/plugin-reconfiguration.md`, now says the install `--config` rerun takes the scope `claude plugin list` reports for the plugin, with a `project` or `local` rerun run from the project that install lives in, and passes `user` only when the working directory is the home directory and the list labels the plugin both `user` and `project`.
+
+## [3.1.1] - 2026-11-14
+
+### Fixed
+
+- The `dd-standard-dispatches-verifier-arms` eval case is tagged `no-network`. Its fixture URL is a placeholder the eval sandbox cannot reach, so verifier A's live re-fetch is always denied; without the tag the validity gate read every run INVALID.
+
+## [3.1.0] - 2026-11-14
+
+### Added
+
+- `video-digest` `watch <url> --from <h:mm:ss> --to <h:mm:ss>` (either bound optional, YouTube only) downloads only that range of the video through yt-dlp `--download-sections`. The slice keeps every stamp in full-video time: frame times, densification windows, timeline entries and ASR cues get the range's start added. `watch.json` `timeRange` records the range and the error bound from the keyframe-aligned cut, which also widens each timed frame's `timestampErrorSec`. The slice `README.md` names the range.
+
+## [3.0.2] - 2026-11-14
+
+### Changed
+
+- The verification level reader now reads the team file through the shared default-branch reader, `lib/default-branch-file.sh`, which this plugin now carries; levels and messages are unchanged.
+
+## [3.0.1] - 2026-11-14
+
+### Changed
+
+- The shipped copy of the plugin-reconfiguration convention, `reference/plugin-reconfiguration.md`, now opens its routes section by saying a reply prints the preferred `claude plugin configure` command in full first and the install `--config` fallback after it, whatever the working directory. Its scope caveat now says `claude plugin configure` has no scope flag and finds only an install visible from the working directory.
+
+## [3.0.0] - 2026-11-13
+
+### Changed
+
+- **Breaking:** `/knowledge:docpage-digest` now reads the `verification` level on the single-page path. Under the default `light` (and `off`) Phase 4 dispatches neither verifier arm: the pin and the standing gates still run, Phase 4 is ticked with `verification: skipped (<level>)`, and the checklist and handoff carry `unverified: verification: skipped (<level>)`. Set `verification: standard` (or `verification_skills.docpage-digest`) in `<home>/knowledge.yaml` on the default branch to keep both arms. The batch workflow still runs both arms at every level.
+- The map-corpus inventory format no longer names a verifier for rationale quality; none runs.
+
+## [2.0.0] - 2026-11-13
+
+### Changed
+
+- **Breaking:** the `verification` level now defaults to `light` when the default branch sets no `verification` key or cannot be read: verifier dispatches are skipped and the skip line is written. An invalid value or a team file that does not parse still resolves `standard`, naming the error. Set `verification: standard` (or `strict`), or `verification_skills.<skill>`, in the team file on the default branch to raise it.
+
+## [1.4.13] - 2026-11-13
+
+### Changed
+
+- Corrected in place: the released entries [0.9.5] now name the rate-limit windows plugin by its current name, `rate-limits`.
+
+## [1.4.12] - 2026-11-13
+
+### Changed
+
+- Repaired the stale vtt-parser path in the course-digest Teachable adapter reference to point at the vendored module.
+
+## [1.4.11] - 2026-11-13
+
+### Changed
+
+- The vendored prerequisites checker's usage and schema errors give `EXAMPLE_ENABLED` as the sample option name, one that names no plugin.
+
+## [1.4.10] - 2026-11-13
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [1.4.9] - 2026-11-12
+
+### Changed
+
+- Internal restructuring, no behavior change.
+
+## [1.4.8] - 2026-11-12
+
+### Fixed
+
+- course-digest: the Hotmart player frame is now chosen by an exact hostname match on the frame URL, not a substring match, and a frame whose URL does not parse is skipped.
+- video-digestion: reading frame times from ffmpeg `showinfo` output now runs in linear time on long stderr lines.
+
+## [1.4.7] - 2026-11-12
+
+### Changed
+
+- Pointer records no longer carry an as-of date or recheck trigger; stored values keep theirs.
+
+### Fixed
+
+- `/knowledge:video-digest` sets the default maximum gap between sampled frames by video length:
+  5 s up to 90 s, 6 s up to 5 minutes, then growing with length so gap fill stays near 80 frames,
+  up to 60 s from 80 minutes. Demo-heavy videos no longer miss screens shown between scene cuts;
+  `--max-frame-gap-sec` still overrides it.
+- Watch checklist row 1.5 states the `highVolume` rule the pipeline applies, including the
+  candidate-count condition, and its generated tick checks that condition too.
+- `init-watch-checklist.js --force` and a `run-watch.js` re-run rewrite the generated evidence
+  lines from the new run and keep agent-written ticks and evidence; a criteria-change notice goes
+  to stderr.
+
+- video-digest preflight escapes backslashes in queue table cells and caps a title before escaping it, so a title with a backslash no longer breaks the queue row.
+
+## [1.4.6] - 2026-11-12
+
+### Changed
+
+- Pointer records no longer carry an as-of date or recheck trigger; stored values keep theirs.
+
+## [1.4.5] - 2026-11-11
+
+### Changed
+
+- The README options reference lists its upstream documentation as pointers only, with no as-of date or recheck trigger.
+
+## [1.4.4] - 2026-11-11
+
+### Changed
+
+- The setup skill's reconfiguration guidance keeps its decisions (reconfigure through the native configure flow, never uninstall to reconfigure, recheck in a fresh session) and now points at the plugin-reconfiguration convention's "The routes" and "Caveats" sections and the plugin CLI reference's `plugin configure` section instead of restating the headless command, its version floor and failure signals, and drops any claim that option values are fixed at session start or skill load, which the docs do not state.
+- Eval cases that graded the removed reconfiguration wording now grade the decisions: the native configure route, the option key and value, a pointer at the convention, no uninstall, and the fresh-session recheck.
+- The plugin now ships a generated copy of the plugin-reconfiguration convention at `reference/plugin-reconfiguration.md`, and its skills link that copy by relative path, so an agent without network access can read the routes and caveats the skills point at.
+- The setup skill tells the agent to read the convention's routes and caveats sections and print what they give (the fallback route, its behavior on an already-installed plugin and the scope to pass), leaving out the verified-version record, rather than only naming the sections.
+
+## [1.4.3] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- **Bump the npm-minor-patch group in /plugins/knowledge/skills/course-digest/extraction with 2 updates** (#15332).
+  - `playwright` 1.64.1→1.65.0
+  - `vitest` 5.0.5→5.1.0
+
+## [1.4.2] - 2026-11-11
+
+### Changed
+
+- **build(deps-dev): Bump vitest from 5.0.5 to 5.1.0 in /plugins/knowledge/skills/video-digest/extraction in the npm-minor-patch group** (#15331).
+  - `vitest` 5.0.5→5.1.0
+
+## [1.4.1] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [1.4.0] - 2026-11-11
+
+### Added
+
+- `video-digest` now waits for captions on a YouTube live stream that has not had them published yet. Before, it stopped or digested without captions. Queue rows move to a new `awaiting_captions` status. They are re-checked every 30 minutes for at most 12 hours. After that the digest uses ASR or records a `transcriptDegradation`. `transcript` and `watch` exit 3 with `captions pending, next check at <time>`.
+
+## [1.3.16] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+## [1.3.15] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [1.3.14] - 2026-11-10
+
+### Fixed
+
+- video-digest auto-caption transcripts no longer repeat a one- or two-word line that a rolling caption carries into its next cue
+
+## [1.3.13] - 2026-11-10
+
+### Changed
+
+- Skill and spoke text that restated upstream behavior (where option values are kept, nested-reference reading, `${user_config.*}` substitution, the `shell: bash` failure mode, the `fable` alias, the yt-dlp refusal string, per-call effort routes) now states our decision and points at the live upstream section or the code constant instead. The map-corpus effort-tiers citation now uses the published URL, and the video-digest companion step and checklist row name the fetch-route rungs instead of WebFetch. No behavior change.
+
+## [1.3.12] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [1.3.11] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [1.3.10] - 2026-11-10
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+- Internal simplification, no behavior change.
+
+## [1.3.9] - 2026-11-10
+
+### Changed
+
+- A docpage-digest-batch comment says why `best` stays in the frontier list: it names Fable on older Claude Code releases. No behavior change.
+
+- Internal simplification, no behavior change.
+
+## [1.3.8] - 2026-11-09
+
+### Changed
+
+- The Anthropic docs queue records the "What's new in Claude Fable 5.2" page beside the Fable 5 launch page.
+
+## [1.3.7] - 2026-11-09
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [1.3.6] - 2026-11-09
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [1.3.5] - 2026-11-09
+
+### Changed
+
+- Simplified the shared HTML escape helper without changing its output.
+
+## [1.3.4] - 2026-11-09
+
+### Changed
+
+- Simplified the shared yaml-subset parser copies; behavior is unchanged.
+
+- Simplified the internals of the docs fetcher script; its behavior is unchanged.
+
+## [1.3.3] - 2026-11-09
+
+### Changed
+
+- Simplified the shared resolve-convention-home.sh, resolve-convention-pattern.sh and rewrite-guard.sh copies; behavior is unchanged.
+
+- Simplified `docs-cache.sh`: one routine now warns on a bad summary or note file, and the UTC formatter picks its format once. Outputs, exit codes and messages are unchanged.
+
+## [1.3.2] - 2026-11-06
+
+### Fixed
+
+- run distill's progress-key script and `unzip -l` as single Bash calls
+
+  The progress-key command and the EPUB entry listing each run alone, and the
+  plugin data state and EPUB cache are checked with Glob or Read, so no command
+  chains a listing of the plugin data directory with other commands.
+
+## [1.3.1] - 2026-11-06
+
+### Fixed
+
+- presence-gate discovery and x in course-digest and video-digest
+
+  course-digest's freshness check runs /discovery:explore and
+  /discovery:research when the discovery plugin is installed, else
+  explores and researches directly. video-digest's reply-chain harvest
+  runs /x:read only when the x plugin is installed, else says the
+  replies were not read.
+
+## [1.3.0] - 2026-11-06
+
+### Added
+
+- A `verification` level (`off`, `light`, `standard`, `strict`) and per-skill `verification_skills` in `<home>/knowledge.yaml`, read from the default branch by `lib/read-verification.sh`. Under `light` and `off`, `/knowledge:video-digest` dispatches no spot-check, ticks 9.4 with `verification: skipped (<level>)` and reports the slice structural complete only, never vision-complete.
+
+### Changed
+
+- `/knowledge:video-digest` checklist item 9.4, the vision fidelity spot-check, is dispatched to a fresh-context subagent instead of being run by the context that produced the slice.
+
+## [1.2.6] - 2026-11-05
+
+### Changed
+
+- `/knowledge:distill` Phase 5 no longer asks the model to re-read files that felt rushed; the cross-reference, routing and fresh-session corpus tests stay.
+
+## [1.2.5] - 2026-11-04
+
+### Changed
+
+- Prose uses the vocabulary the planning chain settled on (scope, fallback chain, personal override, the Brief), and names the file or setting it means.
+
+## [1.2.4] - 2026-11-04
+
+### Changed
+
+- The config reference now calls the config cascade's gitignored `*.local.*` layer the personal
+  override, the marketplace's name for it (#13192). Behavior is unchanged.
+
+## [1.2.3] - 2026-11-04
+
+### Fixed
+
+- `fetch-docs.sh --profile generic`: a `text/plain` answer to a URL whose path ends in `.md` is
+  read as markdown on the first request, so a host that serves `.md` files as `text/plain` no
+  longer leaves the page unread `unexpected-content-type`
+  ([#13354](https://github.com/melodic-software/claude-code-plugins/issues/13354)). A `text/plain`
+  answer for any other path is still refused.
+
+## [1.2.2] - 2026-11-04
+
+### Fixed
+
+- `/knowledge:setup` points at "Reference a saved value" for where `${user_config.*}` resolves.
+
+## [1.2.1] - 2026-11-04
+
+### Fixed
+
+- docpage-digest: the checklist's `Verification status` line starts as `unverified: not recorded`, so a batch run that stops before close cannot leave a line listing `verified`.
+
+## [1.2.0] - 2026-11-04
+
+### Added
+
+- `docpage-digest-batch` workflow ([#7369](https://github.com/melodic-software/claude-code-plugins/issues/7369)): digests several documentation pages with every Phase 3 digest agent and both Phase 4 verifier arms dispatched by the workflow script, so no agent has to spawn another and no page skips verification. `/knowledge:docpage-digest` documents it as its Batch path and `/knowledge:map-corpus` launches it for a multi-page queue. Its stages run as the new `knowledge:digest-worker` agent.
+- The workflow rejects a page URL that is not https on a public host, or that carries a quote, `$`, a backtick, whitespace or another shell metacharacter, before any agent sees it; it returns rejected and deferred pages with a reason code each and a `verification` of `unverified: not run: <code>`, which map-corpus records. The single-page path runs the same checks on the canonical URL before any shell command carries it. Verifier B runs as a same-vendor refuter, recorded degraded in its header, because `codex:codex-rescue` returns raw stdout that cannot carry a structured verdict.
+- Every agent reply passes one strict parser per stage (own properties, exact types and enums, single-line capped strings) before the script reads it. Agents supply no path, skip flag, gate name or reason text: the script derives each page's slug from the launched URL by the single-page slug guard, refuses a setup that reports another slug or a redirect (the single-page path takes that page), builds every path from that slug, holds the standing-gate set, and builds each page's `verification` from its own reason codes. A `FAIL` verdict, a high finding or a false gate on any attempt, in any reply shape, fails the page. The batch path has no resume and no correction rounds; a page whose verifiers fail ends `failed: verifier-fail` and is rerun on the single-page path.
+- The checklist gains a `Verification status` line (`verified`, `unverified: <reason>`, `failed: <reason>`), copied into the interview handoff's first line and each map-corpus `queue.json` entry. The workflow never says `verified`, because a workflow script cannot read the disk: its best state is `claimed`, with `unverified: awaiting-check` in the result and on disk.
+- `scripts/verify-batch-page.py`, which the launcher runs per page after the workflow returns, alone writes `verified`. It requires both verifier verdict files from this run with a passing verdict and no high finding, an unmoved pin taken after the run started, a pass from each standing gate it re-runs, and the checklist and handoff. It overwrites whatever status is on disk, and refuses a slice outside the work root or a symlink leaving it.
+
+## [1.1.5] - 2026-11-04
+
+### Changed
+
+- **chore(deps-dev): Bump @types/node from 26.6.5 to 26.6.6 in /plugins/knowledge/skills/course-digest/extraction in the npm-minor-patch group** (#13151).
+  - `@types/node` 26.6.5→26.6.6
+
+- **chore(deps-dev): Bump @types/node from 26.6.5 to 26.6.6 in /plugins/knowledge/skills/video-digest/extraction in the npm-minor-patch group** (#13155).
+  - `@types/node` 26.6.5→26.6.6
+
+## [1.1.4] - 2026-11-04
+
+### Fixed
+
+- Shared `fetch-docs.sh` synced where this plugin carries it ([#12945](https://github.com/melodic-software/claude-code-plugins/issues/12945)): with `--profile generic`, an x.com or twitter.com page that is X's logged-out shell (`redirect_after_login` links and no article text) is now `unread` with reason `login-wall` instead of `read`, whether fetched or served from the cache or a fixture, and is never cached; no other change to this plugin.
+
+## [1.1.3] - 2026-11-03
+
+### Changed
+
+- Upstream facts restated in the README, `distill`, `docpage-digest` and `setup` are now
+  pointers to the docs section that owns them, each with an as-of date and a recheck trigger:
+  how the Read tool handles a PDF, where a `sensitive` option is stored, when Edit and Write need
+  a prior Read, and where `${user_config.*}` resolves. The local rules stay: Read a renamed file
+  at its new path before editing it, rerun `check` in a fresh session, and keep course-platform
+  credentials in shell env vars.
+- `docpage-digest` no longer names which systems lack `sha256sum`.
+
+## [1.1.2] - 2026-11-03
+
+### Fixed
+
+- **The docs lookup removes its output directory.** The reading procedure's step 1 makes the
+  `--out` directory with `mktemp -d`; it now tells the reader to remove that directory by its
+  literal path when the lookup ends. Each lookup used to leave one `tmp.*` directory, up to
+  1.2 MB, in the OS temp folder
+  ([#9571](https://github.com/melodic-software/claude-code-plugins/issues/9571)).
+
+## [1.1.1] - 2026-11-03
+
+### Changed
+
+- `/knowledge:absorb-upstream` and its record template point at the upstream-drift convention's "What a row may describe" section for what a row may hold, the five-word test and what a **Stated** label links to, instead of restating those rules. The template keeps its What it does and Upstream problem columns (#12737).
+
+## [1.1.0] - 2026-11-03
+
+### Changed
+
+- `/knowledge:absorb-upstream` reads a repository through the GitHub REST API at the pin (the default branch head's commit) and no longer clones it, so no file of a repository source is written under a working tree or a temp directory. A symbolic link in the tree is reported as not read. A repository URL that does not read `public` stops with the local-checkout instruction, whatever the destination. A page is fetched into a new directory under `${CLAUDE_PLUGIN_DATA}` (#12709).
+
+### Removed
+
+- `vendor/repo-analysis/clone-cli.js` and its tests: nothing calls it now. `clone.js` stays for course-digest and video-digest (#12709).
+
+## [1.0.0] - 2026-11-03
+
+### Removed
+
+- The `check` skill is gone. To check this plugin's prerequisites, run `node "<plugin root>/lib/prerequisites.mjs" check "<plugin root>"`.
+
+## [0.32.2] - 2026-11-02
+
+### Changed
+
+- Hook notices name the bundled checker command; `check` is optional (#12485).
+
+## [0.32.1] - 2026-11-02
+
+### Changed
+
+- Shared `prerequisites.mjs` synced where this plugin carries it (#6633): a manifest may declare an optional `session_probe`, which opts the plugin into harness-ops' session-start probe.
+
+## [0.32.0] - 2026-11-02
+
+### Added
+
+- `/knowledge:map-corpus` can map a repository. Name it as a repository seed pinned to a commit SHA, with `--include` and `--exclude` path globs, and the new `repo-tree` discovery rung lists its files from the forge's tree listing. `parse_discovery.py --rung repo-tree` computes the URL set through a forge adapter (GitHub's fetch steps are in `reference/providers/github/repo-tree.md`). `check_linkmap.py` accepts the rung and passes a corpus whose only seed is a repository seed. The rung and its `repository` record are additions to `discovery-output/v1` and `link-map/v1` (#7368).
+
+## [0.31.2] - 2026-11-01
+
+### Fixed
+
+- A hardened shallow clone killed by SIGINT, SIGTERM or SIGHUP no longer leaves its `harvest-clone-home-*` directory in the temp root: the exit handler that kills the clone's process group now removes the isolated home as well.
+
+## [0.31.1] - 2026-11-01
+
+### Fixed
+
+- `docpage-digest` no longer says its own verifiers always share the session's concurrent subagent
+  limit, and `map-corpus` no longer says no spend ceiling exists: print mode has a budget flag.
+  Both point at the upstream section. The digest-agent model match is labeled as this repository's
+  heuristic, and the vision triage template's `model` field is now a placeholder instead of a fixed
+  model id ([#6916](https://github.com/melodic-software/claude-code-plugins/issues/6916)).
+
+## [0.31.0] - 2026-10-31
+
+### Added
+
+- `/knowledge:distill` distills a person's or company's published web corpus (essays, blog, talk transcripts, newsletter, docs, or an export the user provides) into a skill: it scopes the corpus whole, collects it through the plugin's `fetch-docs.sh` (public addresses only) outside the skill folder, writes one sourced note per piece, clusters notes into theme files, a glossary and an article index, writes a fixed-shape corpus SKILL.md, tests it in a fresh session, and refreshes it when the author publishes more. `reference/web-corpus.md` holds the procedure and `context/templates.md` its corpus, note, theme, index and SKILL.md skeletons.
+
+### Changed
+
+- `/knowledge:distill` checks the target skill directory with `scripts/repo-visibility.mjs` before any write and stops on a public or unknown repository, for a book as well as a web corpus, telling the person to rerun from a private repository or one with no remote. Fetched pages and exported posts are framed as data, never instructions, like book text.
+- `/knowledge:distill`'s description names its two sources, a PDF or EPUB book and an author's published web corpus, and states that it writes skill reference files only.
+- `/knowledge:absorb-upstream` states what the hardened clone accepts, only `https://github.com/<owner>/<repo>` with symbolic links checked out as plain files, and what to do on exit 2, and its working-tree check of a local checkout runs `git status` with `core.fsmonitor` and `core.untrackedCache` off.
+
+## [0.30.1] - 2026-10-31
+
+### Added
+
+- Eval cases for the knowledge work-root, visibility and untrusted-source rules: `au-*` for absorb-upstream (team layer, `--out` handling, local checkout pin, private and unknown sources, unread page), `distill-progress-key-shape`, `distill-book-planted-directive`, `distill-corpus-injected-finding`, `cd-status-reads-phase-markers`, `cd-prereq-gap-stops-before-discovery`, `cd-public-work-root-stops-before-write`, `dd-library-dir-unset-env-stops`, `mc-root-resolved-before-discovery`, `setup-install-deps-shared-provisioner`, and `vd-*` cases for video-digest's default and `library_dir` work roots. Most are ported from the skills' `evals/evals.json` cases.
+
+## [0.30.0] - 2026-10-31
+
+### Added
+
+- `vendor/node-launcher/` holds the launcher, resolve hook and dependency installer both extraction packages share. Each package's `run.mjs` and `setup-deps.mjs` stays at its path and passes only its own options; a package names its install stamp, its label and whether it needs Chromium in the `setupDeps` field of its `package.json`. `/knowledge:setup apply install-deps` runs the shared `setup-deps.mjs` once per package with `--package`.
+- `vendor/repo-analysis/` (0.2.0) holds the one shallow clone, hardened by default (no credential helper, no prompt, no LFS download, an isolated home, a timeout that kills the clone's process group), with an `inheritGitEnvironment` option that runs git in the user's own environment, and `clone-cli.js`, which runs the hardened clone with no install.
+- `lib/gates/` holds the failure list and the heading and code-fence recognizers the docpage-digest gates, the map-corpus gates and the map-corpus node extractor share; each caller passes the options that keep its own results.
+
+- `scripts/work-root.mjs` resolves the work root every knowledge skill writes under: the session's git top-level (the working directory outside git) joined with `library_dir`, expanding `~` and `${NAME}` / `%NAME%` and failing on an unset variable. `--progress-key` prints the distill progress key. `reference/work-root.md` states the rule once.
+
+- `scripts/repo-visibility.mjs` reports who can read a directory's repository, or a named GitHub repository: `public`, `private` or `internal` as GitHub reports it, `local` with no `.git` in the directory or any ancestor or with no remote, and `unknown` when git fails where a `.git` exists or a remote URL's visibility cannot be read, which callers treat as public. A directory reads `private` or `internal` only when every fetch and push URL of every remote does; any public URL makes it `public`. With `--commit <sha>`, a public directory reads `public` only when a public remote's tracking ref holds that commit. A directory that does not exist yet is judged by the repository it would land in.
+- `/knowledge:absorb-upstream` reads a local checkout of a GitHub repository, pinned to its HEAD commit and read through git, so a private repository is absorbed from its checkout. The hardened clone stays public-only.
+
+### Changed
+
+- `/knowledge:course-digest` clones a course's companion repository through the shared clone with `inheritGitEnvironment`, so a private course repository still clones with the user's credentials and a failure still reports git's own error text.
+- `/knowledge:absorb-upstream` clones a repository through `clone-cli.js` and reads a page through the plugin's `fetch-docs.sh` (generic profile, public addresses only), reading a page only when its manifest record says it was read.
+- The course-digest overview names Playwright as its browser automation, and the README's revisit condition for a standalone video plugin names every vendored package `video-digest` shares.
+
+- `/knowledge:docpage-digest`, `/knowledge:map-corpus`, `/knowledge:video-digest`, `/knowledge:course-digest` and `/knowledge:distill` resolve their roots through `work-root.mjs` instead of `CLAUDE_PROJECT_DIR`. In a worktree session, video-digest's default work root and distill's target skill directory and progress key are now that worktree's own; a main checkout keeps its existing progress key.
+- `/knowledge:course-digest` keeps its course layout, `courses/<platform>/<slug>/`, now under the work root; with no `library_dir` set it lands under the session's git top-level instead of the plugin data directory.
+- `/knowledge:course-digest` no longer requires Claude in Chrome: Phase 1 discovery and the adapter discovery checklist use the browser tool the `/testing:run-e2e` browser-tool rubric picks, the Playwright CLI by default.
+
+- `/knowledge:absorb-upstream` checks the source and destination visibility before reading the source, a local checkout at its pinned commit, and writes no record of a source not proven public (`private`, `internal`, `unknown`, or `local` with no remote) in a public or unknown destination: it tells the person to rerun with `--out` into a private checkout's `docs/upstream`, or from that checkout, where the full record is written. An absolute `--out` is valid when its directory reads `private`, `internal` or `local`. Its team-layer root comes from `scripts/work-root.mjs` instead of `CLAUDE_PROJECT_DIR`.
+- `/knowledge:course-digest` writes nothing, the `.work/` checklist included, unless its work root is in a private or internal repository or one with no remote. On a public or unreadable one it stops and names `library_dir` pointed at a private corpus checkout, since course material is paid content kept for personal use.
+- The Dometrain adapter notes and the adapter discovery checklist describe page reads as accessibility snapshots in the picked browser tool, not Claude in Chrome's tool vocabulary.
+
+- The book distillation skill is now `/knowledge:distill`; invoke it by that name. Its eval cases are `distill-target-name-slugified` and `distill-traversal-epub-aborts`, and its probe file is `probes/distill.json`.
+
+### Security
+
+- `/knowledge:course-digest` loads platform adapters from a static registry (`extraction/adapters/registry.js`) instead of a computed dynamic import, so a `course.json` `platform` value selects only a registered adapter and any other name, a path fragment or prototype key included, fails closed.
+
+- The hardened clone drops git config passed through the environment (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`) and points `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` at an empty file with `GIT_CONFIG_NOSYSTEM=1`, so an inherited `url.<x>.insteadOf` no longer redirects it.
+- `scripts/repo-visibility.mjs` runs git with `-C`, without any inherited `GIT_*` variable, and with global and system config at the null device, so a caller's `GIT_DIR` or `insteadOf` rule cannot make a public repository read as private.
+
+## [0.29.4] - 2026-10-30
+
+### Changed
+
+- `/knowledge:setup apply` names `claude plugin configure knowledge@<marketplace> --values-stdin` as the preferred headless way to change `library_dir`, and keeps the `claude plugin install --config` rerun as the fallback for a Claude Code release without `plugin configure`, with each route's scope rule and failure signal, per the plugin-reconfiguration convention. The apply-mismatch eval asserts both routes in that order.
+
+## [0.29.3] - 2026-10-30
+
+### Changed
+
+- The generated plugin-options block in this plugin's docs now links `docs/contracts/<name>/` instead of the old `docs/conventions/<name>/` stub.
+
+- Shared copies synced: links and paths to marketplace plugin contracts now name `docs/contracts/<name>/`, where the contracts moved from `docs/conventions/<name>/`. The old paths keep a stub with every section heading.
+
+- Shared copies synced: links and paths to marketplace plugin contracts now name `docs/contracts/<name>/`, where the contracts moved from `docs/conventions/<name>/`. The old paths keep a stub with every section heading.
+
+## [0.29.2] - 2026-10-30
+
+### Changed
+
+- Links and paths to marketplace plugin contracts now name `docs/contracts/<name>/`, where the contracts moved from `docs/conventions/<name>/`. The old paths keep a stub with every section heading.
+
+## [0.29.1] - 2026-10-29
+
+### Changed
+
+- The generated README "How to set these" block names `claude plugin configure <plugin>@<marketplace> --values-stdin` as the preferred headless route, per the plugin-reconfiguration convention, and keeps the `claude plugin install --config` rerun only as its fallback.
+
+## [0.29.0] - 2026-10-29
+
+### Added
+
+- `/knowledge:video-digest`: `init-watch-checklist.js` now ticks the Phase 1 rows the CLI already proved, and writes an evidence line under each one naming the fact it read. Row 1.1 is ticked when `watch.json` is present. Row 1.3 is ticked when `selection.json` frame, sheet and densification counts match the `watch.json` metrics. Row 1.4 is ticked when the `tempSession` directories exist on disk, 1.5 when `highVolume` matches the sheet, duration and densification rule, and 1.6 when acquire, transcript, watching and harvest are complete. When the slice has no `source/companion-sources.md`, the Phase 0b rows arrive ticked as n/a. That n/a state is recomputed on every run, so a rerun after the brief appears unticks those rows. Rows 0.1-0.4 and 1.2 stay hand-ticked.
+
+## [0.28.2] - 2026-10-27
+
+### Changed
+
+- The README's generated "How to set these" block no longer restates Claude Code CLI and settings behavior as fact. Each upstream specific is now a link to the docs section that owns it (`/plugin` in a session, what an uninstall deletes and keeps, `pluginConfigs`), and what this repository measured stays in the plugin-reconfiguration convention.
+
+## [0.28.1] - 2026-10-27
+
+### Security
+
+- Shared `prerequisites.mjs` synced: each dependency probe runs from the library's own directory, so a probed tool never starts with the user's repository as its working directory.
+
+## [0.28.0] - 2026-10-27
+
+### Added
+
+- `/knowledge:absorb-upstream` reads one outside source, a GitHub repository at a pinned commit or one web page or post, and writes a tracked `docs/upstream/` record. Each row gives what an idea does; the upstream's problem, motivation and goal in our own words, labeled Stated or Inference, with a link at the pin; our matching problem; and a take, adapt, already-have or reject disposition with the reason. The record also carries the pin marker, the recheck trigger and a license notice, holds no quoted or paraphrased upstream text, and the skill stops instead of overwriting an existing record.
+- `upstream_records_dir` in `<home>/knowledge.yaml` (default `docs/upstream`, overridden for one run by `--out`) sets where the record lands, with its schema at `schemas/knowledge.schema.json` and its contract at `reference/config.md`. `/knowledge:setup check` reports the directory and its layer, and names an invalid value.
+
+## [0.27.6] - 2026-10-26
+
+### Changed
+
+- **`docpage-digest` profile:** worked examples for four tagging readings: a pointer that states what its target covers takes a vocabulary tag, a named Agent SDK option or callback is an SDK call, a request-body field of an Anthropic-served endpoint is a request parameter, and Basis anchors come from the rendered page's ids, percent-encoded where an id keeps a typographic apostrophe.
+
+## [0.27.5] - 2026-10-25
+
+### Changed
+
+- Shared `prerequisites.mjs` synced where this plugin carries it (#9684): `detect.version` accepts an exclusive `below` bound; no other change to this plugin.
+
+## [0.27.4] - 2026-10-25
+
+### Changed
+
+- The docpage-digest Anthropic docs profile adds six tagging rules: a row splits by clause when a docs page states only one of its clauses, and a near-miss never drops `vendor-claimed`; a prescribed method no docs page states is `vendor-claimed`, while applying a documented method is `unverified-inference` only; a contradicted clause keeps `vendor-claimed` with a "contradicted by" note; a bare lever or feature word is not a request parameter; and every absence statement names the pages the run could not read.
+
 ## [0.27.3] - 2026-10-23
 
 ### Changed
@@ -2526,7 +3199,7 @@ amendment rather than decided in-run.
   silently uninstalled a separate user-scope record while the effective project/local install kept
   loading, and the reinstall landed at a scope that does not load. Both commands now carry
   `-s <scope>`, sourced from what `claude plugin list` reports for this plugin, the same fix
-  already applied to `session-flow` and `rate-limit-guard` in #1393.
+  already applied to `session-flow` and `rate-limits` in #1393.
   The recipe also now requires the reinstall to re-supply **every** key whose value should
   stay non-default, not only the key being changed: uninstalling drops the stored
   `pluginConfigs` entry, so an omitted key silently falls back to its manifest default.

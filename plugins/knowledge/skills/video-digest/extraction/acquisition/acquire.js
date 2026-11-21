@@ -19,6 +19,13 @@ import {
 import { withAcquireThrottle } from "./acquire-throttle.js";
 import { spawnFailureDetail } from "./acquire-with-retry.js";
 import { allowTranslatedSubs, buildYtDlpArgs } from "./build-yt-dlp-args.js";
+import {
+  captionsPendingMessage,
+  captionWaitEndedNote,
+  captionWaitSkippedNote,
+  decideCaptionWait,
+  liveStreamInfo,
+} from "./caption-wait.js";
 import { selectCaptionFile } from "./select-caption.js";
 import { spawnYtDlpWithAuthFallback } from "./spawn-yt-dlp-with-auth-fallback.js";
 import { parseVideoMetadata } from "./video-metadata.js";
@@ -78,6 +85,7 @@ const LEGACY_ACQUIRE_PHASE_GAP_ENV = "YOUTUBE_ACQUIRE_PHASE_GAP_SEC";
  * @property {(filePath: string) => Promise<string>} readFile
  * @property {(ms: number) => Promise<void>} [sleep]
  * @property {<T>(fn: () => Promise<T>) => Promise<T>} [withThrottle]
+ * @property {() => number} [now] - epoch ms the caption wait is judged at
  */
 
 /** @type {AcquireDeps} */
@@ -86,7 +94,26 @@ const DEFAULT_DEPS = {
   listFiles: listWorkDirFiles,
   readFile: (/** @type {string} */ filePath) => fs.readFile(filePath, "utf8"),
   sleep: sleepMs,
+  now: Date.now,
 };
+
+/**
+ * The caption-wait decision for an exhausted ladder, from info.json's live fields.
+ * No readable info.json means no wait.
+ *
+ * @param {string} metadataPath
+ * @param {(filePath: string) => Promise<string>} readFile
+ * @param {{ deadline: string|null, nowMs: number }} options
+ * @returns {Promise<import('./caption-wait.js').CaptionWaitDecision>}
+ */
+async function readCaptionWait(metadataPath, readFile, options) {
+  if (!metadataPath) return { state: "none" };
+  try {
+    return decideCaptionWait(liveStreamInfo(JSON.parse(await readFile(metadataPath))), options);
+  } catch {
+    return { state: "none" };
+  }
+}
 
 /**
  * @returns {number}
@@ -146,35 +173,25 @@ export function resolveMediaArtifacts(files, videoId) {
     files.find((filePath) => filePath.endsWith(".info.json")) ??
     files.find((filePath) => filePath.includes(videoId) && filePath.endsWith(".json")) ??
     "";
-  const videoPath =
-    files.find(
-      (filePath) =>
-        filePath.endsWith(".mp4") || filePath.endsWith(".mkv") || filePath.endsWith(".webm"),
-    ) ?? "";
+  const videoPath = files.find((filePath) => /\.(?:mp4|mkv|webm)$/.test(filePath)) ?? "";
 
   return { videoPath, captionPaths, metadataPath };
 }
 
 /**
- * @param {{
- *   spawn: AcquireDeps['spawn'],
- *   url: string,
- *   workDir: string,
- *   mode: AcquisitionMode,
- *   source: SourceAcquisitionDeclarations,
- *   sleepSubtitlesSec?: number,
- *   env?: NodeJS.ProcessEnv,
- * }} params
+ * @param {AcquireDeps} deps
+ * @param {string} url
+ * @param {string} workDir
+ * @param {{ mode: AcquisitionMode, source: SourceAcquisitionDeclarations, sleepSubtitlesSec?: number, downloadSection?: string|null }} pass
  */
-async function runYtDlpAcquire({
-  spawn,
+async function runAcquirePass(
+  deps,
   url,
   workDir,
-  mode,
-  source,
-  sleepSubtitlesSec,
-  env = process.env,
-}) {
+  { mode, source, sleepSubtitlesSec, downloadSection = null },
+) {
+  const { spawn, listFiles } = deps;
+  const env = process.env;
   const outputTemplate = path.join(workDir, "%(id)s.%(ext)s");
   const buildArgs = (authOverride = {}) =>
     buildYtDlpArgs(url, {
@@ -185,19 +202,13 @@ async function runYtDlpAcquire({
       env,
       authOverride,
       source,
+      downloadSection,
     });
-  return spawnYtDlpWithAuthFallback(spawn, buildArgs, { cwd: workDir, env, source });
-}
-
-/**
- * @param {AcquireDeps} deps
- * @param {string} url
- * @param {string} workDir
- * @param {{ mode: AcquisitionMode, source: SourceAcquisitionDeclarations, sleepSubtitlesSec?: number }} pass
- */
-async function runAcquirePass(deps, url, workDir, { mode, source, sleepSubtitlesSec }) {
-  const { spawn, listFiles } = deps;
-  const spawnResult = await runYtDlpAcquire({ spawn, url, workDir, mode, source, sleepSubtitlesSec });
+  const spawnResult = await spawnYtDlpWithAuthFallback(spawn, buildArgs, {
+    cwd: workDir,
+    env,
+    source,
+  });
   // Listed on failure too: yt-dlp stops at the first failed caption track,
   // so tracks written before it are still usable.
   const files = await listFiles(workDir);
@@ -237,12 +248,13 @@ function captionsOnlyPass(source) {
  * @param {string} workDir
  * @param {string} videoId
  * @param {SourceAcquisitionDeclarations} source
+ * @param {string|null} downloadSection - bounds the video pass; captions stay whole
  * @returns {Promise<
  *   {ok: true, artifacts: MediaArtifacts, acquireMetrics: object, captionError: string} |
  *   {ok: false, error: string, acquireMetrics: object}
  * >}
  */
-async function acquireFullStaged(deps, url, workDir, videoId, source) {
+async function acquireFullStaged(deps, url, workDir, videoId, source, downloadSection) {
   const { sleep = sleepMs } = deps;
   const videoStarted = Date.now();
 
@@ -258,7 +270,7 @@ async function acquireFullStaged(deps, url, workDir, videoId, source) {
 
   const throttle = deps.withThrottle ?? withAcquireThrottle;
   const videoPass = await throttle(() =>
-    runAcquirePass(deps, url, workDir, { mode: "video-only", source }),
+    runAcquirePass(deps, url, workDir, { mode: "video-only", source, downloadSection }),
   );
   if (!videoPass.spawnResult.success) {
     return failStaged(videoPass.detail || "yt-dlp video-only pass failed");
@@ -291,19 +303,31 @@ async function acquireFullStaged(deps, url, workDir, videoId, source) {
 
 /**
  * @param {string} url
- * @param {{workDir: string, mode?: AcquisitionMode, source?: SourceAcquisitionDeclarations, videoId?: string}} options -
+ * @param {{workDir: string, mode?: AcquisitionMode, source?: SourceAcquisitionDeclarations, videoId?: string, captionWaitDeadline?: string|null, downloadSection?: string|null, skipCaptionWait?: boolean}} options -
  *   `videoId` is the URL-claim id the adapter derived (`matchUrl`); this driver
- *   never re-derives it
+ *   never re-derives it. `captionWaitDeadline` is the deadline a held queue row
+ *   recorded, so the caption wait stays bounded across runs. `downloadSection`
+ *   (`*<from>-<to>`) bounds the media download to a time range; captions and
+ *   info.json still cover the whole video. `skipCaptionWait` turns an open wait
+ *   in full mode into a caption-less acquisition with a `captionWait` note.
  * @param {Partial<AcquireDeps>} [deps]
  */
 export async function acquireYouTubeMedia(
   url,
-  { workDir, mode = "full", source = {}, videoId },
+  {
+    workDir,
+    mode = "full",
+    source = {},
+    videoId,
+    captionWaitDeadline = null,
+    downloadSection = null,
+    skipCaptionWait = false,
+  },
   deps = {},
 ) {
   const started = Date.now();
   const mergedDeps = { ...DEFAULT_DEPS, ...deps };
-  const { readFile, withThrottle = withAcquireThrottle } = mergedDeps;
+  const { readFile, withThrottle = withAcquireThrottle, now = Date.now } = mergedDeps;
   const throttle = /** @type {<T>(fn: () => Promise<T>) => Promise<T>} */ (withThrottle);
 
   if (!videoId) {
@@ -323,11 +347,17 @@ export async function acquireYouTubeMedia(
   let artifacts;
   /** @type {object | undefined} */
   let acquireMetrics;
-  // yt-dlp failure detail of the caption download the selection comes from.
   let captionError = "";
 
   if (mode === "full") {
-    const staged = await acquireFullStaged(mergedDeps, url, workDir, videoId, source);
+    const staged = await acquireFullStaged(
+      mergedDeps,
+      url,
+      workDir,
+      videoId,
+      source,
+      downloadSection,
+    );
     acquireMetrics = staged.acquireMetrics;
     if (!staged.ok) {
       return failVideo(staged.error);
@@ -336,7 +366,7 @@ export async function acquireYouTubeMedia(
     captionError = staged.captionError;
   } else {
     const single = await throttle(() =>
-      runAcquirePass(mergedDeps, url, workDir, { mode, source }),
+      runAcquirePass(mergedDeps, url, workDir, { mode, source, downloadSection }),
     );
     artifacts = resolveMediaArtifacts(single.files, videoId);
     if (!single.spawnResult.success) {
@@ -355,7 +385,6 @@ export async function acquireYouTubeMedia(
 
   const retryCaptions = (mode === "full" && artifacts.videoPath) || mode === "transcript";
   if (!captionResult.success && retryCaptions) {
-    // No English landed, so the ladder needs the translated tracks the first pass skipped.
     const retrySource = { ...source, extractorArgs: allowTranslatedSubs(source.extractorArgs) };
     const captionRetry = await throttle(() =>
       runAcquirePass(mergedDeps, url, workDir, captionsOnlyPass(retrySource)),
@@ -373,11 +402,34 @@ export async function acquireYouTubeMedia(
     }
   }
 
-  // Full mode holds the downloaded video, so an exhausted ladder proceeds caption-less and the
-  // transcript strategy picks ASR or records a degradation. Transcript mode has no media and stops.
   const captionOptional = mode === "full" && Boolean(artifacts.videoPath);
+
+  // A live-derived video's captions can still be in post-stream processing: hold it while
+  // the wait is open, in either mode, rather than stop or digest caption-less. A caller
+  // that can transcribe the downloaded media itself skips the hold.
+  /** @type {import('./caption-wait.js').CaptionWaitDecision} */
+  let captionWait = { state: "none" };
+  let captionWaitNote = "";
+  if (!captionResult.success) {
+    captionWait = await readCaptionWait(artifacts.metadataPath, readFile, {
+      deadline: captionWaitDeadline,
+      nowMs: now(),
+    });
+    if (captionWait.state === "wait" && skipCaptionWait && captionOptional) {
+      captionWaitNote = captionWaitSkippedNote(captionWait);
+    } else if (captionWait.state === "wait") {
+      return { ...failVideo(captionsPendingMessage(captionWait)), captionWait };
+    } else if (captionWait.state === "expired") {
+      captionWaitNote = captionWaitEndedNote(captionWait);
+    }
+  }
   if (!captionResult.success && !captionOptional) {
-    return failVideo(captionResult.error);
+    return captionWaitNote
+      ? { ...failVideo(`${captionResult.error}; ${captionWaitNote}`), captionWait }
+      : failVideo(captionResult.error);
+  }
+  if (captionWaitNote) {
+    acquireMetrics = { ...acquireMetrics, captionWait: captionWaitNote };
   }
 
   if (!artifacts.metadataPath) {
@@ -417,7 +469,6 @@ export async function acquireYouTubeMedia(
 
   let caption = finalCaption.success ? finalCaption.selection : null;
   if (caption && captionError) {
-    // A failed track beside the chosen one is recorded, not dropped.
     const errorLine = captionErrorLine(captionError);
     caption = {
       ...caption,

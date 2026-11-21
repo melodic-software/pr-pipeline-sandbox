@@ -19,6 +19,7 @@ import {
 
 import { primaryEntry } from "../adapters/adapter-contract.js";
 import { LANES, lanePath } from "../lib/slice-lanes.js";
+import { cuesInRange, cuesInVideoTime, describeTimeRange } from "../lib/time-range.js";
 import { detectAsrCapability, runAsrTranscription } from "./asr-transcribe.js";
 import { buildRepairLexicon, repairCues } from "./proper-noun-repair.js";
 import { resolveTranscriptStrategy } from "./transcript-strategy.js";
@@ -41,7 +42,7 @@ function countParagraphs(transcript) {
 /** @typedef {{ startSec: number, endSec: number, text: string }} WatchCue */
 
 /**
- * @param {{ startSec: number, endSec: number, text: string }} cue
+ * @param {WatchCue} cue
  * @returns {WatchCue}
  */
 function toWatchCue(cue) {
@@ -59,8 +60,6 @@ function tokens(text) {
 
 /** @param {string} word */
 function comparableWord(word) {
-  // Apostrophes in any form (', ’, ʼ) drop out, so don't, don’t and dont match.
-  // Only sentence punctuation at either end goes, so C++. and C# stay distinct.
   const plain = word.toLowerCase().replace(/['\u2019\u02BC]/g, "");
   let start = 0;
   let end = plain.length;
@@ -100,11 +99,12 @@ function comparableRun(run) {
  * True when the cue opening the paragraph stamped `stamp` carries `run` over
  * from the cue before it: the two cues overlap in time, or the opening cue
  * starts with the previous cue's closing words verbatim (a rolling caption).
- * False whenever the opening cue cannot be identified exactly.
+ * False whenever the opening cue cannot be identified exactly, or its carried
+ * line was already dropped, which leaves only new speech.
  *
  * @param {string} stamp - the paragraph's `[M:SS]`
  * @param {string[]} run - the paragraph's leading words
- * @param {readonly { startSec: number, endSec: number, text: string }[]} cues
+ * @param {readonly { startSec: number, endSec: number, text: string, carriedLineDropped?: boolean }[]} cues
  */
 function carriesOverFromPreviousCue(stamp, run, cues) {
   // The paragraph stamp floors the opening cue's start to the second, so it
@@ -115,6 +115,7 @@ function carriesOverFromPreviousCue(stamp, run, cues) {
   );
   if (openers.length !== 1 || openers[0] === 0) return false;
   const cue = cues[openers[0]];
+  if (cue.carriedLineDropped) return false;
   const previous = cues[openers[0] - 1];
   const head = run.join(" ");
   if (words(cue.text).slice(0, run.length).join(" ") !== head) return false;
@@ -135,7 +136,7 @@ function carriesOverFromPreviousCue(stamp, run, cues) {
  * keeps at least one word.
  *
  * @param {string} transcript - paragraphs joined by a blank line, each `[M:SS] text`
- * @param {readonly { startSec: number, endSec: number, text: string }[]} cues - the
+ * @param {readonly { startSec: number, endSec: number, text: string, carriedLineDropped?: boolean }[]} cues - the
  *   cues the transcript was formatted from
  * @returns {string}
  */
@@ -161,8 +162,6 @@ export function dropParagraphBoundaryRepeats(transcript, cues) {
       // a speaker may genuinely repeat several words ("I don't know." / "I
       // don't know why.").
       if (!carriesOverFromPreviousCue(current[1].trim(), run, cues)) continue;
-      // Keep punctuation-only tokens before the dropped words (a `>>` speaker
-      // marker); drop any between them.
       const kept = [
         ...currentTokens.slice(0, wordAt[0]),
         ...currentTokens.slice(wordAt[length - 1] + 1),
@@ -179,12 +178,17 @@ export function dropParagraphBoundaryRepeats(transcript, cues) {
  *
  * @param {string} vttText
  * @param {boolean} isAutoCaption
- * @param {{ repairLexicon?: readonly string[] | null }} [options] - a non-empty
+ * @param {{ repairLexicon?: readonly string[] | null, timeRange?: import('../lib/time-range.js').TimeRange|null }} [options] - a non-empty
  *   `repairLexicon` applies proper-noun repair over the cleaned cues (the
- *   `captions+repair` strategy)
+ *   `captions+repair` strategy); a `timeRange` keeps only the cleaned cues that
+ *   overlap it, in full-video time
  * @returns {{ transcript: string, cueCount: number, paragraphCount: number, cleanedAutoCaptions: boolean, cleanedManualCaptions: boolean, repairedTermCount: number }}
  */
-export function buildTranscriptText(vttText, isAutoCaption, { repairLexicon = null } = {}) {
+export function buildTranscriptText(
+  vttText,
+  isAutoCaption,
+  { repairLexicon = null, timeRange = null } = {},
+) {
   let cleanedManualCaptions = false;
   let cues;
 
@@ -197,6 +201,9 @@ export function buildTranscriptText(vttText, isAutoCaption, { repairLexicon = nu
     const cleaned = cleanManualCaptions(vttText);
     cues = cleaned.cues;
     cleanedManualCaptions = cleaned.cleanedManualCaptions;
+  }
+  if (timeRange) {
+    cues = cuesInRange(cues, timeRange);
   }
 
   let repairedTermCount = 0;
@@ -232,6 +239,8 @@ export function buildTranscriptText(vttText, isAutoCaption, { repairLexicon = nu
  * @param {readonly string[]} [options.transcriptFiles] - slice-relative
  *   transcript paths actually written (default: the primary `source/transcript.txt`)
  * @param {boolean} [options.noVideoEntries] - the acquisition produced 0 entries
+ * @param {import('../lib/time-range.js').TimeRange|null} [options.timeRange] - the
+ *   range a ranged watch acquired; recorded under the source line
  * @param {{ writeFile?: typeof fs.writeFile }} [io]
  * @returns {Promise<string>} the README path
  */
@@ -243,23 +252,29 @@ export async function writeSliceReadme(
     sourceUrl,
     transcriptFiles = ["source/transcript.txt"],
     noVideoEntries = false,
+    timeRange = null,
   },
   { writeFile = fs.writeFile } = {},
 ) {
-  let transcriptLines = transcriptFiles
-    .map((file) => `- \`${file}\` — cleaned timestamped transcript (\`[M:SS]\` paragraphs)\n`)
-    .join("");
+  let transcriptLines;
   if (noVideoEntries) {
     transcriptLines = "- No video entries were found in this post, so no transcript was written\n";
   } else if (transcriptFiles.length === 0) {
     transcriptLines = "- No transcript was written (see the run's transcript degradation)\n";
+  } else {
+    transcriptLines = transcriptFiles
+      .map((file) => `- \`${file}\` — cleaned timestamped transcript (\`[M:SS]\` paragraphs)\n`)
+      .join("");
   }
+  const rangeLine = timeRange
+    ? `Range: ${describeTimeRange(timeRange)} (every timestamp in this slice is full-video time)\n`
+    : "";
   const readmePath = path.join(sliceDir, "README.md");
   const readme = `# ${videoTitle}
 
 Video id: \`${videoId}\`
 Source: ${sourceUrl}
-
+${rangeLine}
 ## Artifacts
 
 ${transcriptLines}- \`key-frames/\` — curated visual frames (Phase 5+)
@@ -348,6 +363,10 @@ export function transcriptFilename(entryIndex, primaryEntryIndex) {
  *   pipeline override; wins over the adapter default
  * @param {readonly HarvestedLink[]} [options.harvestedLinks] - harvested links
  *   feeding the proper-noun repair lexicon
+ * @param {import('../lib/time-range.js').TimeRange|null} [options.timeRange] - the
+ *   range a ranged watch acquired: recorded in the README, and ASR cues (timed from
+ *   the ranged media's start) get its start added so every stamp is full-video time.
+ *   Captions cover the whole video in full-video time, so their cues are cut to the range.
  * @param {object} [io]
  * @param {typeof fs.readFile} [io.readFile]
  * @param {typeof fs.writeFile} [io.writeFile]
@@ -366,6 +385,7 @@ export async function writeEnvelopeTranscriptArtifacts(
     transcriptStrategy = "captions",
     strategyOverride = null,
     harvestedLinks = [],
+    timeRange = null,
   },
   {
     readFile = fs.readFile,
@@ -381,9 +401,6 @@ export async function writeEnvelopeTranscriptArtifacts(
 
   await mkdir(sliceDir, { recursive: true });
 
-  // The ASR toolchain probe spawns interpreters — run it only when some entry
-  // could actually take the ASR rung (caption-less media, or an explicit
-  // asr request).
   const requested = strategyOverride ?? transcriptStrategy;
   const needAsrProbe =
     requested === "asr" || entries.some((entry) => !entry.caption && entry.mediaPath);
@@ -398,12 +415,8 @@ export async function writeEnvelopeTranscriptArtifacts(
   const transcripts = [];
   /** @type {EnvelopeEntryDegradation[]} */
   const entryDegradations = [];
-  let captionlessEntryCount = 0;
 
   for (const [entryIndex, entry] of entries.entries()) {
-    if (!entry.caption) {
-      captionlessEntryCount += 1;
-    }
     const plan = resolveTranscriptStrategy({
       adapterDefault: transcriptStrategy,
       override: strategyOverride,
@@ -434,11 +447,12 @@ export async function writeEnvelopeTranscriptArtifacts(
         });
         continue;
       }
-      const repaired = repairCues(asr.cues, repairLexicon);
+      const asrCues = timeRange ? cuesInVideoTime(asr.cues, timeRange.fromSec) : asr.cues;
+      const repaired = repairCues(asrCues, repairLexicon);
       const transcript = formatTranscript(repaired.cues);
       built = {
         transcript,
-        sourceCues: asr.cues.map(toWatchCue),
+        sourceCues: asrCues.map(toWatchCue),
         cueCount: repaired.cues.length,
         paragraphCount: countParagraphs(transcript),
         cleanedAutoCaptions: false,
@@ -447,12 +461,13 @@ export async function writeEnvelopeTranscriptArtifacts(
     } else {
       const caption = /** @type {NonNullable<typeof entry.caption>} */ (entry.caption);
       const vttText = String(await readFile(caption.path, "utf8"));
+      const parsedCues = parseVttSegment(vttText).map(toWatchCue);
       built = {
         ...buildTranscriptText(vttText, caption.isAutoCaption, {
           repairLexicon: plan.strategy === "captions+repair" ? repairLexicon : null,
+          timeRange,
         }),
-        // The raw parsed caption cues, as watching always received them.
-        sourceCues: parseVttSegment(vttText).map(toWatchCue),
+        sourceCues: timeRange ? cuesInRange(parsedCues, timeRange) : parsedCues,
       };
     }
 
@@ -475,7 +490,6 @@ export async function writeEnvelopeTranscriptArtifacts(
     });
   }
 
-  // Written last so the Artifacts list names only transcripts that exist.
   await writeSliceReadme(
     {
       sliceDir,
@@ -486,6 +500,7 @@ export async function writeEnvelopeTranscriptArtifacts(
         path.relative(sliceDir, entry.transcriptPath).split(path.sep).join("/"),
       ),
       noVideoEntries: entries.length === 0,
+      timeRange,
     },
     { writeFile },
   );
@@ -499,7 +514,7 @@ export async function writeEnvelopeTranscriptArtifacts(
     entryCount: entries.length,
     primaryEntryIndex,
     transcripts,
-    captionlessEntryCount,
+    captionlessEntryCount: entries.filter((entry) => !entry.caption).length,
     transcriptDegradation: primaryDegradation?.reason ?? primary?.caption?.provenanceNote ?? null,
     entryDegradations,
   };

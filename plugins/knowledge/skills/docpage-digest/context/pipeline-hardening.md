@@ -6,7 +6,7 @@ spots; this file owns the format, invocation, and pin-manifest shape so
 `SKILL.md` stays a procedure. It also holds the one subagent-death ladder; the
 degraded-verifier rule is in [dual-verification.md](dual-verification.md).
 
-**Prerequisite:** `python3` (3.9+) on PATH for the two standing gates under
+**Prerequisite:** `python3` (3.9+) on PATH for the standing gates under
 `scripts/`. Missing Python means say so and stop. There is no agent-judgment
 fallback for a deterministic quote/snippet check. The five scripts that import a
 sibling module set `sys.dont_write_bytecode` so they leave no `__pycache__` in the skill's
@@ -100,7 +100,7 @@ suite is green. The ordering is the one `SKILL.md` already states.
 
 ## Freeze / pin
 
-Pin the tree on **agent-REPORTED completion**, never on file presence. A digest
+Pin the tree on **agent-reported completion**, never on file presence. A digest
 file appearing on disk does not mean its agent is done.
 
 After every dispatched digest agent has *returned*:
@@ -150,16 +150,17 @@ copy of the ladder; every other file points here.
    agent. Do not re-dispatch at once. If
    this run has agents of its own running, wait for one to return. If it has
    none, do phase work that needs no agent, or wait a few minutes with a
-   Monitor wait (the Bash tool blocks a foreground `sleep`). Then dispatch the
+   Monitor wait, never a foreground `sleep`: a foreground sleep holds the
+   turn, so nothing else in the run moves until it ends, while a Monitor wait
+   leaves the session free and wakes it when the wait is over. Then dispatch the
    refused units once more, and record each wait and each refusal on the
    checklist. A unit refused again falls to rung 2 with the refusals recorded.
    Rung 1 does not apply to a refusal.
    - **Pointer**: <https://code.claude.com/docs/en/sub-agents#concurrent-subagent-limit>
      (the refusal text, what it tells the caller, and when spawning succeeds
      again).
-   - **As of**: 2026-10-17
-   - **Recheck trigger**: that section changes what the refusal tells Claude
-     to do or when spawning succeeds again.
+   - **Pointer**: <https://code.claude.com/docs/en/tools-reference#monitor-tool>
+     (what a Monitor wait does and where it is unavailable).
 1. **Retry window** (an agent that died, not a refusal): re-dispatch the same
    brief once; record the death and the retry.
 2. **Inline-with-disclosure**: if the retry also dies, or a unit was refused

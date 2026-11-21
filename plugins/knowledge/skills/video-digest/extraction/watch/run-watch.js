@@ -4,7 +4,22 @@
  *
  * Usage: node watch/run-watch.js <video-url> [--skip-research] [--target <repo>]
  *   [--recover <slice-dir>] [--transcript-strategy <captions|captions+repair|asr>]
- *   [--max-frame-gap-sec <sec>]
+ *   [--max-frame-gap-sec <sec>] [--caption-wait-deadline <iso>]
+ *   [--from <h:mm:ss>] [--to <h:mm:ss>]
+ *
+ * `--from` / `--to` (either optional) acquire only that range of the media
+ * (`lib/time-range.js`). Watching runs on the ranged media; every stamp the slice
+ * stores is full-video time, and watch.json `timeRange` records the range, the
+ * offset added and the offset's error bound from the keyframe-aligned cut. A ranged
+ * slice's key carries the range (`rangedSliceKey`), so each range of one video is its
+ * own slice.
+ *
+ * A live-derived video whose captions are not published yet exits 3 with a
+ * `captionsPending` report and writes no slice (`acquisition/caption-wait.js`);
+ * `--caption-wait-deadline` carries the deadline a held queue row recorded, and
+ * once it passes the run digests caption-less and reports `captionWait`. A ranged
+ * run with ASR available and no caption strategy override skips the wait: the asr
+ * rung transcribes the ranged media, and `captionWait` records the skip.
  *
  * Acquisition dispatches through the source-adapter registry (unknown host
  * fails closed, non-zero exit, listing supported sources) and consumes the
@@ -16,8 +31,12 @@
  * flag is the explicit pipeline override, and a degraded transcript surfaces
  * in the `transcriptDegradation` provenance field (watch.json + output),
  * never silently. `--max-frame-gap-sec` overrides the coverage plan's longest
- * allowed stretch between timed frames (`MAX_FRAME_GAP_SEC` by default); the
- * effective value is recorded in watch.json so `--recover` plans with it too.
+ * allowed stretch between timed frames (`maxFrameGapForDuration` by default) and
+ * is recorded in watch.json so `--recover` plans with it too; without it,
+ * `--recover` derives the same duration default.
+ *
+ * Before the download, `temp-space-check.js` probes the selected formats' size: the run exits 1
+ * when OS temp has less than twice that free, and warns and continues when no size is known.
  *
  * Vision absorption, research, and synthesis run in the skill session (not this script).
  */
@@ -28,10 +47,14 @@ import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 
-import { isMainModule } from "@melodic/video-digestion/shared/main-module";
 import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/terminal";
 import { parseVttSegment } from "@melodic/video-digestion/transcript/vtt-parser";
 
+import {
+  CAPTIONS_PENDING_EXIT,
+  captionsPendingReport,
+  parseCaptionWaitDeadline,
+} from "../acquisition/caption-wait.js";
 import {
   primaryEntry,
   sourceMetadataSubset,
@@ -39,21 +62,28 @@ import {
 } from "../adapters/adapter-contract.js";
 import { acquireMedia, resolveSourceAdapter } from "../adapters/registry.js";
 import { portableTargetName } from "../lib/portable-target.js";
+import { runMain } from "../lib/run-main.js";
 import { LANES, lanePath } from "../lib/slice-lanes.js";
+import {
+  cuesInMediaTime,
+  keyframeOffsetErrorSec,
+  parseTimeRangeArgs,
+  rangedSliceKey,
+  watchingInVideoTime,
+} from "../lib/time-range.js";
 import { resolveWorkRoot } from "../lib/work-root.js";
+import { detectAsrCapability } from "../transcript/asr-transcribe.js";
 import { deriveVideoSlug, resolveWorkSliceDir } from "../transcript/derive-video-slug.js";
 import { parseTranscriptStrategyOverride } from "../transcript/transcript-strategy.js";
 import { writeEnvelopeTranscriptArtifacts } from "../transcript/write-transcript.js";
-import {
-  MAX_FRAME_GAP_SEC,
-  parseMaxFrameGapSecOverride,
-} from "../watching/compute-coverage-plan.js";
+import { parseMaxFrameGapSecOverride } from "../watching/compute-coverage-plan.js";
 import { orchestrateWatching } from "../watching/orchestrate-watching.js";
 import { writeWatchingManifest } from "../watching/write-watching-manifest.js";
 import { detectRecoverableBootstrap } from "./detect-recoverable-bootstrap.js";
 import { recordDurationMismatch } from "./duration-mismatch.js";
 import { postBootstrapSlice } from "./post-bootstrap-slice.js";
 import { recoverWatchBootstrapCli } from "./recover-watch-bootstrap.js";
+import { checkTempSpace } from "./temp-space-check.js";
 import {
   continuationPromptPath,
   createWatchState,
@@ -136,14 +166,29 @@ export async function runWatchCli(argv) {
     writeStderr(maxFrameGapArg.error);
     return 1;
   }
-  const maxFrameGapSec = maxFrameGapArg.override ?? MAX_FRAME_GAP_SEC;
+  const maxFrameGapSec = maxFrameGapArg.override ?? undefined;
+  const waitArg = parseCaptionWaitDeadline(argv);
+  if (!waitArg.ok) {
+    writeStderr(waitArg.error);
+    return 1;
+  }
+  const captionWaitDeadline = waitArg.deadline;
+  const rangeArg = parseTimeRangeArgs(argv);
+  if (!rangeArg.ok) {
+    writeStderr(rangeArg.error);
+    return 1;
+  }
+  const timeRange = rangeArg.range;
+  if (timeRange && adapter.capabilities.timeRange !== true) {
+    writeStderr(`--from/--to are not supported for ${adapter.id} sources`);
+    return 1;
+  }
 
   // Until watch.json records the temp dirs, nothing else points at them, so a
   // failure removes the ones this run made. Once recorded, --recover needs them.
   /** @type {TempDirs} */
   const temp = { dirs: {}, recorded: false, interrupted: false };
   const children = trackChildren(temp);
-  // The signal handlers and the finally block share one cleanup, so it runs once.
   /** @type {Promise<void> | null} */
   let cleanup = null;
   const cleanUpOnce = () => {
@@ -170,7 +215,17 @@ export async function runWatchCli(argv) {
     return /** @type {const} */ ([signal, handler]);
   });
   try {
-    running = watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFrameGapSec, temp });
+    running = watchUrl({
+      url,
+      adapter,
+      skipResearch,
+      target,
+      strategyArg,
+      maxFrameGapSec,
+      captionWaitDeadline,
+      timeRange,
+      temp,
+    });
     return await running;
   } catch (error) {
     if (error instanceof InterruptedError) return 1;
@@ -262,16 +317,27 @@ function trackChildren(temp) {
  *   skipResearch: boolean,
  *   target: string|undefined,
  *   strategyArg: { override: import('../adapters/adapter-contract.js').TranscriptStrategy | null },
- *   maxFrameGapSec: number,
+ *   maxFrameGapSec: number|undefined,
+ *   captionWaitDeadline: string|null,
+ *   timeRange: import('../lib/time-range.js').TimeRange|null,
  *   temp: TempDirs,
  * }} options
  */
-async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFrameGapSec, temp }) {
+async function watchUrl({
+  url,
+  adapter,
+  skipResearch,
+  target,
+  strategyArg,
+  maxFrameGapSec,
+  captionWaitDeadline,
+  timeRange,
+  temp,
+}) {
   const throwIfInterrupted = () => {
     if (temp.interrupted) throw new InterruptedError();
   };
   throwIfInterrupted();
-  // Temp dirs retained for vision reads in the same session; regen via run-watch when missing.
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "video-extraction-"));
   temp.dirs.workDir = workDir;
   throwIfInterrupted();
@@ -282,11 +348,26 @@ async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFr
   temp.dirs.contactSheetsDir = sheetsDir;
   throwIfInterrupted();
 
+  const asrCanStandIn = strategyArg.override === null || strategyArg.override === "asr";
+  const asrDetection = timeRange && asrCanStandIn ? await detectAsrCapability() : null;
+  throwIfInterrupted();
+
+  const space = await checkTempSpace({ url, adapter, tempDir: os.tmpdir(), timeRange });
+  throwIfInterrupted();
+  if (space.message) writeStderr(space.message);
+  if (space.state === "short") return 1;
+
   /** @type {import('../adapters/adapter-contract.js').AcquireOutcome} */
   let acquisition;
   writeStderr("watch: acquire start");
   try {
-    acquisition = await acquireMedia(url, { workDir, mode: "full" });
+    acquisition = await acquireMedia(url, {
+      workDir,
+      mode: "full",
+      captionWaitDeadline,
+      timeRange,
+      skipCaptionWait: Boolean(asrDetection?.available),
+    });
   } catch (error) {
     if (error instanceof UnsupportedSourceError) {
       writeStderr(error.message);
@@ -295,6 +376,12 @@ async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFr
     throw error;
   }
   throwIfInterrupted();
+  if (acquisition.captionWait?.state === "wait") {
+    const report = captionsPendingReport(acquisition.captionWait);
+    writeStdout(JSON.stringify(report, null, 2));
+    writeStderr(report.message);
+    return CAPTIONS_PENDING_EXIT;
+  }
   if (!acquisition.success || !acquisition.data) {
     writeStderr(acquisition.error ?? "Acquisition failed");
     return 1;
@@ -303,8 +390,9 @@ async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFr
 
   const envelope = acquisition.data;
   const { metadata, entries } = envelope;
+  const captionWait = envelope.acquireMetrics?.captionWait ?? null;
   const sliceKey = adapter.extractSliceKey(url, metadata) ?? metadata.id;
-  const videoSlug = deriveVideoSlug(metadata.title, sliceKey);
+  const videoSlug = deriveVideoSlug(metadata.title, rangedSliceKey(sliceKey, timeRange));
   const sliceDir = resolveWorkSliceDir(resolveWorkRoot(), videoSlug);
   const primary = primaryEntry(envelope);
 
@@ -323,6 +411,7 @@ async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFr
     target,
     sourceMetadata: sourceMetadataSubset(metadata),
     maxFrameGapSec,
+    timeRange,
   });
   state.tempSession = tempSession;
   state.status = "acquiring";
@@ -344,19 +433,23 @@ async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFr
   const harvestedLinks = adapter.harvestLinks(metadata);
   const transcriptStrategyLabel = strategyArg.override ?? adapter.transcriptStrategy;
   writeStderr(`watch: transcript start (strategy: ${transcriptStrategyLabel})`);
-  const written = await writeEnvelopeTranscriptArtifacts({
-    sliceDir,
-    envelope,
-    sourceUrl: url,
-    sliceKey,
-    transcriptStrategy: adapter.transcriptStrategy,
-    strategyOverride: strategyArg.override,
-    harvestedLinks,
-  });
-  const primaryTranscript =
-    written.transcripts.find((entry) => entry.entryIndex === written.primaryEntryIndex) ??
-    written.transcripts[0] ??
-    null;
+  const written = await writeEnvelopeTranscriptArtifacts(
+    {
+      sliceDir,
+      envelope,
+      sourceUrl: url,
+      sliceKey,
+      transcriptStrategy: adapter.transcriptStrategy,
+      strategyOverride: strategyArg.override,
+      harvestedLinks,
+      timeRange,
+    },
+    asrDetection ? { detectAsr: async () => asrDetection } : {},
+  );
+  const primaryWritten = written.transcripts.find(
+    (entry) => entry.entryIndex === written.primaryEntryIndex,
+  );
+  const primaryTranscript = primaryWritten ?? written.transcripts[0] ?? null;
   const degradationMetric = written.transcriptDegradation
     ? { transcriptDegradation: written.transcriptDegradation }
     : {};
@@ -412,8 +505,6 @@ async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFr
   };
 
   if (!primary?.mediaPath) {
-    // 0-media envelope: well-formed text-only slice — watching/vision cannot
-    // run without media, recorded as skipped so resume advances past them.
     writeStderr("watch: watching start");
     state = markPhaseComplete(state, "watching", { skipped: true, reason: "no media entries" });
     writeStderr("watch: watching end (skipped: no media entries)");
@@ -432,6 +523,7 @@ async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFr
           textOnly: true,
           transcriptStrategy: primaryTranscript?.strategy ?? null,
           transcriptDegradation: written.transcriptDegradation,
+          captionWait,
           harvestedLinkCount: harvestedLinks.length,
           skipResearch,
           tempSession,
@@ -449,15 +541,8 @@ async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFr
     return 0;
   }
 
-  // The cues the primary transcript was built from: caption cues, or the ASR
-  // cues when no caption exists.
-  // An explicit asr override that fails on a captioned entry writes no
-  // transcript, so the caption still supplies the cues, as it always did.
-  const primaryCues = written.transcripts.find(
-    (entry) => entry.entryIndex === written.primaryEntryIndex,
-  )?.cues;
   const cues =
-    primaryCues ??
+    primaryWritten?.cues ??
     (primary.caption
       ? parseVttSegment(await fs.readFile(primary.caption.path, "utf8")).map((cue) => ({
           startSec: cue.startSec,
@@ -476,29 +561,45 @@ async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFr
   temp.recorded = true;
   throwIfInterrupted();
 
-  const watching = await orchestrateWatching({
+  const mediaWatching = await orchestrateWatching({
     videoPath: primary.mediaPath,
     framesDir,
     contactSheetsDir: sheetsDir,
-    cues,
+    cues: timeRange ? cuesInMediaTime(cues, timeRange) : cues,
     maxFrameGapSec,
   });
-  // A killed ffmpeg yields a degraded result, not a rejection: write nothing from it.
   throwIfInterrupted();
+  let watching = mediaWatching;
+  if (timeRange && state.timeRange) {
+    const offsetErrorSec = keyframeOffsetErrorSec(timeRange, {
+      probedDurationSec: mediaWatching.probedDurationSec,
+      videoDurationSec: metadata.durationSec,
+    });
+    state.timeRange = { ...state.timeRange, offsetErrorSec };
+    watching = watchingInVideoTime(mediaWatching, {
+      offsetSec: state.timeRange.offsetSec,
+      offsetErrorSec,
+    });
+  }
+  const selectedCount = watching.selectedFrames.length;
+  const targetMinFrames = watching.targetMinFrames ?? 0;
+  const highVolume = watching.highVolume ?? false;
 
   state.status = "vision";
   state.frameSelection = {
-    selectedCount: watching.selectedFrames.length,
-    targetMinFrames: watching.targetMinFrames ?? 0,
-    highVolume: watching.highVolume ?? false,
+    selectedCount,
+    targetMinFrames,
+    highVolume,
     overCap: false,
     candidateCount: watching.candidateCount,
   };
 
-  state = await recordDurationMismatch(state, sliceDir, {
-    metadataDurationSec: metadata.durationSec,
-    probedDurationSec: watching.probedDurationSec,
-  });
+  if (!timeRange) {
+    state = await recordDurationMismatch(state, sliceDir, {
+      metadataDurationSec: metadata.durationSec,
+      probedDurationSec: watching.probedDurationSec,
+    });
+  }
 
   const manifest = await writeWatchingManifest(sliceDir, watching, tempSession);
   state.artifactPaths = {
@@ -508,12 +609,12 @@ async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFr
     contactSheetCount: manifest.contactSheetCount,
   };
   state = markPhaseComplete(state, "watching", {
-    selectedCount: watching.selectedFrames.length,
-    highVolume: watching.highVolume ?? false,
+    selectedCount,
+    highVolume,
     densificationWindows: watching.densificationWindows.length,
     frameCount: manifest.frameCount,
     contactSheetCount: manifest.contactSheetCount,
-    targetMinFrames: watching.targetMinFrames ?? 0,
+    targetMinFrames,
   });
   writeStderr("watch: watching end");
 
@@ -527,11 +628,13 @@ async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFr
         sliceDir,
         status: state.status,
         entryCount: entries.length,
-        highVolume: watching.highVolume ?? false,
-        selectedCount: watching.selectedFrames.length,
-        targetMinFrames: watching.targetMinFrames ?? 0,
+        highVolume,
+        selectedCount,
+        targetMinFrames,
+        timeRange: state.timeRange ?? null,
         transcriptStrategy: primaryTranscript?.strategy ?? null,
         transcriptDegradation: written.transcriptDegradation,
+        captionWait,
         harvestedLinkCount: harvestedLinks.length,
         skipResearch,
         tempSession,
@@ -552,13 +655,4 @@ async function watchUrl({ url, adapter, skipResearch, target, strategyArg, maxFr
   return 0;
 }
 
-if (isMainModule(import.meta.url)) {
-  runWatchCli(process.argv)
-    .then((code) => {
-      process.exitCode = code;
-    })
-    .catch((error) => {
-      writeStderr(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    });
-}
+runMain(import.meta.url, runWatchCli);

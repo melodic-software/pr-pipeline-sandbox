@@ -14,14 +14,19 @@
     "build": "tsc --noEmit",
     "test": "vitest run"
   },
+  "setupDeps": {
+    "stamp": ".video-extraction.stamp",
+    "label": "video extraction",
+    "sentinel": "@melodic/video-digestion"
+  },
   "dependencies": {
     "@melodic/repo-analysis": "file:../../../vendor/repo-analysis",
     "@melodic/video-digestion": "file:../../../vendor/video-digestion",
     "mdast-util-from-markdown": "~2.1.0"
   },
   "devDependencies": {
-    "@types/node": "^26.6.5",
+    "@types/node": "^26.6.6",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.5"
+    "vitest": "^5.1.0"
   }
 }

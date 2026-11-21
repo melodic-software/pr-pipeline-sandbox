@@ -36,11 +36,16 @@ collision check reads them to tell a resume from a slug collision.
       quoted from `source.html`) PASS; Verifier A (same-vendor) +
       Verifier B (cross-vendor) verdicts in `verification/` (append-only; each arm states the
       hashes it audited and one verdict, PASS / PASS-WITH-FINDINGS / FAIL / BLOCKED, done only on
-      PASS or PASS-WITH-FINDINGS from both arms; degraded fallback / death-ladder recorded, never silent)
+      PASS or PASS-WITH-FINDINGS from both arms; degraded fallback / death-ladder recorded, never silent;
+      under verification `light` or `off`, ticked after the pin and gates with
+      `verification: skipped (<level>)`, and the slice stays unverified)
   - Verifier A effort (level and source; `requested <level>, unconfirmed` when the arm never
     confirmed it):
   - Verifier B effort (level and source; `requested <level>, unconfirmed` when the arm never
     confirmed it):
+  - Verification status: unverified: not recorded
+    (replace with `verified`, `unverified: <reason>` or `failed: <reason>`; the handoff's first
+    line and the map-corpus queue read it)
 - [ ] Phase 5: Interview handoff, with `interview-handoff.md` authored (relied-on-links table: one
       disposition per link, covered / queued / skipped with a reason) and its own commands replayed
       (every Phase 4 check precedes it); `/planning:interview` run or artifact presented
@@ -53,4 +58,4 @@ collision check reads them to tell a resume from a slug collision.
   concurrency refusal waits, then one more dispatch → retry window → inline-with-disclosure, never
   for a unit the profile maps to another model → degraded marker + re-run trigger); do not tick
   the phase complete on a degraded marker
-- Phase 5 interview invocation: skip (present artifact only) when the planning plugin is absent
+- Phase 5 interview invocation: skip (present artifact only) when the planning plugin is not enabled

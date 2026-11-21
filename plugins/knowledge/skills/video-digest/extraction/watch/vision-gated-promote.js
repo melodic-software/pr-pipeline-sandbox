@@ -18,6 +18,7 @@ import {
   normalizeSynthesisDestName,
 } from "../lib/synthesis-filename.js";
 import { resolveTempSession } from "../lib/temp-session-paths.js";
+import { readJsonFile, readLaneJson, writeJsonFile } from "../lib/watch-frame-index.js";
 import {
   promotionSourceFileReason,
   validatePromotionDecisionsForSlice,
@@ -108,12 +109,9 @@ export async function visionGatedPromote(sliceDir, { dryRun = false } = {}) {
     throw new Error(validation.errors.join("; "));
   }
 
-  const decisionsPath = lanePath(absSlice, LANES.keyFrames, "promotion-decisions.json");
-  const doc = JSON.parse(fs.readFileSync(decisionsPath, "utf8"));
-  const watch = JSON.parse(fs.readFileSync(watchStatePath(absSlice), "utf8"));
-  const selection = JSON.parse(
-    fs.readFileSync(lanePath(absSlice, LANES.keyFrames, "selection.json"), "utf8"),
-  );
+  const doc = readLaneJson(absSlice, LANES.keyFrames, "promotion-decisions.json");
+  const watch = readJsonFile(watchStatePath(absSlice));
+  const selection = readLaneJson(absSlice, LANES.keyFrames, "selection.json");
   const { framesDir } = resolveTempSession(watch.tempSession ?? selection.tempSession ?? {});
 
   if (!framesDir) {
@@ -154,15 +152,16 @@ export async function visionGatedPromote(sliceDir, { dryRun = false } = {}) {
 
   const promotedPaths = await promoteKeyFrames(absSlice, promotions, {
     copyFile: (src, dest) => {
-      const expected = identities.get(String(src));
-      if (!expected) throw new Error(`no containment check recorded for ${String(src)}`);
-      return copyCheckedFrame(String(src), String(dest), expected);
+      const source = String(src);
+      const expected = identities.get(source);
+      if (!expected) throw new Error(`no containment check recorded for ${source}`);
+      return copyCheckedFrame(source, String(dest), expected);
     },
   });
   dedupeSynthesisDir(lanePath(absSlice, LANES.keyFrames, "frames"));
 
   const mapPath = lanePath(absSlice, LANES.keyFrames, "promotion-map.json");
-  fs.writeFileSync(mapPath, `${JSON.stringify(promotionMap, null, 2)}\n`, "utf8");
+  writeJsonFile(mapPath, promotionMap);
 
   return {
     promoted: promotedPaths.map((p) => path.basename(p)),

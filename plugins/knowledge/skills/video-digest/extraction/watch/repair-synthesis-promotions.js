@@ -21,18 +21,11 @@ import {
   isPipelinePlaceholderGapNote,
   normalizeSynthesisDestName,
 } from "../lib/synthesis-filename.js";
+import { readJsonFile, writeJsonFile } from "../lib/watch-frame-index.js";
 import { parseSessionsFromClaimInventory } from "../lib/watch-slice-sessions.js";
 import { slugifyTitle } from "../transcript/derive-video-slug.js";
 import { renderKeyFramesManifest } from "./render-key-frames-manifest.js";
 import { renderQualityAudit } from "./render-quality-audit.js";
-
-/**
- * @param {string} sessionName
- * @returns {string}
- */
-function sessionSlugFromName(sessionName) {
-  return slugifyTitle(sessionName).slice(0, 32);
-}
 
 /**
  * @typedef {{ selectedFrames: { file: string, timestampSec?: number }[], sessions: ReturnType<typeof parseSessionsFromClaimInventory> }} SessionIndex
@@ -52,7 +45,7 @@ function loadSessionIndex(sliceDir) {
   if (!fs.existsSync(selectionPath) || !fs.existsSync(claimPath)) {
     return null;
   }
-  const selection = JSON.parse(fs.readFileSync(selectionPath, "utf8"));
+  const selection = readJsonFile(selectionPath);
   return {
     selectedFrames: selection.selectedFrames ?? [],
     sessions: parseSessionsFromClaimInventory(fs.readFileSync(claimPath, "utf8")),
@@ -73,12 +66,10 @@ function resolveSessionForSource(index, sourceFile) {
     return "misc";
   }
   const ts = frame.timestampSec;
-  for (const session of index.sessions) {
-    if (ts >= session.startSec && (session.endSec === null || ts < session.endSec)) {
-      return sessionSlugFromName(session.name);
-    }
-  }
-  return "misc";
+  const session = index.sessions.find(
+    (s) => ts >= s.startSec && (s.endSec === null || ts < s.endSec),
+  );
+  return session ? slugifyTitle(session.name).slice(0, 32) : "misc";
 }
 
 /**
@@ -156,10 +147,7 @@ function pruneUnpromotedSynthesisFiles(synthesisDir, doc) {
   );
 
   for (const name of fs.readdirSync(synthesisDir)) {
-    if (!name.endsWith(".png")) {
-      continue;
-    }
-    if (!promotedNames.has(name)) {
+    if (name.endsWith(".png") && !promotedNames.has(name)) {
       fs.unlinkSync(path.join(synthesisDir, name));
     }
   }
@@ -186,13 +174,8 @@ function writePromotionArtifacts(absSlice, doc) {
     };
   }
 
-  fs.writeFileSync(
-    lanePath(absSlice, LANES.keyFrames, "promotion-map.json"),
-    `${JSON.stringify(promotionMap, null, 2)}\n`,
-    "utf8",
-  );
-
-  const auditDoc = {
+  writeJsonFile(lanePath(absSlice, LANES.keyFrames, "promotion-map.json"), promotionMap);
+  writeJsonFile(lanePath(absSlice, LANES.keyFrames, "key-frame-quality-audit.json"), {
     reviewedAt: new Date().toISOString(),
     model: "repair-synthesis-promotions",
     files: promotes.map((row) => ({
@@ -200,12 +183,7 @@ function writePromotionArtifacts(absSlice, doc) {
       pass: true,
       note: (row.gapNote ?? "vision-gated promotion").slice(0, 120),
     })),
-  };
-  fs.writeFileSync(
-    lanePath(absSlice, LANES.keyFrames, "key-frame-quality-audit.json"),
-    `${JSON.stringify(auditDoc, null, 2)}\n`,
-    "utf8",
-  );
+  });
   renderKeyFramesManifest(absSlice);
   renderQualityAudit(absSlice);
 }
@@ -221,7 +199,6 @@ function repairPromotionRows(doc, reserved, absSlice) {
   let sessionsFixed = 0;
   /** @type {[string, string][]} */
   const renamePairs = [];
-  // Loaded on the first row that needs a session fix, then reused.
   /** @type {SessionIndex|null|undefined} */
   let sessionIndex;
 
@@ -247,7 +224,6 @@ function repairPromotionRows(doc, reserved, absSlice) {
     }
   }
 
-  // Every rename recorded a pair, so the pair list IS the rename count.
   return { renamed: renamePairs.length, rejected, sessionsFixed, renamePairs };
 }
 
@@ -260,7 +236,7 @@ export function repairSynthesisPromotions(sliceDir, { dryRun = false } = {}) {
   const absSlice = path.resolve(sliceDir);
   const decisionsPath = lanePath(absSlice, LANES.keyFrames, "promotion-decisions.json");
   const synthesisDir = lanePath(absSlice, LANES.keyFrames, "frames");
-  const doc = JSON.parse(fs.readFileSync(decisionsPath, "utf8"));
+  const doc = readJsonFile(decisionsPath);
   const reserved = new Set(
     fs.existsSync(synthesisDir)
       ? fs.readdirSync(synthesisDir).filter((f) => f.endsWith(".png"))
@@ -274,7 +250,7 @@ export function repairSynthesisPromotions(sliceDir, { dryRun = false } = {}) {
   );
 
   if (!dryRun) {
-    fs.writeFileSync(decisionsPath, `${JSON.stringify(doc, null, 2)}\n`, "utf8");
+    writeJsonFile(decisionsPath, doc);
     applyFileRenames(synthesisDir, renamePairs);
     pruneUnpromotedSynthesisFiles(synthesisDir, doc);
     writePromotionArtifacts(absSlice, doc);

@@ -186,9 +186,11 @@ export async function relayoutSlice({
       );
     }
   }
-  if (fs.existsSync(target) && !replace) return refuse(`${target} exists; pass --replace to replace it`);
-  if (fs.existsSync(target) && !fs.statSync(target).isDirectory()) {
-    return refuse(`${target} exists and is not a directory; --replace only replaces a directory`);
+  if (fs.existsSync(target)) {
+    if (!replace) return refuse(`${target} exists; pass --replace to replace it`);
+    if (!fs.statSync(target).isDirectory()) {
+      return refuse(`${target} exists and is not a directory; --replace only replaces a directory`);
+    }
   }
 
   /** @type {{ from: string, to: string, sourceFile?: string }[]} */
@@ -233,7 +235,6 @@ export async function relayoutSlice({
       return refuse(`the temp session's video is ${id}, not this slice's ${state.videoId}`);
     }
     plan.push({ from: path.join(workDir, videos[0]), to: `media/${state.videoId}${path.extname(videos[0])}` });
-    // Acquisition can record a bare `<id>.json` fallback; its caption stem is the video's basename.
     const stem = infoName.endsWith(".info.json")
       ? infoName.slice(0, -".info.json".length)
       : path.basename(videos[0], path.extname(videos[0]));
@@ -256,7 +257,6 @@ export async function relayoutSlice({
   const entries = new Set(
     sliceFiles.flatMap((file) => file.split("/").map((_, i, parts) => parts.slice(0, i + 1).join("/"))),
   );
-  // A slice directory maps to one target directory when every kept file under it agrees.
   /** @type {Map<string, string>} */
   const dirs = new Map();
   for (const dir of entries) {
@@ -286,11 +286,14 @@ export async function relayoutSlice({
   let rewrites = 0;
   /** @type {{ file: string, ref: string }[]} */
   const unresolved = [];
-  const write = (/** @type {string} */ to, /** @type {string} */ body) => {
-    fs.mkdirSync(path.dirname(path.join(staging, to)), { recursive: true });
-    fs.writeFileSync(path.join(staging, to), body);
+  /** Make room for one staged file, count it, and return its path. */
+  const stage = (/** @type {string} */ to) => {
+    const dest = path.join(staging, to);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
     copied += 1;
+    return dest;
   };
+  const write = (/** @type {string} */ to, /** @type {string} */ body) => fs.writeFileSync(stage(to), body);
   try {
     for (const [from, to] of files) {
       if (MARKDOWN_FILE.test(from)) {
@@ -302,11 +305,7 @@ export async function relayoutSlice({
         plan.push({ from: path.join(slice, from), to });
       }
     }
-    for (const entry of plan) {
-      fs.mkdirSync(path.dirname(path.join(staging, entry.to)), { recursive: true });
-      fs.copyFileSync(entry.from, path.join(staging, entry.to));
-      copied += 1;
-    }
+    for (const entry of plan) fs.copyFileSync(entry.from, stage(entry.to));
     if (info) write("metadata/info.json", `${JSON.stringify(trimInfoJson(info), null, 2)}\n`);
     const existingReadme = path.join(target, "README.md");
     if (fs.existsSync(existingReadme)) {

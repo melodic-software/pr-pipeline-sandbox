@@ -13,7 +13,7 @@ import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/termin
 
 import { LANES, lanePath } from "../lib/slice-lanes.js";
 import { normalizePortableTempPath, serializeTempSession } from "../lib/temp-session-paths.js";
-import { readJsonFile } from "../lib/watch-frame-index.js";
+import { readJsonFile, writeJsonFile } from "../lib/watch-frame-index.js";
 import { watchStatePath } from "./watch-state.js";
 
 /**
@@ -39,7 +39,7 @@ export function sanitizeSliceTempPaths(sliceDir) {
     const watch = readJsonFile(watchPath);
     if (watch.tempSession) {
       watch.tempSession = serializeTempSession(watch.tempSession);
-      fs.writeFileSync(watchPath, `${JSON.stringify(watch, null, 2)}\n`, "utf8");
+      writeJsonFile(watchPath, watch);
       touched.push("run-state/watch.json");
     }
   }
@@ -61,7 +61,7 @@ export function sanitizeSliceTempPaths(sliceDir) {
         entry?.frame ? { ...entry, frame: withoutPath(entry.frame) } : entry,
       );
     }
-    fs.writeFileSync(selectionPath, `${JSON.stringify(selection, null, 2)}\n`, "utf8");
+    writeJsonFile(selectionPath, selection);
     touched.push("key-frames/selection.json");
   }
 
@@ -84,21 +84,16 @@ export function sanitizeSliceTempPaths(sliceDir) {
         })),
       }));
     }
-    fs.writeFileSync(indexPath, `${JSON.stringify(index, null, 2)}\n`, "utf8");
+    writeJsonFile(indexPath, index);
     touched.push("key-frames/sheet-frame-index.json");
   }
 
-  const snapshotMetaPath = lanePath(
-    absSlice,
-    LANES.keyFrames,
-    "contact-sheets",
-    "snapshot-meta.json",
-  );
+  const snapshotMetaPath = lanePath(absSlice, LANES.keyFrames, "contact-sheets", "snapshot-meta.json");
   if (fs.existsSync(snapshotMetaPath)) {
     const meta = readJsonFile(snapshotMetaPath);
     if (meta.sourceDir) {
       meta.sourceDir = normalizePortableTempPath(meta.sourceDir);
-      fs.writeFileSync(snapshotMetaPath, `${JSON.stringify(meta, null, 2)}\n`, "utf8");
+      writeJsonFile(snapshotMetaPath, meta);
       touched.push("key-frames/contact-sheets/snapshot-meta.json");
     }
   }

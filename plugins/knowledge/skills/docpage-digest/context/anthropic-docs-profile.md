@@ -40,11 +40,16 @@ extraction waits for the third (Rule of Three).
   stays the unaltered fetch. URLs arrive `\&`-escaped. Some real headings arrive as HTML tags
   (`<h2 id="where-skills-live">`, any of `<h1>`-`<h6>` with an `id`) instead of `#` lines, so the
   Phase 2 inventory counts both forms; a `#`-only scan drops an H2 and merges its section into
-  the previous unit. Digest text reproduces these artifacts
+  the previous unit. A slug derived from a `.md` heading can name an anchor the live page does
+  not have, so take every Basis anchor from the rendered page's `id`s, and cite an id that keeps
+  a typographic apostrophe (U+2019) percent-encoded (`%E2%80%99`). Probe for a page: list its
+  rendered ids with `grep -o 'id="[^"]*"'` and compare them with the anchors the `.md` fetch
+  implies.
+  Digest text reproduces these artifacts
   byte-exact and never repairs them. The reader-facing exception under **Archive-reading
   conventions** covers escaped links: a downstream artifact written *for a reader* repairs the
   corruption and discloses that it did.
-- **Cite a LIVE page by anchor, never by line number.** These pages gain and lose rows between
+- **Cite a live page by anchor, never by line number.** These pages gain and lose rows between
   reads and the `.md` channel renumbers with them, so a `<page>.md:<line>` citation rots silently
   into a pointer at an unrelated row. Cite the heading, the table row's key, or the variable name,
   something the page itself carries. Rows on these pages move by a few lines between reads, so a
@@ -91,10 +96,7 @@ extraction waits for the third (Rule of Three).
   - **Pointer**: when the `.md` channel's shape or figure handling matters, read the probe in the
     Verification section of
     [#7214](https://github.com/melodic-software/claude-code-plugins/pull/7214); no docs page
-    covers this channel as of 2026-10-11.
-  - **As of**: 2026-10-11
-  - **Recheck trigger**: a `.md` fetch returns a non-markdown content type, or its body lacks the
-    article's H1 title.
+    covers this channel.
 - **Figure data decoded from a framework payload is a derived file (both blog hosts).** When a
   figure's values sit in a script payload inside `source.html` (for example a `self.__next_f`
   script) rather than in its text, decode the payload into a file beside the originals, never
@@ -119,16 +121,15 @@ extraction waits for the third (Rule of Three).
   the claim, never evidence of absence. A rendered `WebFetch` result is never trusted to hold the
   whole page (**Pointer**: when judging what a rendered fetch returned of a page, fetch
   [WebFetch tool behavior](https://code.claude.com/docs/en/tools-reference#webfetch-tool-behavior)
-  live. **As of**: 2026-10-11. **Recheck trigger**: that section changes how much of a page one
-  call reads, what it does to the content, or how a result reports content it left out). The
+  live). The
   asymmetry is what makes this binding: a fetch that misses part of a page cannot fabricate a
-  PRESENCE, only an ABSENCE. A re-fetch through the same channel reproduces
+  presence, only an absence. A re-fetch through the same channel reproduces
   the blind spot rather than testing it, so the recheck uses the raw channel, not a repeat of the
   rendered one. This is a
   [noted source artifact, not a repaired one](#archive-reading-conventions): an observation is
   qualified where it is thin, never rewritten. This rule is the fleet-wide
-  [fetch route](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/upstream-drift/README.md#reading-the-basis-the-fetch-route)'s
-  rung 1, which the upstream-drift convention now owns for every surface; the asymmetry above stays
+  [fetch route](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/contracts/upstream-drift/README.md#reading-the-basis-the-fetch-route)'s
+  rung 1, which the upstream-drift convention owns for every surface; the asymmetry above stays
   here because it is this pipeline's reason for binding the rung to absence claims specifically.
 
 ## Archive-reading conventions
@@ -164,7 +165,8 @@ archive wrong in a way its own verification cannot catch:
 Anthropic docs mix API-surface guidance with harness-relevant guidance. Every digest tags each
 claim's applicability (`cc-applicable` / `api-only` / `mixed`, or the tag-exempt disposition
 below for material the vocabulary does not adjudicate), with evidence scaled to what the tag
-asserts:
+asserts. Where a rule below changes an already-verified slice's tag, that retag executes inside a
+graduation-time verification cycle, never as a bare edit.
 
 - **`cc-applicable` / `mixed` (positive claims):** verified against live code.claude.com docs at
   tag time. Cite the URL consulted in the digest row. A positive tag assigned by inference,
@@ -185,8 +187,7 @@ asserts:
   own command and count over that corpus, so every row of every slice rests on the same set. A
   search over a hand-picked subset is a sample: the row says so, and a sample never certifies
   absence.
-  Pointer: <https://code.claude.com/docs/llms.txt>. As of: 2026-10-01. Recheck trigger: that URL
-  stops serving the full page index.
+  Pointer: <https://code.claude.com/docs/llms.txt>.
 - **Every absence statement is scoped to the pages the run actually read.** A row or prose line
   saying no page states something names the corpus it searched, and names any page the corpus
   index lists that the run could not fetch or read. An unread page is a gap the statement
@@ -200,7 +201,7 @@ asserts:
   surface for **the claim's own specific assertion**, so only the corpus documenting *that
   assertion* falsifies it; topical overlap never does. Below that falsifying line sits the
   **near-miss**: a harness page covers the row's subject without stating the row's specific rule.
-  The tag survives, the row MUST name the near-miss by page and line, and an affirmative "no
+  The tag survives, the row must name the near-miss by page and line, and an affirmative "no
   surface" or "undisclosed" phrasing in
   such a row is simply false and goes. A row that says nothing about an adjacent surface reads as
   "no surface at all", which is the defect this notation exists to prevent.
@@ -218,7 +219,7 @@ asserts:
   doc line describing some *other* model's tier is not harness-internal behavior toward the subject,
   fails (3)'s own test, and is disclosed as a near-miss without entering this list.
 - **`tag-exempt (<sub-shape>)`: material the vocabulary does not adjudicate.** One disposition
-  for rows carrying no guidance for ANY surface the applicability vocabulary adjudicates, with the
+  for rows carrying no guidance for any surface the applicability vocabulary adjudicates, with the
   sub-shape named at the row. Five sub-shapes: `consumer-surface` (a different product surface,
   e.g. claude.ai web/mobile), `archive-descriptive` (an archive's own apparatus and entry
   structure), `metadata` (dates, titles, version labels), `navigation-pointer` (links and
@@ -226,7 +227,7 @@ asserts:
   covers, figure controls, slider labels, preset names, related-post cards). The disposition
   describes the material's genre and asserts nothing about harness applicability. It is not a positive tag and not a negative claim, so it owes no
   live-doc citation and no absence basis, and the near-miss disclosure burden never attaches.
-  `api-only` remains reserved for rows that DO assert a harness absence for their own specific
+  `api-only` remains reserved for rows that do assert a harness absence for their own specific
   assertion.
   - **`consumer-surface` is a documented-subject test, not a hosting test.** It fires only when
     claude.ai-the-product is what the page documents, not because a page is served from a
@@ -249,7 +250,12 @@ asserts:
     row-class table at the end of this section assigns the common blog rows.
   - **Pointer convention:** a bare "See X" is `navigation-pointer`. A directive pointer, one
     that tells the operator to do something or that asserts a fact about the target, is
-    guidance and takes a vocabulary tag, not the exempt disposition.
+    guidance and takes a vocabulary tag, not the exempt disposition. A pointer that states what
+    its target covers asserts a fact about the target. Worked examples: a Next steps bullet such
+    as "Test a mod: catch problems before they reach a session", and a "For X, see Y" line,
+    take a vocabulary tag; a See also link carrying only a topic label stays
+    `navigation-pointer`. An already-verified slice tagged the other way retags only inside a
+    graduation-time verification cycle.
 - **`cc-applicable`/`mixed` boundary:** a claim row is `mixed` only when that row's OWN quoted
   text names one of the four API surfaces: an API **request** parameter, an endpoint, an SDK
   call, or a model ID. That holds even when its guidance transfers to the harness. `cc-applicable` is
@@ -257,7 +263,15 @@ asserts:
   adjacent joins it.
   - **"parameter" means an Anthropic API request parameter.** A harness/tool argument the
     settings page happens to call a "parameter" (e.g. `dangerouslyDisableSandbox`) never
-    triggers `mixed`.
+    triggers `mixed`. A field in the request body of an Anthropic-served endpoint is a request
+    parameter even where the page places that endpoint outside the Claude Platform API. Worked
+    example: the routines page's `/fire` request field `text`, so a row naming `text` is `mixed`.
+  - **A named Agent SDK option or callback is an SDK call.** An option or callback reaches the
+    SDK only through a call, so a row naming one is `mixed`. Worked examples: the `settingSources`
+    and `managedSettings` options (managed-settings page), and the `canUseTool` callback
+    (headless and mods admin pages). A type name such as `SDKSystemMessage`, a link into an Agent
+    SDK page, and "Agent SDK" or "SDK session" with no named option are bare names and stay
+    `cc-applicable`.
   - **A hostname is a name, not an endpoint.** An endpoint is a callable address. Worked pair:
     `prUrlTemplate` names `github.com` and stays `cc-applicable`; `skipWebFetchPreflight` names
     `api.anthropic.com` and is also `cc-applicable`. Any retag of an already-verified slice
@@ -320,7 +334,7 @@ asserts:
   exemption.
 - **Vendor-blog attestation:** a `claude.com/blog` or `claude.dev/blog` page is a correlate-only
   source in marketing-adjacent vendor voice, not reference documentation. Any assertion of fact
-  that exists ONLY in the blog (no harness or platform doc states the same assertion) additionally
+  that exists only in the blog (no harness or platform doc states the same assertion) additionally
   carries
   `vendor-claimed (blog, <fetch date> fetch)` beside its vocabulary tag. That covers behavioral,
   performance, figure/percentage, comparative, frequency, methodological/definitional,
@@ -336,8 +350,7 @@ asserts:
   rules as an `api-only` basis. A row that searched only the harness corpus has not established
   blog-only. When a platform page states the same assertion, the row cites that page and drops
   the marker.
-  Pointer: <https://platform.claude.com/llms.txt>. As of: 2026-10-01. Recheck trigger: that URL
-  stops serving the docs page index.
+  Pointer: <https://platform.claude.com/llms.txt>.
 - **A prescribed method no docs page states is vendor-claimed.** A directive that prescribes a
   method or structure no docs page states carries `vendor-claimed`. A directive that applies a
   documented method to a new case carries `unverified-inference` only.
@@ -357,8 +370,10 @@ the page (a figure, a caption, a summary box):
 
 ## Digest-agent model matching
 
-A model-specific guide digests on the model it describes, since the subject model recognizes its own
-behavioral descriptions:
+A model-specific guide digests on the model it describes. The reason is this repository's
+heuristic, not an upstream claim: the subject model is assumed to recognize its own behavioral
+descriptions best. Recheck trigger: an eval comparing digest agents on a model-specific guide
+shows another model doing as well.
 
 | Doc subject | Digest-agent model |
 |---|---|
@@ -372,9 +387,6 @@ against the live page; this profile stores no generation rule.
 - **Pointer**: for which model IDs are pinned snapshots, see
   <https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions#model-id-format>
   and <https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions#dateless-ids-are-pinned-snapshots>.
-- **As of**: 2026-10-01
-- **Recheck trigger**: that page changes how a dateless ID or alias resolves, or a new model
-  generation ships.
 
 **Known gap: a plain Agent tool spawn cannot pin a model ID.** Our probe on 2026-10-01: the
 Agent tool's per-call `model` parameter, as this harness exposes it, takes only the family
@@ -421,7 +433,7 @@ undecided). The handoff records the candidate target per finding; the interview 
 ## Hedge preservation, and the residual-risk footer
 
 A source's own hedge stays attached to the content it qualifies. An artifact graduated from this
-publisher carries a pointer to the hedge (exact section, as-of date, recheck trigger) beside the
+publisher carries a pointer to the hedge (exact section) beside the
 content it qualifies. It never carries the hedge's text, quoted or paraphrased, and never drops
 the pointer or widens it to content the hedge does not qualify. The residual-risk footer below is
 the standing instance; the harness best-practices material's hedge on its own recommendations is
@@ -441,8 +453,6 @@ nor an artifact stores its text, and a reader follows the pointer.
 
 - **Pointer**: for the residual-risk sentence, see
   <https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/reduce-hallucinations#advanced-techniques>.
-- **As of**: 2026-08-03
-- **Recheck trigger**: that section drops, moves, or rewords its residual-risk sentence.
 
 An artifact says nothing about that sentence's scope or mechanism beyond the pointer. Naming the
 failure mode it covers more broadly than the section does, or naming who acts on it, states

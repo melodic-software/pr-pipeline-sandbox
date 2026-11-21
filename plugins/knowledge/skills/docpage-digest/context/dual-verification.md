@@ -2,7 +2,8 @@
 
 The terminal verification phase of [`../SKILL.md`](../SKILL.md), run once Phase 3's digest exists
 and before anything is presented. A digest presented without it is unverified, which is the state
-this phase exists to rule out.
+this phase exists to rule out. The verification level ([`../SKILL.md`](../SKILL.md) Phase 4)
+decides whether the two arms run; under `light` and `off` only the pin and the standing gates run.
 
 Two independent verifiers over the full digest set, fresh context, production rationale withheld:
 
@@ -19,13 +20,8 @@ Two independent verifiers over the full digest set, fresh context, production ra
   - **Pointer**: for the Workflow route only, `docs/plugin-philosophy.md` "Effort tiers", the
     "Where per-task effort is set" record, in the marketplace repository; no docs page covers
     per-call Workflow effort.
-  - **As of**: 2026-10-02
-  - **Recheck trigger**: a docs page starts covering it.
   - **Pointer**: when verifier A goes through the Agent tool, fetch
     <https://code.claude.com/docs/en/sub-agents#choose-an-effort-level> live.
-  - **As of**: 2026-10-10
-  - **Recheck trigger**: that section changes what the per-call `effort` overrides, what
-    overrides it, or which spawns honor it.
 - **Verifier B**. Cross-vendor (e.g. Codex via the `codex` plugin, high reasoning effort), same
   three checks. Cross-vendor independence is the point: correlated blind spots differ.
   The verdict header records B's effort as confirmed only when the arm itself reports it or the
@@ -45,9 +41,6 @@ Two independent verifiers over the full digest set, fresh context, production ra
     substitute arm is dispatched for them.
   - **Pointer**: for a Codex sandbox's network default and how to enable it, see
     <https://learn.chatgpt.com/docs/agent-approvals-security#network-access>.
-  - **As of**: 2026-10-01
-  - **Recheck trigger**: that section changes the default network access of a local Codex
-    sandbox mode.
 
 Verdicts land in `<work-root>/verification/` and are **append-only historical records**. A
 wrong verdict gets a dated corrections-applied record beside it, never a rewrite. Corrections
@@ -95,7 +88,7 @@ file. After every correction agent has returned, the parent writes the round's i
 `verification/corrections-applied-r<round>-<YYYY-MM-DD>.md`, which lists each unit file and
 gathers their "New findings" sections. That index is the round's applied record below.
 
-**Pin on agent-REPORTED completion, never file presence.** A digest file on disk does not mean
+**Pin on agent-reported completion, never file presence.** A digest file on disk does not mean
 its agent is done: an agent can rewrite its file minutes after a presence-based pin.
 Pin the tree only after every dispatched digest agent has *returned*, then write
 `<work-root>/verification/pin-manifest.json` with
@@ -177,7 +170,7 @@ deliberate look finds them.)
 
 **Degraded-verifier fallback (never silent):** when the cross-vendor verifier is unavailable
 (not installed, sandbox-broken, quota), substitute a second same-vendor verifier briefed as an
-adversarial refuter, and RECORD the degradation and its reason in the verdict file header. A
+adversarial refuter, and record the degradation and its reason in the verdict file header. A
 verification record that hides its degraded provenance is worse than a missing one. That rule
 covers a *missing* cross-vendor arm, not a session that cannot spawn.
 

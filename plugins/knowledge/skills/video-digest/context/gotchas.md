@@ -11,9 +11,6 @@ This skill's decision: a browser whose cookies yt-dlp cannot read counts as a fa
 - **Pointer**: when Chromium-based cookie extraction fails on Windows, fetch
   <https://github.com/yt-dlp/yt-dlp/issues/7271> (database locked while the browser runs) and
   <https://github.com/yt-dlp/yt-dlp/issues/10927> (DPAPI decryption) live.
-- **As of**: 2026-10-10
-- **Recheck trigger**: either issue closes, or a yt-dlp release note changes `--cookies-from-browser`
-  on Windows.
 
 ## HTTP 429 throttling
 
@@ -31,13 +28,19 @@ Bulk frames and contact sheets stay in OS `tempSession` dirs, not the repo. When
 
 A successful `close` removes those recorded dirs on purpose, after it marks the slice complete. To keep the media in a project layout, run `watch/relayout-slice.js` before `close` (`output-contract.md` "Scope of the setting"); afterwards the media is gone and only `--no-media` works. When one is locked (on Windows, a scanner or player holding a file open), `close` warns on stderr with the path and still succeeds; delete that dir by hand once the lock is gone.
 
+## Small temp filesystem
+
+yt-dlp stages the separate video and audio streams, the merged file and the remuxed mp4 in the OS temp directory, so staging peaks at about twice the media size. Before the download, `run-watch.js` asks yt-dlp for the size of the formats it will select. When the temp directory has less than twice that free, it exits 1 before downloading and names the directory, the space needed and the space free. When yt-dlp reports no size, it prints a warning naming the directory and continues. A ranged run counts only its share of the video.
+
+To stage on a larger disk, set `TMPDIR` (on Windows, `TEMP`) to a directory there before the watch, since `os.tmpdir()` reads it ([Node.js `os.tmpdir()`](https://nodejs.org/api/os.html#ostmpdir)). Keep it set for every later `run.mjs` call in the session: `watch.json` stores the `tempSession` paths relative to the temp directory and resolves them against it again, so a later call without it looks for the frames and contact sheets in the default temp directory. No flag moves the staging.
+
 ## Cloud agent without media toolchain
 
 `watch` needs ffmpeg + ImageMagick for frame extraction and contact sheets. A cloud agent lacking the media toolchain must **fail closed and not run watch**; route to the prerequisites fix path instead of producing a frameless run. The tools can often be installed in place: `SKILL.md` "Prerequisites" lists the fallbacks to try when the platform package is missing or below its floor.
 
 ## Video download blocked (HTTP 403 on the media stream)
 
-Captions and metadata can come through while the video itself is refused: yt-dlp fetches the caption track and then fails the media download with HTTP 403. YouTube applies this most to requests from datacenter IP ranges, so a cloud container sees it where a home connection does not. The full acquisition runs the video pass first, so `run-watch.js` exits non-zero before any slice is written, and the watch stops there ("No video, no watch" in `SKILL.md`). The fix path is to run the watch from a machine whose connection YouTube serves, such as a local session. Cookies (the `yt_dlp_cookies_file` option) and a proof-of-origin token provider plugin are the other levers; before reaching for either, read what each can and cannot clear and what it risks for the account in the yt-dlp [PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide), the [cookies FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp), and the [bgutil-ytdlp-pot-provider README](https://github.com/Brainicism/bgutil-ytdlp-pot-provider), as of 2026-10-06; recheck when a yt-dlp release changes which clients need a token or how cookies are passed.
+Captions and metadata can come through while the video itself is refused: yt-dlp fetches the caption track and then fails the media download with HTTP 403. YouTube applies this most to requests from datacenter IP ranges, so a cloud container sees it where a home connection does not. The full acquisition runs the video pass first, so `run-watch.js` exits non-zero before any slice is written, and the watch stops there ("No video, no watch" in `SKILL.md`). The fix path is to run the watch from a machine whose connection YouTube serves, such as a local session. Cookies (the `yt_dlp_cookies_file` option) and a proof-of-origin token provider plugin are the other levers; before reaching for either, read what each can and cannot clear and what it risks for the account in the yt-dlp [PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide), the [cookies FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp), and the [bgutil-ytdlp-pot-provider README](https://github.com/Brainicism/bgutil-ytdlp-pot-provider).
 
 ## Phase state lives only in `watch.json`
 

@@ -4,26 +4,35 @@ Owner doc for the corpus mapper's discovery layer: the deterministic URL extract
 (`parse_discovery.py`) and the classified link map the user approves before any bulk fetch
 (`check_linkmap.py` gates it).
 
-The same denominator discipline as the node manifest, one layer up: the set of URLs that MUST be
+The same denominator discipline as the node manifest, one layer up: the set of URLs that must be
 classified is produced by a script over immutable discovery snapshots, never by an agent's recall
 of what it saw. An agent classifies; it does not get to choose what needs classifying.
 
-## Discovery ladder (V1: rungs 1–2 only)
+## Discovery ladder (rungs 1–2, plus `repo-tree`)
 
 1. **Rung 1, `llms.txt`**: fetch `<origin>/llms.txt` (and `llms-full.txt` when the profile or
    user says so), snapshot it into the slice under `discovery/`.
 2. **Rung 2, sitemap**: fetch the site's sitemap (`sitemap.xml`, `sitemap.md`, or a
    robots.txt-declared location), snapshot likewise.
-3. **Rung 3, in-page link extraction: NOT IN V1.** Deferred and USER-RESERVED: reaching it
+3. **Rung 3, in-page link extraction: not in v1.** Deferred and user-reserved: reaching it
    requires either a presence-gated `/firecrawl:firecrawl map` call or a recorded reason to
    reimplement. The trigger is the first corpus whose seeds resolve neither an
    `llms.txt` nor a sitemap. Until then a corpus with neither artifact stops loudly at discovery.
+
+**Repository-tree rung, `repo-tree`**: for a repository seed, not an origin. The skill snapshots
+the forge's recursive tree listing at a commit SHA into `discovery/`, through the forge's adapter
+(`reference/providers/<forge>/repo-tree.md` at the plugin root; the parsing half is the forge's
+entry in `repo_tree_adapters.py`). `parse_discovery.py --rung repo-tree` keeps the listed files
+(not directories or submodules) whose paths match an `--include` glob and no `--exclude` glob, and
+emits each one's raw URL. `**` spans directories; `*` and `?` stay inside one path segment. It
+refuses a ref that is not a full commit SHA, a listing the forge marked truncated, and a glob set
+that selects no file.
 
 Fetching is the skill's job (WebFetch/curl per the skill's own text, channel recorded); parsing
 the snapshots is `parse_discovery.py`'s job and is deterministic: same snapshot bytes, same
 output bytes.
 
-WebFetch only finds which page to read; read the page itself by the [fetch-route rungs](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/upstream-drift/README.md#the-rungs).
+WebFetch only finds which page to read; read the page itself by the [fetch-route rungs](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/contracts/upstream-drift/README.md#the-rungs).
 
 ## `discovery-output/v1` (per snapshot; emitted by `parse_discovery.py`)
 
@@ -38,11 +47,26 @@ WebFetch only finds which page to read; read the page itself by the [fetch-route
 }
 ```
 
-- `rung`: `llms-txt` | `sitemap-xml` | `sitemap-md`.
+- `rung`: `llms-txt` | `sitemap-xml` | `sitemap-md` | `repo-tree`.
 - `base_url`: the URL the snapshot was fetched from, supplied by the caller; relative links
-  resolve against it.
+  resolve against it. For `repo-tree`, the adapter's raw-file base at the pinned SHA.
+- `repository`: present only, and required, when `rung` is `repo-tree`. Exactly the keys
+  `forge`, `owner`, `repo`, `ref` (the full commit SHA), `seed_url` (the normalized repository
+  seed URL the adapter builds), `include` and `exclude` (the globs, as given).
+
+  ```json
+  {"forge": "github", "owner": "cursor", "repo": "plugins", "ref": "<sha40>",
+   "seed_url": "https://github.com/cursor/plugins/tree/<sha40>",
+   "include": ["pstack/skills/**"], "exclude": []}
+  ```
+
 - `urls`: normalized (see below), deduplicated, sorted lexicographically. Sorting is part of the
   determinism contract.
+
+**`repo-tree` within v1.** The `repo-tree` rung value (in discovery outputs and in link-map row
+`rungs`) and the `repository` key are part of `discovery-output/v1` and `link-map/v1`. A gate that
+predates them rejects a `repo-tree` output as an unknown rung, so the parser and gate ship
+together.
 
 URL normalization (mirrors `docpage-digest`'s canonical-URL rules, minus the redirect step a
 offline script cannot take): scheme+host lowercased, fragment dropped, tracking-only query
@@ -62,7 +86,7 @@ resource cannot enter the map under two spellings. (Known, disclosed approximati
 is the sole producer of queue URLs, so identity is stable within mapper-driven runs; only a slice
 digested stand-alone earlier under a different spelling would not resume.)
 
-**Sitemap index files:** a `<sitemapindex>`'s `<loc>` entries are child SITEMAPS, not pages. The
+**Sitemap index files:** a `<sitemapindex>`'s `<loc>` entries are child sitemaps, not pages. The
 skill must fetch each child sitemap as an additional rung-2 snapshot and parse it too; the child
 `.xml` URLs themselves are then classified `ignore` (reason: sitemap index member) in the map.
 Skipping the child fetch under-discovers with a clean-looking gate. The gate cannot see URLs
@@ -92,8 +116,8 @@ nobody parsed.
   maximum number of `in-corpus` rows the run may fetch and digest. Optional `notes` string.
 - `rows`: exactly one row per distinct URL across seeds + every discovery output. Each row:
   - `url`: normalized URL.
-  - `rungs`: non-empty subset of `seed` | `llms-txt` | `sitemap-xml` | `sitemap-md`, the
-    provenance of every appearance. (`in-page` joins this enum only when the deferred rung-3
+  - `rungs`: non-empty subset of `seed` | `llms-txt` | `sitemap-xml` | `sitemap-md` |
+    `repo-tree`, the provenance of every appearance. (`in-page` joins this enum only when the deferred rung-3
     decision above is made.)
   - `classification`: exactly one of:
     - `in-corpus`, fetched, snapshotted, node-extracted, inventoried, queued for digestion.
@@ -107,13 +131,15 @@ nobody parsed.
 ## Gate contract (`check_linkmap.py`)
 
 Inputs: the link map and every discovery-output JSON for the slice (at least one is required,
-because a map with no discovery basis cannot demonstrate coverage; a corpus consisting solely of
-resource seeds, with no origin seed and so no discovery output, is outside V1 gate scope, the
-same recorded deferral as the repo-tree enumeration rung). Checks:
+because a map with no discovery basis cannot demonstrate coverage). A corpus whose only seed is a
+repository seed passes on its `repo-tree` output. A corpus of resource seeds only, with no origin
+or repository seed and so no discovery output, is outside gate scope: route it to direct
+`docpage-digest` runs, or name its repository as a repository seed. Checks:
 
 1. All inputs parse (duplicate JSON keys rejected at any depth); unknown or missing keys rejected
-   in the link map, its rows, AND each discovery output; schema literals exact; seeds and row
-   URLs must be in normalized form. Failures name the file/row; exit 2 for unusable input.
+   in the link map, its rows, and each discovery output; schema literals exact; seeds and row
+   URLs must be in normalized form. A `repo-tree` output's `repository.seed_url` must be one of
+   the map's `seeds`. Failures name the file/row; exit 2 for unusable input.
 2. **Classification coverage**, this gate's reason to exist: every URL in every discovery output
    and every seed has exactly one row; every row's URL traces back to at least one discovery
    output or the seed list (no phantom rows); every row carries a valid classification and
@@ -127,7 +153,7 @@ Exit codes: 0 pass; 1 named check failures; 2 unusable input; 3 internal gate bu
 
 ## What approval means
 
-The user approves the LINK MAP (classifications + bounds), not raw discovery. After approval the
+The user approves the link map (classifications + bounds), not raw discovery. After approval the
 map is frozen for the run; a later discovery change (re-fetch finds new URLs) reopens approval.
 Rows never appear or change classification silently. The approved queue handed to
 `/knowledge:docpage-digest` is exactly the `in-corpus` rows, in map order.

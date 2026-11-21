@@ -12,10 +12,14 @@
  *
  * Usage:
  *   node acquisition/preflight-metadata.js <video-url> [<video-url>...]
+ *   node acquisition/preflight-metadata.js <video-url> [--from <h:mm:ss>] [--to <h:mm:ss>]
  *
  * Emits a JSON array (one entry per URL) to stdout. Each entry:
- *   { url, videoId, ok, status, action, note, reason,
- *     title, channel, handle, displayTitle, displayChannel }
+ *   { url, videoId, queueKey, ok, status, action, note, reason,
+ *     title, channel, handle, displayTitle, displayChannel, liveStatus }
+ *
+ * queueKey is the QUEUE.md `video-id` cell and dedupe key: the videoId, plus the
+ * `-r<fromSec>-<toSec>` range suffix for a ranged add (`rangedSliceKey`).
  *
  * status:  ok | unavailable | transient | invalid-url
  * action:  enqueue (ok / transient) | reject (unavailable / invalid-url)
@@ -29,6 +33,7 @@ import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/termin
 import { classifyErrorDetail, UnsupportedSourceError } from "../adapters/adapter-contract.js";
 import { resolveSourceAdapter } from "../adapters/registry.js";
 import { parseDelegationRefusal } from "../adapters/x.js";
+import { parseTimeRangeArgs, rangedSliceKey } from "../lib/time-range.js";
 import { adapterSourceDeclarations } from "./acquire.js";
 import { spawnFailureDetail } from "./acquire-with-retry.js";
 import { resolveYtDlpAuthArgs } from "./build-yt-dlp-args.js";
@@ -49,7 +54,15 @@ export const PREFLIGHT_PRINT_TEMPLATE = [
   "%(repost_count)s",
   "%(comment_count)s",
   "%(like_count)s",
+  // After the emptiness probes, so their field positions stay fixed.
+  "%(live_status)s",
 ].join(PREFLIGHT_FIELD_SEP);
+
+/** Index of `live_status` in a {@link PREFLIGHT_PRINT_TEMPLATE} line. */
+const LIVE_STATUS_FIELD = 8;
+
+/** `live_status` values whose captions may still be in post-stream processing. */
+const STREAM_PROCESSING_STATUSES = new Set(["is_live", "post_live"]);
 
 /** Display cap for the queue `title` cell (keeps the markdown table scannable). */
 export const MAX_QUEUE_TITLE_CHARS = 60;
@@ -58,14 +71,14 @@ export const MAX_QUEUE_TITLE_CHARS = 60;
 const YT_DLP_NULL_FIELD = "NA";
 
 /**
- * Escape a value for a markdown table cell: collapse whitespace/newlines and escape `|`,
- * which would otherwise silently break the row's column count.
+ * Escape a value for a markdown table cell: collapse whitespace/newlines and escape `\` and `|`,
+ * either of which would otherwise break the row's column count.
  *
  * @param {string} text
  * @returns {string}
  */
 export function escapeTableCell(text) {
-  return (text ?? "").replace(/\s+/g, " ").trim().replace(/\|/g, "\\|");
+  return (text ?? "").replace(/\s+/g, " ").trim().replace(/[\\|]/g, "\\$&");
 }
 
 /**
@@ -153,7 +166,17 @@ export function isEmptyPostShell(stdout) {
   if (fields.length < 8) {
     return false;
   }
-  return fields.slice(2).every((field) => normalizeField(field) === "");
+  return fields.slice(2, 8).every((field) => normalizeField(field) === "");
+}
+
+/**
+ * The probe's yt-dlp `live_status`; empty when the line lacks it or yt-dlp printed none.
+ *
+ * @param {string} stdout
+ * @returns {string}
+ */
+export function parsePreflightLiveStatus(stdout) {
+  return normalizeField(firstNonEmptyLine(stdout).split(PREFLIGHT_FIELD_SEP)[LIVE_STATUS_FIELD]);
 }
 
 /**
@@ -182,8 +205,6 @@ export function buildPreflightArgs(url, { env = process.env, authOverride = {}, 
     "--skip-download",
     "--no-warnings",
     "--no-playlist",
-    // Same SSRF guard as acquisition: a source-declared extractor allow-list
-    // refuses delegated foreign URLs without fetching them.
     ...(source.allowedExtractors ? ["--use-extractors", source.allowedExtractors] : []),
     // Sources declaring 0-media posts as well-formed (mediaOptional) keep them
     // enqueueable: yt-dlp reports metadata instead of a no-formats error.
@@ -191,7 +212,6 @@ export function buildPreflightArgs(url, { env = process.env, authOverride = {}, 
     "--print",
     PREFLIGHT_PRINT_TEMPLATE,
     ...resolveYtDlpAuthArgs(env, authOverride, source.allowBrowserCookieProfileFallback === true),
-    // End-of-options sentinel: the URL can never be parsed as a flag.
     "--",
     url,
   ];
@@ -210,6 +230,8 @@ function summarizeDetail(detail) {
  * @typedef {Object} PreflightResult
  * @property {string} url
  * @property {string|null} videoId
+ * @property {string|null} queueKey - QUEUE.md `video-id` cell: videoId plus the range suffix
+ *   on a ranged add; null when videoId is
  * @property {boolean} ok
  * @property {'ok'|'unavailable'|'transient'|'invalid-url'} status
  * @property {'enqueue'|'reject'} action
@@ -220,7 +242,49 @@ function summarizeDetail(detail) {
  * @property {string} handle - raw channel handle, leading at-sign included
  * @property {string} displayTitle - escaped + truncated title cell
  * @property {string} displayChannel - escaped channel cell
+ * @property {string} liveStatus - yt-dlp `live_status` from the probe; empty when unknown
  */
+
+/**
+ * Build a result row; omitted text fields are empty. `queueKey` is derived from
+ * `videoId` and `timeRange`, so every enqueueable row carries the cell to paste.
+ *
+ * @param {Pick<PreflightResult, 'url' | 'videoId' | 'ok' | 'status' | 'action'> & Partial<Omit<PreflightResult, 'queueKey'>> & { timeRange?: import('../lib/time-range.js').TimeRange|null }} fields
+ * @returns {PreflightResult}
+ */
+function preflightResult({
+  url,
+  videoId,
+  timeRange = null,
+  ok,
+  status,
+  action,
+  note = "",
+  reason = "",
+  title = "",
+  channel = "",
+  handle = "",
+  displayTitle = "",
+  displayChannel = "",
+  liveStatus = "",
+}) {
+  return {
+    url,
+    videoId,
+    queueKey: videoId === null ? null : rangedSliceKey(videoId, timeRange),
+    ok,
+    status,
+    action,
+    note,
+    reason,
+    title,
+    channel,
+    handle,
+    displayTitle,
+    displayChannel,
+    liveStatus,
+  };
+}
 
 /**
  * @typedef {Object} PreflightDeps
@@ -229,32 +293,31 @@ function summarizeDetail(detail) {
  */
 
 /**
- * Validate a single URL and fetch its title + channel.
+ * Validate a single URL and fetch its title + channel. A `timeRange` (a ranged
+ * add) puts the range suffix on `queueKey`; a source without the `timeRange`
+ * capability rejects it, as `run-watch.js` would.
  *
  * @param {string} url
  * @param {PreflightDeps} [deps]
+ * @param {{ timeRange?: import('../lib/time-range.js').TimeRange|null }} [options]
  * @returns {Promise<PreflightResult>}
  */
-export async function preflightVideo(url, deps = {}) {
+export async function preflightVideo(url, deps = {}, { timeRange = null } = {}) {
   const { spawn = spawnAsync, env = process.env } = deps;
 
   /** @param {string} note @param {string} reason @returns {PreflightResult} */
-  const rejectInvalid = (note, reason) => ({
-    url,
-    videoId: null,
-    ok: false,
-    status: "invalid-url",
-    action: "reject",
-    // Escaped at construction: both cells can carry URL- or stderr-derived
-    // text, which must never break the markdown queue table it lands in.
-    note: escapeTableCell(note),
-    reason: escapeTableCell(reason),
-    title: "",
-    channel: "",
-    handle: "",
-    displayTitle: "",
-    displayChannel: "",
-  });
+  const rejectInvalid = (note, reason) =>
+    preflightResult({
+      url,
+      videoId: null,
+      ok: false,
+      status: "invalid-url",
+      action: "reject",
+      // Escaped at construction: both cells can carry URL- or stderr-derived
+      // text, which must never break the markdown queue table it lands in.
+      note: escapeTableCell(note),
+      reason: escapeTableCell(reason),
+    });
 
   /** @type {import('../adapters/adapter-contract.js').SourceAdapter} */
   let adapter;
@@ -273,6 +336,10 @@ export async function preflightVideo(url, deps = {}) {
   const decision = adapter.acceptForEnqueue(url);
   if (!decision.ok) {
     return rejectInvalid(decision.note ?? "rejected by source adapter", decision.reason ?? "");
+  }
+  if (timeRange && adapter.capabilities.timeRange !== true) {
+    const message = `--from/--to are not supported for ${adapter.id} sources`;
+    return rejectInvalid(message, message);
   }
   const videoId = decision.key ?? adapter.extractSliceKey(url, null);
 
@@ -300,89 +367,100 @@ export async function preflightVideo(url, deps = {}) {
 
   if (result.success && mediaOptional && isEmptyPostShell(result.stdout)) {
     // Removed or nonexistent post: yt-dlp still exits 0 with a synthetic title.
-    return {
+    return preflightResult({
       url,
       videoId,
+      timeRange,
       ok: false,
       status: "unavailable",
       action: "reject",
-      note: "",
       reason: "post removed or nonexistent (no uploader, description or counts)",
-      title: "",
-      channel: "",
-      handle: "",
-      displayTitle: "",
-      displayChannel: "",
-    };
+    });
   }
 
   if (result.success) {
-    const parsed = parsePreflightLine(result.stdout);
-    return {
+    const { title, channel, handle } = parsePreflightLine(result.stdout);
+    const liveStatus = parsePreflightLiveStatus(result.stdout);
+    return preflightResult({
       url,
       videoId,
+      timeRange,
       ok: true,
       status: "ok",
       action: "enqueue",
-      note: "",
-      reason: "",
-      title: parsed.title,
-      channel: parsed.channel,
-      handle: parsed.handle,
-      displayTitle: truncateTitle(escapeTableCell(parsed.title)),
-      displayChannel: escapeTableCell(formatChannel(parsed.channel, parsed.handle)),
-    };
+      note: STREAM_PROCESSING_STATUSES.has(liveStatus)
+        ? `live stream (${liveStatus}): captions may follow post-stream processing`
+        : "",
+      liveStatus,
+      title,
+      channel,
+      handle,
+      displayTitle: escapeTableCell(truncateTitle(title)),
+      displayChannel: escapeTableCell(formatChannel(channel, handle)),
+    });
   }
 
   const detail = spawnFailureDetail(result);
-  // A link post: the allow-list refused the post's outbound URL without a
-  // fetch. That is the well-formed 0-media result, so it takes the `ok` row.
   if (mediaOptional && parseDelegationRefusal(detail)) {
-    return {
+    return preflightResult({
       url,
       videoId,
+      timeRange,
       ok: true,
       status: "ok",
       action: "enqueue",
       note: "link post, no video (empty media)",
-      reason: "",
-      title: "",
-      channel: "",
-      handle: "",
-      displayTitle: "",
-      displayChannel: "",
-    };
+    });
   }
   const status = classifyPreflightFailure(detail, adapter.errorPatterns);
   const reason = escapeTableCell(summarizeDetail(detail));
-  return {
+  return preflightResult({
     url,
     videoId,
+    timeRange,
     ok: false,
     status,
     action: status === "unavailable" ? "reject" : "enqueue",
     note: status === "unavailable" ? "" : `preflight: ${reason || "needs auth/cookies"}`,
     reason,
-    title: "",
-    channel: "",
-    handle: "",
-    displayTitle: "",
-    displayChannel: "",
-  };
+  });
 }
 
 /**
  * @param {string[]} urls
  * @param {PreflightDeps} [deps]
+ * @param {{ timeRange?: import('../lib/time-range.js').TimeRange|null }} [options]
  * @returns {Promise<PreflightResult[]>}
  */
-export async function preflightVideos(urls, deps = {}) {
+export async function preflightVideos(urls, deps = {}, options = {}) {
   /** @type {PreflightResult[]} */
   const results = [];
   for (const url of urls) {
-    results.push(await preflightVideo(url, deps));
+    results.push(await preflightVideo(url, deps, options));
   }
   return results;
+}
+
+/** Flags that take a value; the value is not a URL. */
+const RANGE_FLAGS = new Set(["--from", "--to"]);
+
+/**
+ * Split the CLI arguments (after `node <script>`) into URLs and an optional time
+ * range. A ranged add names exactly one URL, as the queue's ranged row does.
+ *
+ * @param {string[]} args
+ * @returns {{ ok: true, urls: string[], timeRange: import('../lib/time-range.js').TimeRange|null } | { ok: false, error: string }}
+ */
+export function parsePreflightArgs(args) {
+  const rangeArg = parseTimeRangeArgs(args);
+  if (!rangeArg.ok) return rangeArg;
+  const urls = args.filter(
+    (arg, index) => arg.length > 0 && !RANGE_FLAGS.has(arg) && !RANGE_FLAGS.has(args[index - 1]),
+  );
+  if (rangeArg.range && urls.length !== 1) {
+    return { ok: false, error: "--from/--to take exactly one URL" };
+  }
+  return { ok: true, urls, timeRange: rangeArg.range };
 }
 
 /**
@@ -390,13 +468,20 @@ export async function preflightVideos(urls, deps = {}) {
  * @returns {Promise<void>}
  */
 async function main(argv) {
-  const urls = argv.slice(2).filter((arg) => arg.length > 0);
+  const parsed = parsePreflightArgs(argv.slice(2));
+  if (!parsed.ok) {
+    writeStderr(parsed.error);
+    process.exit(1);
+  }
+  const { urls, timeRange } = parsed;
   if (urls.length === 0) {
-    writeStderr("Usage: preflight-metadata.js <video-url> [<video-url>...]");
+    writeStderr(
+      "Usage: preflight-metadata.js <video-url> [<video-url>...] | <video-url> [--from <h:mm:ss>] [--to <h:mm:ss>]",
+    );
     process.exit(1);
   }
 
-  const results = await preflightVideos(urls);
+  const results = await preflightVideos(urls, {}, { timeRange });
   writeStdout(JSON.stringify(results, null, 2));
 
   if (results.some((entry) => entry.action === "reject")) {

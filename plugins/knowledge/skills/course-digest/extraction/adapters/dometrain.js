@@ -56,8 +56,6 @@ export const defaults = {
   },
 };
 
-// Required adapter methods
-
 /**
  * The configured video-player selector, falling back to the adapter default.
  * Reads the config directly: a nullish `platformCfg` is a caller error here.
@@ -212,20 +210,17 @@ export function deriveLandingUrl(courseUrl, platformCfg) {
  * Pattern: {baseUrl}{lesson.slug}/
  */
 export function buildLessonUrl(course, lesson, _platformCfg) {
-  const baseUrl = courseBaseUrl(course.url);
-  return `${baseUrl}${lesson.slug}/`;
+  return `${courseBaseUrl(course.url)}${lesson.slug}/`;
 }
-
-// Optional adapter methods
 
 function applyJsonLdMetadata(metadata, jsonLd) {
   if (!jsonLd) return;
   metadata.structuredData = jsonLd;
   if (jsonLd.name) metadata.title = jsonLd.name;
   if (jsonLd.description) metadata.description = jsonLd.description;
-  if (jsonLd.dateCreated) metadata.dateCreated = jsonLd.dateCreated;
-  if (jsonLd.dateModified) metadata.dateModified = jsonLd.dateModified;
-  if (jsonLd.datePublished) metadata.datePublished = jsonLd.datePublished;
+  for (const key of ["dateCreated", "dateModified", "datePublished"]) {
+    if (jsonLd[key]) metadata[key] = jsonLd[key];
+  }
   if (jsonLd.aggregateRating) {
     metadata.rating = {
       value: jsonLd.aggregateRating.ratingValue,
@@ -331,29 +326,22 @@ export async function authenticate({ context, page, course, storageStatePath, pl
   const envPrefix = platformCfg.authEnvPrefix ?? "COURSE";
 
   await page
-    .goto(`${baseUrl}${firstLesson.slug}/`, {
-      waitUntil: "domcontentloaded",
-      timeout: 15000,
-    })
+    .goto(`${baseUrl}${firstLesson.slug}/`, { waitUntil: "domcontentloaded", timeout: 15000 })
     .catch(() => {});
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(2000);
 
-  const hasPlayer = await hasPlayerElement(page, videoSelector);
-
-  if (hasPlayer) {
+  if (await hasPlayerElement(page, videoSelector)) {
     writeStdout("  Already authenticated.\n");
-    return { baseUrl };
+  } else {
+    await loginOrPromptManual({
+      context,
+      page,
+      storageStatePath,
+      envPrefix,
+      loginUrl: platformCfg.loginUrl,
+      login: clerkLogin,
+    });
   }
-
-  await loginOrPromptManual({
-    context,
-    page,
-    storageStatePath,
-    envPrefix,
-    loginUrl: platformCfg.loginUrl,
-    login: clerkLogin,
-  });
-
   return { baseUrl };
 }

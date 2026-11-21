@@ -17,8 +17,10 @@ Owned hosts are `youtube.com` and `youtu.be`. Host matching is suffix-aware, so 
 
 Slice key = the 11-character video id (`[A-Za-z0-9_-]{11}`), derived from the URL rather than from
 post-redirect metadata; metadata `id` is a fallback only when the URL yields none. One id → one
-slice; the id is also the `QUEUE.md` dedupe key. Canonicalization is identity: every claimed
-variant is acquired verbatim.
+whole-video slice; the id is also the `QUEUE.md` dedupe key. A ranged watch (`--from`/`--to`)
+adds `-r<fromSec>-<toSec>` to the key, so each range is its own slice and its own queue row
+(`../../context/watch-pipeline.md`). Canonicalization is identity: every claimed variant is
+acquired verbatim.
 
 ## Acquisition
 
@@ -32,9 +34,10 @@ Built by `acquisition/build-yt-dlp-args.js`. Auto-generated captions are in scop
 the caption ladder below deliberately falls through to them.
 
 **Caption ladder:** manual EN → auto EN (the original `en-orig` before a bare auto `en`) →
-auto-translate EN → exhausted: `transcript` mode STOPs and surfaces; `watch` (video downloaded)
+auto-translate EN → exhausted: `transcript` mode stops and surfaces; `watch` (video downloaded)
 proceeds caption-less and the transcript strategy picks `asr` or records a
-`transcriptDegradation`. A track is manual only when info.json
+`transcriptDegradation`. A live-derived video inside its caption wait (below) waits instead,
+in both modes. A track is manual only when info.json
 `subtitles` lists its key.
 Rung 3 and below trigger the auto-caption dedup clean-up pass. Declared caption class:
 `manual-and-auto`. Declared transcript strategy: `captions`.
@@ -46,9 +49,6 @@ track behind the decision is [#6740](https://github.com/melodic-software/claude-
 - **Pointer**: when caption files or info.json caption keys look different, fetch the probe in
   [#6740](https://github.com/melodic-software/claude-code-plugins/issues/6740) and yt-dlp's subtitle
   options at <https://github.com/yt-dlp/yt-dlp#subtitle-options> live.
-- **As of**: 2026-10-10
-- **Recheck trigger**: a yt-dlp release note that renames subtitle output files or changes the
-  `subtitles` / `automatic_captions` keys in info.json.
 
 **Comments and extractor args** are adapter-declared capabilities, not pipeline defaults. Both
 flags are pushed only because this adapter declares them. Comment harvest is on (the pinned
@@ -61,18 +61,39 @@ the extractor argument that carries the decision.
 
 - **Pointer**: when a translated track lands despite the skip, or the retry finds none, fetch
   yt-dlp's YouTube extractor arguments at <https://github.com/yt-dlp/yt-dlp#youtube> live.
-- **As of**: 2026-10-10
-- **Recheck trigger**: a yt-dlp release note that renames or changes `skip` values for the youtube
-  extractor.
 
 A caption pass that exits non-zero still selects from the tracks already written, and the failed
 track's `ERROR:` line lands in `transcriptDegradation`.
+
+### Caption wait for live streams
+
+An exhausted ladder reads info.json `live_status`, and the queue preflight prints it too.
+
+This spoke's decision: a video whose `live_status` is `is_live` or `post_live`, or `was_live` with
+a known, recent end, may still get auto-captions from post-stream processing, so the run waits for
+them instead of stopping (`transcript`) or digesting caption-less (`watch`). The stream's end is
+taken as `release_timestamp` plus `duration`. The wait is bounded: a re-check every 30 minutes, at
+most 12 hours from the stream's end (from the first hold when the end is unknown). Once that
+deadline passes, the run takes the exhausted-ladder path above and records the ended wait. Every
+other value, an absent one, and a `was_live` stream whose end is unknown or older than the window
+take the exhausted-ladder path at once, with no wait. A ranged `watch` (`--from`/`--to`) with ASR
+detected also skips the wait, unless `--transcript-strategy` names a caption strategy: it has the
+ranged media, so the `asr` rung transcribes it, and the `captionWait` note records the skip. The constants live in
+`extraction/acquisition/caption-wait.js`; the queue side is `../../context/watch-queue.md`
+"Caption wait". The observation behind the decision, auto-captions arriving about 2 hours after
+a stream ended, is [#14743](https://github.com/melodic-software/claude-code-plugins/issues/14743).
+
+- **Pointer**: when a held video's `live_status` or timestamps look different, fetch the
+  `live_status` and `release_timestamp` entries in yt-dlp's output template field list at
+  <https://github.com/yt-dlp/yt-dlp#output-template> and the YouTube extractor's
+  `_list_formats` live-status mapping at
+  <https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/youtube/_video.py> live.
 No extractor allow-list is declared: the youtube extractor resolves claimed URLs in-family, with
 no foreign delegation on the single-video path.
 
 ## Auth and throttle overrides
 
-Four personal `userConfig` options tune YouTube acquisition. Each is wired the **same**
+Four personal `userConfig` options tune YouTube acquisition. Each is wired the same
 cross-platform way as `--work-root` (see `../../context/output-contract.md`): a leading, double-quoted
 flag on the `run.mjs` invocation that the launcher forwards to the extraction child as an
 environment variable. Those env vars are internal plumbing, not a channel to set by hand.
@@ -80,7 +101,7 @@ environment variable. Those env vars are internal plumbing, not a channel to set
 This file arrives through Read unsubstituted. Take each option's value from SKILL.md's "Configured
 options" table, written `<option>` below.
 
-Apply the **same guard** as `library_dir`: pass a flag only when its option holds a non-empty
+Apply the same guard as `library_dir`: pass a flag only when its option holds a non-empty
 value other than the option default, and not still an unexpanded `user_config` token;
 otherwise omit it and the pipeline keeps its built-in default. All are leading and
 order-independent, so they combine with `--work-root` in any order.
@@ -99,12 +120,13 @@ one keeps the default). Raise it after an HTTP 429 on the caption pass, for exam
 launcher forwards it as `VIDEO_DIGEST_ACQUIRE_PHASE_GAP_SEC`. Pass it only when you want a gap other
 than the default.
 
-Example combining a non-default library dir with a forced cookie source (unset options
-contribute no flag):
+Example combining a non-default library dir (`<work-root>` resolved as
+`../../context/output-contract.md` says) with a forced cookie source (unset options contribute no
+flag):
 
 ```bash
 node "<skill-dir>/extraction/run.mjs" --data-dir "<plugin-data>" \
-  --work-root "${CLAUDE_PROJECT_DIR}/<library_dir>" \
+  --work-root "<work-root>" \
   --cookies-from-browser "<yt_dlp_cookies_from_browser>" \
   <script.js> [args…]
 ```
@@ -122,15 +144,13 @@ classified, acquisition iterates browser cookie profiles before giving up. Recov
 | Not a YouTube video URL | queue-lane rejection (not an error class) | adapter (`acceptForEnqueue`) | `reject` / `invalid-url` |
 | Unsupported host | unsupported-source | registry, before any adapter | `reject` / `invalid-url`, listing the supported sources |
 | HTTP 403 on media fragments | stale client | this spoke | update yt-dlp first |
-| HTTP 429 / 503 / connection reset / timeout | retryable | **shared retry policy**, not this adapter | backoff + honor the concurrency cap; see `../../context/gotchas.md` |
+| HTTP 429 / 503 / connection reset / timeout | retryable | shared retry policy, not this adapter | backoff + honor the concurrency cap; see `../../context/gotchas.md` |
 
 The HTTP 403 row is this spoke's decision: treat a media-fragment 403 as a stale client and update yt-dlp before any other recovery. The probe that an aging client failed that way and a newer build succeeded is [#6048](https://github.com/melodic-software/claude-code-plugins/issues/6048).
 
 - **Pointer**: when a media download returns HTTP 403, fetch the probe in [#6048](https://github.com/melodic-software/claude-code-plugins/issues/6048) and the current yt-dlp release at <https://github.com/yt-dlp/yt-dlp/releases> live.
-- **As of**: 2026-10-03
-- **Recheck trigger**: a yt-dlp release note that changes how an aging binary fails a media download.
 
-The last row is the one to read carefully: this adapter declares **no** retryable patterns of its
+The last row is the one to read carefully: this adapter declares no retryable patterns of its
 own. Transport-level retry is shared machinery applied to every source, so a 429 never reaches
 adapter classification. Cookie fallback fires on a login-required classification only, and only
 because this adapter declares the browser-cookie-fallback capability. An explicit cookies-file or
@@ -138,6 +158,6 @@ cookies-from-browser setting suppresses the profile loop entirely.
 
 ## Prerequisite floor
 
-yt-dlp **2026.6** or newer, for every action. `--js-runtimes node` by default; set the
+yt-dlp 2026.6 or newer, for every action. `--js-runtimes node` by default; set the
 `yt_dlp_js_runtimes` option to `off` to omit it. Install commands are in the hub's
 Prerequisites section.

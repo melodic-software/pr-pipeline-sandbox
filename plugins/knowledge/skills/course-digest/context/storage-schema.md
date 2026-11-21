@@ -1,6 +1,6 @@
 # Storage Schema
 
-All course data lives under the invoking project's `library_dir` setting (or `<plugin-data>` when no library dir is configured), as `courses/<platform>/<slug>/`.
+All course data lives at `<work-root>/courses/<platform>/<slug>/`, with `<work-root>` resolved as SKILL.md's "Emit checklist" says. That directory is the `--course-dir` every extraction script takes.
 
 ## Platform naming
 
@@ -8,12 +8,7 @@ Use platform's lowercase brand name: `dometrain`, `pluralsight`, `udemy`, `manni
 
 ## Slug naming
 
-Derive slug from course title: lowercase, kebab-case, max 50 chars, include instructor surname for disambiguation.
-
-Examples:
-
-- "Test-Driven Development in C#" by Guilherme Ferreira → `dometrain/tdd-csharp-ferreira`
-- "From Zero to Hero: Dependency Injection in .NET" by Nick Chapsas → `dometrain/dependency-injection-dotnet-chapsas`
+Derive slug from course title: lowercase, kebab-case, max 40 chars, include instructor surname for disambiguation.
 
 ## Directory structure
 
@@ -28,9 +23,10 @@ courses/<platform>/<slug>/
         notes.md                 # Lesson notes (if platform provides them)
         code-snippets.md         # Code extracted from lesson (inline code blocks)
         resources.json           # Download URLs, article links, PDF links (Teachable adapter)
-        screenshots/             # Key frames as PNG files
-          001-slide-intro.png    # Zero-padded, descriptive suffix
-          002-code-example.png
+        screenshots/             # Extracted frames as PNG files
+          scene-01/
+            scene_0001.png       # Scene-detection frame
+            interval_0001.png    # Interval-capture fallback frame
       02-what-will-you-learn/
         transcript.md
         ...
@@ -64,11 +60,11 @@ courses/<platform>/<slug>/
 
 ```json
 {
-  "title": "Test-Driven Development in C#",
-  "slug": "tdd-csharp-ferreira",
+  "title": "Test-Driven Development Fundamentals",
+  "slug": "tdd-fundamentals-doe",
   "platform": "dometrain",
   "url": "https://dometrain.com/take/course/...",
-  "instructor": "Guilherme Ferreira",
+  "instructor": "Jane Doe",
   "duration": "5h 41m",
   "totalLessons": 67,
   "extractedAt": "2026-03-31T...",
@@ -131,11 +127,9 @@ phases are non-null to determine where to continue.
 
 ## Transcript
 
-[0:00] Hello, and welcome to the From Zero to Hero course on test-driven
-development in C#.
+[0:00] Hello, and welcome to this course on test-driven development.
 
-[0:07] My name is Guilherme Ferreira, also known as GI, and I'm a Microsoft
-MVP for developer technologies.
+[0:07] My name is Jane Doe, and I've written tests first for over a decade.
 
 [0:15] Not only that, but I'm addicted to test-driven development.
 ```
@@ -205,7 +199,7 @@ Per-lesson resource metadata: download URLs, article links, PDF links extracted 
 - Understanding progression (how codebase evolves lesson by lesson)
 - Catching discrepancies (what code does vs what instructor says)
 
-Phase 3 synthesis agents read BOTH: repo for architectural context, downloads for lesson-specific teaching. Repo alone misses journey; ZIPs alone miss big picture.
+Phase 3 synthesis agents read both: repo for architectural context, downloads for lesson-specific teaching. Repo alone misses journey; ZIPs alone miss big picture.
 
 For courses with GitHub repos instead of ZIPs, `code/repo/` is a shallow clone and per-section analysis comes from `git log` or directory-based sections.
 
@@ -213,13 +207,13 @@ For courses with GitHub repos instead of ZIPs, `code/repo/` is a shallow clone a
 
 - Format: PNG
 - Max width: 1280px
-- Naming: `{NNN}-{descriptive-suffix}.png` (e.g., `001-test-list-creation.png`)
+- Naming: the extractor writes `screenshots/scene-01/scene_NNNN.png` (scene detection) and `screenshots/scene-01/interval_NNNN.png` (interval fallback)
 - Only capture when visual content adds information beyond transcript:
   - Code on screen (IDE, terminal)
   - Architecture diagrams
   - Slides with visual content
   - UI demonstrations
-- Do NOT screenshot talking-head segments; the transcript covers those
+- Do not screenshot talking-head segments; the transcript covers those
 
 ## Size management
 
@@ -227,4 +221,4 @@ For courses with GitHub repos instead of ZIPs, `code/repo/` is a shallow clone a
 - **Screenshots**: resize to 1280px wide, compress with reasonable quality
 - **Transcripts**: typically 1-3 KB per minute of video (~30 KB for a 30-min lesson)
 - **course.json**: grows with lessons but stays under 50 KB for large courses
-- **Expected total per course**: 1-5 MB for transcripts + metadata, 10-50 MB with screenshots
+- **Expected total per course**: 1-5 MB for transcripts + metadata; with screenshots, size it from the measured per-lesson figures in [screenshot-strategy.md](../reference/screenshot-strategy.md#file-size-management)

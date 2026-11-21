@@ -9,7 +9,6 @@
  */
 
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { spawnAsync } from "@melodic/video-digestion/shared/process";
 
@@ -30,10 +29,7 @@ const DETECT_ARGS = Object.freeze([
   "import faster_whisper; print(faster_whisper.__version__)",
 ]);
 
-const ASR_SCRIPT_PATH = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "asr_transcribe.py",
-);
+const ASR_SCRIPT_PATH = path.join(import.meta.dirname, "asr_transcribe.py");
 
 /**
  * @typedef {Object} AsrDetection
@@ -73,7 +69,6 @@ export async function detectAsrCapability({ spawn = spawnAsync, env = process.en
   /** @type {string[]} */
   const attempts = [];
   for (const candidate of candidates) {
-    // spawnAsync never rejects — a spawn failure resolves success:false + error.
     const result = await spawn(candidate, [...DETECT_ARGS], { timeout: 30_000 });
     if (result.success) {
       const version = (result.stdout ?? "").trim() || null;
@@ -137,7 +132,6 @@ export async function runAsrTranscription({
     String(ASR_BATCH_SIZE),
     ...(initialPrompt ? ["--initial-prompt", initialPrompt] : []),
   ];
-  // spawnAsync never rejects — a spawn failure resolves success:false + error.
   const result = await spawn(python, args, {});
   if (!result.success) {
     return {

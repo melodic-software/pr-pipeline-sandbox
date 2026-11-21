@@ -20,10 +20,10 @@ Tick only after verification evidence. Criteria SSOT: `quality-gates.md` (the `/
 ## Phase 0b: Companion primary sources (when `source/companion-sources.md` exists)
 
 - [ ] **0b.1** Brief read. Verify: `source/companion-sources.md` present; section fan-out table complete
-- [ ] **0b.2** Companion URL(s) deep-fetched. Verify: WebFetch full page per URL; not surface skim
+- [ ] **0b.2** Companion URL(s) deep-fetched. Verify: full page per URL by the fetch-route rungs (`companion-primary-sources.md`); not surface skim
 - [ ] **0b.3** Section fan-out complete. Verify: `source/companion-digest/<section-slug>.md` for every row in brief
 - [ ] **0b.4** Hub digest written. Verify: `source/companion-digest/README.md` links all section shards
-- [ ] **0b.5** `mark-phase <slice-dir> companion` only after 0b.1–0b.4. Verify: `watch.json`; run **before** Phase 1 on fresh watch
+- [ ] **0b.5** `mark-phase <slice-dir> companion` only after 0b.1–0b.4. Verify: `watch.json`; run before Phase 1 on fresh watch
 
 ## Phase 1: CLI bootstrap
 
@@ -31,7 +31,7 @@ Tick only after verification evidence. Criteria SSOT: `quality-gates.md` (the `/
 - [ ] **1.2** `transcript.txt` readable. Verify: spot-read; not empty/error stub
 - [ ] **1.3** `key-frames/selection.json` matches `watch.json` metrics. Verify: frame count, `contactSheets`, `densificationWindows`
 - [ ] **1.4** tempSession paths exist on disk. Verify: `contactSheetsDir`, frames dir from `watch.json` `artifactPaths`
-- [ ] **1.5** `highVolume` correct for long VOD. Verify: true when sheets ≥8 or duration ≥2h or densification ≥30
+- [ ] **1.5** `highVolume` matches the pipeline rule. Verify: equals `isHighVolume` (`extraction/watching/frame-budget.js`) over the slice's sheets, duration, densification windows, `candidateCount` and `targetMinFrames`
 - [ ] **1.6** CLI phases marked complete only after 1.1–1.5. Verify: acquire, transcript, watching, harvest in `watch.json`
 
 ## Phase 2: Vision plan (before fan-out)
@@ -42,7 +42,7 @@ Tick only after verification evidence. Criteria SSOT: `quality-gates.md` (the `/
 
 ## Phase 3: Claim landscape (before research)
 
-- [ ] **3.1** `research/claim-inventory.md`. Verify: one `## <n>. <name>` heading plus `**Boundary:** [m:ss] … [m:ss]` line per session (format in `watch-pipeline.md` Phase 2; a table is not parsed); ≥4 claims/session (conference); ≥40 claims if ≥4h
+- [ ] **3.1** `research/claim-inventory.md`. Verify: one `## <n>. <name>` heading plus `**Boundary:** [m:ss] … [m:ss]` line per session (format in `watch-pipeline.md` Phase 3; a table is not parsed); ≥4 claims/session (conference); ≥40 claims if ≥4h
 - [ ] **3.2** `research/research-agenda.md` drafted from inventory. Verify: cluster rows map to claim IDs
 - [ ] **3.3** No research fan-out started before 3.1. Verify: agenda exists before first research cluster
 
@@ -79,7 +79,7 @@ Tick only after verification evidence. Criteria SSOT: `quality-gates.md` (the `/
 - [ ] **6.3** Pre-promotion: read each candidate PNG. Verify: no promote from filename/cell index alone
 - [ ] **6.4** Vision-gated promote → `key-frames/frames/`. Verify: semantic filenames only (`synthesis-contract.md`); count floor warn-only
 - [ ] **6.5** On-screen URLs merged. Verify: `source/harvested-links.json` updated if URLs found
-- [ ] **6.6** Post-promotion review of every `frames/*.png`. Verify: failures **deleted**, not kept under `key-frames/frames/`
+- [ ] **6.6** Post-promotion review of every `frames/*.png`. Verify: failures deleted, not kept under `key-frames/frames/`
 - [ ] **6.7** `key-frames/key-frames-manifest.md` + `key-frames/key-frame-quality-audit.md`. Verify: files exist; audit covers each synthesis file
 - [ ] **6.8** `mark-phase <slice-dir> vision` only after 4.x–6.7. Verify: `watch.json` vision metrics honest vs triage log
 
@@ -109,7 +109,7 @@ Tick only after verification evidence. Criteria SSOT: `quality-gates.md` (the `/
 - [ ] **9.2** `verification/<ISO-basic>Z-watch-outcomes.md` shows PASS. Verify: all `fail` severity checks green
 - [ ] **9.5** Corpus relayout, only when a corpus target is configured (otherwise tick as n/a). Run before 9.3: `close` removes the temp session the media is copied from. Verify: `watch/relayout-slice.js <slice-dir> <target-dir>` exit 0
 - [ ] **9.3** `watch-state.js close <slice-dir>` exit 0 after 9.1, 9.2, 9.4 and 9.5; it is the only writer of `status: complete`. Verify: `watch.json` `status: complete`
-- [ ] **9.4** Vision fidelity spot-check (required for a vision-complete claim). Verify: ≥10 synthesis PNG images name↔content + ≥3 contact sheets verdict↔JPG; notes in Resume notes below. Verify script exit 0 alone is structural only.
+- [ ] **9.4** Vision fidelity spot-check (required for a vision-complete claim), dispatched to a fresh-context subagent, never run by the context that produced the slice (`context/quality-gates.md`, "Structural vs vision fidelity"). Verify: the `read-verification.sh` line, then ≥10 synthesis PNG images name↔content + ≥3 contact sheets verdict↔JPG from the subagent's notes, in Resume notes below. Under `light` or `off`: tick with `verification: skipped (<level>)` and report the slice structural-complete only. Verify script exit 0 alone is structural only.
 
 ---
 

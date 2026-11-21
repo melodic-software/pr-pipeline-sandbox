@@ -33,18 +33,27 @@ from parse_discovery import normalize_url  # noqa: E402  (URL identity has ONE o
 LINKMAP_SCHEMA = "link-map/v1"
 DISCOVERY_SCHEMA = "discovery-output/v1"
 CLASSIFICATIONS = ("in-corpus", "companion", "referenced-external", "ignore")
-DISCOVERY_RUNGS = ("llms-txt", "sitemap-xml", "sitemap-md")
+DISCOVERY_RUNGS = ("llms-txt", "sitemap-xml", "sitemap-md", "repo-tree")
 ROW_RUNGS = ("seed",) + DISCOVERY_RUNGS
 
 LINKMAP_KEYS = {"schema", "topic", "seeds", "bounds", "rows"}
 ROW_KEYS = {"url", "rungs", "classification", "reason"}
 BOUNDS_KEYS = {"max_resources", "notes"}
 DISCOVERY_KEYS = {"schema", "rung", "snapshot", "base_url", "url_count", "urls"}
+REPOSITORY_KEYS = {"forge", "owner", "repo", "ref", "seed_url", "include", "exclude"}
 
 
 def fail(code: int, message: str) -> NoReturn:
     sys.stderr.write(f"check_linkmap: ERROR: {message}\n")
     sys.exit(code)
+
+
+def is_nonempty_string_list(value) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, str) and item for item in value)
+    )
 
 
 def load_json(path: str, what: str):
@@ -59,14 +68,36 @@ def load_json(path: str, what: str):
         fail(2, f"{what} {path!r} is not parseable JSON: {exc}.")
 
 
-def check_discovery_output(path: str, doc) -> tuple:
+def check_repository(path: str, repository, seeds: list) -> None:
+    """A repo-tree output's repository record; its seed must be a declared seed."""
+    if not isinstance(repository, dict) or set(repository) != REPOSITORY_KEYS:
+        fail(
+            2,
+            f"discovery output {path!r} 'repository' is not an object with "
+            f"exactly the keys {sorted(REPOSITORY_KEYS)}.",
+        )
+    seed_url = repository["seed_url"]
+    if not isinstance(seed_url, str) or normalize_url(seed_url) != seed_url:
+        fail(2, f"discovery output {path!r} repository.seed_url {seed_url!r} is not normalized.")
+    if seed_url not in seeds:
+        fail(
+            2,
+            f"discovery output {path!r} enumerates repository seed "
+            f"{seed_url!r}, which the link map does not declare in 'seeds'.",
+        )
+
+
+def check_discovery_output(path: str, doc, seeds: list) -> tuple:
     """Returns (rung, set-of-urls); anything unrecognized is exit 2."""
     if not isinstance(doc, dict):
         fail(2, f"discovery output {path!r} root is not a JSON object.")
-    d_unknown = set(doc) - DISCOVERY_KEYS
+    expected = DISCOVERY_KEYS | (
+        {"repository"} if doc.get("rung") == "repo-tree" else set()
+    )
+    d_unknown = set(doc) - expected
     if d_unknown:
         fail(2, f"discovery output {path!r} has unknown keys {sorted(d_unknown)}.")
-    d_missing = DISCOVERY_KEYS - set(doc)
+    d_missing = expected - set(doc)
     if d_missing:
         fail(2, f"discovery output {path!r} missing keys {sorted(d_missing)}.")
     if doc["schema"] != DISCOVERY_SCHEMA:
@@ -82,12 +113,10 @@ def check_discovery_output(path: str, doc) -> tuple:
             f"discovery output {path!r} rung {rung!r} is not one of "
             f"{list(DISCOVERY_RUNGS)}.",
         )
+    if rung == "repo-tree":
+        check_repository(path, doc["repository"], seeds)
     urls = doc["urls"]
-    if (
-        not isinstance(urls, list)
-        or not urls
-        or not all(isinstance(u, str) and u for u in urls)
-    ):
+    if not is_nonempty_string_list(urls):
         fail(2, f"discovery output {path!r} 'urls' is not a non-empty list of strings.")
     if doc["url_count"] != len(urls):
         fail(
@@ -116,12 +145,14 @@ def main(argv=None) -> int:
         fail(
             2,
             "at least one --discovery output is required: a link map with "
-            "no discovery basis cannot demonstrate coverage. Two cases "
+            "no discovery basis cannot demonstrate coverage. Three cases "
             "land here: (1) an origin seed resolved neither llms.txt nor "
             "a sitemap -- stop loudly (rung 3 is deferred, user-reserved); "
-            "(2) a corpus of resource seeds only -- outside V1 gate scope "
-            "by recorded deferral (see link-map-format.md); route those "
-            "URLs to direct docpage-digest runs instead.",
+            "(2) a repository seed whose tree listing was not parsed -- run "
+            "parse_discovery.py --rung repo-tree and pass its output; "
+            "(3) a corpus of resource seeds only -- outside gate scope "
+            "(see link-map-format.md); route those URLs to direct "
+            "docpage-digest runs instead.",
         )
 
     linkmap = load_json(args.linkmap, "link map")
@@ -141,11 +172,7 @@ def main(argv=None) -> int:
         )
 
     seeds = linkmap["seeds"]
-    if (
-        not isinstance(seeds, list)
-        or not seeds
-        or not all(isinstance(s, str) and s for s in seeds)
-    ):
+    if not is_nonempty_string_list(seeds):
         fail(2, "link map 'seeds' is not a non-empty list of strings.")
     for seed in seeds:
         normalized_seed = normalize_url(seed)
@@ -178,19 +205,19 @@ def main(argv=None) -> int:
     if not isinstance(rows, list) or not rows:
         fail(2, "link map 'rows' is not a non-empty list.")
 
-    rungs_by_url = {}
-    for seed in seeds:
-        rungs_by_url.setdefault(seed, set()).add("seed")
+    rungs_by_url = {seed: {"seed"} for seed in seeds}
     discovery_counts = {}
     for path in args.discovery:
-        rung, urls = check_discovery_output(path, load_json(path, "discovery output"))
+        rung, urls = check_discovery_output(
+            path, load_json(path, "discovery output"), seeds
+        )
         discovery_counts[path] = (rung, len(urls))
         for url in urls:
             rungs_by_url.setdefault(url, set()).add(rung)
 
     failures = Failures("check_linkmap")
     seen = {}
-    tally = {c: 0 for c in CLASSIFICATIONS}
+    tally = dict.fromkeys(CLASSIFICATIONS, 0)
     for index, row in enumerate(rows):
         label = f"row[{index}]"
         if not isinstance(row, dict):
@@ -206,7 +233,7 @@ def main(argv=None) -> int:
             continue
         url = row["url"]
         if not isinstance(url, str) or not url:
-            failures.add(f"row[{index}]: url is not a non-empty string.")
+            failures.add(f"{label}: url is not a non-empty string.")
             continue
         label = f"row[{index}] ({url!r})"
         normalized = normalize_url(url)
@@ -305,8 +332,6 @@ def main(argv=None) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except SystemExit:
-        raise
     except Exception as exc:  # residual bug: documented exit 3, never a traceback
         sys.stderr.write(
             f"check_linkmap: ERROR: internal failure {type(exc).__name__}: "

@@ -8,6 +8,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAcquisitionEnvelope } from "../adapters/adapter-contract.js";
 import { acquireMedia } from "../adapters/registry.js";
 import { runWatchCli } from "./run-watch.js";
+process.env.GIT_CONFIG_GLOBAL ??= "/dev/null";
+process.env.GIT_CONFIG_NOSYSTEM = "1";
 
 const captured = vi.hoisted(() => ({
   stderr: /** @type {string[]} */ ([]),
@@ -27,6 +29,10 @@ vi.mock("../adapters/registry.js", async (importOriginal) => {
   const actual = await importOriginal();
   return { ...actual, acquireMedia: vi.fn() };
 });
+
+vi.mock("./temp-space-check.js", () => ({
+  checkTempSpace: vi.fn(async () => ({ state: "enough", message: "" })),
+}));
 
 vi.mock("../watching/orchestrate-watching.js", async (importOriginal) => {
   const actual = await importOriginal();

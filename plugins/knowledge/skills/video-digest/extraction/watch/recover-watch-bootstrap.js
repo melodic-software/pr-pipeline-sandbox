@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 /**
  * Recover run-watch bootstrap from an interrupted session when temp dirs still exist.
+ * A ranged slice (watch.json `timeRange`) is recovered in the range's media time and
+ * written in full-video time, with the recorded range kept.
  *
  * Usage:
  *   node watch/recover-watch-bootstrap.js <slice-dir> <workDir> <framesDir> <contactSheetsDir>
@@ -12,14 +14,19 @@ import path from "node:path";
 
 import { readFrameTimes } from "@melodic/video-digestion/frames/scene-detect";
 import { probeVideoDuration } from "@melodic/video-digestion/media/ffprobe-duration";
-import { isMainModule } from "@melodic/video-digestion/shared/main-module";
 import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/terminal";
 
 import { resolveSourceAdapter } from "../adapters/registry.js";
 import { selectCaptionFile } from "../acquisition/select-caption.js";
 import { parseVideoMetadata } from "../acquisition/video-metadata.js";
+import { runMain } from "../lib/run-main.js";
 import { LANES, lanePath } from "../lib/slice-lanes.js";
-import { MAX_FRAME_GAP_SEC, planFrameCoverage } from "../watching/compute-coverage-plan.js";
+import {
+  cuesInMediaTime,
+  keyframeOffsetErrorSec,
+  watchingInVideoTime,
+} from "../lib/time-range.js";
+import { planFrameCoverage } from "../watching/compute-coverage-plan.js";
 import { normalizeVttCues } from "../watching/cue-normalize.js";
 import { isHighVolume, selectFramesForCoverage } from "../watching/frame-budget.js";
 import { mergeFrameCandidates } from "../watching/merge-frame-candidates.js";
@@ -53,15 +60,34 @@ export async function resolveRecoverySourceUrl(sliceDir) {
 }
 
 /**
- * The maximum frame gap the original run recorded in `watch.json`, or the
- * default for a slice recorded before the field existed.
+ * The maximum frame gap the original run recorded in `watch.json`, or
+ * `undefined` so the coverage plan derives the duration default, as the
+ * original run did when it was interrupted before recording one.
  *
  * @param {string} sliceDir
- * @returns {Promise<number>}
+ * @returns {Promise<number|undefined>}
  */
 async function resolveRecoveryMaxFrameGapSec(sliceDir) {
   const recorded = (await readWatchState(sliceDir))?.maxFrameGapSec;
-  return typeof recorded === "number" && recorded > 0 ? recorded : MAX_FRAME_GAP_SEC;
+  return typeof recorded === "number" && recorded > 0 ? recorded : undefined;
+}
+
+/**
+ * The range a ranged run recorded in `watch.json`, or null for a whole-video slice.
+ * The work dir holds that run's ranged media, so recovery plans in media time and
+ * adds the range's start back before writing, as `run-watch.js` does.
+ *
+ * @param {string} sliceDir
+ * @returns {Promise<import('../lib/time-range.js').TimeRange & { offsetErrorSec: number|null } | null>}
+ */
+async function resolveRecoveryTimeRange(sliceDir) {
+  const recorded = (await readWatchState(sliceDir))?.timeRange;
+  if (!recorded || typeof recorded.fromSec !== "number") return null;
+  return {
+    fromSec: recorded.fromSec,
+    toSec: typeof recorded.toSec === "number" ? recorded.toSec : null,
+    offsetErrorSec: typeof recorded.offsetErrorSec === "number" ? recorded.offsetErrorSec : null,
+  };
 }
 
 /**
@@ -184,26 +210,26 @@ function scopeToEntry(names, videoName, entryNamed) {
  */
 export function resolveWorkArtifacts(workDir, captionClass = "manual-and-auto") {
   const entries = fs.readdirSync(workDir);
-  const videoPath = entries.find((name) => name.endsWith(".mp4"));
+  const videoName = entries.find((name) => name.endsWith(".mp4"));
   const infoNames = entries.filter((name) => name.endsWith(".info.json"));
   const vttNames = entries.filter((name) => name.endsWith(".vtt"));
-  if (!videoPath || vttNames.length === 0 || infoNames.length === 0) {
+  if (!videoName || vttNames.length === 0 || infoNames.length === 0) {
     throw new Error(`Missing mp4/vtt/info.json in ${workDir}`);
   }
   const entryNamed = infoNames.some((info) => {
     const prefix = `${info.slice(0, -".info.json".length)}.`;
     return entries.some((name) => name !== info && name.startsWith(prefix));
   });
-  const [infoPath] = scopeToEntry(infoNames, videoPath, entryNamed);
-  const entryVttNames = scopeToEntry(vttNames, videoPath, entryNamed);
-  if (!infoPath || entryVttNames.length === 0) {
-    throw new Error(`Missing vtt/info.json for ${videoPath} in ${workDir}`);
+  const [infoName] = scopeToEntry(infoNames, videoName, entryNamed);
+  const entryVttNames = scopeToEntry(vttNames, videoName, entryNamed);
+  if (!infoName || entryVttNames.length === 0) {
+    throw new Error(`Missing vtt/info.json for ${videoName} in ${workDir}`);
   }
-  const vttPath = pickCaptionName(entryVttNames, path.join(workDir, infoPath), captionClass);
+  const infoPath = path.join(workDir, infoName);
   return {
-    videoPath: path.join(workDir, videoPath),
-    vttPath: path.join(workDir, vttPath),
-    infoPath: path.join(workDir, infoPath),
+    videoPath: path.join(workDir, videoName),
+    vttPath: path.join(workDir, pickCaptionName(entryVttNames, infoPath, captionClass)),
+    infoPath,
   };
 }
 
@@ -271,7 +297,9 @@ export async function recoverWatchBootstrapCli(argv) {
   const { videoPath, vttPath, infoPath } = resolveWorkArtifacts(workDir, adapter.captionClass);
   const metadata = parseVideoMetadata(JSON.parse(fs.readFileSync(infoPath, "utf8")));
   const vttText = fs.readFileSync(vttPath, "utf8");
-  const cues = normalizeVttCues(vttText);
+  const timeRange = await resolveRecoveryTimeRange(sliceDir);
+  const videoCues = normalizeVttCues(vttText);
+  const cues = timeRange ? cuesInMediaTime(videoCues, timeRange) : videoCues;
 
   const probe = await probeVideoDuration(videoPath);
   const durationSec = probe?.durationSec ?? cues.at(-1)?.endSec ?? 0;
@@ -279,11 +307,10 @@ export async function recoverWatchBootstrapCli(argv) {
   const rawFrames = loadFramesFromDir(framesDir);
   const merged = mergeFrameCandidates(rawFrames);
 
-  const maxFrameGapSec = await resolveRecoveryMaxFrameGapSec(sliceDir);
   const { windows, coveragePlan } = planFrameCoverage(cues, {
     durationSec,
     sceneCandidateCount: merged.length,
-    maxFrameGapSec,
+    maxFrameGapSec: await resolveRecoveryMaxFrameGapSec(sliceDir),
   });
 
   let selection = selectFramesForCoverage(merged, {
@@ -308,16 +335,18 @@ export async function recoverWatchBootstrapCli(argv) {
 
   const batches = batchFramesForContactSheets(selection.selected, FRAMES_PER_CONTACT_SHEET);
   const contactSheets = loadExistingContactSheets(contactSheetsDir, sheetFiles, batches);
+  const selectedCount = selection.selected.length;
+  const targetMinFrames = selection.targetMinFrames ?? 0;
 
   const highVolume = isHighVolume({
-    candidateCount: selection.selected.length,
+    candidateCount: selection.candidateCount,
     targetMinFrames: coveragePlan.targetMinFrames,
     contactSheetCount: contactSheets.length,
     durationSec,
     densificationWindowCount: windows.length,
   });
 
-  const watching = {
+  const mediaWatching = {
     sceneFrames: [],
     uniqueFrames: merged,
     densificationWindows: windows,
@@ -331,6 +360,15 @@ export async function recoverWatchBootstrapCli(argv) {
     overCap: false,
     candidateCount: selection.candidateCount,
   };
+  const offsetErrorSec = timeRange
+    ? (keyframeOffsetErrorSec(timeRange, {
+        probedDurationSec: probe?.durationSec,
+        videoDurationSec: metadata.durationSec,
+      }) ?? timeRange.offsetErrorSec)
+    : null;
+  const watching = timeRange
+    ? watchingInVideoTime(mediaWatching, { offsetSec: timeRange.fromSec, offsetErrorSec })
+    : mediaWatching;
 
   const tempSession = {
     workDir,
@@ -344,24 +382,28 @@ export async function recoverWatchBootstrapCli(argv) {
     videoSlug: path.basename(sliceDir),
     sourceUrl,
     title: metadata.title,
-    maxFrameGapSec,
+    maxFrameGapSec: coveragePlan.maxFrameGapSec,
+    timeRange,
   });
+  if (state.timeRange) state.timeRange = { ...state.timeRange, offsetErrorSec };
   state.tempSession = tempSession;
   state.status = "vision";
   state = markPhaseComplete(state, "acquire", { videoDownloaded: true, recovered: true });
   state = markPhaseComplete(state, "transcript", { recovered: true });
   state.frameSelection = {
-    selectedCount: watching.selectedFrames.length,
-    targetMinFrames: watching.targetMinFrames ?? 0,
+    selectedCount,
+    targetMinFrames,
     highVolume,
     overCap: false,
     candidateCount: watching.candidateCount,
   };
 
-  state = await recordDurationMismatch(state, sliceDir, {
-    metadataDurationSec: metadata.durationSec,
-    probedDurationSec: probe?.durationSec,
-  });
+  if (!timeRange) {
+    state = await recordDurationMismatch(state, sliceDir, {
+      metadataDurationSec: metadata.durationSec,
+      probedDurationSec: probe?.durationSec,
+    });
+  }
 
   const manifest = await writeWatchingManifest(sliceDir, watching, tempSession);
   state.artifactPaths = {
@@ -371,12 +413,12 @@ export async function recoverWatchBootstrapCli(argv) {
     contactSheetCount: manifest.contactSheetCount,
   };
   state = markPhaseComplete(state, "watching", {
-    selectedCount: watching.selectedFrames.length,
+    selectedCount,
     highVolume,
     densificationWindows: windows.length,
     frameCount: manifest.frameCount,
     contactSheetCount: manifest.contactSheetCount,
-    targetMinFrames: watching.targetMinFrames ?? 0,
+    targetMinFrames,
     recovered: true,
   });
 
@@ -397,7 +439,7 @@ export async function recoverWatchBootstrapCli(argv) {
       {
         recovered: true,
         sliceDir,
-        selectedCount: watching.selectedFrames.length,
+        selectedCount,
         contactSheetCount: contactSheets.length,
         highVolume,
         durationSec,
@@ -411,13 +453,4 @@ export async function recoverWatchBootstrapCli(argv) {
   return 0;
 }
 
-if (isMainModule(import.meta.url)) {
-  recoverWatchBootstrapCli(process.argv)
-    .then((code) => {
-      process.exitCode = code;
-    })
-    .catch((error) => {
-      writeStderr(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    });
-}
+runMain(import.meta.url, recoverWatchBootstrapCli);
