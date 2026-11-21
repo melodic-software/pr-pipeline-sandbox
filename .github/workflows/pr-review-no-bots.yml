@@ -1,8 +1,8 @@
 name: PR Review No Bots
 
-# Sandbox control for Phase 9 case 14: the code-review reusable with an empty
-# allowed-bot-sender-ids, so a lanes App push is skipped. docs-only-paths
-# matches every file, so a human event runs no model either.
+# Sandbox control for Phase 9 case 14: the pr-review-cli reusable (lane `code`)
+# with an empty allowed-bot-sender-ids, so a lanes App push is skipped.
+# docs-only-paths matches every file, so a human event runs no model either.
 
 on:
   pull_request:
@@ -20,13 +20,17 @@ jobs:
     name: PR Review No Bots
     if: github.event.pull_request.draft == false
     permissions:
+      actions: read
+      checks: read
       contents: read
       pull-requests: write
-      id-token: write
-    uses: melodic-software/ci-workflows/.github/workflows/pr-review.yml@main
+    uses: melodic-software/ci-workflows/.github/workflows/pr-review-cli.yml@main
     with:
-      runner: ubuntu-24.04
+      lane: code
+      publish: comments
       allowed-bot-sender-ids: ""
       docs-only-paths: "**"
     secrets:
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      CLAUDE_API_KEY: ${{ secrets.REVIEWS_CLAUDE_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.REVIEWS_CLAUDE_CODE_OAUTH_TOKEN }}
+      FALLBACK_CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.FALLBACK_CLAUDE_CODE_OAUTH_TOKEN }}
