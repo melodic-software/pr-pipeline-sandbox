@@ -1,5 +1,335 @@
 # Changelog
 
+## [0.20.0] - 2026-11-19
+
+### Added
+
+- **Several repositories in one run.** `/ai-slop:audit` takes the target-scope forms (`--repo`, `--repos-from`, `--owner`, `--fleet`, `--skip`) and runs `audit` or `fix` once per repository, each script anchored at that repository's tree so its own config and tracked markdown apply. Findings carry their `owner/name`, the findings file stays per repository, and `fix` opens one pull request per repository. With no target form the skill behaves as before. The plugin now ships `reference/target-scope.md`, a generated copy of the contract.
+
+## [0.19.12] - 2026-11-19
+
+### Fixed
+
+- `/ai-slop:audit` reads the detector-findings contract from the copy bundled at
+  `reference/detector-findings.md` before writing a findings file, instead of fetching it from the
+  publisher's repository, so persisting works offline.
+
+## [0.19.11] - 2026-11-18
+
+### Removed
+
+- `audit` no longer names a language, tool or placeholder syntax in two spots: the TypeScript example in the rewrite guide's copulative row and the two placeholder examples in the interface-copy step ([#16778](https://github.com/melodic-software/claude-code-plugins/issues/16778)).
+
+## [0.19.10] - 2026-11-17
+
+### Changed
+
+- The bundled prerequisites checker's `when` also counts a config git tracks anywhere in the project directory's repository, from one `git ls-files` per run, so a repository whose only config sits in a subdirectory gets its probe line. A `config_any` item may now be a path from the repository root with `*`, `?` and `**` wildcards; `..`, `.` and absolute paths are rejected. When git is missing, fails or runs past two seconds, the entry counts as needed.
+
+## [0.19.9] - 2026-11-17
+
+### Changed
+
+- The bundled prerequisites checker honors an entry's optional `when` (`config_any`: file names, or a file and a pattern its text must match): the SessionStart probe stays silent about the entry unless one of those configs sits in the project directory or above it, and `check` reports it INFO there.
+
+## [0.19.8] - 2026-11-16
+
+### Changed
+
+- The bundled prerequisites stubs' node notice names the plugin whose hook printed it, and names a check skill of another plugin with the condition that that plugin is enabled.
+
+## [0.19.7] - 2026-11-16
+
+### Changed
+
+- Optional calls to another plugin's skills are gated on that plugin being enabled, so a plugin that is installed but switched off takes the documented fallback, per the seam-phrasing contract.
+
+## [0.19.6] - 2026-11-15
+
+### Changed
+
+- Remove history, provenance and migration-relative wording and as-of dates on plain pointers from skill and reference text, lower-case emphasis markers, and correct stale facts.
+
+## [0.19.5] - 2026-11-15
+
+### Changed
+
+- Restore the earlier skill wording a prompt audit cut without eval evidence, pending eval evidence of no loss.
+
+## [0.19.4] - 2026-11-15
+
+### Changed
+
+- The audit skill drops capital-letter emphasis and dated recheck logs.
+- The rewrite guide collapses a triad only under its entailment condition, and a fix writes a
+  figure only when the text or its sources already state it.
+
+## [0.19.3] - 2026-11-15
+
+### Added
+
+An eval case checks that a fix for a figure for fact leaves plain idioms and field terms in other sentences unchanged.
+
+### Changed
+
+The audit now reports an abstraction given a living thing's act as a figure for fact, and a fix for that tell leaves no figure in the rewritten sentence while keeping its subject.
+
+## [0.19.2] - 2026-11-15
+
+### Added
+
+- Eval case `audit-fix-keeps-referent`: an explicit fix of a figurative parenthetical must keep naming the thing the sentence is about, and fails when it swaps in a different noun from the next paragraph. Deterministic graders only.
+
+## [0.19.1] - 2026-11-14
+
+### Changed
+
+- The verification level reader now reads the team file through the shared default-branch reader, `lib/default-branch-file.sh`, which this plugin now carries; levels and messages are unchanged.
+
+## [0.19.0] - 2026-11-13
+
+### Changed
+
+- **Breaking:** the `verification` level now defaults to `light` when the default branch sets no `verification` key or cannot be read: verifier dispatches are skipped and the skip line is written. An invalid value or a team file that does not parse still resolves `standard`, naming the error. Set `verification: standard` (or `strict`), or `verification_skills.<skill>`, in the team file on the default branch to raise it.
+
+## [0.18.9] - 2026-11-13
+
+### Changed
+
+- The vendored prerequisites checker's usage and schema errors give `EXAMPLE_ENABLED` as the sample option name, one that names no plugin.
+
+## [0.18.8] - 2026-11-12
+
+### Changed
+
+- Pointer records no longer carry an as-of date or recheck trigger; stored values keep theirs.
+
+## [0.18.7] - 2026-11-12
+
+### Changed
+
+- Synced the shared library copies this plugin carries; their pointer records no longer carry an as-of date or recheck trigger.
+
+## [0.18.6] - 2026-11-11
+
+### Changed
+
+- The setup skill's pre-computed context keeps its fallback for a row showing the `disableSkillShellExecution` placeholder and adds a pointer record to the skills docs' "Inject dynamic context" section, where that placeholder text is documented.
+
+## [0.18.5] - 2026-11-11
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [0.18.4] - 2026-11-11
+
+### Changed
+
+- The `audit` skill's `user-scope` notes no longer restate the `.claude` directory and auto
+  memory docs: they keep the surface list and link the exact sections to read live, with an
+  as-of date and a recheck trigger. No behavior change.
+
+- The `audit` skill now cites the gather-block convention record, "The pre-compute block runs as one shell
+  invocation", instead of restating how the harness runs the pre-compute block. No behavior
+  change.
+
+## [0.18.3] - 2026-11-09
+
+### Changed
+
+- Simplified the shared yaml-subset parser copies; behavior is unchanged.
+
+- Internal simplification, no behavior change.
+
+## [0.18.2] - 2026-11-09
+
+### Changed
+
+- Internal simplification, no behavior change.
+
+## [0.18.1] - 2026-11-09
+
+### Changed
+
+- Simplified the shared resolve-convention-home.sh, resolve-convention-pattern.sh and rewrite-guard.sh copies; behavior is unchanged.
+
+## [0.18.0] - 2026-11-06
+
+### Added
+
+- A `verification` level and per-skill `verification_skills` in `<home>/ai-slop.yaml`, read from the default branch by `lib/read-verification.sh`. The `/ai-slop:audit` fix flow skips its semantic-diff subagent under `light` and `off`.
+
+## [0.17.1] - 2026-11-05
+
+### Fixed
+
+- `audit` settles whether the run writes a findings file (it examined tracked files) before fetching the detector-findings contract, so an audit of untracked files no longer makes a network fetch it never uses ([#7296](https://github.com/melodic-software/claude-code-plugins/issues/7296)).
+
+## [0.17.0] - 2026-11-05
+
+### Removed
+
+- `/ai-slop:audit` no longer reads the repository's `.claude/ai-slop.json` and
+  `.claude/ai-slop.local.json`, deprecated in 0.15.0. The team and personal layers are
+  `<home>/ai-slop.yaml` and `<home>/ai-slop.local.yaml` only; `/ai-slop:setup` still offers to
+  carry an old JSON team file's values into the YAML. The user-global `~/.claude/ai-slop.json`
+  layer is unchanged.
+
+## [0.16.9] - 2026-11-04
+
+### Changed
+
+- `setup`, its evals and the `detect.sh` comments and test labels now call the config cascade's
+  gitignored `ai-slop.local.yaml` layer the personal override, the marketplace's name for it
+  (#13192). Behavior is unchanged.
+
+## [0.16.8] - 2026-11-04
+
+### Changed
+
+- Shared config-cascade library synced: comments now call the personal layer the personal override (#13187). No behavior or printed text changed.
+
+## [0.16.7] - 2026-11-03
+
+### Changed
+
+- Cross-references to `code-tidying`'s comment skills now name `/code-tidying:remove-comments`, which replaces `dissolve-comments`, and its `audit` action.
+
+## [0.16.6] - 2026-11-02
+
+### Changed
+
+- Hook notices name the bundled checker command; `check` is optional (#12485).
+
+## [0.16.5] - 2026-11-02
+
+### Changed
+
+- Shared `prerequisites.mjs` synced where this plugin carries it (#6633): a manifest may declare an optional `session_probe`, which opts the plugin into harness-ops' session-start probe.
+
+## [0.16.4] - 2026-11-02
+
+### Fixed
+
+- The `audit-over-compression-boundary` eval case loads again. Its `fixture-unchanged` grader matched the table separator rows with a literal `---`, which `claude plugin eval` read as the end of the grader's frontmatter, so the case produced no runs. The pattern now writes them as `-{3}`.
+
+## [0.16.3] - 2026-11-02
+
+### Changed
+
+- The `/ai-slop:audit` skill body is restored to its text before the trimmed version. A negative control showed the outcome suite cannot tell a loss in the body: a copy whose body was cut to one generic line scored 0.930 against the trimmed body's 0.950 on Opus 5.5 over the 9 loading cases, every pass VALID, so the earlier no-loss measurement could not vouch for the trim.
+
+## [0.16.2] - 2026-11-02
+
+### Changed
+
+- The `/ai-slop:audit` skill body says its purpose, rubric fan-out, relay recommendation and fix rules in fewer words; every directive, gate and contract line is unchanged. Measured before and after on Opus 5.5 and Sonnet 5.5 over 9 of the plugin's 10 outcome cases, every read pass VALID: mean case score 0.939 to 0.974 on Opus and 0.957 to 0.957 on Sonnet, with no case falling.
+
+## [0.16.1] - 2026-11-01
+
+### Changed
+
+- The `/ai-slop:audit` description names commit messages, PR bodies, interface copy and generic headlines beside markdown, and sends code-comment requests to `/code-tidying:audit-comment-residue`. Measured before and after on the frozen probes and a blind held-out set on Opus 5.5 and Sonnet 5.5, every run VALID: no lost trigger, and held-out triggering rose from 58% to 83% on Opus and from 57% to 70% on Sonnet.
+
+## [0.16.0] - 2026-10-31
+
+### Added
+
+- `/ai-slop:audit` audits commit messages (`commit [rev]`), pull request bodies (`pr-body`) and interface copy (`copy <source files>`) through a scratch markdown copy, reports generic closing lines (`rule-generic-conclusions`), name-drop lists and headlines a competitor could paste unchanged, and its rewrite guide gains plain-word rows, a sweep order and two voice techniques: an aside the reader would want, and saying what you don't know.
+
+- `/ai-slop:audit` has outcome eval cases under `evals/` (vague attribution, the challenges closer, curly quotes, the over-compression boundary, mechanism-free claims, a commit message that asks to be amended, and three fix cases: colon crutch, plain words, voice) and a frozen trigger probe file, `probes/audit.json`.
+
+- `/ai-slop:audit` eval cases check that a "some critics argue" line is reported, that a list of outlets each carrying what it said is not, and that a bare optimism closer is not filed as the challenges formula.
+
+## [0.15.8] - 2026-10-31
+
+### Fixed
+
+- The convention-home resolver refuses a pointer that names `.git` or a path inside it, and a
+  working-tree home reached through a symlink: both exit 3.
+
+## [0.15.7] - 2026-10-30
+
+### Changed
+
+- Shared copies synced: links and paths to marketplace plugin contracts now name `docs/contracts/<name>/`, where the contracts moved from `docs/conventions/<name>/`. The old paths keep a stub with every section heading.
+
+- Shared copies synced: links and paths to marketplace plugin contracts now name `docs/contracts/<name>/`, where the contracts moved from `docs/conventions/<name>/`. The old paths keep a stub with every section heading.
+
+## [0.15.6] - 2026-10-30
+
+### Changed
+
+- Links and paths to marketplace plugin contracts now name `docs/contracts/<name>/`, where the contracts moved from `docs/conventions/<name>/`. The old paths keep a stub with every section heading.
+
+## [0.15.5] - 2026-10-30
+
+### Fixed
+
+- `detect.sh` retries its prose extraction once when awk aborts with exit status 134. gawk returned that status after `fatal error: internal error` on trees that passed an unchanged rerun. Before it retries, it prints a notice on stderr. Any other awk failure, or a second abort, still stops the scan with `prose extraction failed; nothing was scanned` and exit 2.
+
+## [0.15.4] - 2026-10-29
+
+### Changed
+
+- **audit:** the fix flow's concurrent-edit guard runs through `scripts/digest-guard.sh`, which creates the run directory (`init`), records a file's sha256 in one flat state file under `<run>/digests/` (`record`), and compares it before each write (`check`, exit 1 on a mismatch). It refuses a run directory outside its state root, symlinks resolved, so a lane can allow the script by path in place of open `sha256sum` and `mkdir` rules. The skill no longer grants `sha256sum` or `shasum`. ([#10529](https://github.com/melodic-software/claude-code-plugins/issues/10529))
+
+## [0.15.3] - 2026-10-29
+
+### Changed
+
+- Synced the shared `yaml-subset.awk` parser, which now refuses what `yaml-subset.mjs` refuses: a key repeated in one mapping (before, only under `-v STRICT=1`), an unknown backslash escape in a double-quoted string, a nested flow sequence such as `a: [[1, 2]]`, a `%` directive line (before, skipped), and a sequence-item map whose later keys sit more than two columns past the dash. A config file holding one of these is now a parse error.
+
+## [0.15.2] - 2026-10-27
+
+### Security
+
+- Shared `prerequisites.mjs` synced: each dependency probe runs from the library's own directory, so a probed tool never starts with the user's repository as its working directory.
+
+## [0.15.1] - 2026-10-25
+
+### Changed
+
+- The audit's findings-persistence guide names `/review:fanout` and its `fix` action by invocation instead of citing files inside the review plugin's skill folder, which a separate install of `ai-slop` does not carry.
+
+## [0.15.0] - 2026-10-25
+
+### Changed
+
+- The ai-slop audit reads its team settings from `docs/conventions/ai-slop.yaml` and its personal
+  overlay from `docs/conventions/ai-slop.local.yaml`, in the convention home the repository binds,
+  validated by the new `schemas/ai-slop.schema.json`. The older JSON files in `.claude/` are read
+  only when the YAML beside them is absent, for one release; when both exist the YAML wins.
+- `detect.sh --show-config` ends each effective value with `[layer: <file>]`, the layer that supplied
+  it, or `[layer: default]` when none did.
+- `/ai-slop:setup` writes the YAML team file and offers to carry an existing JSON file's values into
+  it, turning the JSON `_comment` text into YAML comments. The README and the audit and setup skills
+  describe the YAML location.
+- The user-global JSON layer is unchanged in this release.
+
+## [0.14.7] - 2026-10-25
+
+### Changed
+
+- Shared `prerequisites.mjs` synced where this plugin carries it (#9684): `detect.version` accepts an exclusive `below` bound; no other change to this plugin.
+
+## [0.14.6] - 2026-10-23
+
+### Fixed
+
+- `detect.sh --paths-file` keeps the last entry of a file with no trailing newline; a one-entry file no longer reports that it lists no paths.
+
+## [0.14.5] - 2026-10-22
+
+### Security
+
+- `detect.sh` and `rubric-fanout.sh` run every git call with `core.fsmonitor` and hooks turned
+  off, so a target repository's own config cannot make an audit run a program. A probe of the
+  fix-docs lane showed a nested repository's `core.fsmonitor` running under
+  `detect.sh --list-targets`
+  (run 39782588972).
+
 ## [0.14.4] - 2026-10-20
 
 ### Fixed

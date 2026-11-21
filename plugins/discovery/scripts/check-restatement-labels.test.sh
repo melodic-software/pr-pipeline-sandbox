@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+# Black-box contract test for check-restatement-labels.py.
+#
+# Self-contained and cwd-independent; mutates only its own guarded mktemp dir.
+# The two fixture slices under tests/fixtures/restatement-labels/ are read in
+# place and never written.
+#
+# The cases that matter are the ones where a wrong answer is invisible: a
+# summary line, handoff bullet, catalog row or abstract that names a flagged or
+# MEDIUM claim without its label must fail, and the same slice with the labels
+# restored must pass.
+# test-scope: plugins/discovery/tests/fixtures/restatement-labels/*
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUT="$SCRIPT_DIR/check-restatement-labels.py"
+FIXTURES="$SCRIPT_DIR/../tests/fixtures/restatement-labels"
+
+WORK="$(mktemp -d)"
+if [[ -z "$WORK" || ! -d "$WORK" ]]; then
+  printf 'error: mktemp -d failed; refusing to write fixtures\n' >&2
+  exit 2
+fi
+trap 'rm -rf "$WORK"' EXIT
+
+# shellcheck source=../lib/test-helpers.sh
+source "$SCRIPT_DIR/../lib/test-helpers.sh"
+
+# run <expected-exit> <label> [--err <stderr-substring>] [args...]
+# --err also requires stderr to contain the substring, so a case fails for its
+# intended reason rather than for any violation at all.
+run() {
+  local expected="$1" label="$2" want_err=""
+  shift 2
+  if [[ "${1:-}" == --err ]]; then
+    want_err="$2"
+    shift 2
+  fi
+  local err actual
+  python3 "$SUT" "$@" >"$WORK/stdout" 2>"$WORK/stderr"
+  actual=$?
+  err="$(cat "$WORK/stderr")"
+  if [[ "$actual" -ne "$expected" ]]; then
+    fail "$label: expected exit $expected, got $actual: $err"
+  elif [[ -n "$want_err" && "$err" != *"$want_err"* ]]; then
+    fail "$label: stderr lacks '$want_err': $err"
+  else
+    pass "$label (exit $actual)"
+  fi
+}
+
+# expect_out <label> <want>: the last run's stdout equals <want>.
+expect_out() {
+  local out
+  out="$(cat "$WORK/stdout")"
+  if [[ "$out" == "$2" ]]; then
+    pass "$1"
+  else
+    fail "$1: want '$2', got '$out'"
+  fi
+}
+
+# claim <id or -> <confidence> [text]; "-" omits the id: key, and the text
+# defaults to "c".
+claim() {
+  printf '  - claim: "%s"\n' "${3-c}"
+  if [[ "$1" != - ]]; then printf '    id: %s\n' "$1"; fi
+  printf '    confidence: %s\n    applies_to: version-independent\n    sources: []\n' "$2"
+}
+
+# mkslice <name> <claims text> <index body> [sidecar body]; prints the slice dir.
+# The sidecar abstract quotes the first claim that has an id, as
+# <id> (<confidence>): "<claim>", and the index mirrors it after the body as
+# "- s: <abstract>", so a slice passes the abstract rules unless a case
+# overrides them. With no id'd claim the abstract is "a" and is not mirrored.
+mkslice() {
+  local d="$WORK/$1" first abstract="a" mirror=""
+  mkdir -p "$d"
+  first="$(printf '%s\n' "$2" | awk '
+    /^  - claim: "/ { text = substr($0, 13); sub(/"$/, "", text); id = "" }
+    /^    id: / { id = substr($0, 9) }
+    /^    confidence: / && id != "" && !done { print id " (" substr($0, 17) "): \"" text "\""; done = 1 }')"
+  if [[ -n "$first" ]]; then
+    abstract="'${first//\'/\'\'}'"
+    mirror="
+- s: $first"
+  fi
+  printf -- '---\nabstract: a\n---\n# Index\n\n%s\n%s\n' "$3" "$mirror" >"$d/RESEARCH.md"
+  printf -- '---\ntopic: t\nsection: s\nabstract: %s\nclaims:\n%s\nproduced_by: p\n---\n# Body\n\n%s\n' \
+    "$abstract" "$2" "${4:-}" >"$d/RESEARCH-s.md"
+  printf '%s' "$d"
+}
+
+FLAGGED="$(claim M1 'HIGH (single source)')"
+MEDIUM="$(claim CI-02 MEDIUM)"
+PLAIN="$(claim K9 HIGH)"
+
+# --- the fixture pair -------------------------------------------------------
+
+run 1 "unlabeled fixture fails" --err 'RESEARCH.md:13: M1 (HIGH (single source)) appears without its label' \
+  "$FIXTURES/unlabeled"
+for want in 'RESEARCH.md:17: M1 (HIGH (single source))' 'RESEARCH.md:27: CI-02 (MEDIUM)' \
+  'RESEARCH.md:33: CI-02 (MEDIUM)' 'RESEARCH-perf.md:4: M1 (HIGH (single source))' \
+  'RESEARCH-perf.md:45: M1 (HIGH (single source))'; do
+  if [[ "$(cat "$WORK/stderr")" == *"$want appears without its label"* ]]; then
+    pass "unlabeled fixture reports $want"
+  else
+    fail "unlabeled fixture should report $want: $(cat "$WORK/stderr")"
+  fi
+done
+for want in 'RESEARCH-perf.md:4: M1' 'RESEARCH-perf.md:45: M1' 'RESEARCH-perf.md:49: CI-02'; do
+  if [[ "$(cat "$WORK/stderr")" == *"$want cited without its claim quoted verbatim"* ]]; then
+    pass "unlabeled fixture reports $want unquoted"
+  else
+    fail "unlabeled fixture should report $want unquoted: $(cat "$WORK/stderr")"
+  fi
+done
+if [[ "$(cat "$WORK/stderr")" == *'RESEARCH-perf.md:4: abstract quotes none of its claims'* ]]; then
+  pass "unlabeled fixture reports its unquoted abstract"
+else
+  fail "unlabeled fixture should report its unquoted abstract: $(cat "$WORK/stderr")"
+fi
+expect_out "unlabeled fixture summary line" 'status=fail violations=10 ids=3 labeled=2 mentions=7 quoted=0'
+if [[ "$(cat "$WORK/stderr")" != *K9* && "$(cat "$WORK/stderr")" != *'RESEARCH.md:39:'* ]]; then
+  pass "a plain HIGH claim and the fetch log are not reported"
+else
+  fail "a plain HIGH claim and the fetch log are not reported: $(cat "$WORK/stderr")"
+fi
+run 0 "corrected fixture passes" "$FIXTURES/corrected"
+expect_out "corrected fixture summary line" 'status=pass ids=3 labeled=2 mentions=7 quoted=4'
+
+# --- labels -----------------------------------------------------------------
+
+run 0 "labeled mentions pass" \
+  "$(mkslice labeled "$FLAGGED
+$MEDIUM" 'See M1 (HIGH (single source)) and CI-02 (MEDIUM).')"
+run 1 "a flagged claim's bare pointer fails" --err 'M1 (HIGH (single source)) appears without its label' \
+  "$(mkslice bare "$FLAGGED" 'See M1.')"
+run 1 "HIGH alone does not carry the single-source label" --err 'M1 (HIGH (single source))' \
+  "$(mkslice high-only "$FLAGGED" 'See M1 (HIGH).')"
+run 1 "a LOW claim needs its label" --err 'L3 (LOW) appears without its label' \
+  "$(mkslice low "$(claim L3 LOW)" 'L3 is below the bar.')"
+run 1 "BELOW is not the LOW label" --err 'L3 (LOW)' \
+  "$(mkslice below "$(claim L3 LOW)" 'L3 is BELOW the bar.')"
+run 0 "a LOW claim with its label passes" "$(mkslice low-ok "$(claim L3 LOW)" 'L3 (LOW) is a gap.')"
+run 0 "a plain HIGH claim needs no label" "$(mkslice plain "$PLAIN" 'K9 is settled.')"
+run 0 "a claim without an id is not looked for" \
+  "$(mkslice no-id "$(claim - MEDIUM)" 'Nothing names it.')"
+expect_out "a slice with no ids passes with ids=0" 'status=pass ids=0 labeled=0 mentions=0 quoted=0'
+
+# --- matching ---------------------------------------------------------------
+
+run 0 "M1 is not found in M10" "$(mkslice m10 "$FLAGGED" 'M10 is another claim.')"
+run 0 "S2 is not found in S2a" "$(mkslice s2a "$(claim S2 MEDIUM)" 'S2a is another claim.')"
+run 1 "a range names both ends" --err 'P3 (MEDIUM)' \
+  "$(mkslice range "$(claim P1 HIGH)
+$(claim P3 MEDIUM)" 'Causes P1-P3 hold.')"
+# mkslice puts the index body on line 6, and a one-claim sidecar's body on
+# line 15.
+run 1 "a table row is one line" --err 'RESEARCH.md:6: CI-02 (MEDIUM)' \
+  "$(mkslice row "$MEDIUM" '| CI-02 | started_at - created_at |')"
+run 1 "a sidecar body line is checked" --err 'RESEARCH-s.md:15: M1 (HIGH (single source))' \
+  "$(mkslice sidecar-body "$FLAGGED" 'Index.' 'M1 holds.')"
+run 0 "the claims block itself is not a restatement" "$(mkslice header-only "$FLAGGED" 'Index.')"
+abstract_slice="$(mkslice abstract "$FLAGGED" 'Index.')"
+printf -- '---\ntopic: t\nsection: s\nabstract: M1 says so\nclaims:\n%s\nproduced_by: p\n---\n' \
+  "$FLAGGED" >"$abstract_slice/RESEARCH-s.md"
+run 1 "the sidecar abstract is checked" --err 'RESEARCH-s.md:4: M1' "$abstract_slice"
+
+fetch="$(mkslice fetch "$FLAGGED" '## Fetch log
+
+| Claim | URL |
+|---|---|
+| M1 | https://example.com |
+
+## Summary
+
+M1 again.')"
+run 1 "the fetch log is skipped and the next section is not" --err 'RESEARCH.md:14: M1' "$fetch"
+if [[ "$(cat "$WORK/stderr")" != *'RESEARCH.md:10:'* ]]; then
+  pass "the fetch log row is not reported"
+else
+  fail "the fetch log row is not reported: $(cat "$WORK/stderr")"
+fi
+run 1 "a fetch-log heading inside a code fence does not open a skip" --err 'RESEARCH.md:10: M1' \
+  "$(mkslice fenced "$FLAGGED" '```text
+## Fetch log
+```
+
+See M1.')"
+
+# --- sweep words ------------------------------------------------------------
+# An index line that cites a claim ID carries no sweep word: "every", "all",
+# "none" or "only" there widens the claim it points at.
+
+run 1 "a sweep word beside a cited ID fails" --err 'RESEARCH.md:6: M1 cited beside the sweep word "every"' \
+  "$(mkslice sweep "$FLAGGED" 'M1 (HIGH (single source)) holds for every version.')"
+expect_out "sweep summary line" 'status=fail violations=1 ids=1 labeled=1 mentions=3 quoted=2'
+run 0 "an ID pointer with its label passes" \
+  "$(mkslice pointer "$FLAGGED" 'Settled: M1 (HIGH (single source)).')"
+run 1 "a plain HIGH claim's line is checked for sweep words too" --err 'K9 cited beside the sweep word "All"' \
+  "$(mkslice sweep-plain "$PLAIN" 'All hooks follow K9.')"
+run 1 "one line citing two IDs is one violation" --err 'CI-02, K9 cited beside the sweep word "only"' \
+  "$(mkslice sweep-two "$MEDIUM
+$PLAIN" 'K9 and CI-02 (MEDIUM) are the only answers.')"
+expect_out "two IDs on one sweep line count once" 'status=fail violations=1 ids=2 labeled=1 mentions=3 quoted=2'
+run 0 "a word that only contains a sweep word passes" \
+  "$(mkslice overall "$PLAIN" 'Overall, K9 is settled; nonetheless it is small.')"
+run 0 "a sweep word with no cited ID passes" \
+  "$(mkslice no-cite "$PLAIN" 'None of this is settled.')"
+run 0 "a sidecar body line may carry a sweep word" \
+  "$(mkslice sweep-sidecar "$PLAIN" 'Index.' 'K9: "c" holds for every hook.')"
+
+# --- verbatim quotes --------------------------------------------------------
+# A sidecar line that cites a claim ID quotes the claim as <id>[ (<label>)]: "<claim>",
+# matched byte for byte. A dropped condition, a "prefer" turned into a rule or
+# an added "only" carries no sweep word and keeps its label, so only the exact
+# match catches it.
+
+SD2="$(claim SD2 HIGH 'Prefer one phase per concern unless the phase mixes independent concerns')"
+run 0 "a sidecar line quoting its claim verbatim passes" \
+  "$(mkslice quote-ok "$FLAGGED" 'Index.' 'M1 (HIGH (single source)): "c" holds.')"
+expect_out "a verbatim quote is counted" 'status=pass ids=1 labeled=1 mentions=3 quoted=3'
+run 1 "a labeled sidecar pointer without a quote fails" \
+  --err 'RESEARCH-s.md:15: M1 cited without its claim quoted verbatim' \
+  "$(mkslice quote-none "$FLAGGED" 'Index.' 'Decision: M1 (HIGH (single source)) holds.')"
+run 1 "a sidecar paraphrase without a quote fails" \
+  --err 'RESEARCH-s.md:15: SD2 cited without its claim quoted verbatim' \
+  "$(mkslice quote-paraphrase "$SD2" 'Index.' '- SD2: use one phase per concern.')"
+run 1 "a quote that drops its condition fails" --err 'RESEARCH-s.md:15: SD2 quote does not match its claim' \
+  "$(mkslice quote-condition "$SD2" 'Index.' '- SD2: "Prefer one phase per concern"')"
+run 1 "a quote that turns prefer into a rule fails" --err 'SD2 quote does not match its claim' \
+  "$(mkslice quote-rule "$SD2" 'Index.' '- SD2: "Use one phase per concern unless the phase mixes independent concerns"')"
+run 1 "a quote that adds only fails" --err 'SD2 quote does not match its claim' \
+  "$(mkslice quote-only "$SD2" 'Index.' '- SD2: "Prefer only one phase per concern unless the phase mixes independent concerns"')"
+expect_out "a mismatched quote is one violation" 'status=fail violations=1 ids=1 labeled=0 mentions=0 quoted=2'
+run 1 "a quote with a different label form does not open a quote" \
+  --err 'M1 cited without its claim quoted verbatim' \
+  "$(mkslice quote-label-form "$FLAGGED" 'Index.' '(M1, HIGH (single source)): "c"')"
+run 1 "every ID a sidecar line cites needs its own quote" --err 'RESEARCH-s.md:20: K9 cited without its claim quoted verbatim' \
+  "$(mkslice quote-two "$FLAGGED
+$PLAIN" 'Index.' 'M1 (HIGH (single source)): "c" and K9.')"
+run 1 "a quote on an index line must match too" --err 'RESEARCH.md:6: SD2 quote does not match its claim' \
+  "$(mkslice quote-index "$SD2" 'SD2: "Prefer one phase per concern"')"
+run 0 "an index pointer needs no quote" "$(mkslice quote-index-pointer "$SD2" 'Settled: SD2.')"
+ALL="$(claim A1 HIGH 'All hooks read JSON on stdin')"
+run 0 "a sweep word inside a matching quote is the claim's own" \
+  "$(mkslice quote-sweep "$ALL" 'A1: "All hooks read JSON on stdin"')"
+run 1 "a sweep word outside the quote still fails on the index" --err 'A1 cited beside the sweep word "every"' \
+  "$(mkslice quote-sweep-out "$ALL" 'A1: "All hooks read JSON on stdin" for every version')"
+quoted_abstract="$(mkslice quote-abstract "$(claim M1 MEDIUM "it's c")" 'Index.')"
+printf -- "---\ntopic: t\nsection: s\nabstract: 'M1 (MEDIUM): \"it''s c\"'\nclaims:\n%s\nproduced_by: p\n---\n" \
+  "$(claim M1 MEDIUM "it's c")" >"$quoted_abstract/RESEARCH-s.md"
+run 0 "a quoted YAML abstract is read as its unquoted value" "$quoted_abstract"
+expect_out "the abstract's quote is counted" 'status=pass ids=1 labeled=1 mentions=2 quoted=2'
+
+# --- abstracts --------------------------------------------------------------
+# A sidecar that declares an id'd claim quotes one of its claims in its
+# abstract, and the index mirrors that abstract as "- <section>: <abstract>"
+# byte for byte. An abstract that names no ID escapes every rule above, so a
+# seed abstract that drops its claim's exception would reach the index unseen.
+
+# abstracts <name> <sidecar abstract, as YAML> <index mirror line>: an SD2 slice
+# whose sidecar abstract and index mirror line are the given ones.
+abstracts() {
+  local d
+  d="$(mkslice "$1" "$SD2" 'Index.')"
+  printf -- '---\ntopic: t\nsection: s\nabstract: %s\nclaims:\n%s\nproduced_by: p\n---\n# Body\n' \
+    "$2" "$SD2" >"$d/RESEARCH-s.md"
+  printf -- '---\nabstract: a\n---\n# Index\n\n%s\n' "$3" >"$d/RESEARCH.md"
+  printf '%s' "$d"
+}
+
+run 0 "an abstract quoting its claim verbatim, mirrored unchanged, passes" "$(mkslice abstract-ok "$SD2" 'Index.')"
+expect_out "the abstract and its mirror are both counted" 'status=pass ids=1 labeled=0 mentions=0 quoted=2'
+run 1 "an abstract that names no claim ID fails" --err 'RESEARCH-s.md:4: abstract quotes none of its claims' \
+  "$(abstracts abstract-no-id 'Decompose seeds one slice per phase today' \
+    '- s: Decompose seeds one slice per phase today')"
+expect_out "an ID-less abstract is one violation" 'status=fail violations=1 ids=1 labeled=0 mentions=0 quoted=0'
+run 1 "an abstract quoting its claim with the exception dropped fails" \
+  --err 'RESEARCH-s.md:4: SD2 quote does not match its claim' \
+  "$(abstracts abstract-dropped "'SD2: \"Prefer one phase per concern\"'" \
+    '- s: SD2: "Prefer one phase per concern"')"
+run 1 "an index copy that differs from the sidecar abstract fails" \
+  --err "RESEARCH.md:6: abstract line differs from RESEARCH-s.md's abstract" \
+  "$(abstracts abstract-drift "'SD2: \"Prefer one phase per concern unless the phase mixes independent concerns\"'" \
+    '- s: Decompose seeds one slice per phase today')"
+expect_out "a drifted index copy is one violation" 'status=fail violations=1 ids=1 labeled=0 mentions=0 quoted=1'
+run 1 "an abstract the index never mirrors fails" \
+  --err 'RESEARCH.md: no "- s: " abstract line for RESEARCH-s.md' \
+  "$(abstracts abstract-unmirrored "'SD2: \"Prefer one phase per concern unless the phase mixes independent concerns\"'" \
+    'Settled: SD2.')"
+run 0 "another bullet with the abstract's prefix does not fail an exact copy" \
+  "$(abstracts abstract-prefix "'SD2: \"Prefer one phase per concern unless the phase mixes independent concerns\"'" \
+    '- s: SD2: "Prefer one phase per concern unless the phase mixes independent concerns"
+- s: open question, see Gaps.')"
+run 0 "a sidecar whose claims carry no id needs no abstract quote" \
+  "$(mkslice abstract-no-ids "$(claim - MEDIUM)" 'Index.')"
+
+# --- ungradeable ------------------------------------------------------------
+
+run 2 "missing slice" "$WORK/does-not-exist"
+no_index="$(mkslice no-index "$FLAGGED" 'x')"
+rm "$no_index/RESEARCH.md"
+run 2 "no index" --err 'no index' "$no_index"
+no_sidecar="$(mkslice no-sidecar "$FLAGGED" 'x')"
+mv "$no_sidecar/RESEARCH-s.md" "$no_sidecar/notes.md"
+run 2 "no sidecars" --err 'no RESEARCH-*.md sidecar' "$no_sidecar"
+run 2 "an id that is not a claim ID" --err 'id is not a claim ID: m1' \
+  "$(mkslice bad-id "$(claim m1 MEDIUM)" 'x')"
+run 2 "an empty id" --err 'id is not a claim ID: None' \
+  "$(mkslice empty-id "$(claim '' MEDIUM)" 'x')"
+run 2 "one id declared twice" --err 'id M1 is already declared' \
+  "$(mkslice dup-id "$FLAGGED
+$(claim M1 MEDIUM)" 'x')"
+no_claims_key="$(mkslice no-claims-key "$FLAGGED" 'x')"
+printf -- '---\ntopic: t\n---\n' >"$no_claims_key/RESEARCH-s.md"
+run 2 "a sidecar without a claims: key" --err 'no claims: key' "$no_claims_key"
+run 0 "--help" --help
+run 2 "no args"
+run 2 "unknown flag" "$FIXTURES/corrected" --strict
+run 2 "two slice dirs" "$FIXTURES/corrected" "$FIXTURES/unlabeled"
+expect_out "ungradeable summary line" 'status=ungradeable'
+
+# A labeled mention in a sub-slice is never read.
+nested="$(mkslice nested "$FLAGGED" 'Index.')"
+mkdir -p "$nested/sub"
+printf -- '---\nabstract: a\n---\nM1 here.\n' >"$nested/sub/RESEARCH.md"
+run 0 "sub-slices are not recursed into" "$nested"
+
+# --- a claim-free slice root, checked against its sub-slices ----------------
+# A synthesis that adds no claims cites each sub-slice claim by ID. Without
+# --sub-slice no script sees those pointers; with it, the sub-slices' declared
+# IDs and labels grade the root's index lines.
+
+# mkroot <name> <index body> [claims-free]: a slice root with no sidecar, or
+# with one holding only claims: [] when a third argument is given.
+mkroot() {
+  local d="$WORK/$1"
+  mkdir -p "$d"
+  printf -- '---\nabstract: a\n---\n# Index\n\n%s\n' "$2" >"$d/RESEARCH.md"
+  if [[ -n "${3:-}" ]]; then
+    printf -- '---\ntopic: t\nsection: s\nabstract: a\nclaims: []\nproduced_by: p\n---\n# Body\n' \
+      >"$d/RESEARCH-s.md"
+  fi
+  printf '%s' "$d"
+}
+
+# The sub-slice's own index drops M1's label; only the root's lines are read.
+sub_a="$(mkslice sub-a "$FLAGGED" 'M1 unlabeled in the sub-slice.')"
+sub_b="$(mkslice sub-b "$MEDIUM" 'Index.')"
+run 0 "a claim-free root citing sub-slice claims with their labels passes" \
+  "$(mkroot root-ok 'Settled: M1 (HIGH (single source)); gap: CI-02 (MEDIUM).')" \
+  --sub-slice "$sub_a" --sub-slice "$sub_b"
+expect_out "the sub-slices' claims are counted" 'status=pass ids=2 labeled=2 mentions=2 quoted=0'
+run 1 "a root pointer that drops a sub-slice claim's label fails" \
+  --err 'RESEARCH.md:6: M1 (HIGH (single source)) appears without its label' \
+  "$(mkroot root-bare 'Settled: M1.')" --sub-slice "$sub_a"
+run 1 "a sweep word on a root pointer fails" --err 'M1 cited beside the sweep word "every"' \
+  "$(mkroot root-sweep 'Settled: M1 (HIGH (single source)) for every version.')" --sub-slice "$sub_a"
+claims_free="$(mkroot root-empty 'Settled: M1.' claims-free)"
+run 1 "a root holding claims: [] is checked against its sub-slices" \
+  --err 'RESEARCH.md:6: M1 (HIGH (single source)) appears without its label' \
+  "$claims_free" --sub-slice "$sub_a"
+run 0 "without --sub-slice a claims: [] root finds no ID to look for" "$claims_free"
+expect_out "the unchecked root reports ids=0" 'status=pass ids=0 labeled=0 mentions=0 quoted=0'
+
+x1_a="$(mkslice x1-a "$(claim X1 MEDIUM)" 'Index.')"
+x1_b="$(mkslice x1-b "$(claim X1 LOW)" 'Index.')"
+x1_c="$(mkslice x1-c "$(claim X1 HIGH)" 'Index.')"
+run 0 "three sub-slices that each declare X1 are gradeable" \
+  "$(mkroot root-x1 'Settled: x1-c/X1; gap: x1-a/X1 (MEDIUM).')" \
+  --sub-slice "$x1_a" --sub-slice "$x1_b" --sub-slice "$x1_c"
+expect_out "each sub-slice's X1 is its own claim" 'status=pass ids=3 labeled=2 mentions=1 quoted=0'
+run 0 "a bare shared ID carrying each claim's label passes" \
+  "$(mkroot root-x1-bare 'Gaps: X1 (MEDIUM; LOW).')" \
+  --sub-slice "$x1_a" --sub-slice "$x1_b" --sub-slice "$x1_c"
+run 1 "a bare shared ID missing one claim's label fails" \
+  --err 'RESEARCH.md:6: x1-b/X1 (LOW) appears without its label' \
+  "$(mkroot root-x1-half 'Gap: X1 (MEDIUM).')" \
+  --sub-slice "$x1_a" --sub-slice "$x1_b" --sub-slice "$x1_c"
+run 0 "a qualified ID is graded against its one sub-slice's claim" \
+  "$(mkroot root-x1-qual 'Gap: x1-a/X1 (MEDIUM).')" --sub-slice "$x1_a" --sub-slice "$x1_b"
+run 1 "a qualified ID needs its own claim's label" \
+  --err 'RESEARCH.md:6: x1-b/X1 (LOW) appears without its label' \
+  "$(mkroot root-x1-wrong 'Gap: x1-b/X1 (MEDIUM).')" --sub-slice "$x1_a" --sub-slice "$x1_b"
+run 0 "a sweep word inside a sub-slice name is not a sweep word" \
+  "$(mkroot root-all 'Settled: all-x/X1 (MEDIUM).')" \
+  --sub-slice "$(mkslice all-x "$(claim X1 MEDIUM)" 'Index.')"
+run 2 "a root claim reusing a sub-slice ID is ambiguous" --err 'id X1 is already declared' \
+  "$(mkslice root-x1-own "$(claim X1 MEDIUM)" 'Index.')" --sub-slice "$x1_a"
+run 2 "one ID declared twice in one sub-slice is ambiguous" --err 'id X1 is already declared' \
+  "$(mkroot root-x1-dup 'Settled.')" \
+  --sub-slice "$(mkslice x1-dup "$(claim X1 MEDIUM)
+$(claim X1 LOW)" 'Index.')"
+run 2 "two sub-slices sharing a directory name are ambiguous" --err 'is empty or already used' \
+  "$(mkroot root-x1-name 'Settled.')" --sub-slice "$(mkslice one/same "$(claim X1 MEDIUM)" 'Index.')" \
+  --sub-slice "$(mkslice two/same "$(claim X2 MEDIUM)" 'Index.')"
+empty_sub="$WORK/sub-empty"
+mkdir -p "$empty_sub"
+run 2 "a sub-slice with no sidecar" --err 'no RESEARCH-*.md sidecar in sub-slice' \
+  "$(mkroot root-nosub 'Settled.')" --sub-slice "$empty_sub"
+run 2 "a missing sub-slice" --err 'sub-slice directory not found' \
+  "$(mkroot root-missing 'Settled.')" --sub-slice "$WORK/no-such-sub"
+run 2 "--sub-slice with no directory" --err '--sub-slice needs a directory' \
+  "$(mkroot root-noarg 'Settled.')" --sub-slice
+run 2 "a root with no sidecar still needs --sub-slice" --err 'no RESEARCH-*.md sidecar' \
+  "$(mkroot root-alone 'Settled: M1.')"
+
+total=$((passes + fails))
+if [[ "$fails" -eq 0 ]]; then
+  printf '\nAll %d cases passed.\n' "$total"
+  exit 0
+fi
+printf '\n%d of %d case(s) failed.\n' "$fails" "$total" >&2
+exit 1

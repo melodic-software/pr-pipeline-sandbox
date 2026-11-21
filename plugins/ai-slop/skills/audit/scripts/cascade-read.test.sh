@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Reader-interface tests for lib/cascade-read.sh. Assertion helpers are local.
 # cascade::* assigns through printf -v and namerefs, which shellcheck cannot see.
 # shellcheck disable=SC2154
 set -uo pipefail
@@ -11,12 +10,8 @@ source "$SCRIPT_DIR/lib/cascade-read.sh"
 TEST_TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_TMPDIR"' EXIT
 
-FAILED=0
-pass() { printf 'PASS: %s\n' "$1"; }
-fail() {
-  FAILED=$((FAILED + 1))
-  printf 'FAIL: %s\n  expected: %s\n  actual:   %s\n' "$1" "$2" "$3" >&2
-}
+# shellcheck source=lib/test-helpers.sh
+source "$SCRIPT_DIR/lib/test-helpers.sh"
 assert_eq() {
   if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1" "$3" "$2"; fi
 }
@@ -122,6 +117,10 @@ SHIM="$TEST_TMPDIR/bin"
 mkdir -p "$SHIM"
 cat >"$SHIM/jq" <<EOF
 #!/usr/bin/env bash
+# A wrapper jq that falls back to the next jq on PATH would land here again;
+# refuse the second entry rather than start a bash and an awk per level.
+[[ -z "\${CRLF_JQ_SHIM:-}" ]] || { echo "crlf jq shim: re-entered through $REAL_JQ" >&2; exit 97; }
+export CRLF_JQ_SHIM=1
 "$REAL_JQ" "\$@" | awk '{ printf "%s\r\n", \$0 }'
 exit "\${PIPESTATUS[0]}"
 EOF

@@ -167,71 +167,58 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-  --paths-file)
-    require_opt_value "detect.sh" "$@"
-    PATHS_FILE="$2"
-    shift 2
-    ;;
-  --offset)
-    require_opt_value "detect.sh" "$@"
-    OFFSET="$2"
-    shift 2
-    ;;
-  --limit)
-    require_opt_value "detect.sh" "$@"
-    LIMIT="$2"
-    shift 2
-    ;;
-  --show-config)
-    SHOW_CONFIG=1
-    shift
-    ;;
-  --list-targets)
-    LIST_TARGETS=1
-    shift
-    ;;
-  --help | -h)
-    usage
-    exit 0
-    ;;
-  -*)
-    echo "detect.sh: unknown option: $1" >&2
-    exit 2
-    ;;
-  *)
-    TARGETS+=("$1")
-    shift
-    ;;
+  --paths-file) require_opt_value "detect.sh" "$@"; PATHS_FILE="$2"; shift 2 ;;
+  --offset) require_opt_value "detect.sh" "$@"; OFFSET="$2"; shift 2 ;;
+  --limit) require_opt_value "detect.sh" "$@"; LIMIT="$2"; shift 2 ;;
+  --show-config) SHOW_CONFIG=1; shift ;;
+  --list-targets) LIST_TARGETS=1; shift ;;
+  --help | -h) usage; exit 0 ;;
+  -*) echo "detect.sh: unknown option: $1" >&2; exit 2 ;;
+  *) TARGETS+=("$1"); shift ;;
   esac
 done
 
-# --- Config cascade (.claude/ai-slop.json; user-global -> team -> overlay) ------
+# --- Config cascade (user-global JSON -> team -> personal override YAML) --------
 
 REPO_ROOT="${CLAUDE_PROJECT_DIR:-}"
 if [[ -z "$REPO_ROOT" ]]; then
-  REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  REPO_ROOT="$(git -c core.fsmonitor= -c core.hooksPath=/dev/null rev-parse --show-toplevel 2>/dev/null || pwd)"
 fi
 
-# Config-cascade step 2: a home or non-repo root has no team or overlay layer, and
-# a team or overlay file that is the user-global file is not read a second time.
+# Config-cascade step 2: a home or non-repo root has no team layer or personal
+# override, and a team file or personal override that is the user-global file is
+# not read a second time.
 # shellcheck source=../../../lib/config-root.sh
 source "$SCRIPT_DIR/../../../lib/config-root.sh"
 USER_CFG="${HOME:-/nonexistent}/.claude/ai-slop.json"
 CFG_LAYERS=()
 [[ -f "$USER_CFG" ]] && CFG_LAYERS+=("$USER_CFG")
 if [[ "$(config_root_classify "$REPO_ROOT")" == repo ]]; then
-  for _cfg in "$REPO_ROOT/.claude/ai-slop.json" "$REPO_ROOT/.claude/ai-slop.local.json"; do
+  # The team layer is <home>/ai-slop.yaml and the personal layer
+  # <home>/ai-slop.local.yaml (ADR 0075).
+  CONV_HOME="docs/conventions"
+  if _home="$(bash "$SCRIPT_DIR/../../../lib/resolve-convention-home.sh" --root "$REPO_ROOT" 2>/dev/null)" && [[ -n "$_home" ]]; then
+    CONV_HOME="$_home"
+  fi
+  for _name in ai-slop ai-slop.local; do
+    _cfg="$REPO_ROOT/$CONV_HOME/$_name.yaml"
     [[ -f "$_cfg" ]] && ! config_root_paths_same "$_cfg" "$USER_CFG" && CFG_LAYERS+=("$_cfg")
   done
 fi
 
+# jq reads the user-global JSON layer; the YAML layers need no jq.
 HAVE_JQ=1
 command -v jq >/dev/null 2>&1 || HAVE_JQ=0
+HAVE_JSON_LAYER=0
+for _cfg in ${CFG_LAYERS[@]+"${CFG_LAYERS[@]}"}; do
+  [[ "$_cfg" == *.json ]] && HAVE_JSON_LAYER=1
+done
 
 VOCAB="$DEFAULT_VOCAB"
 PHRASE_ADD=()
 PHRASE_REMOVE=()
 PHRASE_ADD_LAYER=""
+PHRASE_REMOVE_LAYER=""
 EXCLUDED_GLOBS=()
 EM_DASH_ALLOWED_GLOBS=()
 DISABLED_RULES=""
@@ -250,7 +237,7 @@ threshold_for() {
   printf '%s' "${v:-$default}"
 }
 
-if [[ "$HAVE_JQ" -eq 1 && "${#CFG_LAYERS[@]}" -gt 0 ]]; then
+if [[ "${#CFG_LAYERS[@]}" -gt 0 ]]; then
   cascade::list EXCLUDED_GLOBS excluded_paths "${CFG_LAYERS[@]}"
   cascade::list EM_DASH_ALLOWED_GLOBS em_dash_allowed_paths "${CFG_LAYERS[@]}"
   _disabled=()
@@ -277,8 +264,10 @@ if [[ "$HAVE_JQ" -eq 1 && "${#CFG_LAYERS[@]}" -gt 0 ]]; then
   cascade::list PHRASE_ADD phrase_add "${CFG_LAYERS[@]}"
   PHRASE_ADD_LAYER="$cascade_list_layer"
   cascade::list PHRASE_REMOVE phrase_remove "${CFG_LAYERS[@]}"
-elif [[ "$HAVE_JQ" -eq 0 && "${#CFG_LAYERS[@]}" -gt 0 ]]; then
-  echo "Note: jq not found; config layers present but unread, using defaults" >&2
+  PHRASE_REMOVE_LAYER="$cascade_list_layer"
+fi
+if [[ "$HAVE_JQ" -eq 0 && "$HAVE_JSON_LAYER" -eq 1 ]]; then
+  echo "Note: jq not found; JSON config layers present but unread, using defaults" >&2
 fi
 
 VOCAB_ERE="($(printf '%s' "$VOCAB" | tr ' ' '|'))"
@@ -291,16 +280,14 @@ VOCAB_ERE="($(printf '%s' "$VOCAB" | tr ' ' '|'))"
 # row indistinguishable from a clean corpus. Invalid fragments are skipped with
 # a note; the rule keeps running on the fragments that survive.
 phrase_fragment_ok() {
-  LC_ALL=C grep -E -- "($1)" /dev/null >/dev/null 2>&1
+  grep -E -- "($1)" /dev/null >/dev/null 2>&1
   [[ $? -ne 2 ]]
 }
 EFFECTIVE_PHRASES=()
 for frag in "${MODEL_PHRASES[@]}"; do
-  removed=0
   for r in ${PHRASE_REMOVE[@]+"${PHRASE_REMOVE[@]}"}; do
-    [[ "$frag" == "$r" ]] && removed=1 && break
+    [[ "$frag" == "$r" ]] && continue 2
   done
-  [[ "$removed" -eq 1 ]] && continue
   EFFECTIVE_PHRASES+=("$frag")
 done
 for frag in ${PHRASE_ADD[@]+"${PHRASE_ADD[@]}"}; do
@@ -355,18 +342,39 @@ if [[ "$SHOW_CONFIG" -eq 1 ]]; then
   else
     for layer in "${CFG_LAYERS[@]}"; do echo "  $layer"; done
   fi
+  # Every Effective line ends with "[layer: <file>]" naming the layer that
+  # supplied the value, or "[layer: default]" when no layer did.
   for entry in "${DENSITY_RULES[@]}"; do
     IFS='|' read -r slug key default _ <<<"$entry"
-    echo "Effective: threshold_${key}=$(threshold_for "$key" "$default") (rule $slug)"
+    _val=""
+    cascade::scalar _val ".thresholds.${key}" ${CFG_LAYERS[@]+"${CFG_LAYERS[@]}"}
+    echo "Effective: threshold_${key}=${_val:-$default} (rule $slug) [layer: ${cascade_scalar_layer:-default}]"
   done
-  echo "Effective: vocab=$VOCAB"
-  echo "Effective: model_phrases=${PHRASES_ERE:-"(empty roster; rule inert)"}"
-  echo "Effective: excluded_paths=${EXCLUDED_GLOBS[*]:-}"
-  echo "Effective: em_dash_allowed_paths=${EM_DASH_ALLOWED_GLOBS[*]:-}"
+  _scratch=()
+  cascade::list _scratch vocab_add ${CFG_LAYERS[@]+"${CFG_LAYERS[@]}"}
+  _vocab_add_layer="$cascade_list_layer"
+  cascade::list _scratch vocab_remove ${CFG_LAYERS[@]+"${CFG_LAYERS[@]}"}
+  _vocab_remove_layer="$cascade_list_layer"
+  echo "Effective: vocab=$VOCAB [layer: add ${_vocab_add_layer:-default}, remove ${_vocab_remove_layer:-default}]"
+  echo "Effective: model_phrases=${PHRASES_ERE:-"(empty roster; rule inert)"} [layer: add ${PHRASE_ADD_LAYER:-default}, remove ${PHRASE_REMOVE_LAYER:-default}]"
+  cascade::list _scratch excluded_paths ${CFG_LAYERS[@]+"${CFG_LAYERS[@]}"}
+  echo "Effective: excluded_paths=${EXCLUDED_GLOBS[*]:-} [layer: ${cascade_list_layer:-default}]"
+  cascade::list _scratch em_dash_allowed_paths ${CFG_LAYERS[@]+"${CFG_LAYERS[@]}"}
+  _em_dash_layer="${cascade_list_layer:-default}"
+  echo "Effective: em_dash_allowed_paths=${EM_DASH_ALLOWED_GLOBS[*]:-} [layer: $_em_dash_layer]"
+  # Re-read the per-rule map so cascade_slug_layer holds this call's layers.
+  declare -A _slug_scratch=()
+  cascade::slug_map _slug_scratch rule_allowed_paths ${CFG_LAYERS[@]+"${CFG_LAYERS[@]}"}
   for slug in "${!RULE_ALLOWED_GLOBS[@]}"; do
-    echo "Effective: rule_allowed_paths[$slug]=${RULE_ALLOWED_GLOBS[$slug]# }"
+    _slug_layer="${cascade_slug_layer[$slug]:-}"
+    if [[ "$slug" == rule-em-dash ]]; then
+      _slug_layer="${_slug_layer:+$_slug_layer, }$_em_dash_layer"
+      _slug_layer="${_slug_layer%, default}"
+    fi
+    echo "Effective: rule_allowed_paths[$slug]=${RULE_ALLOWED_GLOBS[$slug]# } [layer: ${_slug_layer:-default}]"
   done
-  echo "Effective: disabled_rules=${DISABLED_RULES:-}"
+  cascade::list _scratch disabled_rules ${CFG_LAYERS[@]+"${CFG_LAYERS[@]}"}
+  echo "Effective: disabled_rules=${DISABLED_RULES:-} [layer: ${cascade_list_layer:-default}]"
   exit 0
 fi
 
@@ -768,8 +776,7 @@ trap 'rm -rf "$SCAN_DIR"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-mkdir -p "$SCAN_DIR/P" "$SCAN_DIR/W" "$SCAN_DIR/TP" "$SCAN_DIR/TW" \
-  "$SCAN_DIR/DP" "$SCAN_DIR/DW" "$SCAN_DIR/TDW" || {
+mkdir -p "$SCAN_DIR"/{P,W,TP,TW,DP,DW,TDW} || {
   echo "detect.sh: cannot create the scan's stream directories; nothing was scanned" >&2
   exit 2
 }
@@ -778,7 +785,7 @@ mkdir -p "$SCAN_DIR/P" "$SCAN_DIR/W" "$SCAN_DIR/TP" "$SCAN_DIR/TW" \
 scan_grep() {
   local stream="$1"
   shift
-  (cd "$SCAN_DIR" && LC_ALL=C grep -r "$@" "$stream")
+  (cd "$SCAN_DIR" && grep -r "$@" "$stream")
 }
 
 # file_counts c|o: reads `grep -r` output and prints "k<TAB>n" for each file with
@@ -822,7 +829,24 @@ N_TARGETS=$k
 # blank: an extraction that did not complete would report a clean tree. It stops
 # the scan instead, and a run that returned fewer status rows than files fails
 # the same way.
-if ! LC_ALL=C awk -v dir="$SCAN_DIR" "$EXTRACT_AWK" "$SCAN_DIR/list" >"$SCAN_DIR/status"; then
+#
+# gawk has aborted this run on clean trees (exit 134, SIGABRT, after "fatal
+# error: internal error") and passed on an unchanged rerun, with no cause found.
+# That status alone earns one retry: an error in the program itself exits
+# otherwise and still stops the scan at once. The retry reads the same list, so
+# it truncates and rewrites each stream file the first run wrote, and the
+# status file.
+extract_prose() {
+  awk -v dir="$SCAN_DIR" "$EXTRACT_AWK" "$SCAN_DIR/list" >"$SCAN_DIR/status"
+}
+extract_prose
+extract_status=$?
+if [[ "$extract_status" -eq 134 ]]; then
+  echo "detect.sh: prose extraction aborted (awk exit 134); retrying once" >&2
+  extract_prose
+  extract_status=$?
+fi
+if [[ "$extract_status" -ne 0 ]]; then
   echo "detect.sh: prose extraction failed; nothing was scanned" >&2
   exit 2
 fi
@@ -919,7 +943,7 @@ for entry in "${PATTERN_RULES[@]}"; do
     row="${row#*$'\t'}"
     [[ -n "${ALLOWED[$kk]:-}" ]] && continue
     emit_finding "$kk" "$slug" "${row%%$'\t'*}" "$label" "${row#*$'\t'}"
-  done < <(scan_grep "$stream" "${flags[@]}" -- "$ere" | LC_ALL=C awk "$FINDING_AWK")
+  done < <(scan_grep "$stream" "${flags[@]}" -- "$ere" | awk "$FINDING_AWK")
 done
 
 # Density rules: one finding per file when density reaches the threshold. All

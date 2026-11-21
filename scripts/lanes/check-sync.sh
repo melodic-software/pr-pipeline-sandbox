@@ -83,8 +83,11 @@ SYNCED=(
   package-lock.json
   package.json
   plugins/multi-agent/reference/defaults.yaml
-  # Whole plugins: the babysit-prs scripts, the work-item tracker and the issue
-  # lane's skill, with everything they read inside their plugin.
+  # Whole plugins: the babysit-prs scripts, the work-item tracker, the issue
+  # lane's skill, the research/doc skills (discovery) and the fix-docs audit
+  # skill (ai-slop), with everything they read inside their plugin.
+  plugins/ai-slop
+  plugins/discovery
   plugins/source-control
   plugins/work-items
   scripts/setup-env.sh
@@ -106,6 +109,8 @@ SYNCED=(
 # fixtures hold a fake AWS key the secret scan refuses; no workflow reads them.
 LEFT_OUT=(
   .github/scripts/pr-verify/probe
+  # Reads generated docs and other plugins' fixtures this sandbox does not carry.
+  plugins/ai-slop/skills/audit/scripts/generated-docs-regions.test.sh
   # These read SKILL.md files of plugins this sandbox does not carry.
   plugins/work-items/skills/work/unattended-callers.test.mjs
   plugins/work-items/skills/work/unattended-callers.test.sh

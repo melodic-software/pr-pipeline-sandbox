@@ -7,9 +7,11 @@
 
 # list_tracked_markdown <dir>: tracked *.md paths relative to dir, one per line.
 # The exit status is git's. quotePath is forced off so a non-ASCII name is the
-# raw filename, not a C-quoted escape.
+# raw filename, not a C-quoted escape. Every git call here and in the callers
+# turns off core.fsmonitor and hooks, so a target repository's own config
+# runs no program.
 list_tracked_markdown() {
-  git -C "$1" -c core.quotePath=false ls-files '*.md'
+  git -c core.fsmonitor= -c core.hooksPath=/dev/null -C "$1" -c core.quotePath=false ls-files '*.md'
 }
 
 # Strip one trailing slash, except a Windows drive root (`C:/`) or `/`.
@@ -52,7 +54,7 @@ list_tracked_or_fallback() {
     return 0
   fi
 
-  inside="$(git -C "$dir" rev-parse --is-inside-work-tree 2>/dev/null)"
+  inside="$(git -c core.fsmonitor= -c core.hooksPath=/dev/null -C "$dir" rev-parse --is-inside-work-tree 2>/dev/null)"
   status=$?
   if [[ "$mode" == walk ]]; then
     if [[ "$status" -ne 0 ]]; then
@@ -82,13 +84,11 @@ list_tracked_or_fallback() {
     [[ -n "$listing" ]] && printf '%s\n' "$listing"
     return 0
   fi
+  local sep=/
+  [[ "$dir" == */ || "$dir" == *\\ ]] && sep=""
   while IFS= read -r rel; do
     [[ -n "$rel" ]] || continue
-    if [[ "$dir" == */ || "$dir" == *\\ ]]; then
-      printf '%s%s\n' "$dir" "$rel"
-    else
-      printf '%s/%s\n' "$dir" "$rel"
-    fi
+    printf '%s%s%s\n' "$dir" "$sep" "$rel"
   done <<<"$listing"
 }
 
@@ -114,14 +114,13 @@ resolve_targets() {
   local -a raw=("$@")
   local line rest t end p
   local -a expanded=() windowed=() files=()
-  local paths_file_empty=0
 
   if [[ -n "$paths_file" ]]; then
     if [[ ! -r "$paths_file" ]]; then
       echo "detect.sh: cannot read --paths-file: $paths_file" >&2
       return 2
     fi
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n $line ]]; do
       [[ -n "${line//[[:space:]]/}" ]] || continue
       rest="${line#*$'\t'}"
       [[ "$rest" != "$line" && "$rest" != *$'\t'* ]] && line="$rest"
@@ -129,11 +128,8 @@ resolve_targets() {
     done <"$paths_file"
     if [[ "${#raw[@]}" -eq 0 ]]; then
       echo "detect.sh: --paths-file lists no paths; nothing was scanned: $paths_file" >&2
-      paths_file_empty=1
     fi
-  fi
-
-  if [[ "${#raw[@]}" -eq 0 && "$paths_file_empty" -eq 0 ]]; then
+  elif [[ "${#raw[@]}" -eq 0 ]]; then
     while IFS= read -r line; do
       [[ -n "$line" ]] || continue
       raw+=("$repo_root/$line")
@@ -162,10 +158,6 @@ resolve_targets() {
     files+=("$p")
   done
 
-  if [[ ${#files[@]} -eq 0 ]]; then
-    dest_ref=()
-  else
-    # shellcheck disable=SC2034  # nameref: writes the caller's array
-    dest_ref=("${files[@]}")
-  fi
+  # shellcheck disable=SC2034  # nameref: writes the caller's array
+  dest_ref=(${files[@]+"${files[@]}"})
 }

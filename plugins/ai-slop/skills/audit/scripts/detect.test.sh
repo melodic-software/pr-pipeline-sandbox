@@ -4,15 +4,15 @@
 # the tree). The eval suite is the deliberate exception: evals/fixtures/ holds
 # committed slop samples, because a prose scenario cannot be checked against
 # the detector and drifted from it three times (#3041). This repo keeps its own
-# audit off them with an excluded_paths glob in .claude/ai-slop.json, and they
+# audit off them with an excluded_paths glob in docs/conventions/ai-slop.yaml, and they
 # stay measurable through the same config isolation this suite uses — an empty
 # HOME and CLAUDE_PROJECT_DIR give the shipped defaults back.
-# Per the shell-test-helpers convention, assertion helpers are local.
 set -uo pipefail
 
 # Fixture git isolation: an inherited GIT_DIR/GIT_WORK_TREE/GIT_CONFIG would
 # make the nested-repo fixture operate on the CALLER's repository.
 unset GIT_DIR GIT_WORK_TREE GIT_CONFIG
+export GIT_CONFIG_GLOBAL="${GIT_CONFIG_GLOBAL:-/dev/null}" GIT_CONFIG_NOSYSTEM=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DETECT="$SCRIPT_DIR/detect.sh"
@@ -22,7 +22,7 @@ trap 'rm -rf "$TEST_TMPDIR"' EXIT
 # Fixture CONFIG isolation, the same idea as the git isolation above and found
 # the same way: detect.sh resolves its config cascade from $HOME and from
 # CLAUDE_PROJECT_DIR (falling back to the CWD's git toplevel), so running this
-# suite inside a repo that ships `.claude/ai-slop.json` graded the fixtures
+# suite inside a repo that ships `docs/conventions/ai-slop.yaml` graded the fixtures
 # against THAT repo's taste. Measured: this marketplace disabling rule-em-dash
 # for its own house style turned nine unrelated cases red, each reporting
 # `disabled=1` for a rule the case never mentions. Both layers are pointed at
@@ -32,55 +32,22 @@ export HOME="$TEST_TMPDIR/home"
 export CLAUDE_PROJECT_DIR="$TEST_TMPDIR/noconfig"
 mkdir -p "$HOME" "$CLAUDE_PROJECT_DIR"
 
-# A fixture root that carries a team or overlay config layer must be a git working
-# tree: config-cascade step 2 gives a non-repo root no team or overlay layer.
+# A fixture root that carries a team config layer or personal override must be a git
+# working tree: config-cascade step 2 gives a non-repo root no team layer or personal
+# override.
 make_repo() {
   git init -q "$1" >/dev/null 2>&1
 }
 
-FAILED=0
-CASE_NUM=0
-SKIPPED=0
+# shellcheck source=lib/test-helpers.sh
+source "$SCRIPT_DIR/lib/test-helpers.sh"
 # The total this suite registers when every case runs: PASS + FAIL + SKIP. It is
 # host-independent because every host-conditional branch calls skip() once per
 # assertion it replaces, so a host that cannot build a fixture moves cases
 # between the two counters without changing their sum. Adding or removing a case
 # updates this number, and the Result block names both totals when they disagree.
-EXPECTED_CASES=248
+EXPECTED_CASES=274
 
-pass() {
-  CASE_NUM=$((CASE_NUM + 1))
-  printf 'PASS: %s\n' "$1"
-}
-# A case whose subject this host cannot build is neither a pass nor a failure.
-# It prints its own visible line and carries its own counter, and never routes
-# through pass(), so a proof this host could not run can never be read off the
-# summary as one that did.
-skip() {
-  SKIPPED=$((SKIPPED + 1))
-  printf 'SKIP (host: %s): %s\n' "$2" "$1"
-}
-
-fail() {
-  CASE_NUM=$((CASE_NUM + 1))
-  FAILED=$((FAILED + 1))
-  printf 'FAIL: %s\n  expected: %s\n  actual:   %s\n' "$1" "$2" "$3" >&2
-}
-assert_exit() {
-  if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1" "exit $2" "exit $3"; fi
-}
-assert_contains() {
-  case "$2" in
-  *"$3"*) pass "$1" ;;
-  *) fail "$1" "contains: $3" "$2" ;;
-  esac
-}
-assert_not_contains() {
-  case "$2" in
-  *"$3"*) fail "$1" "absent: $3" "present" ;;
-  *) pass "$1" ;;
-  esac
-}
 assert_eq() {
   if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1" "$3" "$2"; fi
 }
@@ -427,10 +394,11 @@ assert_contains "cutoff families: all five source-gap lines fire" "$out" "rule=a
 # or deleting this block aborts the suite there under `set -u` rather than
 # quietly vacating those cases.
 RAP="$TEST_TMPDIR/rap-repo"
-mkdir -p "$RAP/.claude"
+mkdir -p "$RAP/docs/conventions"
 make_repo "$RAP"
-cat >"$RAP/.claude/ai-slop.json" <<'EOF'
-{ "rule_allowed_paths": { "rule-filler-phrases": ["quirks/**"] } }
+cat >"$RAP/docs/conventions/ai-slop.yaml" <<'EOF'
+rule_allowed_paths:
+  rule-filler-phrases: ["quirks/**"]
 EOF
 mkdir -p "$RAP/quirks"
 printf '# Quirks\n\nWritten in order to stay exempt here.\n' >"$RAP/quirks/doc.md"
@@ -463,10 +431,11 @@ assert_contains "glob expansion: both exempt files counted as declined" "$out" "
 # consumer wanting gitignore-precision single-level matching has no spelling for
 # it; the README states the semantics.
 WIDE="$TEST_TMPDIR/rap-wide"
-mkdir -p "$WIDE/.claude" "$WIDE/sub/deep"
+mkdir -p "$WIDE/docs/conventions" "$WIDE/sub/deep"
 make_repo "$WIDE"
-cat >"$WIDE/.claude/ai-slop.json" <<'EOF'
-{ "rule_allowed_paths": { "rule-filler-phrases": ["sub/*.md"] } }
+cat >"$WIDE/docs/conventions/ai-slop.yaml" <<'EOF'
+rule_allowed_paths:
+  rule-filler-phrases: ["sub/*.md"]
 EOF
 printf '# Deep\n\nWritten in order to test star depth.\n' >"$WIDE/sub/deep/nested.md"
 out="$(CLAUDE_PROJECT_DIR="$WIDE" bash "$DETECT" "$WIDE/sub/deep/nested.md" 2>&1)"
@@ -504,13 +473,11 @@ assert_contains "model phrases: bare bigrams do not fire (anchored roster only)"
 # word-split regression: a reader that split on spaces would break the added
 # fragment into three word alternates and "kiss" alone would match that line too.
 PREPO="$TEST_TMPDIR/phrase-repo"
-mkdir -p "$PREPO/.claude"
+mkdir -p "$PREPO/docs/conventions"
 make_repo "$PREPO"
-cat >"$PREPO/.claude/ai-slop.json" <<'EOF'
-{
-  "phrase_add": ["chef.s kiss architecture"],
-  "phrase_remove": ["(the|my) honest take"]
-}
+cat >"$PREPO/docs/conventions/ai-slop.yaml" <<'EOF'
+phrase_add: ["chef.s kiss architecture"]
+phrase_remove: ["(the|my) honest take"]
 EOF
 cat >"$PREPO/doc.md" <<'EOF'
 # Doc
@@ -526,10 +493,10 @@ assert_contains "phrase config: add fires whole, remove silences, no word-split"
 # Empty roster: every shipped phrase removed. The rule goes inert instead of
 # matching every line (an empty alternation "()" would).
 EMPTYREPO="$TEST_TMPDIR/phrase-empty"
-mkdir -p "$EMPTYREPO/.claude"
+mkdir -p "$EMPTYREPO/docs/conventions"
 make_repo "$EMPTYREPO"
-cat >"$EMPTYREPO/.claude/ai-slop.json" <<'EOF'
-{ "phrase_remove": ["the part most people skip", "(the|my) honest take", "that.s the unlock"] }
+cat >"$EMPTYREPO/docs/conventions/ai-slop.yaml" <<'EOF'
+phrase_remove: ["the part most people skip", "(the|my) honest take", "that.s the unlock"]
 EOF
 cp "$PHRASES_FIX" "$EMPTYREPO/doc.md"
 out="$(CLAUDE_PROJECT_DIR="$EMPTYREPO" bash "$DETECT" "$EMPTYREPO/doc.md" 2>&1)"
@@ -539,31 +506,34 @@ assert_contains "phrase config: emptied roster still reports its summary row" "$
 # Fragment hygiene, both measured failure modes: an invalid ERE fragment is
 # skipped with a note (instead of erroring every grep into a silent findings=0),
 # and an empty-string element is dropped (instead of joining as an empty
-# alternation branch that matches every prose line).
+# alternation branch that matches every prose line). The YAML reader drops an
+# empty element itself, so the user-global JSON layer, which keeps it, carries
+# this fixture.
 BADREPO="$TEST_TMPDIR/phrase-bad"
-mkdir -p "$BADREPO/.claude"
+BADHOME="$TEST_TMPDIR/phrase-bad-home"
+mkdir -p "$BADREPO" "$BADHOME/.claude"
 make_repo "$BADREPO"
-cat >"$BADREPO/.claude/ai-slop.json" <<'EOF'
+cat >"$BADHOME/.claude/ai-slop.json" <<'EOF'
 { "phrase_add": ["", "broken ("] }
 EOF
 cp "$PHRASES_FIX" "$BADREPO/doc.md"
-out="$(CLAUDE_PROJECT_DIR="$BADREPO" bash "$DETECT" "$BADREPO/doc.md" 2>&1)"
+out="$(HOME="$BADHOME" CLAUDE_PROJECT_DIR="$BADREPO" bash "$DETECT" "$BADREPO/doc.md" 2>&1)"
 assert_contains "phrase hygiene: invalid fragment skipped with a note naming it" "$out" "phrase_add fragment is not a valid ERE, skipped: 'broken ('"
 assert_contains "phrase hygiene: shipped roster keeps firing past the bad fragment" "$out" "rule=ai-slop/audit/rule-model-era-phrases findings=3 declined=1"
-out="$(CLAUDE_PROJECT_DIR="$BADREPO" bash "$DETECT" "$CLEAN" 2>&1)"
+out="$(HOME="$BADHOME" CLAUDE_PROJECT_DIR="$BADREPO" bash "$DETECT" "$CLEAN" 2>&1)"
 assert_not_contains "phrase hygiene: empty-string element does not flood clean prose" "$out" "Finding: rule=ai-slop/audit/rule-model-era-phrases"
 
 # Wholesale replacement includes the empty override: a later layer's explicit
-# `"phrase_add": []` clears the inherited list (key presence decides, not value
-# emptiness). The local overlay is the later layer.
+# `phrase_add: []` clears the inherited list (key presence decides, not value
+# emptiness). The personal override is the later layer.
 CLRREPO="$TEST_TMPDIR/phrase-clear"
-mkdir -p "$CLRREPO/.claude"
+mkdir -p "$CLRREPO/docs/conventions"
 make_repo "$CLRREPO"
-cat >"$CLRREPO/.claude/ai-slop.json" <<'EOF'
-{ "phrase_add": ["chef.s kiss architecture"] }
+cat >"$CLRREPO/docs/conventions/ai-slop.yaml" <<'EOF'
+phrase_add: ["chef.s kiss architecture"]
 EOF
-cat >"$CLRREPO/.claude/ai-slop.local.json" <<'EOF'
-{ "phrase_add": [] }
+cat >"$CLRREPO/docs/conventions/ai-slop.local.yaml" <<'EOF'
+phrase_add: []
 EOF
 cat >"$CLRREPO/doc.md" <<'EOF'
 # Doc
@@ -576,20 +546,22 @@ assert_contains "phrase config: explicit empty array clears the inherited add li
 # A layer caught mid-write (valid object, then truncated bytes) is refused
 # whole for the phrase keys, as cascade::list does: jq's exit status guards
 # the read, so the partially parsed values never become the effective roster.
+# The user-global layer is the JSON one.
 TRUNCPHRASE="$TEST_TMPDIR/phrase-trunc"
-mkdir -p "$TRUNCPHRASE/.claude"
+TRUNCPHOME="$TEST_TMPDIR/phrase-trunc-home"
+mkdir -p "$TRUNCPHRASE" "$TRUNCPHOME/.claude"
 make_repo "$TRUNCPHRASE"
-printf '%s\n' '{ "phrase_add": ["chef.s kiss architecture"] }' '{bad' >"$TRUNCPHRASE/.claude/ai-slop.json"
+printf '%s\n' '{ "phrase_add": ["chef.s kiss architecture"] }' '{bad' >"$TRUNCPHOME/.claude/ai-slop.json"
 cp "$CLRREPO/doc.md" "$TRUNCPHRASE/doc.md"
-out="$(CLAUDE_PROJECT_DIR="$TRUNCPHRASE" bash "$DETECT" "$TRUNCPHRASE/doc.md" 2>&1)"
+out="$(HOME="$TRUNCPHOME" CLAUDE_PROJECT_DIR="$TRUNCPHRASE" bash "$DETECT" "$TRUNCPHRASE/doc.md" 2>&1)"
 assert_contains "phrase config: partially parsed layer is refused, no phrase added" "$out" "rule=ai-slop/audit/rule-model-era-phrases findings=0 declined=0"
 
 # disabled_rules covers the new rule like any other.
 DISREPO="$TEST_TMPDIR/phrase-disabled"
-mkdir -p "$DISREPO/.claude"
+mkdir -p "$DISREPO/docs/conventions"
 make_repo "$DISREPO"
-cat >"$DISREPO/.claude/ai-slop.json" <<'EOF'
-{ "disabled_rules": ["rule-model-era-phrases"] }
+cat >"$DISREPO/docs/conventions/ai-slop.yaml" <<'EOF'
+disabled_rules: ["rule-model-era-phrases"]
 EOF
 cp "$PHRASES_FIX" "$DISREPO/doc.md"
 out="$(CLAUDE_PROJECT_DIR="$DISREPO" bash "$DETECT" "$DISREPO/doc.md" 2>&1)"
@@ -662,12 +634,12 @@ assert_contains "chunking: limit 1 scans one file" "$out" "across 1 files scanne
 # per file, after directory expansion and excluded_paths; the key is the file=
 # spelling. Chunk options are ignored so a caller plans over the whole list.
 LT="$TEST_TMPDIR/list-targets"
-mkdir -p "$LT/sub" "$LT/vendor" "$LT/.claude"
+mkdir -p "$LT/sub" "$LT/vendor" "$LT/docs/conventions"
 make_repo "$LT"
 printf 'one\n' >"$LT/a.md"
 printf 'two\n' >"$LT/sub/b.md"
 printf 'three\n' >"$LT/vendor/c.md"
-printf '%s\n' '{ "excluded_paths": ["vendor/**"] }' >"$LT/.claude/ai-slop.json"
+printf '%s\n' 'excluded_paths: ["vendor/**"]' >"$LT/docs/conventions/ai-slop.yaml"
 git -C "$LT" add -A >/dev/null 2>&1
 TAB=$'\t'
 out="$(CLAUDE_PROJECT_DIR="$LT" bash "$DETECT" --list-targets --offset 0 --limit 1 "$LT" "$LT/missing.md" 2>/dev/null)"
@@ -712,16 +684,16 @@ assert_contains "empty paths-file: zero-file Summary" "$out" "0 findings across 
 
 # --- Config cascade --------------------------------------------------------------
 
-cfgdir="$TEST_TMPDIR/repo/.claude"
+cfgdir="$TEST_TMPDIR/repo/docs/conventions"
 mkdir -p "$cfgdir"
 make_repo "$TEST_TMPDIR/repo"
 cp "$SLOP" "$TEST_TMPDIR/repo/allowed.md"
-cat >"$cfgdir/ai-slop.json" <<'EOF'
-{
-  "em_dash_allowed_paths": ["allowed.md"],
-  "thresholds": { "ai_vocabulary": 999, "copulative_avoidance": 999 },
-  "disabled_rules": ["rule-significance-inflation"]
-}
+cat >"$cfgdir/ai-slop.yaml" <<'EOF'
+em_dash_allowed_paths: ["allowed.md"]
+thresholds:
+  ai_vocabulary: 999
+  copulative_avoidance: 999
+disabled_rules: ["rule-significance-inflation"]
 EOF
 out="$(cd "$TEST_TMPDIR/repo" && CLAUDE_PROJECT_DIR="$TEST_TMPDIR/repo" bash "$DETECT" "$TEST_TMPDIR/repo/allowed.md" 2>&1)"
 assert_not_contains "config: em_dash_allowed_paths exempts the document" "$out" "Finding: rule=ai-slop/audit/rule-em-dash"
@@ -730,37 +702,43 @@ assert_not_contains "config: disabled rule emits no findings" "$out" "Finding: r
 assert_contains "config: disabled rule reported in summary" "$out" "rule=ai-slop/audit/rule-significance-inflation findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0 disabled=1"
 
 out="$(CLAUDE_PROJECT_DIR="$TEST_TMPDIR/repo" bash "$DETECT" --show-config 2>&1)"
-assert_contains "show-config: names the supplying layer" "$out" "$cfgdir/ai-slop.json"
+assert_contains "show-config: names the supplying layer" "$out" "$cfgdir/ai-slop.yaml"
 assert_contains "show-config: effective threshold shown" "$out" "threshold_ai_vocabulary=999"
 assert_contains "show-config: disabled rules shown" "$out" "disabled_rules=rule-significance-inflation"
 
-# Config-cascade step 2: a home or non-repo root has no team or overlay layer, and
-# the user-global file is read once, never again as team.
+# Config-cascade step 2: a home or non-repo root has no team layer or personal
+# override, and the user-global file is read once, never again as team.
 HOMEROOT="$TEST_TMPDIR/home-root"
 mkdir -p "$HOMEROOT/.claude"
 printf '%s\n' '{ "thresholds": { "ai_vocabulary": 777 } }' >"$HOMEROOT/.claude/ai-slop.json"
+# Count the "Config layers" rows only: each Effective line also names its layer.
 out="$(HOME="$HOMEROOT" CLAUDE_PROJECT_DIR="$HOMEROOT" bash "$DETECT" --show-config 2>&1)"
-assert_eq "home root: the user-global file is listed once" "$(printf '%s\n' "$out" | grep -c "$HOMEROOT/.claude/ai-slop.json")" "1"
+assert_eq "home root: the user-global file is listed once" "$(printf '%s\n' "$out" | grep -cxF "  $HOMEROOT/.claude/ai-slop.json")" "1"
 assert_contains "home root: the user-global threshold applies" "$out" "threshold_ai_vocabulary=777"
 make_repo "$HOMEROOT"
+mkdir -p "$HOMEROOT/docs/conventions"
+printf '%s\n' 'thresholds:' '  ai_vocabulary: 666' >"$HOMEROOT/docs/conventions/ai-slop.yaml"
 out="$(HOME="$HOMEROOT" CLAUDE_PROJECT_DIR="$HOMEROOT" bash "$DETECT" --show-config 2>&1)"
-assert_eq "a git repository at the home is still a home root" "$(printf '%s\n' "$out" | grep -c "$HOMEROOT/.claude/ai-slop.json")" "1"
+assert_eq "a git repository at the home is still a home root" "$(printf '%s\n' "$out" | grep -cxF "  $HOMEROOT/.claude/ai-slop.json")" "1"
+assert_not_contains "a home root: its YAML is not a team layer" "$out" "$HOMEROOT/docs/conventions/ai-slop.yaml"
 NONREPO="$TEST_TMPDIR/non-repo-root"
-mkdir -p "$NONREPO/.claude"
-printf '%s\n' '{ "thresholds": { "ai_vocabulary": 555 } }' >"$NONREPO/.claude/ai-slop.json"
+mkdir -p "$NONREPO/docs/conventions"
+printf '%s\n' 'thresholds:' '  ai_vocabulary: 555' >"$NONREPO/docs/conventions/ai-slop.yaml"
 out="$(CLAUDE_PROJECT_DIR="$NONREPO" bash "$DETECT" --show-config 2>&1)"
-assert_not_contains "a non-repo root: its .claude file is not a team layer" "$out" "$NONREPO/.claude/ai-slop.json"
+assert_not_contains "a non-repo root: its YAML is not a team layer" "$out" "$NONREPO/docs/conventions/ai-slop.yaml"
 
 # A threshold is config text: a newline and tabs in it must not forge a density
-# row whose file field reaches an array subscript or a path.
+# row whose file field reaches an array subscript or a path. A YAML scalar holds
+# no newline, so the JSON user-global layer carries the forged value.
 INJREPO="$TEST_TMPDIR/threshold-inject"
-mkdir -p "$INJREPO/.claude"
+INJHOME="$TEST_TMPDIR/threshold-inject-home"
+mkdir -p "$INJREPO" "$INJHOME/.claude"
 make_repo "$INJREPO"
 cp "$SLOP" "$INJREPO/doc.md"
-cat >"$INJREPO/.claude/ai-slop.json" <<EOF
+cat >"$INJHOME/.claude/ai-slop.json" <<EOF
 { "thresholds": { "ai_vocabulary": "99\\nSCANNED[\$(touch $INJREPO/PWNED)0]\\t5\\t5\\t0" } }
 EOF
-out="$(CLAUDE_PROJECT_DIR="$INJREPO" bash "$DETECT" "$INJREPO/doc.md" 2>&1)"
+out="$(HOME="$INJHOME" CLAUDE_PROJECT_DIR="$INJREPO" bash "$DETECT" "$INJREPO/doc.md" 2>&1)"
 assert_eq "threshold injection: a forged density row runs no command" "$([[ -e "$INJREPO/PWNED" ]] && echo ran || echo none)" "none"
 assert_not_contains "threshold injection: a forged row reaches no path" "$out" "SCANNED["
 
@@ -775,17 +753,40 @@ assert_not_contains "threshold injection: a forged row reaches no path" "$out" "
 # the threshold scalar (cascade::scalar). The list, slug-map and phrase cases
 # reproduce on both platforms; the scalar case at the end discriminates on Linux
 # only, for the reason recorded there.
-CRLF_BIN="$TEST_TMPDIR/bin-crlf-jq"
-mkdir -p "$CRLF_BIN"
-REAL_JQ="$(command -v jq)"
-cat >"$CRLF_BIN/jq" <<EOF
+make_crlf_jq() { # make_crlf_jq <dir> <real jq>
+  mkdir -p "$1"
+  cat >"$1/jq" <<EOF
 #!/usr/bin/env bash
 # pipefail so a jq failure stays a failure: awk's exit status would otherwise
 # mask it, and the readers skip a refused layer only on jq's nonzero status.
 set -o pipefail
-"$REAL_JQ" "\$@" | awk '{ printf "%s\r\n", \$0 }'
+# A wrapper jq, such as a mise shim that cannot run its own jq, falls back to the
+# next jq on PATH, which is this shim: each level would start a bash and an awk
+# without end. Refuse the second entry instead.
+[[ -z "\${CRLF_JQ_SHIM:-}" ]] || { echo "crlf jq shim: re-entered through $2" >&2; exit 97; }
+export CRLF_JQ_SHIM=1
+"$2" "\$@" | awk '{ printf "%s\r\n", \$0 }'
 EOF
-chmod +x "$CRLF_BIN/jq"
+  chmod +x "$1/jq"
+}
+CRLF_BIN="$TEST_TMPDIR/bin-crlf-jq"
+make_crlf_jq "$CRLF_BIN" "$(command -v jq)"
+
+# A real jq that resolves jq through PATH, as a falling-back wrapper does, must
+# meet the refusal. Its own depth cap (exit 99) keeps a missing refusal bounded.
+LOOP_BIN="$TEST_TMPDIR/bin-loop-jq"
+mkdir -p "$LOOP_BIN"
+cat >"$LOOP_BIN/fallback-jq" <<'EOF'
+#!/usr/bin/env bash
+d=$((${FALLBACK_DEPTH:-0} + 1))
+[[ "$d" -lt 4 ]] || exit 99
+FALLBACK_DEPTH="$d" exec jq "$@"
+EOF
+chmod +x "$LOOP_BIN/fallback-jq"
+make_crlf_jq "$LOOP_BIN" "$LOOP_BIN/fallback-jq"
+PATH="$LOOP_BIN:$PATH" jq -n 1 >/dev/null 2>&1
+rc=$?
+assert_exit "crlf jq: a jq that resolves back to the shim is refused, not recursed into" 97 "$rc"
 
 # Pin the shim itself. Without this every case below is green on a Linux
 # runner whether or not the shim is ever selected — an unset exec bit or a
@@ -794,40 +795,51 @@ chmod +x "$CRLF_BIN/jq"
 shim_out="$(PATH="$CRLF_BIN:$PATH" jq -rn '"x"' | od -c)"
 assert_contains "crlf jq: the shim is on PATH and emits a carriage return" "$shim_out" '\r'
 
-crlfdir="$TEST_TMPDIR/crlf-repo/.claude"
-mkdir -p "$crlfdir"
-make_repo "$TEST_TMPDIR/crlf-repo"
-cp "$SLOP" "$TEST_TMPDIR/crlf-repo/allowed.md"
-cp "$SLOP" "$TEST_TMPDIR/crlf-repo/vendored.md"
+# jq reads only the user-global layer, so every case below configures it, over a
+# repository with no team layer.
+CRLFREPO="$TEST_TMPDIR/crlf-repo"
+crlfdir="$TEST_TMPDIR/crlf-home/.claude"
+mkdir -p "$crlfdir" "$CRLFREPO/quirks"
+make_repo "$CRLFREPO"
+cp "$SLOP" "$CRLFREPO/allowed.md"
+cp "$SLOP" "$CRLFREPO/vendored.md"
+cp "$RAP/quirks/doc.md" "$CRLFREPO/quirks/doc.md"
+cp "$RAP/plain.md" "$CRLFREPO/plain.md"
+cp "$PREPO/doc.md" "$CRLFREPO/phrases.md"
 cat >"$crlfdir/ai-slop.json" <<'EOF'
 {
   "excluded_paths": ["vendored.md"],
   "em_dash_allowed_paths": ["allowed.md"],
+  "rule_allowed_paths": { "rule-filler-phrases": ["quirks/**"] },
+  "phrase_add": ["chef.s kiss architecture"],
+  "phrase_remove": ["(the|my) honest take"],
   "thresholds": { "ai_vocabulary": 999, "copulative_avoidance": 999 },
   "disabled_rules": ["rule-significance-inflation"]
 }
 EOF
+crlf_detect() {
+  (cd "$CRLFREPO" && HOME="$TEST_TMPDIR/crlf-home" PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$CRLFREPO" \
+    bash "$DETECT" "$@" 2>&1)
+}
 
-out="$(cd "$TEST_TMPDIR/crlf-repo" && PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$TEST_TMPDIR/crlf-repo" \
-  bash "$DETECT" "$TEST_TMPDIR/crlf-repo/vendored.md" 2>&1)"
+out="$(crlf_detect "$CRLFREPO/vendored.md")"
 assert_contains "crlf jq: excluded_paths still declines the file" "$out" "Declined: file=vendored.md cause=excluded-glob"
 
-out="$(cd "$TEST_TMPDIR/crlf-repo" && PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$TEST_TMPDIR/crlf-repo" \
-  bash "$DETECT" "$TEST_TMPDIR/crlf-repo/allowed.md" 2>&1)"
+out="$(crlf_detect "$CRLFREPO/allowed.md")"
 assert_not_contains "crlf jq: em_dash_allowed_paths still exempts the document" "$out" "Finding: rule=ai-slop/audit/rule-em-dash"
 # Positive pin alongside the absence check: on its own, `assert_not_contains`
 # would also be satisfied by an accidental whole-file exclusion.
 assert_contains "crlf jq: the em-dash exemption is a decline, not a dropped file" "$out" "rule=ai-slop/audit/rule-em-dash findings=0 declined=1 declined_marker=0 declined_quote=0 declined_config=1 disabled=0"
 assert_contains "crlf jq: disabled_rules still applies" "$out" "rule=ai-slop/audit/rule-significance-inflation findings=0 declined=0 declined_marker=0 declined_quote=0 declined_config=0 disabled=1"
 
-# rule_allowed_paths under the shim, reusing its own fixture.
-out="$(PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$RAP" bash "$DETECT" "$RAP/quirks/doc.md" "$RAP/plain.md" 2>&1)"
+# rule_allowed_paths under the shim, on copies of the rule_allowed_paths fixture.
+out="$(crlf_detect "$CRLFREPO/quirks/doc.md" "$CRLFREPO/plain.md")"
 assert_not_contains "crlf jq: rule_allowed_paths still declines the listed path" "$out" "file=quirks/doc.md"
 assert_contains "crlf jq: rule_allowed_paths decline still counted" "$out" "rule=ai-slop/audit/rule-filler-phrases findings=1 declined=1"
 
 # phrase_add and phrase_remove under the shim: every fragment must still match.
-# The phrase-repo fixture is reused.
-out="$(PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$PREPO" bash "$DETECT" "$PREPO/doc.md" 2>&1)"
+# The phrase-repo document is reused.
+out="$(crlf_detect "$CRLFREPO/phrases.md")"
 assert_contains "crlf jq: phrase_add and phrase_remove still apply" "$out" "rule=ai-slop/audit/rule-model-era-phrases findings=2 declined=0"
 
 # Anchored on the text that FOLLOWS the value: a bare `=999` substring match
@@ -838,7 +850,7 @@ assert_contains "crlf jq: phrase_add and phrase_remove still apply" "$out" "rule
 # so the case is green either way on a Windows workstation. The list and
 # slug-map cases above carry the Windows reproduction; this one is here for the
 # runner.
-out="$(PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$TEST_TMPDIR/crlf-repo" bash "$DETECT" --show-config 2>&1)"
+out="$(crlf_detect --show-config)"
 assert_contains "crlf jq: scalar threshold parses without the carriage return" "$out" "threshold_ai_vocabulary=999 (rule"
 
 # The CR strip must not swallow jq's verdict on the layer. jq emits the values it
@@ -848,28 +860,94 @@ assert_contains "crlf jq: scalar threshold parses without the carriage return" "
 # cascade-read.sh strips the CR after the substitution and skips the layer. The
 # fixture is a valid object followed by a truncated one, which is what a config
 # file caught mid-write looks like.
-truncdir="$TEST_TMPDIR/trunc-repo/.claude"
+# The user-global layer is the JSON one.
+truncdir="$TEST_TMPDIR/trunc-home/.claude"
 mkdir -p "$truncdir"
-make_repo "$TEST_TMPDIR/trunc-repo"
 printf '%s\n' '{ "thresholds": { "ai_vocabulary": 999 } }' '{bad' >"$truncdir/ai-slop.json"
 
-out="$(CLAUDE_PROJECT_DIR="$TEST_TMPDIR/trunc-repo" bash "$DETECT" --show-config 2>&1)"
+out="$(HOME="$TEST_TMPDIR/trunc-home" bash "$DETECT" --show-config 2>&1)"
 assert_contains "malformed layer: the partially parsed threshold is refused" "$out" "threshold_ai_vocabulary=3.0 (rule"
 
 # Same fixture under the CRLF shim: the strip and the status check have to hold at
 # once, which is the combination the pipeline lost.
-out="$(PATH="$CRLF_BIN:$PATH" CLAUDE_PROJECT_DIR="$TEST_TMPDIR/trunc-repo" bash "$DETECT" --show-config 2>&1)"
+out="$(HOME="$TEST_TMPDIR/trunc-home" PATH="$CRLF_BIN:$PATH" bash "$DETECT" --show-config 2>&1)"
 assert_contains "malformed layer: refused under a CRLF-emitting jq too" "$out" "threshold_ai_vocabulary=3.0 (rule"
 
 # Pin the fixture's premise: a well-formed layer carrying the same value is still
 # honored, so the two cases above are discriminating on the malformation and not
 # on the key going unread for some unrelated reason.
-okdir="$TEST_TMPDIR/trunc-ok-repo/.claude"
+okdir="$TEST_TMPDIR/trunc-ok-home/.claude"
 mkdir -p "$okdir"
-make_repo "$TEST_TMPDIR/trunc-ok-repo"
 printf '%s\n' '{ "thresholds": { "ai_vocabulary": 999 } }' >"$okdir/ai-slop.json"
-out="$(CLAUDE_PROJECT_DIR="$TEST_TMPDIR/trunc-ok-repo" bash "$DETECT" --show-config 2>&1)"
+out="$(HOME="$TEST_TMPDIR/trunc-ok-home" bash "$DETECT" --show-config 2>&1)"
 assert_contains "malformed layer: the same value from a well-formed layer still applies" "$out" "threshold_ai_vocabulary=999 (rule"
+
+# --- YAML team layer (docs/conventions/ai-slop.yaml) -------------------------------
+
+# The old JSON team and personal files are not read, even with no YAML beside them.
+OLDREPO="$TEST_TMPDIR/old-json-repo"
+mkdir -p "$OLDREPO/.claude"
+make_repo "$OLDREPO"
+printf '%s\n' '{ "thresholds": { "ai_vocabulary": 999 } }' >"$OLDREPO/.claude/ai-slop.json"
+printf '%s\n' '{ "thresholds": { "copulative_avoidance": 999 } }' >"$OLDREPO/.claude/ai-slop.local.json"
+out="$(CLAUDE_PROJECT_DIR="$OLDREPO" bash "$DETECT" --show-config 2>&1)"
+assert_contains "yaml: the old team file is not read when the YAML is absent" "$out" "threshold_ai_vocabulary=3.0 (rule rule-ai-vocabulary) [layer: default]"
+assert_contains "yaml: a value no layer supplied reports the default layer" "$out" "threshold_copulative_avoidance=4.0 (rule rule-copulative-avoidance) [layer: default]"
+assert_not_contains "yaml: neither old file is a listed layer" "$out" "$OLDREPO/.claude/"
+
+# The YAML wins when both exist: the old file is not read as a second team layer.
+YREPO="$TEST_TMPDIR/yaml-repo"
+mkdir -p "$YREPO/.claude" "$YREPO/docs/conventions"
+make_repo "$YREPO"
+printf '%s\n' '{ "thresholds": { "ai_vocabulary": 999 }, "disabled_rules": ["rule-em-dash"], "excluded_paths": ["old/**"] }' >"$YREPO/.claude/ai-slop.json"
+cat >"$YREPO/docs/conventions/ai-slop.yaml" <<'EOF'
+# a comment with a "quote" and a # hash
+thresholds:
+  ai_vocabulary: 2.5   # trailing comment
+disabled_rules:
+  - "rule-emoji-formatting"
+excluded_paths: ["vendor/**", "gen/*.md"]
+em_dash_allowed_paths: []
+rule_allowed_paths:
+  rule-ai-vocabulary:
+    - "docs/marketing/**"
+  rule-em-dash: []
+EOF
+out="$(CLAUDE_PROJECT_DIR="$YREPO" bash "$DETECT" --show-config 2>&1)"
+assert_contains "yaml: the YAML is a listed layer" "$out" "$YREPO/docs/conventions/ai-slop.yaml"
+assert_not_contains "yaml: the old file is not read beside it" "$out" "$YREPO/.claude/ai-slop.json"
+assert_contains "yaml: a scalar comes from the YAML" "$out" "threshold_ai_vocabulary=2.5 (rule rule-ai-vocabulary) [layer: $YREPO/docs/conventions/ai-slop.yaml]"
+assert_contains "yaml: a list comes from the YAML and names its layer" "$out" "disabled_rules=rule-emoji-formatting [layer: $YREPO/docs/conventions/ai-slop.yaml]"
+assert_contains "yaml: a flow-sequence list is read" "$out" "excluded_paths=vendor/** gen/*.md [layer: $YREPO/docs/conventions/ai-slop.yaml]"
+assert_contains "yaml: a per-rule glob list names its layer" "$out" "rule_allowed_paths[rule-ai-vocabulary]=docs/marketing/** [layer: $YREPO/docs/conventions/ai-slop.yaml]"
+assert_not_contains "yaml: an empty per-rule list leaves the rule unexempted" "$out" "rule_allowed_paths[rule-em-dash]"
+
+# The personal YAML override refines the team YAML per key and is named for what it set.
+printf '%s\n' 'thresholds:' '  copulative_avoidance: 7' 'disabled_rules: []' >"$YREPO/docs/conventions/ai-slop.local.yaml"
+out="$(CLAUDE_PROJECT_DIR="$YREPO" bash "$DETECT" --show-config 2>&1)"
+assert_contains "yaml: the personal override supplies its own scalar" "$out" "threshold_copulative_avoidance=7 (rule rule-copulative-avoidance) [layer: $YREPO/docs/conventions/ai-slop.local.yaml]"
+assert_contains "yaml: the team YAML still supplies the key the personal override left" "$out" "threshold_ai_vocabulary=2.5 (rule rule-ai-vocabulary) [layer: $YREPO/docs/conventions/ai-slop.yaml]"
+assert_contains "yaml: an explicit empty list in the personal override clears the team list" "$out" "disabled_rules= [layer: $YREPO/docs/conventions/ai-slop.local.yaml]"
+
+# phrase_remove alone names its own layer on the model_phrases line, not only phrase_add's.
+printf '%s\n' 'phrase_remove:' '  - "(the|my) honest take"' >"$YREPO/docs/conventions/ai-slop.local.yaml"
+out="$(CLAUDE_PROJECT_DIR="$YREPO" bash "$DETECT" --show-config 2>&1)"
+assert_contains "yaml: phrase_remove alone names its layer" "$out" "model_phrases=(the part most people skip|that.s the unlock) [layer: add default, remove $YREPO/docs/conventions/ai-slop.local.yaml]"
+
+# A YAML layer outside the parser's subset is skipped whole, like a malformed JSON layer.
+BADY="$TEST_TMPDIR/yaml-bad-repo"
+mkdir -p "$BADY/docs/conventions"
+make_repo "$BADY"
+printf '%s\n' 'thresholds: {ai_vocabulary: 999}' >"$BADY/docs/conventions/ai-slop.yaml"
+out="$(CLAUDE_PROJECT_DIR="$BADY" bash "$DETECT" --show-config 2>&1)"
+assert_contains "yaml: a layer outside the subset is refused" "$out" "threshold_ai_vocabulary=3.0 (rule rule-ai-vocabulary) [layer: default]"
+
+# The effective YAML config drives the scan, not only the report.
+cp "$SLOP" "$YREPO/doc.md"
+printf '%s\n' 'excluded_paths:' '  - "doc.md"' >"$YREPO/docs/conventions/ai-slop.yaml"
+rm -f "$YREPO/docs/conventions/ai-slop.local.yaml"
+out="$(cd "$YREPO" && CLAUDE_PROJECT_DIR="$YREPO" bash "$DETECT" --list-targets "$YREPO/doc.md" 2>&1)"
+assert_not_contains "yaml: excluded_paths from the YAML drops the target" "$out" "doc.md"
 
 # --- Portability -----------------------------------------------------------------
 
@@ -1140,6 +1218,54 @@ chmod +x "$BADLS_BIN/git"
 out="$(cd "$BAREREPO" && PATH="$BADLS_BIN:$PATH" CLAUDE_PROJECT_DIR="$BAREREPO" bash "$DETECT" 2>&1)"
 assert_contains "bare invocation, listing fails: the summary reports 0 files scanned" "$out" "0 files scanned"
 
+# --- Prose extraction retry --------------------------------------------------------
+
+# gawk has aborted the extraction run (exit 134) on trees an unchanged rerun
+# passed, so detect.sh retries that status once. The stub fails the first <n>
+# extraction calls (the only awk call that passes dir=) with <status>, counts
+# them in <dir>/calls, and hands every other call to the real awk.
+REAL_AWK="$(command -v awk)"
+make_failing_awk() { # make_failing_awk <dir> <n> <status>
+  mkdir -p "$1"
+  cat >"$1/awk" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do
+  if [[ "\$a" == dir=* ]]; then
+    n=\$(( \$(cat "$1/calls" 2>/dev/null || echo 0) + 1 ))
+    echo "\$n" >"$1/calls"
+    if [[ "\$n" -le $2 ]]; then
+      echo "awk: fatal error: internal error" >&2
+      exit $3
+    fi
+  fi
+done
+exec "$REAL_AWK" "\$@"
+EOF
+  chmod +x "$1/awk"
+}
+RETRY_DOC="$TEST_TMPDIR/retry.md"
+printf 'One em dash %s in prose.\n' "$EM" >"$RETRY_DOC"
+
+make_failing_awk "$TEST_TMPDIR/bin-awk-abort-once" 1 134
+out="$(PATH="$TEST_TMPDIR/bin-awk-abort-once:$PATH" bash "$DETECT" "$RETRY_DOC" 2>&1)"
+rc=$?
+assert_exit "extraction aborts once: the retry completes the scan" 0 "$rc"
+assert_contains "extraction aborts once: a retry notice reaches stderr" "$out" "prose extraction aborted (awk exit 134); retrying once"
+assert_contains "extraction aborts once: the retried scan still reports the finding" "$out" "Finding: rule=ai-slop/audit/rule-em-dash"
+
+make_failing_awk "$TEST_TMPDIR/bin-awk-abort-always" 99 134
+out="$(PATH="$TEST_TMPDIR/bin-awk-abort-always:$PATH" bash "$DETECT" "$RETRY_DOC" 2>&1)"
+rc=$?
+assert_exit "extraction always aborts: the scan exits 2" 2 "$rc"
+assert_contains "extraction always aborts: the failure message stands" "$out" "prose extraction failed; nothing was scanned"
+assert_eq "extraction always aborts: it is retried once, not more" "$(cat "$TEST_TMPDIR/bin-awk-abort-always/calls")" "2"
+
+make_failing_awk "$TEST_TMPDIR/bin-awk-error" 99 2
+out="$(PATH="$TEST_TMPDIR/bin-awk-error:$PATH" bash "$DETECT" "$RETRY_DOC" 2>&1)"
+rc=$?
+assert_exit "extraction fails without an abort: the scan exits 2" 2 "$rc"
+assert_eq "extraction fails without an abort: no retry runs" "$(cat "$TEST_TMPDIR/bin-awk-error/calls")" "1"
+
 # --- Excerpt truncation at the byte boundary --------------------------------------
 
 # 79 ASCII bytes then an em dash: a byte cut at 80 would keep only the first
@@ -1148,9 +1274,9 @@ LONGLINE="$(printf 'x%.0s' $(seq 1 75)) em${EM}dash tail"
 BOUNDARY="$TEST_TMPDIR/boundary.md"
 printf '%s\n' "$LONGLINE" >"$BOUNDARY"
 out="$(bash "$DETECT" "$BOUNDARY" 2>&1)"
-if printf '%s' "$out" | LC_ALL=C grep -q $'\xe2\x80\x94'; then
+if LC_ALL=C grep -q $'\xe2\x80\x94' <<<"$out"; then
   pass "excerpt truncation: em dash at boundary survives whole"
-elif printf '%s' "$out" | LC_ALL=C grep -q $'\xe2'; then
+elif LC_ALL=C grep -q $'\xe2' <<<"$out"; then
   fail "excerpt truncation: no partial multi-byte sequence" "whole em dash or none" "lone lead byte present"
 else
   pass "excerpt truncation: partial sequence dropped cleanly"
@@ -1402,8 +1528,8 @@ assert_tier() {
   local row
   row="$(LC_ALL=C grep -m1 "ai-slop/audit/$1 " "$TIEROUT")"
   case "$row" in
-  *"| $2 |"*) pass "tier mirror: $1 is $2" ;;
-  *) fail "tier mirror: $1 is $2" "$2" "$row" ;;
+    *"| $2 |"*) pass "tier mirror: $1 is $2" ;;
+    *) fail "tier mirror: $1 is $2" "$2" "$row" ;;
   esac
 }
 for slug in $EXPECTED_IMPORTANT; do assert_tier "$slug" IMPORTANT; done
@@ -1576,7 +1702,7 @@ assert_contains "emit chunked: the finding row from the first chunk is present" 
 
 # The tally is this suite's only witness, so it is reconciled against the
 # declared total before it may report green: the liveness-assertion convention's
-# "Gate / classifier" row, docs/conventions/liveness-assertion/README.md
+# "Gate / classifier" row, docs/contracts/liveness-assertion/README.md
 # ("never green when findings were miscounted"). Both conditions are evaluated
 # and both reports printed, so a failing run that also lost cases says so twice.
 echo

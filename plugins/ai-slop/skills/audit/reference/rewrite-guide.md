@@ -1,6 +1,6 @@
 # Rewrite guide
 
-Fix-time guidance for `/ai-slop:audit fix`: what to write INSTEAD of a flagged tell. The
+Fix-time guidance for `/ai-slop:audit fix`: what to write instead of a flagged tell. The
 [catalog](catalog.md) decides what flags; this file decides what replaces it. Loaded at fix
 step 1, applied under the same semantic-diff guard as every rewrite (meaning over style: a
 rewrite that changes what a sentence asserts is skipped and recorded).
@@ -16,7 +16,7 @@ launders provenance fails the test and is not applied. Perplexity and burstiness
 in this guide as targets: they are detector-side statistics, defined relative to a model and
 tokenizer, and cannot function as writing goals.
 
-## Legitimate-hit taxonomy (when NOT to rewrite)
+## Legitimate-hit taxonomy (when not to rewrite)
 
 Five classes of detector hit are legitimate as written. What the detector skips depends on the
 rule's class (catalog "Quotation exemption"; the detector's rule registry assigns the class):
@@ -60,7 +60,7 @@ whose line no longer trips any rule is residue to remove on the next pass.
 ## Risky rewrite classes (disambiguate before restating)
 
 Three flagged constructions carry systematic meaning-change risk. Each demands a
-disambiguation step BEFORE the rewrite, and the semantic-diff verifier is told to treat these
+disambiguation step before the rewrite, and the semantic-diff verifier is told to treat these
 classes adversarially:
 
 - **Negative parallelism** ("not just X but Y", "not only X, but also Y"): the construction is
@@ -68,7 +68,7 @@ classes adversarially:
   restatement must pick one, and picking wrong inverts the criterion. Resolve the intended
   reading from surrounding context first; when the context does not settle it, keep the original
   and flag the ambiguity to the author instead of guessing.
-- **Triad collapse**: keep the single strongest item ONLY when the surviving text still entails
+- **Triad collapse**: keep the single strongest item only when the surviving text still entails
   every deleted item. An enumeration whose items are independent claims ("no endpoint tables,
   no scope lists, no prices") loses assertions when collapsed; restate without the cadence
   ("no endpoint tables, scope lists, or prices") rather than dropping items.
@@ -86,12 +86,26 @@ A rewrite that swaps one tell for another is not a fix:
   different mark. When the aside needs to stand apart, give it a sentence of its own.
 - **Colon crutches** are not fixed by swapping the colon for a dash or semicolon. Drop the
   two-part staging and state the point once: "The short version: the job retries three times
-  before it pages anyone" becomes "The job retries three times before it pages anyone." A colon
-  that introduces a list or an example is not a crutch and stays.
-- **Triads** collapse toward the single strongest item (the fix flow's standing rule), not
-  toward a two-item list that keeps the cadence.
+  before it pages anyone" becomes "The job retries three times before it pages anyone." The
+  mid-sentence colon as a connector ("If you're coming from X: here's the mapping") is a crutch
+  for a comparison the sentence didn't need. Rewrite so the point stands alone: rephrase it, or
+  split it into two sentences. A colon that
+  introduces a list or an example is not a crutch and stays, and so does a terse `rule: reason`
+  line in a list of operative rules (the catalog's `rule-colon-crutch` boundary).
+- **Triads** collapse toward the single strongest item only under the entailment condition in
+  "Triad collapse" above (the fix flow's standing rule), never toward a two-item list that keeps
+  the cadence.
 - **Vocabulary swaps** must not reach for the next-fanciest synonym. "Utilize" becomes "use",
   not "employ".
+
+## Sweep order
+
+Read the text once for what it's actually trying to say. You can't rewrite a sentence you
+haven't understood; you'll preserve the slop's shape. Sweep in order: words, then sentences, then
+punctuation and formatting, then claims. Each layer hides behind the one above it. A puffed-up
+claim is hard to see until the vocabulary around it is plain. The voice pass and the closing
+reread below come last, and the fresh-context semantic-diff verifier checks the result after
+them.
 
 ## Plain speech
 
@@ -107,6 +121,9 @@ sentence a finding touches, and puts these questions to it:
 | Does the reader have to go back and reread it? | It holds more than one idea. Split it, or remove clauses until one idea is left. | |
 | Is there a plainer word? | Use it. See the plain-word rows below. | |
 
+The figures in the after-forms are illustrative. A fix writes a number only when the text or
+its sources already state it; with no figure at hand, it names the behavior without one.
+
 ## Replacements for flagged phrases
 
 Literal replacements, by rule:
@@ -117,6 +134,17 @@ Literal replacements, by rule:
 | | "facilitate" | "help" |
 | | "in the event that" | "if" |
 | | "numerous" | "many" |
+| Judgment rows: the self-audit and any sentence a fix touches, whether or not a rule fired | "delve into" | "dig into", "look at" |
+| | "crucial", "pivotal" | "important", or name the consequence |
+| | "foster", "cultivate" | "build", "grow" |
+| | "enhance" | "improve", or the specific change |
+| | "showcase" | "show" |
+| | "underscore" | "show", "stress" |
+| | "landscape", "tapestry" (abstract) | "field", "mix", or delete the sentence |
+| | "garner" | "get", "earn" |
+| | "additionally" | "also", "and" |
+| `rule-copulative-avoidance` | "serves as", "stands as" | "is" |
+| | "boasts", "features", "offers" | "has", where the verb means only possession. A literal use keeps its verb: "the store offers a refund" makes an offer, and "the episode features a guest" names a role |
 | `rule-filler-phrases` | "due to the fact that" | "because" |
 | | "in order to" | "to" |
 | | "it should be noted that", "it is worth noting that", "it is important to note that" | nothing: delete the phrase and let the note stand alone |
@@ -129,6 +157,9 @@ Literal replacements, by rule:
 | | "wedge in" | "add" |
 | | "gold-plating" | "work beyond what the task requires" |
 | | "ratchet" | "a limit that can only get stricter", or the mechanism's actual name |
+| | "wedge" (a way into a market or a codebase) | "way in" |
+| | "flywheel" | the actual feedback loop, described |
+| | "primitive" as a noun, "harness" and "scaffolding" as metaphors, "paradigm", "nexus" | the concrete word for what it names |
 
 The metaphor rows apply to figurative uses only. A domain-literal use keeps its word: a test
 harness is still a harness.
@@ -157,7 +188,30 @@ Rewrites that need more than a lookup:
   requests"). A small drama becomes the trigger and its consequence ("the on-call phone lights
   up at 3 a.m." becomes "the nightly job fails and pages the on-call engineer"). A mood becomes
   the behavior ("CI gets grumpy about lockfiles" becomes "CI fails when `package-lock.json` is
-  out of date"). A slogan becomes the rule, then `because` and its reason.
+  out of date"). An act becomes who does what ("flaky tests eat the release week" becomes
+  "engineers spend release week rerunning flaky tests"). A slogan becomes the rule, then
+  `because` and its reason. The rewritten sentence carries no figure. Reread it verb by
+  verb: where an object or abstraction is still said to do what only a living thing does (sit,
+  sleep, want, fight), write where it is or what happens instead, even when that verb alone would
+  not have been reported. A field's own term is not a figure and stays, as do the idioms in other
+  sentences. Moving or re-punctuating the
+  sentence with the figure still in it is not a fix. The sentence stays about the thing it named;
+  never swap its subject for another noun nearby.
+- **Promotional adjectives** (`rule-promotional-language`): "Vibrant", "stunning",
+  "breathtaking", "groundbreaking", "renowned", "seamless", "robust", "nestled". These are
+  travel-brochure words. Describe the thing; let the reader supply the adjective.
+- **Vague attribution and name-drop lists** (`rule-vague-attribution`): name the person or
+  report, or delete it. Same for name-drop lists ("featured in TechCrunch, Wired, and The Verge")
+  with no quote attached: pick one and say what it said, and only when the source text is at
+  hand. A fix never invents a quote.
+- **Generic conclusions** (`rule-generic-conclusions`): end with a specific plan, a fact, or just
+  end.
+- **Interface copy that fits any product** (`rule-mechanism-free-claims`, interface-copy cue):
+  build the rewrite only from what the surrounding copy or the source already states about the
+  product, so a competitor could not run it unchanged. With nothing stated to build from, report
+  the line as a proposal for its author and write nothing. The plain-speech question "would it
+  read the same in an unrelated project's docs?" is the same test. The fix rewrites the scratch
+  copy only; which line ships is the project's call.
 - **Over-compression** (`rule-over-compression`): rebuild each sentence around a subject and a
   verb, then add back what the reader had to guess. A symbol becomes the word it stood for ("→"
   becomes "causes" or "then", "=" becomes "is"); steps are joined by the word that says how
@@ -186,25 +240,36 @@ Three techniques apply wherever the pass runs. Each one adds information the rea
 - **Reach a verdict.** After setting out trade-offs, say which way they come out, instead of
   leaving advantages and disadvantages side by side.
 
-Two more depend on the register:
+Four more depend on the register:
 
 - **Writing as "I" or "we"** belongs only in a document that has an author's voice.
 - **Mixing short sentences with longer ones** that take time to develop a point suits narrative
   sections. Reference prose follows Google's global-audience guidance instead: consistently
   short, translatable sentences and consistent terms, with the point first, so vary its structure
   less.
+- **An aside the reader would want.** One sentence that steps off the main line to give the
+  reader something useful the structure had no slot for, such as the failure the author hit in
+  practice or the reason a default that looks wrong is right. The aside
+  must already be in the text or its sources; a fix pass never invents one, and an aside that
+  serves the writer instead of the reader is cut.
+- **Say what you don't know when you don't know it.** Name the open question once, attached to
+  the claim it limits ("we have not measured this on Windows"), the same one-hedge rule the
+  stacked-hedging row applies. One hedge is honesty; a uniform confident surface hides where the
+  reader should be careful. A fix pass states only uncertainty the source already holds.
 
 Deliberately leaving flaws in the prose is not a voice technique, and a fix pass never adds them.
-Planted imperfection changes how the text would score, not how it reads, so it fails this
-guide's improve-it-anyway test and is the evasion posture the guide refuses. It is left off the
-list on purpose; do not re-add it as a sixth technique.
+Planted imperfection, typos included, changes how the text would score, not how it reads, so it
+fails this guide's improve-it-anyway test and is the evasion posture the guide refuses. It is
+left off the list on purpose; do not re-add it as a technique.
 
-This section never overrides meaning preservation: voice is added in HOW a kept claim is
+This section never overrides meaning preservation: voice is added in how a kept claim is
 phrased, never by inventing new claims during a fix pass.
 
 ## Self-audit
 
 Last pass over each rewritten file, before the semantic-diff verification: read it asking "what
 still makes this read machine-written?" and fix what surfaces, whether or not a rule flagged
-it. Findings from this pass are reported like rubric findings (quoted text, catalog entry when
-one fits).
+it: a leftover "leverage", a triad that came back, a word from the judgment rows above, a
+paragraph with no verdict in it, a figure still in a sentence rewritten for one. Then read it once more; what that second read finds is fixed or
+reported, and the self-audit ends there. Findings from this pass are reported like rubric findings
+(quoted text, catalog entry when one fits).

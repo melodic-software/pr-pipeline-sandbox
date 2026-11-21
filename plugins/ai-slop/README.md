@@ -1,11 +1,19 @@
 # ai-slop
 
-Detects and removes AI-writing tells ("slop") in checked-in markdown prose.
+Detects and removes AI-writing tells ("slop") in checked-in markdown prose, commit messages, PR bodies and interface copy.
+
+## Install
+
+```shell
+/plugin marketplace add melodic-software/claude-code-plugins
+/plugin install ai-slop@melodic-software
+```
 
 ## Skills
 
 - `/ai-slop:audit [target]` reports AI-writing tells in the target (default: the whole repo's
-  tracked markdown). Read-only. `fix` as an explicit argument applies rewrites behind a
+  tracked markdown; `commit [rev]`, `pr-body` and `copy <files>` audit a commit message, a pull
+  request body or interface strings). Read-only. `fix` as an explicit argument applies rewrites behind a
   semantic-diff guard.
 - `/ai-slop:audit user-scope [memory]` audits the user-level Claude Code markdown
   (`CLAUDE.md`, rules, skills, commands, agents, output styles) under `CLAUDE_CONFIG_DIR`,
@@ -47,22 +55,38 @@ from detector output; the skill resolves the destination and the producer-contra
 
 ## Configuration
 
-`.claude/ai-slop.json`, resolved per the config-cascade convention (user-global, team, local
-overlay; later layers refine earlier ones per key):
+The team layer is `docs/conventions/ai-slop.yaml` and the personal layer is
+`docs/conventions/ai-slop.local.yaml` (gitignored), validated by the plugin's
+[`schemas/ai-slop.schema.json`](schemas/ai-slop.schema.json) and resolved per the config-cascade
+convention (user-global, team, personal; later layers refine earlier ones per key). The convention
+home is the one the repository binds in its instruction file, `docs/conventions` by default. The
+audit does not read the older JSON files (the same names with a `.json` extension, under
+`.claude/`); `/ai-slop:setup` writes the YAML and offers to carry an old team file's values into it.
 
-```json
-{
-  "excluded_paths": ["docs/legacy/**"],
-  "em_dash_allowed_paths": ["docs/style-guide.md"],
-  "rule_allowed_paths": { "rule-ai-vocabulary": ["docs/marketing/**"] },
-  "vocab_add": ["utilize"],
-  "vocab_remove": ["landscape"],
-  "phrase_add": ["chef.s kiss architecture"],
-  "phrase_remove": ["(the|my) honest take"],
-  "disabled_rules": ["rule-emoji-formatting"],
-  "thresholds": { "ai_vocabulary": 3.0, "copulative_avoidance": 4.0 }
-}
+```yaml
+excluded_paths: ["docs/legacy/**"]
+em_dash_allowed_paths: ["docs/style-guide.md"]
+rule_allowed_paths:
+  rule-ai-vocabulary: ["docs/marketing/**"]
+vocab_add: ["utilize"]
+vocab_remove: ["landscape"]
+phrase_add: ["chef.s kiss architecture"]
+phrase_remove: ["(the|my) honest take"]
+disabled_rules: ["rule-emoji-formatting"]
+thresholds:
+  ai_vocabulary: 3.0
+  copulative_avoidance: 4.0
 ```
+
+`--show-config` ends each effective value with `[layer: <file>]`, the layer that supplied it, or
+`[layer: default]` when none did.
+
+`verification` (`off`, `light`, `standard`, `strict`; default `light`) and `verification_skills`
+(a skill name to a level, beating `verification`) set how much independent checking `/ai-slop:audit`
+runs: under `light` and `off` its fix flow dispatches no semantic-diff subagent. They are read by
+`lib/read-verification.sh` from the team file at the default branch only, never the personal layer
+or `--show-config`, so a branch cannot lower them
+([verification level](../../docs/contracts/verification-level/README.md)).
 
 `phrase_add`/`phrase_remove` tune the model-era phrase roster (`rule-model-era-phrases`, the
 catalog's "Model-era additions" section). Fragments are whole EREs: spaces allowed,

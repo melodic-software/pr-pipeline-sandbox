@@ -1,5 +1,5 @@
 ---
-description: "Surface the USER's unknown-unknowns before they work in unfamiliar territory and coach a sharper prompt. Use when: 'what am I missing', 'find my blindspots', 'what do I not know here', 'sharpen this prompt', 'I am new to this area', or about to work in an unfamiliar area and the goal is a better prompt, not the codebase handoff /discovery:explore produces."
+description: "Surface the USER's unknown-unknowns before they work in unfamiliar territory and coach a sharper prompt. Use when: 'what am I missing', 'find my blindspots', 'blind spot pass', 'what do I not know here', 'sharpen this prompt', 'I am new to this area', or about to work in an unfamiliar area and the goal is a better prompt, not the codebase handoff /discovery:explore produces."
 argument-hint: "[area-or-domain]"
 user-invocable: true
 disable-model-invocation: false
@@ -19,33 +19,19 @@ invocation:
 - Project root, `git rev-parse --show-toplevel`
 
 Treat a failure (not a repository, git unavailable) as an unknown value and carry on. Keep these as
-separate body Bash calls rather than pre-compute lines: the harness runs a skill's whole pre-compute
-block as one shell invocation, and a worktree-isolated session refuses a compound command that
-contains git. The dated record for that composition claim is the worktree skill's
-[reference/gather-block.md](https://raw.githubusercontent.com/melodic-software/claude-code-plugins/main/plugins/source-control/skills/worktree/reference/gather-block.md),
-"The pre-compute block runs as one shell invocation".
+separate body Bash calls rather than pre-compute lines ([gather-block convention](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/gather-block/README.md#the-pre-compute-block-runs-as-one-shell-invocation),
+"The pre-compute block runs as one shell invocation").
 
 These values orient this session only; resolve files against the project root while working.
 
-## Purpose
-
-Every mode of `/discovery:explore` builds the AGENT's local knowledge and hands off an `EXPLORE.md`
-artifact. Blindspot mode builds the USER's knowledge and hands off a better prompt, a different
-audience and a different deliverable, which is why it is its own skill.
-
-Run it when the user is about to work in territory they don't know, an unfamiliar codebase area OR
-an unfamiliar domain vocabulary, and the goal is to surface what their framing didn't account for
-so they can write a sharper implementation prompt. The output is calibrated to the user's disclosed
-starting point, not to a fixed depth.
-
-Local counterpart discipline to `/discovery:explore` (what IS in the codebase) and `/discovery:research`
-(what SHOULD BE from external sources): blindspot borrows from both lanes but serves the user's
-understanding rather than the agent's.
-
 ## Workflow
 
-1. **Intake**. Ask the user's starting point first (one question). Blindspot output calibrates to
-   that disclosure. What they already know bounds which gaps are worth surfacing.
+This skill builds the user's knowledge, not the agent's: the deliverable is the user's
+understanding plus one improved implementation prompt, calibrated to their disclosed starting
+point rather than a fixed depth.
+
+1. **Intake**. Ask the user's starting point first (one question). What they already know bounds
+   which gaps are worth surfacing.
 2. **Scan**. Two lanes, chosen by what is unfamiliar:
    - **Codebase lane**. Read the target area (the codebase-reading, git-history, and project-structure
      dimensions in [`${CLAUDE_PLUGIN_ROOT}/skills/explore/reference/workflow.md`](${CLAUDE_PLUGIN_ROOT}/skills/explore/reference/workflow.md))
@@ -59,12 +45,12 @@ understanding rather than the agent's.
      a card type. Each axis becomes a prompt-fix line in the improved prompt, which the user keeps or
      deletes like any other fix. A criterion the user's framing never named may also appear as a
      **Missing concept** card.
-3. **Output. Blindspot cards.** One card per blindspot, typed by the kind of gap it is (Landmine /
-   History / Convention / Missing concept): the gap, why it matters here, and a copyable prompt-fix
-   line. Close by assembling the fixes into ONE improved implementation prompt the user can run next.
-4. **Escalate when depth warranted**, a domain too deep for a lightweight ladder gets a recommendation
-   to learn it in a structured way: `/education:teach topic <domain>` when it is among the available
-   skills, otherwise proper external research (`/discovery:research`).
+3. **Output**. Blindspot cards, then one improved implementation prompt assembled from their
+   prompt-fix lines (Output format below).
+4. **Escalate when depth warranted**. A domain too deep for a lightweight ladder gets a
+   recommendation to learn it in a structured way: `/education:teach topic <domain>` when it is
+   among the available skills, otherwise proper external research, `/discovery:research` invoked
+   via the Skill tool.
 
 ## Output format
 
@@ -72,25 +58,48 @@ Present each blindspot as a card:
 
 - **Type**, one of four: **Landmine** (the change would break something non-obvious), **History**
   (a constraint whose reason the code no longer shows), **Convention** (an unwritten team rule the
-  work must follow), or **Missing concept** (a domain idea the user's framing never named). The
-  type tells the user which kind of unknown they were carrying, so repeated runs teach a pattern.
+  work must follow), or **Missing concept** (a domain idea the user's framing never named).
 - **Gap**, the specific thing the user's current framing did not account for.
 - **Why it matters here**, the concrete consequence in this codebase or domain, not a generic caution.
 - **Prompt-fix**, a single copyable line the user can drop into their prompt to close the gap.
 
-Then assemble every prompt-fix into ONE improved implementation prompt, wrapped in clear
+Then assemble every prompt-fix into one improved implementation prompt, wrapped in clear
 copy-start / copy-end markers so the exact text to reuse is unambiguous.
 
 End with one scan-scope disclosure line: which lane(s) ran and what was and was not scanned (areas
-read, sources fetched), so the user knows what the cards do and do not cover. One line, not a
-methodology dump.
+read, sources fetched). One line, not a methodology dump.
 
-For a long card list, offer an interactive view (cards filterable by type, a tick for each that was news, a copy-out of the reaction). The page is never written beside the cards, which stay the record. Build it only with `${CLAUDE_PLUGIN_ROOT}/scripts/build-view.mjs`, never hand-written; the publish destination comes from the `medium` cascade key. Procedure and data shape: [`${CLAUDE_PLUGIN_ROOT}/reference/rendered-view.md`](${CLAUDE_PLUGIN_ROOT}/reference/rendered-view.md).
+For a long card list, offer an interactive view in one sentence (cards filterable by type, a tick
+for each that was news, a copy-out of the reaction). The page is never written beside the cards,
+which stay the record. When the reader accepts:
 
-This skill does NOT write `EXPLORE.md`. Its deliverable is the user's understanding plus the improved
-prompt. When the scan's findings also serve as stage-1 codebase exploration, offer to hand off to
-`/discovery:explore` to persist the `EXPLORE.md` artifact rather than
-duplicating that responsibility here.
+1. Resolve the medium through the shared resolver. Add `--argument "<medium>"` only when the reader
+   named a medium in the request. `<option>` is this plugin's `medium` option,
+   `${user_config.medium}`; pass `""` when that reads empty or as an unsubstituted placeholder.
+   Read each option value from this text; never put a `${user_config.*}` string in a shell command.
+
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/lib/view-settings.mjs" resolve --lane discovery:blindspot --option "<option>"
+   ```
+
+   Take the medium from its JSON line only, never from a rendered-views settings file. The step is
+   done when its report line and each notice line are printed as they stand. When `node` is missing
+   or the resolver exits non-zero, build nothing and say in one line why the view was not built.
+2. `page` false: build nothing. The step is done: the cards stand.
+3. `page` true: build the page only with `${CLAUDE_PLUGIN_ROOT}/scripts/build-view.mjs`, never by
+   hand. With `publishes` true, publish the printed file with the Artifact tool and give the link;
+   when that tool is unavailable, hand back the path and say why in one line. Otherwise hand back
+   the path. The step is done when the reader has the link or the path.
+
+Build command, data shape, build failures and reply ids:
+[`${CLAUDE_PLUGIN_ROOT}/reference/rendered-view.md`](${CLAUDE_PLUGIN_ROOT}/reference/rendered-view.md),
+steps 1, 2, 4 and 6 and its "Discovery: blindspot" section. The resolver above replaces steps 3 and 5.
+
+This skill makes no changes and runs no open-ended external research: the domain lane fetches
+official docs only to ground the ladder and quality axes, and anything deeper routes to
+`/discovery:research`, invoked via the Skill tool. It does not write `EXPLORE.md`. When the scan's findings also serve
+as stage-1 codebase exploration, offer to hand off to `/discovery:explore`, invoked via the Skill
+tool, to persist the `EXPLORE.md` artifact.
 
 ## Next
 
@@ -100,20 +109,11 @@ duplicating that responsibility here.
 
 ## Gotchas
 
-- **Presenting training recall as domain fact**, the domain lane grounds its vocabulary ladder
-  and quality axes with good-vs-bad examples in sources fetched this session (repo files, official docs). Bare recall is the failure mode this
-  skill exists to avoid, not commit.
-- **Surfacing the agent's gaps instead of the user's**. Cards name what the USER's framing missed,
+- **Presenting training recall as domain fact**. The domain lane grounds its vocabulary ladder
+  and quality axes, good-vs-bad examples included, in sources fetched this session (repo files,
+  official docs).
+- **Surfacing the agent's gaps instead of the user's**. Cards name what the user's framing missed,
   calibrated to their intake disclosure, not a generic audit of the area.
 - **Generic cautions in "why it matters"**. Each card's consequence is concrete to this codebase or
   domain; a caution that would read the same in any repo is not a blindspot.
 - **Writing an artifact by reflex**. No `EXPLORE.md` unless the user opts into the explore handoff.
-
-## What this skill does NOT do
-
-- **Does not produce the `EXPLORE.md` handoff**. That is `/discovery:explore`. Hand off by invoking
-  `/discovery:explore` via the Skill tool when the findings double as stage-1 exploration.
-- **Does not make changes**. It surfaces blindspots and coaches a prompt. Execution is a separate step.
-- **Does not run open-ended external research**, the domain lane fetches official docs to ground a
-  lightweight vocabulary ladder and quality axes with good-vs-bad examples; anything deeper routes to `/discovery:research`, invoked via the
-  Skill tool.

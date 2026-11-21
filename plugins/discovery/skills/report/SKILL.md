@@ -60,7 +60,11 @@ else**. No preamble, no closing summary, no diffs, no file bodies, nothing resem
 
 - Never restate this schema in your report.
 - Every path is relative to the worktree root. Absolute paths cost more than they explain.
-- The cap is structural, not a word count. Five bullets is a ceiling, not a target.
+- Five bullets is a ceiling, not a target.
+- Aim for 3,400 bytes; the whole message must stay under 4,096. Detail that does not fit goes
+  in the artifact your definition or brief names, and the block points at it. With no artifact,
+  cut each `what:` and `evidence:` to one line and drop bullets before you drop a `problems:`
+  entry or a verdict.
 - In text a person reads, pair every code (an issue or PR number, a decision id such as Q631, a
   check or rule id) with its plain name, or replace it with the name.
 
@@ -78,10 +82,11 @@ token spend, and an estimate is worse than no number at all.
 *Claim.* A dispatched subagent's result reaches the parent through the Agent tool, and in this
 harness the returned text carries an agent-id and `<usage>` trailer appended to the final message
 with no separating newline.
-*Basis.* [Create custom subagents](https://code.claude.com/docs/en/sub-agents) documents the Agent
-tool and the subagent result it returns. The glued trailer's exact shape is an observed shape of
-that returned text rather than a documented format, and is recorded here as an observation.
-*As of.* 2026-09-13.
+*Basis.* [Subagent output scanning](https://code.claude.com/docs/en/sub-agents#subagent-output-scanning)
+documents the subagent report the Agent tool returns to the parent. The glued trailer's exact
+shape is an observed shape of that returned text rather than a documented format, and is recorded
+here as an observation.
+*As of.* 2026-11-11.
 *Recheck trigger.* A Claude Code release note touching the Agent tool result format.
 
 ## `commit: none` is allowed
@@ -109,8 +114,12 @@ and states how the body reached it in `preload: fired | fallback`:
 - `preload: fired` means the body was already in context at startup and you read no skill file.
 - `preload: fallback` means you read it from disk. Fallback is an accepted recovery, not a defect.
 
-A `skills:` entry that fails to resolve is skipped silently, so the token is the only evidence that
-the discipline reached you. Never report a token you found by reading the skill file as `fired`.
+The token is the only evidence that the discipline reached you. Never report a token you found by
+reading the skill file as `fired`.
+
+- **Pointer**: when deciding what a `skills:` entry that does not load leaves behind, fetch
+  [Preload skills into subagents](https://code.claude.com/docs/en/sub-agents#preload-skills-into-subagents)
+  live.
 
 **When no body reached you at all**, return `preload_token: MISSING` and `verdict: stopped`.
 `verdict: stopped` is terminal and **not resumable**: no resume can deliver a skill body that never

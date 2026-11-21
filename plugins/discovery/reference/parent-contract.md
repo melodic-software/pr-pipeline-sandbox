@@ -97,13 +97,15 @@ it sits below the default stop turn (30), so the worker honors it. The number is
 so the gathering a `low` row allows fits well inside it. Other `Budget:` words leave the value to
 the parent, up to that default.
 
-**Research adds two more labeled lines.** `Source breadth:` because source breadth is the
+**Research adds three more labeled lines.** `Source breadth:` because source breadth is the
 caller's level and the researcher lane is pinned `high` for reasoning; `Evidence use:` because
-only the caller knows whether the answer will be quoted outside the session:
+only the caller knows whether the answer will be quoted outside the session; `Research config:`
+because the caller resolved the research skill's "Tunable defaults":
 
 ```text
 Source breadth: <low|medium|high|xhigh|max>
 Evidence use: <internal|publish>
+Research config: corroborators=<n> recency=<active>/<standard>/<guide>
 ```
 
 The parent resolves the `Source breadth:` value from `${CLAUDE_EFFORT}` in the parent skill load
@@ -113,14 +115,18 @@ never raises it: write the lower of the token and `${CLAUDE_EFFORT}`, and write 
 `Budget:` word. Explore
 and trace-intent write neither line. A research worker that does not receive `Source breadth:`
 treats the run as `high` and names that default in the artifact, the same fallback as an
-unsubstituted body. Dated record: [Harness facts the dispatch design rests on](#harness-facts-the-dispatch-design-rests-on),
-"`${CLAUDE_EFFORT}` is the loading context's level".
+unsubstituted body. Record: [Harness facts the dispatch design rests on](#harness-facts-the-dispatch-design-rests-on),
+"`${CLAUDE_EFFORT}` in a preloaded skill is the session's level".
 
 Write `Evidence use: publish` when the output will be quoted outside this session: a
 pull-request review reply, an issue, a design document, a message to a third party. Otherwise
 `internal`. The line is degradable: a research worker that does not receive it records `internal`
 in the index and says so. What `publish` tightens, and why the value is copied into the index
 rather than trusted from the envelope: the research dispatch contract's `Evidence use` row.
+
+`Research config:` carries the values the parent resolved, because a body read from disk carries
+no `userConfig` substitution. The line is degradable: a research worker that does not receive it
+resolves the keys itself.
 
 Those labels are the ones the research deep tier already ships in its literal dispatch block;
 they are reproduced here rather than reinvented, so the two cannot drift.
@@ -135,14 +141,30 @@ the drift this file exists to close.
 **The worker's model is the parent's call, and it is not an envelope field.** It travels as the
 Agent tool's per-invocation `model` parameter, not as a line the agent parses, which is why it is
 named here rather than in the template above. Each worker definition pins a default model:
-`explorer` runs on `sonnet`; `researcher`, `intent-tracer` and `research-verifier` run on `opus`. The default is still to
-**pass nothing**, and then the pin applies. Supply the parameter only to override the pin for a run
-whose scope earns a different model; it replaces the pin in either direction. Every producing worker
+`explorer` runs on `sonnet`; `researcher`, `intent-tracer` and `research-verifier` run on `opus`.
+A consumer moves a worker off its pin through the multi-agent role map, by the role this table
+names:
+
+| Worker | Role |
+|---|---|
+| `explorer` | `retrieval` |
+| `researcher`, `intent-tracer` | `worker` |
+| `research-verifier` | `verifier` |
+
+When `/multi-agent:route` resolves in this session, run
+`/multi-agent:route all research session=<this session's model alias>` once per run (the deep
+tier's own call serves) and read the worker's role: its `fanout` variant on the deep tier's
+N-topic fan-out, its `single` variant for every other spawn. Pass that variant's model as `model`
+only when a consumer layer set it, meaning its basis (`basis.fanout_model` for `fanout`,
+`basis.model` for `single`) is `config`, and `omit_model` is false. Otherwise, and whenever
+`/multi-agent:route` does not resolve, **pass nothing**, and the pin applies. Pass no `effort`:
+each worker keeps its pinned level. Beyond that, supply the parameter only for a run whose scope
+earns a different model; it replaces the pin in either direction. Every producing worker
 spends `maxTurns: 40`: `researcher` and `intent-tracer` at `effort: high`, and `explorer` at
 `effort: medium`, the effort floor, because its turns go almost entirely to reading. Why 40 stays
 is the harness-facts record "`maxTurns` is set per definition, so 40 is a checkpoint, not a
 completion budget". How the pin and the per-call parameter rank against the consumer's
-subagent-model environment settings is not restated here. Dated record:
+subagent-model environment settings is not restated here. Record:
 [Harness facts the dispatch design rests on](#harness-facts-the-dispatch-design-rests-on),
 "A per-invocation `model` outranks a subagent's frontmatter".
 
@@ -150,7 +172,7 @@ subagent-model environment settings is not restated here. Dated record:
 for a collision or a parallel fan-out. No one can tell from the path alone which ancestor
 is the configured root, and the root is where the self-ignoring `.gitignore` guard belongs. An agent
 that has to derive it derives-and-flags rather than stopping, so the cost is a recoverable wrong
-guess, not a halt: it is the one envelope field an agent repairs by deriving a value. The
+guess, not a halt. It is the one envelope field an agent repairs by deriving a value. The
 `Turn budget:` line is also degradable, but its absence falls back to a fixed default rather than a
 derived guess. Topic/scope, reason and slice path are the hard stop.
 
@@ -193,7 +215,7 @@ Run whichever matches the shell this session actually has. On Windows without Gi
 PowerShell, and the POSIX line fails there in a way that reads as a broken instruction rather than a
 wrong shell.
 
-Creating the directory is not decoration: on a first-time topic the slice does not exist yet, a bare
+The directory has to be created, because on a first-time topic the slice does not exist yet, a bare
 `touch` fails there, and the dispatch either stops before it starts or reaches a gate with no
 baseline to grade against. A baseline the parent *named* but did not create exits 2 rather than
 quietly reporting `freshness=unchecked`. A check the caller asked for and only appeared to get is
@@ -232,13 +254,8 @@ one.
   [subagents: preload skills into subagents](https://code.claude.com/docs/en/sub-agents#preload-skills-into-subagents);
   for the analogue, see
   [skills: run skills in a subagent](https://code.claude.com/docs/en/skills#run-skills-in-a-subagent).
-- **As of**: 2026-10-01
-- **Recheck trigger**: either page starts describing argument substitution on the preload path.
 
-**Re-check both pages before restating any mechanism here.** Through 0.14.0 this plugin asserted a
-specific empty-string rendering of the placeholder on the preload path as settled fact, at five
-sites plus a weaker sixth and in two evals files: the operational conclusion was right and the
-stated reason was never sourced.
+**Re-check both pages before restating any mechanism here.**
 
 ### A different question: `${CLAUDE_…}`-shaped text a *caller* supplies
 
@@ -260,9 +277,6 @@ than each carrying its own copy.
   [skills: available string substitutions](https://code.claude.com/docs/en/skills#available-string-substitutions);
   for the order of argument insertion and variable replacement, see
   [skills: pass arguments to skills](https://code.claude.com/docs/en/skills#pass-arguments-to-skills).
-- **As of**: 2026-10-01
-- **Recheck trigger**: the skills page changes the order of argument insertion and variable
-  replacement, or adds an escape for the `${CLAUDE_…}` variables.
 
 Practically: name a path in plain words rather than passing a `${CLAUDE_…}` token and expecting it
 back. The `topic_as_received` / `scope_as_received` echo-back in the acceptance gate is what catches
@@ -300,27 +314,20 @@ in settings does block the command, for subagents as well as the main conversati
 
 - **Pointer**: for both, see
   [subagents: available tools](https://code.claude.com/docs/en/sub-agents#available-tools).
-- **As of**: 2026-10-01
-- **Recheck trigger**: that section changes how a `disallowedTools` specifier or a settings deny
-  rule applies to a subagent, or a release note names `disallowedTools` specifier matching or
-  subagent permission inheritance.
 
 Command deny rules are a partial guardrail, not the boundary. `Bash(git credential *)` or
 `Bash(gh auth token*)` (each with its `PowerShell(...)` twin, because a background subagent keeps
 `PowerShell`) blocks that one spelling; `printenv`, a `python -c` or `node -e` reader, and every
 other program that opens a file stay open, so we never treat an argument-constraining Bash pattern
 as a boundary (Pointer: for why such patterns are unreliable, see
-[permissions: Bash](https://code.claude.com/docs/en/permissions#bash).
-As of: 2026-10-01. Recheck trigger: the permissions page documents argument matching that holds).
+[permissions: Bash](https://code.claude.com/docs/en/permissions#bash)).
 A `Read(...)` deny does not cover a subprocess either. The stronger layer is the
-operator's sandbox configuration, detailed and dated in the `harness-config` audit's
-[`required-permissions.md`](https://github.com/melodic-software/claude-code-plugins/blob/main/plugins/harness-config/skills/audit/reference/required-permissions.md)
-(a URL, because a marketplace install of `discovery` does not carry that plugin's files). A token held in an
+operator's sandbox configuration, which `/harness-config:audit` details and dates. A token held in an
 environment variable sits outside any file boundary and stays held by instruction. The plugin
 cannot ship any of this, because a plugin's settings cannot carry permission rules (Pointer: for
 the keys a plugin's settings may set, see
-[plugin manifest reference: `settings`](https://code.claude.com/docs/en/plugins/manifest-reference#settings).
-As of: 2026-10-07. Recheck trigger: that field accepts another key).
+[changelog 2.1.323](https://code.claude.com/docs/en/changelog#2-1-323) and the `settings` section
+of the [manifest reference, archived 2026-10-30](https://web.archive.org/web/20261030112732/https://code.claude.com/docs/en/plugins/manifest-reference.md)).
 
 ## Read each file once, stated once
 
@@ -359,8 +366,7 @@ plus a version bump, a price worth paying for an artifact several plugins read a
 stays here.
 
 **This is the single statement of where a dispatched agent may write.** All three agent definitions
-point here rather than restating it; three earlier restatements disagreed with each other about
-whether scratch was inside the boundary or outside it. The dispatched agents, including a
+point here rather than restating it. The dispatched agents, including a
 research deep-tier subagent, cannot ask, so any assumed destination is flagged in the return rather than
 silently adopted.
 
@@ -413,27 +419,25 @@ findings returned in place of an artifact are a failed dispatch, not a fallback.
 
 ## Harness facts the dispatch design rests on
 
-Twelve harness behaviors this plugin's dispatch design depends on, each with one dated record here
+Twelve harness behaviors this plugin's dispatch design depends on, each with one record here
 instead of an undated restatement at every site that relies on it. A skill, context file, or agent
 definition keeps its own one-sentence operative rule and cites this section by heading; none of
 them repeats a pointer. Each record states what we rely on in our words and points at the section
 that carries the detail; none restates the page.
 
-- **As of**: 2026-10-01 for every record below unless the record names its own date, re-read that
-  day against the sub-agents, skills, permissions and CLI reference pages.
 - **Recheck trigger**, shared by all twelve: a record's pointer stops supporting it, a release note
   names subagent tool filtering, skill preloading, background execution, subagent spawn
   permissions, effort substitution, built-in subagent capabilities, subagent model resolution,
   per-invocation subagent parameters, turn-limit output or partial marking, or `SendMessage`
   resume, or the CLI major version moves. On any of those, re-read the pointer before restating
-  the record, and re-date it rather than editing a claim in place.
+  the record.
 
-### A preloaded skill that fails to resolve is skipped silently
+### A preloaded skill that does not load
 
-*What we rely on.* A subagent's `skills:` preload that cannot resolve does not fail the dispatch;
-the agent runs without the body it was supposed to carry, and nothing in the run's normal output
-says so. We rely on a resolved preload carrying the skill body itself.
-*As of:* 2026-10-11. *Pointer:* for what a failed and a resolved preload deliver, see
+*What we rely on.* We never count on the harness to fail a dispatch, or to tell the agent, when a
+`skills:` preload does not load; the liveness token is the only evidence we accept that the body
+arrived. We rely on a resolved preload carrying the skill body itself.
+*Pointer:* for what a missing, a disabled and a resolved preload deliver, see
 [subagents: preload skills into subagents](https://code.claude.com/docs/en/sub-agents#preload-skills-into-subagents).
 *Why the plugin cares.* A run whose discipline never loaded is indistinguishable from a good one by
 every other signal, which is what the liveness token exists to catch.
@@ -454,7 +458,6 @@ agent's own instruction rather than a harness boundary. The section's one except
 subagent run in plan mode, does not apply to any agent here. *Pointer:* for the plan-mode tools a
 non-fork subagent loses and that exception, see
 [subagents: available tools](https://code.claude.com/docs/en/sub-agents#available-tools).
-*As of:* 2026-10-11.
 
 ### The `Workflow` tool is absent from every non-fork subagent
 
@@ -470,14 +473,16 @@ one's. *Pointer:* for the foreground cases, see
 [subagents: run subagents in foreground or background](https://code.claude.com/docs/en/sub-agents#run-subagents-in-foreground-or-background);
 for the background tool set, the available-tools section. *Do not restate the tool subset.* It is a
 list the harness owns and revises; a site that needs it names the page rather than copying the
-members. *As of:* 2026-10-11.
+members.
 
 ### A spawn is permission-checked before it launches, and the depth limit is a different mechanism
 
 *What we rely on.* A denied spawn is not evidence about nesting depth. A permission deny and the
 depth limit are different mechanisms with different symptoms and error text, so read the error
 rather than inferring a depth ceiling from it. A type list on a definition's `Agent` entry is
-never relied on here as a restriction; what that form does is the second pointer's to say. *As of:* 2026-10-11. *Pointer:* for deny rules, see
+never relied on here as a restriction; what that form does is the second pointer's to say. *Pointer:* for deny rules, see
+[subagents: disable specific subagents](https://code.claude.com/docs/en/sub-agents#disable-specific-subagents);
+for the type list on an `Agent` entry, see
 [subagents: restrict which subagents can be spawned](https://code.claude.com/docs/en/sub-agents#restrict-which-subagents-can-be-spawned);
 for the depth limit, see
 [subagents: let subagents spawn their own subagents](https://code.claude.com/docs/en/sub-agents#let-subagents-spawn-their-own-subagents).
@@ -498,7 +503,9 @@ run on Claude Code 2.1.296, is the record. *As of:* 2026-10-10. *Recheck trigger
 fails, or a docs page starts stating which level a preloaded skill's placeholder expands.
 *Why the plugin cares.* `/discovery:research` scales source breadth by caller effort, and
 `discovery:researcher` is pinned `high` so reasoning does not degrade inside a session tuned down
-for cost. The worker's substituted value is therefore the session's level, not the pin it runs
+for cost. The pin is not absolute: what overrides an agent's `effort` is
+[subagents: choose an effort level](https://code.claude.com/docs/en/sub-agents#choose-an-effort-level)'s
+to state. The worker's substituted value is therefore the session's level, not the pin it runs
 at. The parent writes `Source breadth:` from its own load, so the table follows the caller either
 way.
 
@@ -521,7 +528,7 @@ is neither documented nor recoverable from its report, and a worker therefore tr
 hit as a pointer backing `verified: grep`, never `verified: read`. *Not verified:* whether a user-
 or project-scope subagent *named* `Explore` inherits the CLAUDE.md and git-status skip; the page
 ties the skip to the built-in agents by name. Setting `omitClaudeMd: true` on such an override
-makes the question moot. *As of:* 2026-10-11.
+makes the question moot.
 
 ### A per-invocation `model` outranks a subagent's frontmatter
 
@@ -536,16 +543,15 @@ An omitted `model` is not a neutral default: it falls through the order the poin
 machine without a subagent-model setting an unpinned worker runs on the orchestrator's model and
 pays that rate for every turn it spends reading files. `model: inherit` in a worker definition is a
 cost defect for the same reason; how it resolves is at the pointer.
-*As of:* 2026-10-11.
 
 ### The verdict lane pins `opus` at `effort: high`
 
 *Decision.* `research-verifier` grades outcome-gate rows 4, 7, 12 and 14, the rows the producer may
 not grade, so it is a verdict lane and pins `model: opus` and `effort: high`; `explorer`,
 mechanical preparation, stays on `sonnet` at `effort: medium`. *Pointer:*
-[docs/plugin-philosophy.md](../../../docs/plugin-philosophy.md), "Model tiers" (the verdict rule
+[docs/plugin-philosophy.md](../../../docs/plugin-philosophy.md), "Capability tiers" (the verdict rule
 in its ladder) and "Effort tiers" (consequential-output lanes pin `high`; the pinned-agents
-record). *As of:* 2026-10-02. *Recheck trigger:* an edit to the
+record). *Recheck trigger:* an edit to the
 philosophy's tier rule, lane rule, or pinned-agents record.
 
 ### A turn-limit stop returns partial output, and the parent can resume the agent
@@ -561,7 +567,7 @@ for resume, see
 [Resume first, then decide about the slice](#resume-first-then-decide-about-the-slice) the first
 rung rather than a hope. *Not verified:* which text the partial output carries. We found no page
 that says whether a payload block the agent emitted mid-run is part of it, which is why the agents
-keep the disk marker as the primary stop signal. *As of:* 2026-10-11.
+keep the disk marker as the primary stop signal.
 
 ### `maxTurns` is set per definition, so 40 is a checkpoint, not a completion budget
 
@@ -574,7 +580,6 @@ for the Agent tool's per-call parameters, see
 [subagents: subagent names](https://code.claude.com/docs/en/sub-agents#subagent-names);
 for `--agents` and `--max-turns`, see their rows in
 [CLI reference: CLI flags](https://code.claude.com/docs/en/cli-reference#cli-flags).
-*As of:* 2026-10-11.
 
 *Decision.* Every producing worker definition here (`explorer`, `researcher`, `intent-tracer`) sets `maxTurns: 40`. The read-only `research-verifier` sets `maxTurns: 30` and stops gathering at turn 24. The number is a checkpoint and a
 runaway guard for unattended fan-out, not a budget sized to finish the work: each agent stops
@@ -748,7 +753,7 @@ legs:
    necessary but not sufficient, and do not ship a grant on docs alone.
 2. **An interpreter-led rule is still an anti-pattern in this repo.** A grant shaped like
    `bash` wrapping the script path names the interpreter and is dropped under auto mode. See
-   `docs/conventions/permission-rule-hygiene/README.md`, anti-pattern 1. A direct-path rule that
+   `docs/contracts/permission-rule-hygiene/README.md`, anti-pattern 1. A direct-path rule that
    names the `.sh` (or `.py`) under the plugin root is the documented shape, but see leg 3.
 3. **The grant would not last long enough anyway.** We read an `allowed-tools` grant as lasting only
    for the turn that invokes the skill. The parent runs this gate *after* a dispatch returns, which
@@ -759,9 +764,6 @@ legs:
   [skills: available string substitutions](https://code.claude.com/docs/en/skills#available-string-substitutions);
   for leg 3, and for allow rules as the session-wide alternative, see
   [skills: pre-approve tools for a skill](https://code.claude.com/docs/en/skills#pre-approve-tools-for-a-skill).
-- **As of**: 2026-10-01
-- **Recheck trigger**: either section changes where plugin variables substitute or how long an
-  `allowed-tools` grant lasts.
 
 So the rule is the one the rest of this plugin already makes about un-run checks:
 
@@ -784,9 +786,15 @@ path this plugin's skills render for `${CLAUDE_PLUGIN_ROOT}`:
       "Bash(\"<plugin root>/scripts/check-dispatch-artifact.sh\" *)",
       "Bash(\"<plugin root>/scripts/check-coverage-complete.sh\" *)",
       "Bash(\"<plugin root>/scripts/check-source-applicability.py\" *)",
+      "Bash(\"<plugin root>/scripts/check-restatement-labels.py\" *)",
+      "Bash(\"<plugin root>/scripts/check-author-kind.py\" *)",
       "Bash(<plugin root>/scripts/check-dispatch-artifact.sh *)",
       "Bash(<plugin root>/scripts/check-coverage-complete.sh *)",
-      "Bash(<plugin root>/scripts/check-source-applicability.py *)"
+      "Bash(<plugin root>/scripts/check-source-applicability.py *)",
+      "Bash(<plugin root>/scripts/check-restatement-labels.py *)",
+      "Bash(<plugin root>/scripts/check-author-kind.py *)",
+      "Bash(python3 \"<plugin root>/scripts/check-claim-eligibility.py\" *)",
+      "Bash(python3 <plugin root>/scripts/check-claim-eligibility.py *)"
     ]
   }
 }
@@ -796,8 +804,7 @@ The quoted and unquoted forms are both listed because we treat quoting as part o
 matches, and the invocation forms above quote the path while a hand-typed call may not (Pointer:
 when deciding how a Bash rule matches the text of a quoted path, fetch
 [permissions: wildcard patterns](https://code.claude.com/docs/en/permissions#wildcard-patterns)
-live. As of: 2026-10-11. Recheck trigger: that section changes how the text before a rule's first
-`*` is matched). Each rule names the script directly, so it is not the interpreter-led shape auto mode drops.
+live). Each rule names the script directly, so it is not the interpreter-led shape auto mode drops.
 The trailing space-and-`*` covers `--help` and every gate argument.
 
 **Why the rules pin the version instead of wildcarding it.** A cache install's plugin root carries
@@ -873,10 +880,19 @@ acceptance gate prints this value as `verification=<value>`. `pending` left in p
 boundary closed is the one wrong value: a later reader cannot tell it from a run still waiting. A
 `fail` sends the run back to the phase or dimension the failed criterion names, the family's own
 routing, and the value is rewritten when the re-run is verified. It is not a place to annotate an
-artifact with its own failure and ship it. The one exception is research at `Budget: low`, which
-does not resume the researcher on a verifier-owned FAIL row: the artifact keeps the `fail` value
+artifact with its own failure and ship it. The one exception is research at `Budget: low` or under
+`evidence_use: internal`, which does not resume the researcher on a verifier-owned FAIL row: the artifact keeps the `fail` value
 with the failed rows named, and the result is presented with that caveat (`skills/research/SKILL.md`,
 "Effort, source breadth").
+
+**The verification level.** Before the post-dispatch boundary, each family's SKILL.md resolves
+the plugin's `verification` level with its copy of `lib/read-verification.sh --plugin discovery
+--skill <research|explore|trace-intent> --file docs/conventions/discovery.yaml`, and the parent reports its line
+([levels](../../../docs/contracts/verification-level/README.md)). `standard` is this section. Under
+`light`, and `off`, which acts as `light` here, dispatch no verifier and never grade its criterion
+yourself in its place: write `verification: skipped (<level>)` over `pending` and tell the user the
+handoff is unverified. A skipped value is terminal, like `skipped (cost)`: a resuming session reads
+it as the level's choice and does not dispatch on it. `strict` is research's only (its SKILL.md).
 
 **When no verifier can be dispatched.** The `Agent` tool is denied, the session is at the nesting
 limit, or the invoking context is itself a subagent with no spawn: write
@@ -895,6 +911,8 @@ write `general-purpose` as the worker.
 | `pass (research-verifier, <date>)` | `pass` | The verifier passed every criterion it was briefed on. A pass keeps each claim's `single source` flag: the parent presents the flag with the claim and carries it into any record an edit rests on. |
 | `fail rows <n>[,<n>…] (research-verifier, <date>)` | `fail` | The verifier failed those rows, named as it returned them. `explore` and `trace-intent` have no rows: they write `fail (general-purpose, <date>)` and the failed claims stay in the verifier's return. |
 | `skipped (cost)` | outside the shape | Research only. The parent chose not to pay for a verifier: no worker, no date. |
+| `skipped (light)` | outside the shape | All three families. The default branch's `verification` level is `light`, so no verifier ran: no worker, no date. |
+| `skipped (off)` | outside the shape | All three families. As `skipped (light)`, for the level `off`. |
 | `unverified (none, <date>)` | `unverified` | No verifier could be dispatched, in all three families. The index carries a numbered gap. |
 | `pending` | outside the shape | The producer's first write. Valid only until the post-dispatch boundary closes. |
 
@@ -910,7 +928,7 @@ slice. Both also usually leave a **live agent**. The order is:
 
 The harness supports this: a subagent that reaches `maxTurns` returns its output marked as
 partial, and `SendMessage` to its agent ID resumes it with its history intact. Address it by ID,
-not by name. Dated record: [Harness facts the dispatch design rests on](#harness-facts-the-dispatch-design-rests-on),
+not by name. Record: [Harness facts the dispatch design rests on](#harness-facts-the-dispatch-design-rests-on),
 "A turn-limit stop returns partial output, and the parent can resume the agent".
 
 **The discard is what happens next, not instead.** Discard the partial slice, clearing it or

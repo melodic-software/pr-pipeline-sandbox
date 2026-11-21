@@ -7,10 +7,53 @@
   "additionalProperties": false,
   "properties": {
     "$schema": { "type": "string" },
+    "written_against": {
+      "type": "string",
+      "description": "The plugin version the setup writer last wrote this file against, as <plugin>@<version>. The writer owns it; it is not a setting."
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Per setting, whether the team chose the value or it was filled at the plugin default. The writer owns it; it is not a setting."
+    },
     "explore_output": {
       "enum": ["auto", "change-prep", "explain"],
       "default": "auto",
       "description": "What /discovery:explore replies with after it writes EXPLORE.md. auto: explain for a person asking how something works, change-prep otherwise. change-prep: the handoff summary for the next stage. explain: a walkthrough with file:line citations."
+    },
+    "research_corroborators": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 2,
+      "description": "Independent current corroborators /discovery:research needs per accepted claim beside its one primary (discipline 5, outcome-gate row 4). The base floor only: the broad-topic minimum and the single-source exception are unchanged."
+    },
+    "research_recency_active_days": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 14,
+      "description": "Recency window in days for a very active project (weekly releases, breaking changes, security-sensitive) in /discovery:research's recency gate."
+    },
+    "research_recency_standard_days": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 30,
+      "description": "Recency window in days for a standard library, tool, CLI or API in /discovery:research's recency gate."
+    },
+    "research_recency_guide_days": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 90,
+      "description": "Recency window in days for a tool- or vendor-specific architecture guide in /discovery:research's recency gate."
+    },
+    "verification": {
+      "enum": ["off", "light", "standard", "strict"],
+      "default": "light",
+      "description": "How much independent checking this plugin's skills run: off, light (the default: skip the verifier dispatch), standard (run it) or strict (also run the optional passes). Read from the default branch's committed copy only, so a branch cannot lower it. Levels: docs/contracts/verification-level/README.md."
+    },
+    "verification_skills": {
+      "type": "object",
+      "additionalProperties": { "enum": ["off", "light", "standard", "strict"] },
+      "description": "Per-skill verification level, keyed by skill name (for example research); an entry beats this file's verification value."
     }
   }
 }
