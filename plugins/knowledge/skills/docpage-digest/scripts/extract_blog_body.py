@@ -16,6 +16,7 @@ from html.parser import HTMLParser
 VOID = {"area", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
 HEADINGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 FLUSH_ON_START = HEADINGS | {"p", "figcaption", "blockquote"}
+INLINE_MARKS = {"code": "`", "strong": "**", "b": "**", "em": "_", "i": "_"}
 
 
 def classes(attrs: dict) -> list:
@@ -38,7 +39,6 @@ class BodyExtractor(HTMLParser):
 
     def flush(self, prefix=""):
         if self.cells is not None:
-            # A block boundary inside a table row stays in the cell's text.
             self.buf.append(" ")
             return
         text = " ".join("".join(self.buf).split())
@@ -57,8 +57,6 @@ class BodyExtractor(HTMLParser):
             entry[2] = " " * len(entry[2])
 
     def start_skip(self, a):
-        # Widget chrome: copy buttons, video controls, and the code header,
-        # whose language label becomes the next fence's info string.
         self.skip = 1
         self.buf.append(" ")
         if "ch" in classes(a):
@@ -96,12 +94,8 @@ class BodyExtractor(HTMLParser):
             self.flush()
             self.pre = []
             self.fence_lang = (a.get("data-lang") or self.fence_lang).lower()
-        if tag == "code":
-            self.buf.append("`")
-        if tag in ("strong", "b"):
-            self.buf.append("**")
-        if tag in ("em", "i"):
-            self.buf.append("_")
+        if tag in INLINE_MARKS:
+            self.buf.append(INLINE_MARKS[tag])
         if tag == "a":
             self.href = a.get("href")
             self.buf.append("[")
@@ -140,12 +134,8 @@ class BodyExtractor(HTMLParser):
             return
         if tag == "a":
             self.buf.append(f"]({self.href})")
-        if tag == "code":
-            self.buf.append("`")
-        if tag in ("strong", "b"):
-            self.buf.append("**")
-        if tag in ("em", "i"):
-            self.buf.append("_")
+        if tag in INLINE_MARKS:
+            self.buf.append(INLINE_MARKS[tag])
         if tag in ("td", "th") and self.cells is not None:
             self.cells.append(" ".join("".join(self.buf).split()))
             self.buf = []
@@ -158,8 +148,6 @@ class BodyExtractor(HTMLParser):
         if tag == "table" and self.table is not None:
             if self.table:
                 if self.lists:
-                    # A table inside a list item stays in the item: the first row takes the
-                    # item's pending prefix, every later row its continuation indent.
                     entry = self.lists[-1]
                     indent = " " * len(entry[2])
                     rows = [entry[2] + self.table[0], *(indent + row for row in self.table[1:])]

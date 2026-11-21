@@ -84,10 +84,12 @@ SYNCED=(
   package.json
   plugins/multi-agent/reference/defaults.yaml
   # Whole plugins: the babysit-prs scripts, the work-item tracker, the issue
-  # lane's skill, the research/doc skills (discovery) and the fix-docs audit
-  # skill (ai-slop), with everything they read inside their plugin.
+  # lane's skill, the research/doc skills (discovery, knowledge) and the
+  # fix-docs audit skill (ai-slop), with everything they read inside their
+  # plugin.
   plugins/ai-slop
   plugins/discovery
+  plugins/knowledge
   plugins/source-control
   plugins/work-items
   scripts/setup-env.sh

@@ -55,6 +55,12 @@ describe("shallowCloneGitHubRepo", () => {
     expect(capturedArgs).toEqual([
       "-c",
       "credential.helper=",
+      "-c",
+      "protocol.allow=never",
+      "-c",
+      "protocol.https.allow=always",
+      "-c",
+      "core.symlinks=false",
       "clone",
       "--depth",
       "1",
@@ -82,7 +88,8 @@ describe("shallowCloneGitHubRepo hardening", () => {
 
     await shallowCloneGitHubRepo("https://github.com/owner/repo", "dest", spawnFn);
 
-    expect(capturedArgs.slice(0, 3)).toEqual(["-c", "credential.helper=", "clone"]);
+    expect(capturedArgs.slice(0, 2)).toEqual(["-c", "credential.helper="]);
+    expect(capturedArgs[8]).toBe("clone");
     const home = capturedOptions.env.HOME;
     expect(home).not.toBe(os.homedir());
     expect(path.basename(home)).toMatch(/^harvest-clone-home-/);
@@ -178,6 +185,9 @@ describe.skipIf(process.platform === "win32")("clone groups and an abnormal pare
   ])("kills the clone group when the parent gets %s %s", async (signal, _when, holdMs) => {
     const pidDir = fs.mkdtempSync(path.join(os.tmpdir(), "clone-parent-"));
     const pidFile = path.join(pidDir, "clone.pid");
+    // The parent's own temp root, so the clone's isolated home it makes is visible here.
+    const parentTmp = path.join(pidDir, "tmp");
+    fs.mkdirSync(parentTmp);
     const moduleUrl = new URL("./analyze-harvested-repos.js", import.meta.url).href;
     const parentScript = [
       `import { spawn } from "node:child_process";`,
@@ -195,6 +205,7 @@ describe.skipIf(process.platform === "win32")("clone groups and an abnormal pare
     ].join("\n");
     const parent = spawn(process.execPath, ["--input-type=module", "-e", parentScript], {
       stdio: "ignore",
+      env: { ...process.env, TMPDIR: parentTmp },
     });
     const parentExit = new Promise((resolve) => parent.on("close", (code, sig) => resolve({ code, sig })));
 
@@ -218,6 +229,7 @@ describe.skipIf(process.platform === "win32")("clone groups and an abnormal pare
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
       expect(isAlive(clone)).toBe(false);
+      expect(fs.readdirSync(parentTmp).filter((name) => name.startsWith("harvest-clone-home-"))).toEqual([]);
     } finally {
       if (clone && isAlive(clone)) process.kill(clone);
       parent.kill("SIGKILL");

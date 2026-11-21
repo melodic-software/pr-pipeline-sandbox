@@ -11,12 +11,12 @@
 
 import fs from "node:fs/promises";
 
-import { isMainModule } from "@melodic/video-digestion/shared/main-module";
 import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/terminal";
 
 import { UnsupportedSourceError } from "../adapters/adapter-contract.js";
 import { resolveSourceAdapter, supportedHosts } from "../adapters/registry.js";
 import { parseVideoMetadata } from "../acquisition/video-metadata.js";
+import { runMain } from "../lib/run-main.js";
 import { summarizeHeatmap } from "./harvest-links.js";
 
 /**
@@ -50,7 +50,7 @@ export async function runHarvestCli(argv) {
   const metadata = parseVideoMetadata(rawInfo);
 
   const sourceUrl =
-    urlFlag ?? (rawInfo && typeof rawInfo.webpage_url === "string" ? rawInfo.webpage_url : null);
+    urlFlag ?? (typeof rawInfo?.webpage_url === "string" ? rawInfo.webpage_url : null);
   if (!sourceUrl) {
     writeStderr(
       `Cannot resolve the source adapter: the info JSON has no webpage_url — pass --url <source-url>. Supported sources: ${supportedHosts().join(", ")}`,
@@ -74,28 +74,10 @@ export async function runHarvestCli(argv) {
   const heatmap = summarizeHeatmap(metadata.heatmap);
 
   writeStdout(
-    JSON.stringify(
-      {
-        videoId: metadata.id,
-        linkCount: links.length,
-        heatmap,
-        links,
-      },
-      null,
-      2,
-    ),
+    JSON.stringify({ videoId: metadata.id, linkCount: links.length, heatmap, links }, null, 2),
   );
 
   return 0;
 }
 
-if (isMainModule(import.meta.url)) {
-  runHarvestCli(process.argv)
-    .then((code) => {
-      process.exitCode = code;
-    })
-    .catch((error) => {
-      writeStderr(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    });
-}
+runMain(import.meta.url, runHarvestCli);

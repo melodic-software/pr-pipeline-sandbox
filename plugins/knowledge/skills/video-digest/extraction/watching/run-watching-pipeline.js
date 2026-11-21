@@ -11,9 +11,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { isMainModule } from "@melodic/video-digestion/shared/main-module";
 import { writeStderr, writeStdout } from "@melodic/video-digestion/shared/terminal";
 
+import { runMain } from "../lib/run-main.js";
 import { normalizeVttCues } from "./cue-normalize.js";
 import { orchestrateWatching } from "./orchestrate-watching.js";
 
@@ -21,27 +21,17 @@ import { orchestrateWatching } from "./orchestrate-watching.js";
  * @param {string[]} argv
  */
 export async function runWatchingPipelineCli(argv) {
-  const videoPath = argv[2];
-  const vttPath = argv[3];
-
+  const [, , videoPath, vttPath] = argv;
   if (!videoPath || !vttPath) {
     writeStderr("Usage: node watching/run-watching-pipeline.js <video-path> <transcript-vtt-path>");
     return 1;
   }
 
-  // Temp dirs are retained for the skill's vision reads — the caller cleans them up after absorption.
   const framesDir = await fs.mkdtemp(path.join(os.tmpdir(), "video-frames-"));
-  const sheetsDir = await fs.mkdtemp(path.join(os.tmpdir(), "video-sheets-"));
+  const contactSheetsDir = await fs.mkdtemp(path.join(os.tmpdir(), "video-sheets-"));
+  const cues = normalizeVttCues(await fs.readFile(vttPath, "utf8"));
 
-  const vttText = await fs.readFile(vttPath, "utf8");
-  const cues = normalizeVttCues(vttText);
-
-  const state = await orchestrateWatching({
-    videoPath,
-    framesDir,
-    contactSheetsDir: sheetsDir,
-    cues,
-  });
+  const state = await orchestrateWatching({ videoPath, framesDir, contactSheetsDir, cues });
 
   writeStdout(
     JSON.stringify(
@@ -55,7 +45,7 @@ export async function runWatchingPipelineCli(argv) {
         timelineLength: state.interleavedTimeline.length,
         coveragePlan: state.coveragePlan,
         framesDir,
-        contactSheetsDir: sheetsDir,
+        contactSheetsDir,
         selectedFrames: state.selectedFrames.map((frame) => ({
           file: frame.file,
           timestampSec: frame.timestampSec,
@@ -72,13 +62,4 @@ export async function runWatchingPipelineCli(argv) {
   return 0;
 }
 
-if (isMainModule(import.meta.url)) {
-  runWatchingPipelineCli(process.argv)
-    .then((code) => {
-      process.exitCode = code;
-    })
-    .catch((error) => {
-      writeStderr(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    });
-}
+runMain(import.meta.url, runWatchingPipelineCli);

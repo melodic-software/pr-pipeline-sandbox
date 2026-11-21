@@ -59,8 +59,6 @@ export const defaults = {
   manifestTimeoutMs: 15000,
 };
 
-// Required adapter methods
-
 /**
  * Extract transcript from Hotmart HLS subtitle stream.
  * Delegates to hotmart.getTranscript().
@@ -100,8 +98,8 @@ function resolveSubtitleLanguage(platformCfg) {
  * Reads .lecture-attachment-type-* CSS classes from the DOM.
  */
 export async function detectResources(page, platformCfg) {
-  return timed("detect-resources", null, async () => {
-    return page.evaluate(
+  return timed("detect-resources", null, () =>
+    page.evaluate(
       ({ sel, attachmentTypeSource, videoSel }) => {
         const has = (s) => !!document.querySelector(s);
         const attachmentTypePattern = new RegExp(attachmentTypeSource);
@@ -127,8 +125,8 @@ export async function detectResources(page, platformCfg) {
         attachmentTypeSource: LECTURE_ATTACHMENT_TYPE_SOURCE,
         videoSel: resolveVideoPlayerSelector(platformCfg),
       },
-    );
-  });
+    ),
+  );
 }
 
 /**
@@ -138,8 +136,6 @@ export function deriveLandingUrl(courseUrl, platformCfg) {
   if (platformCfg.landingUrl) return platformCfg.landingUrl;
   return courseUrl.replace("/enrolled/", "/");
 }
-
-// Optional lifecycle hooks
 
 /**
  * Install page.on("response") interceptors for HLS and subtitle data.
@@ -154,13 +150,14 @@ export async function setupSession(page, platformCfg) {
  * Delegates to hotmart.preparePage().
  */
 export async function prepareLessonPage(page, platformCfg, lesson) {
-  return timed("prepare-lesson-page", { lesson: lesson?.title }, async () => {
-    const subtitleLang = resolveSubtitleLanguage(platformCfg);
-    const manifestTimeout = platformCfg.manifestTimeoutMs ?? defaults.manifestTimeoutMs;
-    const videoSelector = resolveVideoPlayerSelector(platformCfg);
-
-    return preparePage(page, subtitleLang, manifestTimeout, videoSelector);
-  });
+  return timed("prepare-lesson-page", { lesson: lesson?.title }, () =>
+    preparePage(
+      page,
+      resolveSubtitleLanguage(platformCfg),
+      platformCfg.manifestTimeoutMs ?? defaults.manifestTimeoutMs,
+      resolveVideoPlayerSelector(platformCfg),
+    ),
+  );
 }
 
 async function scrapeCodeSnippets(page, codeDisplaySelector) {
@@ -221,20 +218,14 @@ export async function extractResources(page, platformCfg) {
   return timed("extract-resources", null, async () => {
     const selectors = resolveResourceSelectors(platformCfg);
 
-    const [codeSnippets, downloads, textData, pdfLinks] = await Promise.all([
+    const [codeSnippets, downloads, { articleLinks, textContent }, pdfLinks] = await Promise.all([
       scrapeCodeSnippets(page, selectors.codeDisplay),
       scrapeAttachmentLinks(page, selectors.file),
       scrapeTextAttachments(page, selectors.text),
       scrapeAttachmentLinks(page, selectors.pdfEmbed),
     ]);
 
-    return {
-      codeSnippets,
-      downloads,
-      articleLinks: textData.articleLinks,
-      textContent: textData.textContent,
-      pdfLinks,
-    };
+    return { codeSnippets, downloads, articleLinks, textContent, pdfLinks };
   });
 }
 
@@ -297,9 +288,7 @@ export async function authenticate({ context, page, course, storageStatePath, pl
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(2000);
 
-  const hasPlayer = await hasPlayerElement(page, videoSelector);
-
-  if (hasPlayer) {
+  if (await hasPlayerElement(page, videoSelector)) {
     writeStdout("  Already authenticated.\n");
     return;
   }

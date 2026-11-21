@@ -283,6 +283,8 @@ export function primaryEntry(envelope) {
  * @property {boolean} success
  * @property {AcquisitionEnvelope} [data]
  * @property {string} [error]
+ * @property {import('../acquisition/caption-wait.js').CaptionWaitDecision} [captionWait] -
+ *   set on a failure the caption wait decided: `wait` (captions pending) or `expired`
  */
 
 /**
@@ -298,6 +300,13 @@ export function primaryEntry(envelope) {
  *   post — a shared or pre-populated directory breaks provenance and entry
  *   matching; production entry points mkdtemp a fresh one per run)
  * @property {'full'|'transcript'} mode - 'transcript' must not download media
+ * @property {string|null} [captionWaitDeadline] - the caption-wait deadline a held
+ *   queue row recorded; sources without a caption wait ignore it
+ * @property {import('../lib/time-range.js').TimeRange|null} [timeRange] - the part of
+ *   the media to download; only passed to an adapter declaring the `timeRange` capability
+ * @property {boolean} [skipCaptionWait] - the caller can transcribe the downloaded media
+ *   (a ranged watch with ASR available), so a full-mode acquisition with an open caption
+ *   wait proceeds caption-less and notes the skip; sources without a caption wait ignore it
  * @property {object} [deps] - adapter-specific injectable I/O (tests only)
  */
 
@@ -352,6 +361,8 @@ export function primaryEntry(envelope) {
  * @property {boolean} [mediaOptional] - a 0-media post/URL is a well-formed
  *   metadata-only result for this source: acquisition and queue preflight pass
  *   `--ignore-no-formats-error` so yt-dlp reports metadata instead of erroring
+ * @property {boolean} [timeRange] - acquisition honors `AcquireContext.timeRange`,
+ *   downloading only that part of the media; `watch --from/--to` refuses other sources
  * @property {boolean} [contentClaim] - RESERVED, UNIMPLEMENTED: content-shaped
  *   (non-host) URL claims. Declaring `true` is rejected until implemented.
  */
@@ -415,6 +426,7 @@ const KNOWN_CAPABILITIES = Object.freeze([
   "comments",
   "browserCookieFallback",
   "mediaOptional",
+  "timeRange",
   "contentClaim",
 ]);
 const ERROR_PATTERN_CLASSES = Object.freeze(["retryable", "fatal", "loginRequired"]);
@@ -437,14 +449,12 @@ export function validateAdapter(spec) {
   }
   const record = /** @type {Record<string, unknown>} */ (spec);
 
-  for (const method of REQUIRED_METHODS) {
+  for (const [method, expected] of Object.entries(REQUIRED_METHOD_ARITY)) {
     const value = record[method];
     if (typeof value !== "function") {
       violations.push(`required method "${method}" is missing or not a function`);
       continue;
     }
-    const expected =
-      REQUIRED_METHOD_ARITY[/** @type {keyof typeof REQUIRED_METHOD_ARITY} */ (method)];
     if (value.length !== expected) {
       violations.push(
         `method "${method}" declares ${value.length} parameter(s); the contract requires exactly ${expected} (no defaulted/rest required parameters)`,
@@ -478,19 +488,13 @@ export function validateAdapter(spec) {
       violations.push(`attribute "${attribute}" must be a non-empty string or null`);
     }
   }
-  if (
-    typeof record.captionClass !== "string" ||
-    !CAPTION_CLASSES.includes(/** @type {CaptionClass} */ (record.captionClass))
-  ) {
+  if (!CAPTION_CLASSES.includes(/** @type {CaptionClass} */ (record.captionClass))) {
     violations.push(
       `attribute "captionClass" must be one of: ${CAPTION_CLASSES.join(", ")} (the classes the shared caption ladder consumes)`,
     );
   }
   if (
-    typeof record.transcriptStrategy !== "string" ||
-    !TRANSCRIPT_STRATEGIES.includes(
-      /** @type {TranscriptStrategy} */ (record.transcriptStrategy),
-    )
+    !TRANSCRIPT_STRATEGIES.includes(/** @type {TranscriptStrategy} */ (record.transcriptStrategy))
   ) {
     violations.push(
       `attribute "transcriptStrategy" must be one of: ${TRANSCRIPT_STRATEGIES.join(", ")}`,

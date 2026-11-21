@@ -1,12 +1,4 @@
 #!/usr/bin/env node
-// Build the video-digest recommendations-menu view: the prioritized menu, the
-// takeaways, and the open questions, rendered from a JSON model.
-//
-// Every interpolated field goes through escapeHtml from the synced helper.
-// The page is self-contained: inline style, no script, no image, no link.
-// stampPage adds the generator marker. validateRenderedPage refuses a page
-// this builder would not accept, including its own output if a template edit
-// breaks the allowlist.
 
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -149,12 +141,16 @@ function fail(message, code) {
   process.exit(code);
 }
 
+function errorText(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function runCheck(path) {
   let html;
   try {
     html = readFileSync(path, "utf8");
   } catch (error) {
-    fail(error instanceof Error ? error.message : String(error), 2);
+    fail(errorText(error), 2);
   }
   const verdict = validateRenderedPage(html);
   if (!verdict.ok) fail(verdict.failures.join(","), 1);
@@ -165,7 +161,7 @@ function runBuild() {
   try {
     model = JSON.parse(readFileSync(0, "utf8"));
   } catch (error) {
-    fail(`invalid JSON (${error instanceof Error ? error.message : String(error)})`, 2);
+    fail(`invalid JSON (${errorText(error)})`, 2);
   }
   if (!model || typeof model !== "object" || Array.isArray(model)) {
     fail("JSON root must be an object", 2);

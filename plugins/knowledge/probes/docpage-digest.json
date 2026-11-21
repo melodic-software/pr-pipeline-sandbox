@@ -2,19 +2,13 @@
   "skill": "knowledge:docpage-digest",
   "plugin": "knowledge",
   "skill_dir": "plugins/knowledge/skills/docpage-digest",
-  "ranking_note": "Authored from the before descriptions at commit dfef32de45, frozen before the rewrite; protocol per /playbooks:skill-authoring ## Measurement. Competitors are the other four knowledge skills: book-distill, course-digest, map-corpus, video-digest.",
+  "ranking_note": "Authored from the before descriptions at commit dfef32de45, frozen before the rewrite; protocol per /playbooks:skill-authoring ## Measurement. Competitors are the other four knowledge skills: distill, course-digest, map-corpus, video-digest.",
   "competitors": [
-    "knowledge:book-distill",
+    "knowledge:distill",
     "knowledge:course-digest",
     "knowledge:map-corpus",
     "knowledge:video-digest"
   ],
-  "competitor_dirs": {
-    "knowledge:book-distill": "plugins/knowledge/skills/book-distill",
-    "knowledge:course-digest": "plugins/knowledge/skills/course-digest",
-    "knowledge:map-corpus": "plugins/knowledge/skills/map-corpus",
-    "knowledge:video-digest": "plugins/knowledge/skills/video-digest"
-  },
   "queries": [
     {
       "id": "pos-train-01",

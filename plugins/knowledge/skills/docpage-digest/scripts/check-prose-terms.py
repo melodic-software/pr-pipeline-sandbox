@@ -66,7 +66,7 @@ def prose_lines(text: str):
             continue
         heading = ATX_H2.match(line)
         if heading:
-            section = heading.group(1)
+            section = heading.group(2)
         yield idx, section, line
     if in_fence:
         raise ValueError("a fence is never closed; the rest of the digest was not read")
@@ -75,7 +75,6 @@ def prose_lines(text: str):
 def check_digest(path: str, failures: Failures) -> int:
     """Return the number of prose lines scanned on this digest."""
     text = read_text(path, PROG, "digest")
-    scanned = 0
     try:
         lines = list(prose_lines(text))
     except ValueError as exc:
@@ -85,7 +84,6 @@ def check_digest(path: str, failures: Failures) -> int:
         failures.add(f"{path}: no prose outside fences; nothing to parse is not a PASS.")
         return 0
     for idx, section, line in lines:
-        scanned += 1
         for label, pattern in TERMS:
             match = pattern.search(line)
             if match:
@@ -94,7 +92,7 @@ def check_digest(path: str, failures: Failures) -> int:
                     f"{label!r} in prose ({match.group(0)!r}). Digest prose "
                     f"states the documented mechanism, not the run."
                 )
-    return scanned
+    return len(lines)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

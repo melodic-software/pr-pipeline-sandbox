@@ -16,6 +16,7 @@ import { forbiddenSynthesisFileNameReason } from "../lib/synthesis-filename.js";
 import {
   parseSessionsFromClaimInventory,
   SESSION_FORMAT_HINT,
+  sessionsInTimeRange,
 } from "../lib/watch-slice-sessions.js";
 import {
   listSynthesisPngs,
@@ -207,7 +208,9 @@ export function parseTalkingHeadOnlySessions(visualGapsBody) {
  * @property {number} synthesisCount
  * @property {string} visionPlanBody
  * @property {string} contentClass
- * @property {{ name: string, startSec: number, endSec: number|null }[]} sessions
+ * @property {{ name: string, startSec: number, endSec: number|null }[]} sessions - those that
+ *   overlap `watch.timeRange` on a ranged slice
+ * @property {number} parsedSessionCount - sessions parsed before the range filter
  * @property {ReturnType<typeof outcomeFloors>} floors
  * @property {string} triageBody
  * @property {number} triageSheets
@@ -259,7 +262,8 @@ function loadWatchOutcomeSlice(sliceDir) {
     : 0;
   const visionPlanBody = readTextIfExists(visionPlanPath);
   const contentClass = detectContentClass(visionPlanBody);
-  const sessions = parseSessionsFromClaimInventory(readTextIfExists(claimInventoryPath));
+  const parsedSessions = parseSessionsFromClaimInventory(readTextIfExists(claimInventoryPath));
+  const sessions = sessionsInTimeRange(parsedSessions, watch.timeRange);
   const triageBody = readTextIfExists(triageLogPath);
 
   return {
@@ -273,6 +277,7 @@ function loadWatchOutcomeSlice(sliceDir) {
     visionPlanBody,
     contentClass,
     sessions,
+    parsedSessionCount: parsedSessions.length,
     floors: outcomeFloors(contentClass, durationSec, sessions.length || 1),
     triageBody,
     triageSheets: countTriageSheetsLogged(triageBody),
@@ -348,7 +353,7 @@ function pushArtifactAndFloorChecks(checks, slice) {
  * @param {WatchOutcomeSlice} slice
  */
 function pushSessionCoverageChecks(checks, slice) {
-  const { durationSec, windows, promotedTs, visualGapsBody, floors, sessions } = slice;
+  const { windows, promotedTs, visualGapsBody, floors, sessions } = slice;
   const dens = densificationCoverage({
     windows,
     promotedTimestampsSec: promotedTs,
@@ -363,10 +368,9 @@ function pushSessionCoverageChecks(checks, slice) {
     severity: "fail",
   });
 
-  // A logged talking-head-only gap stands in for the frame the synthesis contract rejects.
   const talkingHeadOnly = parseTalkingHeadOnlySessions(visualGapsBody);
   const sessionFrameCounts = sessions.map((session) => {
-    const end = session.endSec ?? durationSec;
+    const end = session.endSec ?? Number.POSITIVE_INFINITY;
     const gapLogged = talkingHeadOnly.has(session.name.trim().toLowerCase());
     const promoted = promotedTs.filter((ts) => ts >= session.startSec && ts <= end).length;
     return {
@@ -376,7 +380,10 @@ function pushSessionCoverageChecks(checks, slice) {
   });
 
   // Zero parsed sessions would make both checks below pass over nothing.
-  const noSessions = `no session parsed from research/claim-inventory.md: ${SESSION_FORMAT_HINT}`;
+  const noSessions =
+    slice.parsedSessionCount > 0
+      ? "no session in research/claim-inventory.md overlaps the watch.json timeRange"
+      : `no session parsed from research/claim-inventory.md: ${SESSION_FORMAT_HINT}`;
 
   const sessionsWithoutFrame = sessionFrameCounts.filter((s) => s.frameCount === 0);
   checks.push({
@@ -430,8 +437,6 @@ function pushTriageManifestChecks(checks, slice) {
   const { sliceDir, triageBody, triageManifestPath } = slice;
   const triageJson = validateTriageManifestForSlice(sliceDir, { requireIndexMatch: true });
   const triageManifestExists = fs.existsSync(triageManifestPath);
-  // Parsed once and shared by the agentic/batch-file checks below — both only
-  // read it on the same manifest-present-and-valid branch.
   const triageManifestUsable = triageManifestExists && triageJson.valid;
   const triageManifest = triageManifestUsable
     ? JSON.parse(fs.readFileSync(triageManifestPath, "utf8"))
@@ -705,7 +710,6 @@ function pushSynthesisCloseoutChecks(checks, sliceDir) {
 function writeWatchOutcomeReport(sliceDir, checks, pass) {
   const verificationDir = lanePath(sliceDir, LANES.verification);
   fs.mkdirSync(verificationDir, { recursive: true });
-  // Latest report is authoritative: clear prior outcome reports before writing this run's.
   for (const name of fs.readdirSync(verificationDir)) {
     if (name.endsWith("-watch-outcomes.md")) {
       fs.rmSync(path.join(verificationDir, name));

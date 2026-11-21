@@ -11,16 +11,6 @@ export const YT_DLP_SUB_LANGS = "en-orig,en.*,-live_chat";
 // YouTube extractor arg that drops translations of manual tracks (`en-de`,
 // `en-en`); the post-ladder caption retry lifts it when no English landed.
 export const YT_DLP_SKIP_TRANSLATED_SUBS = "skip=translated_subs";
-
-/**
- * Remove the translated-subs skip from an extractor-args value.
- *
- * @param {string|null|undefined} extractorArgs
- * @returns {string|null|undefined}
- */
-export function allowTranslatedSubs(extractorArgs) {
-  return extractorArgs?.replace(`;${YT_DLP_SKIP_TRANSLATED_SUBS}`, "");
-}
 export const YT_DLP_SUB_FORMAT = "vtt";
 // biome-ignore lint/security/noSecrets: yt-dlp format selector string, not a credential
 export const YT_DLP_VIDEO_FORMAT = "bestvideo[height<=1080]+bestaudio/best[height<=1080]";
@@ -33,11 +23,19 @@ export const YT_DLP_COOKIES_FILE_ENV = "VIDEO_DIGEST_YT_DLP_COOKIES_FILE";
 export const YT_DLP_COOKIES_FROM_BROWSER_ENV = "VIDEO_DIGEST_YT_DLP_COOKIES_FROM_BROWSER";
 export const YT_DLP_JS_RUNTIMES_ENV = "VIDEO_DIGEST_YT_DLP_JS_RUNTIMES";
 
-// Deprecated pre-rename spellings, resolved through `resolveEnvWithLegacy` at
-// every read site so existing environments keep working (with a warning).
 export const LEGACY_YT_DLP_COOKIES_FILE_ENV = "YOUTUBE_YT_DLP_COOKIES_FILE";
 export const LEGACY_YT_DLP_COOKIES_FROM_BROWSER_ENV = "YOUTUBE_YT_DLP_COOKIES_FROM_BROWSER";
 export const LEGACY_YT_DLP_JS_RUNTIMES_ENV = "YOUTUBE_YT_DLP_JS_RUNTIMES";
+
+/**
+ * Remove the translated-subs skip from an extractor-args value.
+ *
+ * @param {string|null|undefined} extractorArgs
+ * @returns {string|null|undefined}
+ */
+export function allowTranslatedSubs(extractorArgs) {
+  return extractorArgs?.replace(`;${YT_DLP_SKIP_TRANSLATED_SUBS}`, "");
+}
 
 /**
  * @typedef {'full' | 'video-only' | 'transcript' | 'captions-only'} AcquisitionMode
@@ -123,10 +121,9 @@ export function resolveYtDlpAuthArgs(
     LEGACY_YT_DLP_JS_RUNTIMES_ENV,
     env,
   )?.trim();
-  if (jsRuntimes === "off" || jsRuntimes === "0") {
-    return args;
+  if (jsRuntimes !== "off" && jsRuntimes !== "0") {
+    args.push("--js-runtimes", jsRuntimes || "node");
   }
-  args.push("--js-runtimes", jsRuntimes || "node");
   return args;
 }
 
@@ -142,6 +139,8 @@ export function resolveYtDlpAuthArgs(
  * @param {NodeJS.ProcessEnv} [options.env] - env for auth flags (defaults to process.env)
  * @param {YtDlpAuthOverride} [options.authOverride] - per-invocation cookie override
  * @param {YtDlpSourceOptions} [options.source] - adapter-declared flags; omitted fields push nothing
+ * @param {string|null} [options.downloadSection] - `--download-sections` value
+ *   (`*<from>-<to>`) bounding the media download; ignored when no media is downloaded
  * @returns {string[]}
  */
 export function buildYtDlpArgs(
@@ -154,6 +153,7 @@ export function buildYtDlpArgs(
     env = process.env,
     authOverride = {},
     source = {},
+    downloadSection = null,
   },
 ) {
   /** @type {string[]} */
@@ -206,6 +206,9 @@ export function buildYtDlpArgs(
     args.push("--skip-download");
   } else {
     args.push("-f", YT_DLP_VIDEO_FORMAT, "--remux-video", "mp4");
+    if (downloadSection) {
+      args.push("--download-sections", downloadSection);
+    }
   }
 
   args.push(

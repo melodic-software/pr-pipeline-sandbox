@@ -9,50 +9,31 @@ corruption and a load-bearing trailing space earned a clean quote-gate result.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from typing import Callable, Iterator, List, NamedTuple, NoReturn, Optional, Tuple
 
+sys.dont_write_bytecode = True  # the plugin's own tree is not a cache
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, os.pardir, "lib")
+)
+from gates import failures, headings  # noqa: E402  (the plugin's shared gate primitives)
+
 MIN_PYTHON = (3, 9)
 
 CLAIM_LABEL = re.compile(r"^\*\*C(\d+)\.\*\*")
-ATX_H2 = re.compile(r"^##[ \t]+(.+?)\s*$")
-NONE_MARKERS = frozenset(
-    {
-        "none",
-        "n/a",
-        "(none)",
-        "no prompt snippets",
-        "no snippets",
-        "none.",
-    }
-)
-
-
+ATX_H2 = headings.atx_heading(level=2, max_indent=0, title_required=True, trail=headings.TRAIL_WHITESPACE)
+FENCE = headings.fence(chars="`", indent=headings.INDENT_SPACES_TABS)
+NONE_MARKERS = frozenset({"none", "n/a", "(none)", "no prompt snippets", "no snippets", "none."})
 ECHO_LIMIT = 50
 
 
-class Failures:
-    """Named check failures, echoed to stderr as they land under ``prog``.
-
-    Only the first ``ECHO_LIMIT`` are echoed; ``report_suppressed`` then names
-    how many were not. ``items`` keeps every failure, so the count and the exit
-    code are unaffected.
-    """
+class Failures(failures.Failures):
+    """Named check failures; only the first ``ECHO_LIMIT`` are echoed."""
 
     def __init__(self, prog: str):
-        self.prog = prog
-        self.items: List[str] = []
-
-    def add(self, message: str) -> None:
-        self.items.append(message)
-        if len(self.items) <= ECHO_LIMIT:
-            sys.stderr.write(f"{self.prog}: FAIL: {message}\n")
-
-    def report_suppressed(self) -> None:
-        hidden = len(self.items) - ECHO_LIMIT
-        if hidden > 0:
-            sys.stderr.write(f"{self.prog}: ... {hidden} more failure(s) not shown\n")
+        super().__init__(prog, echo_limit=ECHO_LIMIT)
 
 
 class Fence(NamedTuple):
@@ -132,8 +113,6 @@ def run_gate(prog: str, main: Callable[[], int]) -> NoReturn:
     use_utf8_streams()
     try:
         sys.exit(main())
-    except SystemExit:
-        raise
     except Exception as exc:
         sys.stderr.write(
             f"{prog}: ERROR: internal failure {type(exc).__name__}: {exc}. "
@@ -157,9 +136,7 @@ def read_text(path: str, prog: str, what: str) -> str:
 
 
 def split_lines(text: str) -> List[str]:
-    if text.endswith("\n"):
-        return text[:-1].split("\n")
-    return text.split("\n")
+    return (text[:-1] if text.endswith("\n") else text).split("\n")
 
 
 def iter_h2_sections(text: str) -> Iterator[Tuple[str, str, int]]:
@@ -184,7 +161,7 @@ def iter_h2_sections(text: str) -> Iterator[Tuple[str, str, int]]:
             continue
         match = ATX_H2.match(line)
         if match:
-            starts.append((idx, match.group(1)))
+            starts.append((idx, match.group(2)))
     for i, (idx, title) in enumerate(starts):
         end = starts[i + 1][0] if i + 1 < len(starts) else len(lines)
         body = "\n".join(lines[idx + 1 : end])
@@ -202,21 +179,15 @@ def find_section(text: str, prefix: str) -> Optional[Tuple[str, str, int]]:
 
 def _is_fence_opener(line: str) -> Tuple[bool, bool, int]:
     """Return (is_opener, indented, backtick-run-length)."""
-    stripped = line.lstrip(" \t")
-    if not stripped.startswith("```"):
+    match = FENCE.match(line)
+    if not match:
         return False, False, 0
-    ticks = len(stripped) - len(stripped.lstrip("`"))
-    return True, (len(line) != len(stripped)), ticks
+    return True, match.start(1) > 0, len(match.group(1))
 
 
 def _is_fence_closer(line: str, min_ticks: int) -> bool:
     """CommonMark: a closer is backticks-only, length >= the opener."""
-    stripped = line.lstrip(" \t")
-    if not stripped.startswith("`"):
-        return False
-    ticks = len(stripped) - len(stripped.lstrip("`"))
-    rest = stripped[ticks:].strip(" \t")
-    return rest == "" and ticks >= min_ticks
+    return headings.closes_fence(FENCE.match(line), "`" * min_ticks, blank=" \t")
 
 
 def extract_fences(text: str, *, start_line: int = 1) -> List[Fence]:

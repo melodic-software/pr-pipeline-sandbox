@@ -18,10 +18,10 @@
 
 Eight phases executed in order. Each phase produces artifacts consumed by subsequent phases.
 
-**Critical ordering rule:** ALL context must be gathered before summarization begins. Module
+**Critical ordering rule:** All context must be gathered before summarization begins. Module
 summaries generated from transcripts alone are incomplete. They miss code syntax, visual
 diagrams, repo patterns. Full sequence: Extract → Process Frames → Analyze Code
-Repo → Validate → THEN Synthesize.
+Repo → Validate → then Synthesize.
 
 **Completeness markers:** Module summaries should note their context sources:
 
@@ -35,7 +35,7 @@ Repo → Validate → THEN Synthesize.
 
 **Steps:**
 
-1. Navigate to course URL using `navigate` tool
+1. Open the course URL in the browser tool (SKILL.md Prerequisites)
 2. Read page to identify modules and lessons (use platform adapter for selectors)
 3. For each module, extract:
    - Module title and position
@@ -116,8 +116,9 @@ Postman collections, etc.) so they're available locally for Phase 3 analysis.
 use ZIPs for per-lesson code state, GitHub for final/latest state. ZIPs capture
 code-at-recording-time; repo may have post-publication updates.
 
-**Security note:** Downloaded files gitignored (`**/courses/**/code/*`, `**/courses/**/slides/*`,
-`**/courses/**/resources/*`). Never commit third-party course resources to the repository.
+**Security note:** Keep downloaded files under `<work-root>/courses/<platform>/<slug>/` out of git
+with ignore patterns such as `**/courses/**/code/*`, `**/courses/**/slides/*` and
+`**/courses/**/resources/*`. Never commit third-party course resources to the repository.
 
 ## Phase 2c-ii: Analyze Code Repo
 
@@ -139,14 +140,15 @@ downloaded source code ZIPs. If neither exists, skip.
 
 1. Extract "Final" ZIP (latest complete state) to `code/repo/` for Phase 3 access
 2. If per-lesson Initial/Final ZIPs exist, extract each Final to `code/repo/{module-slug}/`
-3. Analyze project structure: detect .sln, .csproj, frameworks, NuGet packages
+3. Analyze project structure: detect the project and build files, frameworks and package dependencies
 4. Write `code/analysis.json` with structure findings
 5. Build section-to-module mapping from ZIP naming conventions (e.g., "02.4 - Lesson Title")
 
 **Output:** `code/analysis.json`, `code/README.md`, `code/repo/` (gitignored, local only)
 
 **Security note:** Never commit `code/repo/`. It may contain third-party copyrighted code.
-Gitignore pattern `**/courses/**/code/*` blocks everything except `analysis.json` and `README.md`.
+Ignore `<work-root>/courses/<platform>/<slug>/code/*` (pattern `**/courses/**/code/*`) except
+`analysis.json` and `README.md`.
 Verify clone URLs are clean public URLs, and never embed PATs or tokens in `course.json`.
 
 **Freshness caveat:** Course companion repos may be updated after publication. Authors sometimes
@@ -181,7 +183,7 @@ only, then discard.
 ## Phase 3: Synthesize
 
 **Goal:** Produce per-module summaries combining all three knowledge modalities into a unified
-analysis. A `[full-context]` summary is NOT just transcripts with metadata. It synthesizes what
+analysis. A `[full-context]` summary is not just transcripts with metadata. It synthesizes what
 the instructor says, what's shown on screen, what the actual code does.
 
 **Three modalities (all required for `[full-context]`):**
@@ -190,7 +192,7 @@ the instructor says, what's shown on screen, what the actual code does.
 |----------|--------|-----------------|
 | Audio/transcript | `transcript.md` per lesson | Instructor explanations, arguments, verbal emphasis, things said but not shown |
 | Visual/frames | Frame PNG files + `manifest.json` | Code on screen, architecture diagrams, slides, terminal output, UI demos |
-| Code/repo | `code/repo/<section>/` source files | Actual implementation patterns, DI setup, project structure, what the code DOES vs what the instructor SAYS it does |
+| Code/repo | `code/repo/<section>/` source files | Actual implementation patterns, DI setup, project structure, what the code does vs what the instructor says it does |
 
 **Multi-agent approach per module:**
 
@@ -236,7 +238,7 @@ Build this table during Phase 2c. Example from per-section repo:
 **Per module, identify:**
 
 - Core concepts taught (with lesson references)
-- Code patterns demonstrated (from transcripts AND actual code AND visual frames)
+- Code patterns demonstrated (from transcripts and actual code and visual frames)
 - Discrepancies between what's said, shown, and coded (these are high-value findings)
 - Best practices advocated
 - Anti-patterns warned against
@@ -259,7 +261,7 @@ Build this table during Phase 2c. Example from per-section repo:
 
 ## Phase 5: Recommend
 
-**Goal:** Map course learnings to THIS repository. Primary deliverable.
+**Goal:** Map course learnings to this repository. Primary deliverable.
 
 1. Read `course-summary.md` + all module summaries
 2. Read repository's CLAUDE.md, `.claude/rules/`, key architecture files
@@ -269,7 +271,7 @@ Build this table during Phase 2c. Example from per-section repo:
    - What would adoption look like concretely?
    - Effort/impact ratio?
 4. Categorize recommendations using [analysis template](../reference/analysis-template.md):
-   - CLAUDE.md / `.claude/rules/` rule candidates
+   - Rule candidates, each written as a `/corrections:codify "<the rule>"` hand-off. When `/corrections:codify` is among the available skills, hand it the choice of mechanism; it picks the strongest rung of the enforcement ladder that can decide the rule and proves the check. Otherwise, propose the strongest mechanism that can decide the rule: a change that makes the mistake impossible first, then a check that blocks it, then a test, and an instruction only when nothing a machine runs can decide it. Say that `/corrections:codify` was not available, so the proposal is unproven. Name the call in the output; run codify only when the user asks, after [Freshness verification](#freshness-verification-phase-5-prerequisite).
    - Skill candidates (new `/skill-name` opportunities)
    - Architecture pattern changes
    - Testing practice improvements
@@ -287,7 +289,8 @@ Runs throughout all phases, not a separate step. See [storage-schema.md](storage
 
 - Write artifacts as they're produced, don't buffer
 - Update `course.json` status after each lesson/module
-- All paths relative to `data/courses/<slug>/`
+- All paths relative to the course directory, `<work-root>/courses/<platform>/<slug>/`; the phase checklist lives at `<work-root>/.work/<slug>/course-digest-checklist.md`
+- Nothing is written under `<work-root>` until its visibility check in SKILL.md ("Paid content stays private") reads `private`, `internal` or `local`
 
 ## Resuming
 
@@ -300,9 +303,9 @@ When invoked with `/knowledge:course-digest resume <slug>`:
 
 ## Execution model: sequential vs parallel
 
-**Bot detection constraint:** All browser-based extraction (Phase 2) MUST be sequential. Dometrain and
+**Bot detection constraint:** All browser-based extraction (Phase 2) must be sequential. Dometrain and
 similar platforms rate-limit and detect automated access. Navigate no faster than ~2 seconds between
-lessons. Do NOT parallelize DOM interactions, browser contexts, lesson navigation.
+lessons. Do not parallelize DOM interactions, browser contexts, lesson navigation.
 
 **What can run in parallel:**
 
@@ -327,25 +330,21 @@ lessons. Do NOT parallelize DOM interactions, browser contexts, lesson navigatio
 
 - 45-lesson course: ~90 min for transcripts, ~30+ min for frames
 - Use `nohup` pattern for unattended runs (see SKILL.md)
-- Monitor via `tail -20 extraction.log` and `run-report.json`
+- Monitor via `tail -20 <work-root>/.work/<slug>/extraction.log` and `run-report.json`
 
 ## Freshness verification (Phase 5 prerequisite)
 
 **Before integrating any action item from `repo-candidates.md` into the repository:**
 
-1. **Invoke `/discovery:explore` via the Skill tool** on relevant codebase area to verify current state matches what the
+1. **Invoke `/discovery:explore` via the Skill tool** (when it is among the available skills; otherwise explore directly and say once that `discovery` would add a persisted exploration) on relevant codebase area to verify current state matches what the
    action item assumes. Codebase may have changed since course was digested
-2. **Invoke `/discovery:research` via the Skill tool** on specific library/framework/pattern to verify recommendation is
+2. **Invoke `/discovery:research` via the Skill tool** (when it is among the available skills; otherwise research primary sources directly and say once that `discovery` would add tiered multi-source research) on specific library/framework/pattern to verify recommendation is
    current. Course content has a recorded-at date but no guarantee of currency:
-   - NuGet/npm package versions may have changed (pre-release → stable, or breaking changes)
+   - Package versions may have changed (pre-release → stable, or breaking changes)
    - Framework APIs may have evolved
    - Best practices may have shifted
 3. **Flag stale recommendations** in `action-items.md` with `⚠ STALE` marker if `/discovery:research`
    reveals recommendation is outdated
 
-**Example:** MCP course references `ModelContextProtocol` NuGet packages that were pre-release
-at recording time. Before using recommended patterns, verify current stable version via
-`/discovery:research` or `mcp__nuget__get_latest_package_version`.
-
 **Rule:** Course content is a starting point for research, not a final answer. Every action item
-gets `/discovery:explore` + `/discovery:research` verification AT TIME OF INTEGRATION, not at digest time.
+gets `/discovery:explore` + `/discovery:research` verification at time of integration, not at digest time.

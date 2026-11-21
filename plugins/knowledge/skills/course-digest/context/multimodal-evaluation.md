@@ -28,8 +28,9 @@ at higher cost.
 For higher accuracy on specific frames, Claude's vision can read PNG files directly during
 summarization phase.
 
-**Recommended approach**: Hybrid two-pass. Tesseract on all frames (free, fast), then
-selectively send high-value frames (code-heavy keyframes) to Claude vision during summarization.
+**Recommended approach**: start with Claude vision on the curated keyframes (Option B below). Once
+Option A is built, run Tesseract on all frames (free, fast), then send high-value frames
+(code-heavy keyframes) to Claude vision during summarization.
 
 **Output**: `code-snippets.md` per lesson, containing extracted code blocks.
 
@@ -60,10 +61,10 @@ changed between frames reveals instructor's incremental development process.
 **Cost**: Requires keyframe pairs (before/after), so scene analysis must identify code
 transition points first.
 
-### P4: Audio Re-transcription (Whisper). LOW VALUE, HIGH EFFORT
+### P4: Audio Re-transcription. LOW VALUE, HIGH EFFORT
 
 **Problem**: Platform-provided transcripts may have auto-generated errors (names, technical
-terms, acronyms). Whisper could provide higher accuracy.
+terms, acronyms).
 
 **Why**: a modern ASR model can beat an auto-generated platform transcript on names and technical
 terms, but platform transcripts here are already clean enough that the margin does not pay for the
@@ -127,7 +128,7 @@ code extraction format matters for downstream analysis.
 
 | Trigger | Action |
 |---------|--------|
-| Platform transcript accuracy drops below 80% | Add Whisper re-transcription |
+| Platform transcript accuracy drops below 80% | Add audio re-transcription |
 | 10+ courses digested | Automate frame analysis (Option A): build or vendor an OCR + slide-extraction tool |
-| Non-Dometrain platform without transcript panel | Build a full ingest pipeline (transcript via Whisper, scene detection via ffmpeg) |
+| Non-Dometrain platform without transcript panel | Build a full ingest pipeline (transcript from the audio, scene detection via ffmpeg) |
 | Slide-heavy course (>50% lessons with slides) | Add slide-boundary detection + per-slide OCR to workflow |

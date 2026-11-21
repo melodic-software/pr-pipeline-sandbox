@@ -35,6 +35,10 @@ vi.mock("../adapters/registry.js", async (importOriginal) => {
   return { ...actual, acquireMedia: vi.fn() };
 });
 
+vi.mock("./temp-space-check.js", () => ({
+  checkTempSpace: vi.fn(async () => ({ state: "enough", message: "" })),
+}));
+
 // The machine-under-test has no faster-whisper: capability detection reports
 // absent, and the transcription rung must never be reached.
 vi.mock("../transcript/asr-transcribe.js", async (importOriginal) => {
@@ -128,8 +132,6 @@ describe("run-watch capability-absent ASR degradation (CLI-level)", () => {
     expect(code).toBe(0);
 
     const output = JSON.parse(captured.stdout.join(""));
-    // The named provenance field carries the capability-absent reason —
-    // explicitly, never silently, and never as a failure.
     expect(output.transcriptDegradation).toContain("faster-whisper");
     expect(output.transcriptDegradation).toContain("without a transcript");
     expect(output.transcriptStrategy).toBeNull();
@@ -146,7 +148,6 @@ describe("run-watch capability-absent ASR degradation (CLI-level)", () => {
     const state = JSON.parse(stateRaw);
     expect(state.phases.transcript.metrics.transcriptDegradation).toContain("faster-whisper");
     expect(state.phases.transcript.metrics.skipped).toBe(true);
-    // source:* provenance persists into watch state alongside the degradation.
     expect(state.sourceMetadata["source:displayId"]).toBe(TWID);
   });
 });

@@ -76,8 +76,17 @@ function getOrCreateEntry(page) {
   return entry;
 }
 
+const HOTMART_PLAYER_HOST = "player.hotmart.com";
+
+/** The page's frame served from the Hotmart player host; a frame URL that does not parse never matches. */
 function findHotmartFrame(page) {
-  return page.frames().find((f) => f.url().includes("player.hotmart.com"));
+  return page.frames().find((f) => {
+    try {
+      return new URL(f.url()).hostname === HOTMART_PLAYER_HOST;
+    } catch {
+      return false;
+    }
+  });
 }
 
 /** Record `url` as the page's HLS master when it matches the packaged-master pattern. */
@@ -569,14 +578,8 @@ export async function extractFrames(page, duration, outputDir, options = {}) {
   const timestamps = [];
   for (let t = intervalSec; t < duration; t += intervalSec) timestamps.push(t);
 
-  const success = await captureCanvasFrames({
-    hotmartFrame,
-    timestamps,
-    outputDir,
-    maxWidth,
-  });
-
-  return { method: "canvas-seek", count: success };
+  const count = await captureCanvasFrames({ hotmartFrame, timestamps, outputDir, maxWidth });
+  return { method: "canvas-seek", count };
 }
 
 /**
@@ -597,8 +600,6 @@ export function clearCapturedData(page) {
 export async function hasHotmartPlayer(page, videoPlayerSelector = DEFAULT_VIDEO_PLAYER_SELECTOR) {
   return hasPlayerElement(page, videoPlayerSelector);
 }
-
-// Test helpers (exported for unit tests only)
 
 /**
  * @param {import('playwright').Page} page

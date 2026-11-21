@@ -51,6 +51,11 @@ Models:
   The launch source the corpus's own Fable 5 / Mythos 5 positioning claims rest on, and linked
   from the harness model-config doc's
   [Work with Fable](https://code.claude.com/docs/en/model-config#work-with-fable)
+- <https://platform.claude.com/docs/en/models/fable-5-2/whats-new-fable-5-2>
+  The release notes for Fable 5.2, and a first-party source for the `playbooks` Fable 5.2 model-adaptation chapter.
+  `docs/upstream/platform-claude-com-prompting-claude-fable-5-2.md` records what this repository
+  takes from it, with no custody record or attestation pass. Resolved to its titled page on
+  2026-11-09
 - <https://platform.claude.com/docs/en/models/opus-5-5/whats-new-opus-5-5>
   and <https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-opus-5-5>
   The release notes and prompting guide for Opus 5.5, and the first-party
@@ -89,20 +94,19 @@ named with it and keeps the post as a correlate):
   chapter's narrow threads assume these loops is our reading, not the post's claim. Pointer: when
   a digest needs how Claude Code repeats a prompt, fetch
   <https://code.claude.com/docs/en/scheduled-tasks#run-a-prompt-repeatedly-with-/loop> live, the
-  post as correlate. As of: 2026-10-02. Recheck trigger: that section leaves the page.
+  post as correlate.
 - <https://claude.com/blog/code-review> (not a pointer; correlate only)
   The automated-review gate the claude.ai performance post names as a safety mechanism set up
   before the fast phase; the `review` plugin's CI lanes are its local counterpart, with no custody
   record against it. A summary-level fetch on 2026-09-29 confirmed its topic: the launch of Claude
   Code's Code Review. Pointer: when a digest needs whether Code Review findings gate a merge, fetch
   <https://code.claude.com/docs/en/code-review-pull-requests#check-run-output> live, the post as correlate.
-  As of: 2026-10-02. Recheck trigger: that section leaves the page.
 - <https://claude.com/blog/agentic-coding-is-straining-ci-heres-how-we-scaled-test-impact-analysis-at-anthropic> (correlate only)
   The basis the claude.ai performance post cites for wins decaying in a fast-moving codebase,
   which the `performance` plugin's ratchet guardrails rest on. A summary-level fetch on 2026-09-29
   confirmed its topic: test-impact analysis in Anthropic's CI. Pointer: when a digest needs
   test-impact analysis as a CI technique, fetch this post live; no docs page covers test-impact
-  analysis as of 2026-10-01. As of: 2026-10-01. Recheck trigger: a docs page starts covering it.
+  analysis.
 - <https://claude.dev/blog/spending-your-effort/> (not a pointer; correlate only)
   "Using Claude Code: Spending your effort", which `docs/upstream/opus-5-5-task-cost.md` (Q34)
   and the `playbooks` model-adaptation chapters already cite as a correlate without a custody

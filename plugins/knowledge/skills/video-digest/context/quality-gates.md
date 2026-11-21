@@ -7,7 +7,7 @@ Binary criteria for `/knowledge:video-digest watch`. A phase is not done when it
 ## Tick discipline
 
 1. Initialize `watch-checklist.md` at skill session start (`init-watch-checklist.js`).
-2. Tick `[ ]` → `[x]` only after **verification evidence**: cite command exit code, artifact path, or verify row on an indented line under the ticked row or in Resume notes (both survive `--force`), or in an adjacent log line.
+2. Tick `[ ]` → `[x]` only after **verification evidence**: cite command exit code, artifact path, or verify row on an indented line under the ticked row or in Resume notes (both survive `--force`), or in an adjacent log line. The ticks `init-watch-checklist.js` writes itself (rows 1.1 and 1.3-1.6 when `watch.json` and `selection.json` prove them, Phase 0b as n/a without `source/companion-sources.md`) are allowed: each carries a generated evidence line.
 3. **Blocking verify scripts** must exit 0 before ticking the matching phase-complete box. `watch.json` `status: complete` is written only by `watch-state.js close` (see "Complete slice").
 4. Satisficing ("we have 14 frames, close enough") is a FAIL. Re-run the named phase.
 5. **Synthesis contract:** `context/synthesis-contract.md`: transcript-gap bar, vision-gated names, staged deck-first; overrides count-chasing.
@@ -27,6 +27,8 @@ Detected from `key-frames/vision-plan.md` (backtick class tag). Floors apply to 
 
 **Session coverage:** each session in `research/claim-inventory.md` must have ≥1 promoted synthesis frame whose timestamp falls inside the session boundary (or gap logged, but prefer a frame).
 
+**Ranged slice** (`watch.json` `timeRange`, set by `--from`/`--to`): the floors grade the range. `hours` is the ranged media's probed length (the range plus any keyframe lead-in before `--from`), and `sessions` counts only the sessions whose boundary overlaps the range; `Min / session` and session coverage check only those. A session that only touches a range bound is outside it. When no session overlaps the range, both session gates fail.
+
 ## Phase gates (ordered)
 
 This table lists the **blocking artifacts per phase** (which must exist before the phase is done). The artifact's **lane, staged verdict, KIND, and producer** are owned by the "Output contract" table in `output-contract.md`, the single authoritative enumeration; do not restate staging here.
@@ -35,7 +37,7 @@ This table lists the **blocking artifacts per phase** (which must exist before t
 | --- | --- | --- |
 | 0 Prerequisites | deps installed | Pre-computed context in SKILL.md, no MISSING |
 | 0b Companion (when `source/companion-sources.md` exists) | `source/companion-digest/README.md`, `source/companion-digest/<section-slug>.md` per brief | Every section row digested; `mark-phase companion` before Phase 1; SSOT: `companion-primary-sources.md` |
-| 1 CLI bootstrap | `source/transcript.txt`, `run-state/watch.json`, `key-frames/selection.json`, tempSession paths exist | `run-watch.js` exit 0; spot-read transcript; `highVolume` true when sheets ≥8 or duration ≥2h |
+| 1 CLI bootstrap | `source/transcript.txt`, `run-state/watch.json`, `key-frames/selection.json`, tempSession paths exist | `run-watch.js` exit 0; spot-read transcript; `highVolume` equals `isHighVolume` (`extraction/watching/frame-budget.js`) |
 | 2 Vision plan | `key-frames/vision-plan.md` | Content class + segments + triage scope; inspection sample of 3–5 sheets recorded |
 | 3 Claim landscape | `research/claim-inventory.md`, draft `research/research-agenda.md` | ≥4 claims/session for conferences; ≥40 total claims for ≥4h VOD |
 | 4 Vision pass 1 | `key-frames/frame-triage-log.md` | One `## sheet_NNN` per contact sheet with per-cell verdicts |
@@ -81,7 +83,15 @@ This table lists the **blocking artifacts per phase** (which must exist before t
 
 Host verify scripts prove **traceability and shape** (JSON valid, batch files on disk, semantic filename policy, promotion-map parity). They do **not** prove subagents opened contact sheets or that filenames match on-screen content.
 
-**Vision fidelity spot-check (required before reporting the slice as vision-complete):** In a separate pass (fresh context OK), spot-check ≥10 synthesis PNG images (name ↔ content) and ≥3 contact sheets (verdicts ↔ JPG). Record notes in `watch-checklist.md` or slice README. Verify script exit 0 without spot-check = structural complete only.
+**Vision fidelity spot-check (required before reporting the slice as vision-complete):** The context that produced the slice does not check its own vision claims. First run the plugin's `lib/read-verification.sh --plugin knowledge --skill video-digest` (the full command is in SKILL.md, Phase 9) and copy its line into the checklist's Resume notes ([levels](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/contracts/verification-level/README.md)).
+
+- At standard or strict, dispatch a fresh-context subagent with the slice path and nothing from
+  this session's reasoning. It spot-checks ≥10 synthesis PNG images (name ↔ content) and ≥3
+  contact sheets (verdicts ↔ JPG) and returns its notes. Record them in the watch checklist or
+  the slice README.
+- Under `light`, and `off`, which acts as `light` here, dispatch no subagent and never run the spot-check yourself in its place. Tick 9.4 with `verification: skipped (<level>)`, and report the slice as structural complete only, never vision-complete.
+
+Verify script exit 0 without the spot-check = structural complete only.
 
 ## Talking-head-only session gap
 

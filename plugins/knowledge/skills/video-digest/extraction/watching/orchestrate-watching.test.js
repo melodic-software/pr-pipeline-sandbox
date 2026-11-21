@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { cuesInMediaTime, watchingInVideoTime } from "../lib/time-range.js";
 import { orchestrateWatching } from "./orchestrate-watching.js";
 
 /**
@@ -50,6 +51,8 @@ describe("orchestrateWatching", () => {
         framesDir: "/tmp/frames",
         contactSheetsDir: "/tmp/sheets",
         cues: [{ startSec: 10, endSec: 20, text: "Let me show you this code demo" }],
+        // A cap above the two 60s gaps keeps gap fill out of this composition check.
+        maxFrameGapSec: 120,
       },
       {
         extractSceneFrames,
@@ -224,6 +227,8 @@ describe("orchestrateWatching", () => {
   it("extracts a frame inside a gap between scene frames longer than the maximum gap", async () => {
     const { state, requested } = await watchSparseScenes();
 
+    // 300s is the top of the medium tier, whose default cap is 6s.
+    expect(state.coveragePlan.maxFrameGapSec).toBe(6);
     expect(state.coveragePlan.forceStratifiedPass).toBe(false);
     expect(requested.some((t) => t > 0 && t < 200)).toBe(true);
     const filled = state.uniqueFrames.find(
@@ -280,8 +285,8 @@ describe("orchestrateWatching", () => {
 
   it("does not refill a static stretch whose frames dedup dropped", async () => {
     // Timed scene frames every 50s across 300s, all of one unchanged slide: the
-    // deduplicator keeps only the first. The screen was seen every 50s, so no
-    // gap-fill extraction may follow the anchor pass.
+    // deduplicator keeps only the first. The screen was seen every 50s, under the
+    // 60s cap, so no gap-fill extraction may follow the anchor pass.
     const keepFirstDedup = vi.fn(async (inputs) => {
       const frames = inputs.map((input) => ({ ...input }));
       const unique = frames.slice(0, 1);
@@ -300,6 +305,7 @@ describe("orchestrateWatching", () => {
         framesDir: "/tmp/frames",
         contactSheetsDir: "/tmp/sheets",
         cues: [],
+        maxFrameGapSec: 60,
       },
       {
         extractSceneFrames: vi.fn(async () => ({
@@ -332,5 +338,65 @@ describe("orchestrateWatching", () => {
 
     expect(state.coveragePlan.maxFrameGapSec).toBe(250);
     expect(requested).toEqual([]);
+  });
+
+  it("keeps a ranged run's gap-fill frames inside the range in full-video time", async () => {
+    // 1:00:00 to 1:20:00 of a long video: the ranged media is 1200s long. A dense
+    // 10s cap must fill gaps on that media only, never the rest of the video.
+    const range = { fromSec: 3600, toSec: 4800 };
+    const fullVideoCues = [
+      { startSec: 100, endSec: 110, text: "Before the range: look at this slide" },
+      { startSec: 4000, endSec: 4010, text: "Inside the range: look at this slide" },
+      { startSec: 7000, endSec: 7010, text: "After the range: look at this slide" },
+    ];
+    let pass = 0;
+    const extractAnchorFrames = vi.fn(async (_videoPath, _dir, timestampsSec) => {
+      pass += 1;
+      return timestampsSec.map((t) => ({
+        path: `/tmp/pass${pass}_${t}.png`,
+        file: `pass${pass}_${t}.png`,
+        timestampSec: t,
+      }));
+    });
+
+    const mediaState = await orchestrateWatching(
+      {
+        videoPath: "/tmp/ranged.mp4",
+        framesDir: "/tmp/frames",
+        contactSheetsDir: "/tmp/sheets",
+        cues: cuesInMediaTime(fullVideoCues, range),
+        maxFrameGapSec: 10,
+      },
+      {
+        extractSceneFrames: vi.fn(async () => ({
+          method: "scene-detection",
+          count: 2,
+          sceneCount: 2,
+          frames: [0, 1200].map((t) => ({
+            path: `/tmp/scene_${t}.png`,
+            file: `scene_${t}.png`,
+            timestampSec: t,
+          })),
+        })),
+        deduplicateFrames: passThroughDedup(),
+        createContactSheet: vi.fn(async (paths, outputPath) => ({
+          outputPath,
+          inputPaths: paths,
+          frameCount: paths.length,
+        })),
+        probeVideoDuration: vi.fn(async () => ({ durationSec: 1200, formatName: "mp4" })),
+        extractAnchorFrames,
+        log: { info: vi.fn(), warn: vi.fn() },
+      },
+    );
+    const state = watchingInVideoTime(mediaState, { offsetSec: range.fromSec, offsetErrorSec: 0 });
+
+    expect(extractAnchorFrames).toHaveBeenCalledTimes(2);
+    const fillFrames = state.uniqueFrames.filter((frame) => frame.file.startsWith("pass2_"));
+    expect(fillFrames.length).toBeGreaterThan(0);
+    for (const frame of fillFrames) {
+      expect(frame.timestampSec).toBeGreaterThanOrEqual(range.fromSec);
+      expect(frame.timestampSec).toBeLessThanOrEqual(range.toSec);
+    }
   });
 });

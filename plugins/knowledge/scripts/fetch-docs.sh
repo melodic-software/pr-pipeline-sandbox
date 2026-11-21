@@ -28,13 +28,22 @@
 # The generic profile takes any https URL and needs no index. It prefers
 # markdown, in this order: the URL with Accept: text/markdown; the URL with a
 # .md suffix; a same-origin link in the origin's llms.txt whose path, without a
-# .md or .txt suffix or a trailing /index, is the page's path. When none
+# .md or .txt suffix or a trailing /index, is the page's path. The two later
+# channels accept text/plain as markdown. The URL's own request does too when
+# its path ends in .md, so a host that serves .md files as text/plain is read;
+# for any other path a text/plain answer is not markdown and the read moves
+# on. When none
 # answers with markdown, the page's HTML is converted by html2md.py beside this
 # script, run by the first of python3 and python whose probe prints 3, with
 # PYTHONUTF8=1. Identity: the page's own request must end on the requested
 # origin and path, or the page is unread. With --cache the page's title (its
 # first heading, else the HTML <title>) is stored, and an entry whose title
 # differs from the one it replaces quarantines the cache key (docs-cache.sh).
+# A 2xx with an accepted type is still no proof of content: X serves a
+# logged-out shell for a status page. An x.com or twitter.com page whose body
+# links to redirect_after_login and holds fewer than 200 words outside its
+# links is unread login-wall and is never stored, whether it was fetched or
+# served from the cache or the fixture directory; /x:read reads X posts.
 #
 # curl runs with -q, so no ~/.curlrc option reaches a request. With
 # --public-only, for a caller whose URLs come from untrusted text, every
@@ -45,7 +54,6 @@
 # Python 3 the page is unread address-unchecked. OWASP's SSRF prevention cheat
 # sheet, case 2, prescribes this check over an allowlist when the destination
 # is open: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
-# (as of 2026-10-07; recheck when its case 2 guidance changes).
 #
 # The page file is the raw bytes as fetched, or the converter's output. The
 # manifest hash is taken over those bytes, so a caller that strips control
@@ -140,7 +148,9 @@ Usage:
   --public-only      connect only to a global address the host was checked to resolve to
   <slug|url>         a page slug (settings-reference) or an origin URL the index lists
                      (its raw suffix optional, a #fragment ignored);
-                     for --profile generic, any https URL (its slug is host/path)
+                     for --profile generic, any https URL (its slug is host/path); X's
+                     logged-out shell for an x.com or twitter.com page is unread login-wall,
+                     not a read page
 
 Exit: 0 manifest written; 2 fatal (including an unknown profile).
 EOF
@@ -260,7 +270,8 @@ CURL_MISSING=0
 if [[ $FIXTURE_SET -eq 0 ]] && ! command -v curl >/dev/null 2>&1; then CURL_MISSING=1; fi
 CACHE_DISABLED=""
 # The docs cache's configuration holds max_page_bytes, so it resolves with or without --cache.
-DOCS_CACHE="$(dirname "${BASH_SOURCE[0]}")/docs-cache.sh"
+HERE="$(dirname "${BASH_SOURCE[0]}")"
+DOCS_CACHE="$HERE/docs-cache.sh"
 [[ -f "$DOCS_CACHE" ]] || die "docs-cache.sh not found beside fetch-docs.sh"
 # shellcheck source=docs-cache.sh
 . "$DOCS_CACHE"
@@ -278,7 +289,7 @@ if [[ $CACHE -eq 1 ]]; then
   fi
 fi
 MAX_AGE="${MAX_AGE:-0}"
-CONVERTER="${FETCH_DOCS_HTML2MD:-$(dirname "${BASH_SOURCE[0]}")/html2md.py}"
+CONVERTER="${FETCH_DOCS_HTML2MD:-$HERE/html2md.py}"
 
 mkdir -p "$OUT" || die "cannot create $OUT"
 MANIFEST="${MANIFEST:-$OUT/manifest.json}"
@@ -372,7 +383,7 @@ http_get() {
   [[ -z "$4" ]] || args+=(-H "If-None-Match: $4")
   [[ -z "$5" ]] || args+=(-H "If-Modified-Since: $5")
   rm -f "$2" "$hdr"
-  H_STATUS="" H_EFF="" H_CTYPE="" H_ETAG="" H_LM="" H_DATE=""
+  H_STATUS="" H_EFF="" H_CTYPE="" H_CTYPE_LC="" H_ETAG="" H_LM="" H_DATE=""
   if [[ $PUBLIC_ONLY -eq 1 ]]; then
     url_parts "$1" || {
       H_RC=1
@@ -392,7 +403,6 @@ http_get() {
   H_RC=$?
   if [[ -f "$2" && $(wc -c <"$2") -gt $MAX_PAGE ]]; then H_RC=63; fi
   [[ $H_RC -ne 63 ]] || rm -f "$2"
-  H_STATUS="" H_EFF="" H_CTYPE="" H_CTYPE_LC="" H_ETAG="" H_LM=""
   read -r H_STATUS H_EFF H_CTYPE <<<"$meta"
   [[ "$H_STATUS" =~ ^[0-9]+$ ]] || H_STATUS=""
   dc_lower H_CTYPE_LC "$H_CTYPE"
@@ -645,7 +655,10 @@ generic_slug() {
 # 3 (a Store stub or a Python 2 fails it); return 1 when none does.
 resolve_python() {
   local c v
-  if [[ -n "${PY_STATE:-}" ]]; then [[ "$PY_STATE" == ok ]] && return 0 || return 1; fi
+  if [[ -n "${PY_STATE:-}" ]]; then
+    [[ "$PY_STATE" == ok ]]
+    return
+  fi
   PY_STATE=none
   for c in python3 python; do
     command -v "$c" >/dev/null 2>&1 || continue
@@ -734,9 +747,10 @@ convert() {
   return 1
 }
 
-# get_generic <url> <dest> <fixture file>: a generic read, markdown preferred,
-# converted HTML otherwise. Sets the G_ fields like get_doc.
-get_generic() {
+# generic_read <url> <dest> <fixture file>: a generic read, markdown preferred,
+# converted HTML otherwise. Sets the G_ fields like get_doc and stores nothing:
+# get_generic checks the page, then stores what was fetched.
+generic_read() {
   local url="$1" dest="$2" html="$WORK/page.html" html_status="" html_ctype="" html_val="" html_date="" sfx=""
   reset_g
   rm -f "$dest" "$dest.part" "$html"
@@ -745,7 +759,6 @@ get_generic() {
   serve_fresh "$dest" && return 0
   if [[ $FIXTURE_SET -eq 1 ]]; then
     fixture_read "$dest" "$3" markdown
-    [[ "$G_STATE" != read ]] || store "$url" "$dest"
     return 0
   fi
   G_SOURCE=fetch
@@ -774,7 +787,9 @@ get_generic() {
     settle_unread "$url" "$dest" markdown html-converted
     return 0
   fi
-  if [[ "$H_STATUS" =~ ^2[0-9][0-9]$ && "$H_CTYPE_LC" =~ $MD_CTYPE && -s "$dest.part" ]] && mv "$dest.part" "$dest"; then
+  local own_md_re="$MD_CTYPE"
+  [[ "$path" != *.md ]] || own_md_re="$MD_OR_TEXT_CTYPE"
+  if [[ "$H_STATUS" =~ ^2[0-9][0-9]$ && "$H_CTYPE_LC" =~ $own_md_re && -s "$dest.part" ]] && mv "$dest.part" "$dest"; then
     G_STATE=read G_FORMAT=markdown G_VALIDATORS="$(dc_validators_or_none text/markdown "$url")" G_DATE="$H_DATE"
   elif [[ "$H_STATUS" =~ ^2[0-9][0-9]$ && "$H_CTYPE_LC" =~ $HTML_CTYPE && -s "$dest.part" ]]; then
     mv "$dest.part" "$html"
@@ -817,7 +832,31 @@ get_generic() {
     return 0
   fi
   G_REASON=""
-  store "$url" "$dest"
+}
+
+# login_wall <url> <file>: the file is X's logged-out shell, an x.com or
+# twitter.com page that links to redirect_after_login (its Log in and Sign up
+# links) and holds fewer than 200 words outside its links.
+login_wall() {
+  local LC_ALL=C words
+  url_parts "$1" && [[ "$U_ORIGIN" =~ ^https://((www|mobile)\.)?(x|twitter)\.com(:443)?$ ]] || return 1
+  grep -qF redirect_after_login "$2" || return 1
+  words="$(awk '{ gsub(/\[[^]]*\]\([^)]*\)/, ""); n += NF } END { print n + 0 }' "$2")"
+  [[ $words -lt 200 ]]
+}
+
+# get_generic <url> <dest> <fixture file>: generic_read, then a login shell is
+# unread login-wall whatever served it, and a page fetched or read from the
+# fixture directory is stored.
+get_generic() {
+  generic_read "$@"
+  [[ "$G_STATE" == read ]] || return 0
+  if login_wall "$1" "$2"; then
+    rm -f "$2"
+    G_STATE=unread G_REASON=login-wall G_STALE="" G_KEY="" G_VALIDATED="" G_AGE=""
+    return 0
+  fi
+  [[ "$G_SOURCE" == cache ]] || store "$1" "$2"
 }
 
 # emit <slug> <url> <mode> <file>: print one manifest record from the G_ result.
@@ -994,9 +1033,7 @@ if [[ -n "$claude_bin" && -f "$claude_bin" ]]; then
   [[ "$raw" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] && claude_version="${BASH_REMATCH[1]}"
 fi
 
-if jq -n --arg v "$claude_version" --slurpfile idx "$INDEX_REC" --slurpfile pages "$PAGE_RECS" --arg cd "$CACHE_DISABLED" \
-  '{claude_version: $v, index: $idx[0], pages: $pages, cache_disabled: (if $cd == "" then null else $cd end)}' >"$MANIFEST.tmp"; then
-  mv "$MANIFEST.tmp" "$MANIFEST" || die "could not write $MANIFEST"
-else
+jq -n --arg v "$claude_version" --slurpfile idx "$INDEX_REC" --slurpfile pages "$PAGE_RECS" --arg cd "$CACHE_DISABLED" \
+  '{claude_version: $v, index: $idx[0], pages: $pages, cache_disabled: (if $cd == "" then null else $cd end)}' >"$MANIFEST.tmp" ||
   die "could not write $MANIFEST"
-fi
+mv "$MANIFEST.tmp" "$MANIFEST" || die "could not write $MANIFEST"
