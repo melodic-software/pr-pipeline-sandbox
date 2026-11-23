@@ -27,6 +27,10 @@ updates:
       github-actions:
         patterns:
           - "*"
+    # The one SHA-pinned first-party ref sits in the sync-managed
+    # pr-check-managed-files-hosted.yml, which the standards sync owns.
+    ignore:
+      - dependency-name: "melodic-software/ci-workflows/.github/actions/check-managed-files"
 
   - package-ecosystem: npm
     directory: /.github/actions/resolve-config
