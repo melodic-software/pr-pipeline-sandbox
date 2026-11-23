@@ -1,9 +1,11 @@
 # Markdown in pr-pipeline-sandbox. Contract and schema:
 # https://github.com/melodic-software/claude-code-plugins/tree/main/docs/contracts/ecosystem-commands
-# This repository's CI runs no build, test or lint command: pr-require-checks.yml
-# has two jobs, check-force-red (a .ci-force-red file test) and ci-status (that
-# result plus the review and hold gates), and the sandbox's resolve-issue lane
-# keeps "no checks" (docs/conventions/pr-pipeline.yaml, resolve-issue entry).
+# This repository's CI runs no build or test command, and its one lint is zizmor
+# over the GitHub Actions YAML (yaml.yaml): pr-require-checks.yml has three jobs,
+# check-force-red (a .ci-force-red file test), pr-audit-workflows (zizmor) and
+# ci-status (those results plus the review and hold gates), and the sandbox's
+# resolve-issue lane keeps "no checks" (docs/conventions/pr-pipeline.yaml,
+# resolve-issue entry).
 # So every command here is null, and no bundled default fills one in.
 # Keeps toolchain's bundled markdown globs; no markdownlint config is tracked here.
 enabled: true

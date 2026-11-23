@@ -54,9 +54,27 @@ jobs:
           fi
           echo ".ci-force-red is absent."
 
+  pr-audit-workflows:
+    name: PR Audit Workflows
+    permissions:
+      contents: read
+      # The reusable's job declares security-events: write unconditionally and a
+      # called workflow cannot widen the caller's token, so the grant has to be
+      # here for the job to start. upload-sarif stays off, so nothing is written
+      # to code scanning.
+      security-events: write
+    # Blocking on every event, with no path filter: any finding, informational
+    # and up, fails the lane and so ci-status. unpinned-uses is the enforcement
+    # of third-party hash pins.
+    uses: melodic-software/ci-workflows/.github/workflows/pr-audit-workflows.yml@main
+    with:
+      runner: ubuntu-24.04
+      paths: .
+      fail-on-severity: low
+
   ci-status:
     name: CI Status
-    needs: [check-force-red]
+    needs: [check-force-red, pr-audit-workflows]
     # !cancelled(), never a success guard: a failed gate must still run this
     # job so it turns red. A skipped required check reports success.
     if: ${{ !cancelled() }}
@@ -73,9 +91,11 @@ jobs:
       - name: Aggregate lane results
         env:
           FORCE_RED: ${{ needs.check-force-red.result }}
+          AUDIT_WORKFLOWS: ${{ needs.pr-audit-workflows.result }}
         run: |
           echo "check-force-red: $FORCE_RED"
-          [ "$FORCE_RED" = success ]
+          echo "pr-audit-workflows: $AUDIT_WORKFLOWS"
+          [ "$FORCE_RED" = success ] && [ "$AUDIT_WORKFLOWS" = success ]
       # A DRAFT IS NOT REVIEWED. Both review lanes skip a draft, so the
       # review-lane step below skips it too; a draft cannot merge, and the
       # ready_for_review run checks the lanes.

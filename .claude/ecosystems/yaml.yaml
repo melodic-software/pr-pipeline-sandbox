@@ -1,18 +1,23 @@
 # GitHub Actions YAML in pr-pipeline-sandbox. Contract and schema:
 # https://github.com/melodic-software/claude-code-plugins/tree/main/docs/contracts/ecosystem-commands
-# This repository's CI runs no build, test or lint command: pr-require-checks.yml
-# has two jobs, check-force-red (a .ci-force-red file test) and ci-status (that
-# result plus the review and hold gates), and the sandbox's resolve-issue lane
-# keeps "no checks" (docs/conventions/pr-pipeline.yaml, resolve-issue entry).
-# So every command here is null, and no bundled default fills one in.
+# This repository's one CI lint: pr-require-checks.yml's pr-audit-workflows job
+# runs zizmor over the whole tree through ci-workflows' pr-audit-workflows.yml
+# reusable and fails ci-status on any finding. Its other jobs are
+# check-force-red (a .ci-force-red file test) and ci-status (those results plus
+# the review and hold gates); the sandbox's resolve-issue lane keeps "no checks"
+# (docs/conventions/pr-pipeline.yaml, resolve-issue entry).
 # Keeps toolchain's bundled yaml globs. Lint-only surface (/toolchain:lint).
 enabled: true
 globs: [".github/**/*.yml", ".github/**/*.yaml"]
 project-discovery: []
 build-cmd: null
 test-cmd: null
-check-cmd: null
+check-cmd: zizmor --persona=regular --offline -- .
 fix-cmd: null
 code-fix-cmd: null
+install-hint: |
+  zizmor: uv tool install zizmor==1.30.0 (the version ci-workflows' pr-audit-workflows.yml defaults to)
+tool-pin:
+  zizmor: "1.30.0"
 gates: []
-notes: "Null by design: CI here gates no GitHub Actions YAML command. Most files are copies from claude-code-plugins, linted and tested there, and scripts/lanes/check-sync.sh requires the synced ones to stay byte-identical, which a fix-cmd would break. Add a command here when a CI lane in this repository starts running one."
+notes: "Lint-only. check-cmd fails on any finding, as CI does. --offline is narrower than CI, which runs the online audits with the job token: a local run spends no GitHub API calls, and a finding only an online audit reports shows in CI and not here. zizmor reads .github/zizmor.yml, a copy of standards' zizmor component. No fix-cmd: most files are copies from claude-code-plugins, linted and tested there, and scripts/lanes/check-sync.sh requires the synced ones to stay byte-identical, which a fix-cmd would break."
