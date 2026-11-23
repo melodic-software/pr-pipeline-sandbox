@@ -192,7 +192,8 @@ jobs:
     concurrency:
       group: pr-pipeline-write-${{ inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity-read.yml
+    # The ./ form claude-code-plugins' lane callers use, so the sandbox runs the call they run.
+    uses: ./.github/workflows/pr-run-activity-read.yml # zizmor: ignore[self-repository]
     with:
       role: automations
       lane: pr-refine
@@ -225,7 +226,8 @@ jobs:
     concurrency:
       group: pr-pipeline-write-${{ inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity-read.yml
+    # The ./ form claude-code-plugins' lane callers use, so the sandbox runs the call they run.
+    uses: ./.github/workflows/pr-run-activity-read.yml # zizmor: ignore[self-repository]
     with:
       role: automations
       lane: pr-refine
@@ -257,7 +259,8 @@ jobs:
     concurrency:
       group: pr-pipeline-write-${{ inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity-write.yml
+    # The ./ form claude-code-plugins' lane callers use, so the sandbox runs the call they run.
+    uses: ./.github/workflows/pr-run-activity-write.yml # zizmor: ignore[self-repository]
     with:
       role: automations
       lane: pr-refine

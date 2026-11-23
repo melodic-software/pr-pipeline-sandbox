@@ -32,7 +32,8 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-check-read-token-${{ github.event.pull_request.number || inputs.pr-number }}
       queue: max
-    uses: ./.github/workflows/pr-run-activity-read.yml
+    # The ./ form claude-code-plugins' lane callers use, so the sandbox runs the call they run.
+    uses: ./.github/workflows/pr-run-activity-read.yml # zizmor: ignore[self-repository]
     with:
       lane: pr-run-checks
       activity: check-read-token
