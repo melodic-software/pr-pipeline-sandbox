@@ -118,13 +118,13 @@ jobs:
           done
           echo "sha=$sha" >>"$GITHUB_OUTPUT"
       - name: Check out the default branch tip
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
       - name: Write the source-control trust settings
-        uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@d7ba00151fa8429aa9a94fb919f1e517c2e74368 # v0.78.0
+        uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@main
         with:
           drop-in-file: .base/.github/source-control-settings.json
           drop-in-name: 50-source-control
@@ -234,7 +234,7 @@ jobs:
           && (steps.gate.outcome == 'skipped' || steps.gate.outputs.proceed == 'true')
           && steps.pace.outputs.paced != 'true'
         continue-on-error: true
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/pr-unblock-dispatch-record.json
           key: pr-unblock-dispatch-record-${{ github.run_id }}-${{ github.run_attempt }}
@@ -251,7 +251,7 @@ jobs:
           steps.kill.outputs.proceed == 'true' && steps.upstream.outputs.degraded != 'true'
           && (steps.gate.outcome == 'skipped' || steps.gate.outputs.proceed == 'true')
           && steps.pace.outputs.paced != 'true'
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        uses: actions/setup-python@v7
         with:
           python-version-file: .base/.python-version
 
@@ -305,7 +305,7 @@ jobs:
       - name: Save the dispatch record
         if: always() && steps.dispatch.outputs.record-changed == 'true'
         continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/pr-unblock-dispatch-record.json
           key: pr-unblock-dispatch-record-${{ github.run_id }}-${{ github.run_attempt }}
@@ -346,7 +346,7 @@ jobs:
       - name: Record the dispatched runs
         if: >-
           (always() && steps.record.outputs.name != '' && steps.record.outcome == 'success') && steps.scan-upload.outputs.clean == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.record.outputs.name }}
           path: ${{ runner.temp }}/pr-unblock-dispatched.json
@@ -404,7 +404,7 @@ jobs:
       # The record names this commit, which the gate and the broker check is
       # on main and holds main's copy of this file.
       - name: Check out the commit this workflow ran from
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.workflow_sha }}
           path: .base
@@ -476,7 +476,7 @@ jobs:
       - name: Record the dispatched run
         if: >-
           (always() && steps.record.outputs.name != '' && steps.record.outcome == 'success') && steps.scan-upload.outputs.clean == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.record.outputs.name }}
           path: ${{ runner.temp }}/pr-unblock-target-dispatched.json
@@ -522,7 +522,7 @@ jobs:
       - name: Record the second dispatched run
         if: >-
           (always() && steps.record-2.outputs.name != '' && steps.record-2.outcome == 'success') && steps.scan-upload-2.outputs.clean == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.record-2.outputs.name }}
           path: ${{ runner.temp }}/pr-unblock-target-dispatched-2.json

@@ -1,4 +1,4 @@
-# Dependabot keeps this sandbox's SHA-pinned GitHub Actions and its one lockfile-backed npm root
+# Dependabot keeps this sandbox's GitHub Actions tags and its one lockfile-backed npm root
 # (the resolve-config composite action's ajv and yaml) current with pull requests: GitHub-native,
 # no third-party app and no PAT. The other package.json files declare no dependencies, and the
 # composite actions under .github/actions use no other action, so "/" covers every `uses:` line.
@@ -27,11 +27,10 @@ updates:
       github-actions:
         patterns:
           - "*"
-    # Every melodic-software/ci-workflows ref (reusable workflows and composite actions) moves
-    # only through deliberate reviewed PRs per the standards runner-policy selector-revision
-    # lockstep, so all of them are ignored here.
+    # The one SHA-pinned first-party ref sits in the sync-managed
+    # pr-check-managed-files-hosted.yml, which the standards sync owns.
     ignore:
-      - dependency-name: "melodic-software/ci-workflows/*"
+      - dependency-name: "melodic-software/ci-workflows/.github/actions/check-managed-files"
 
   - package-ecosystem: npm
     directory: /.github/actions/resolve-config

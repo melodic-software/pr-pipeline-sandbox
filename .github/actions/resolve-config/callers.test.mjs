@@ -670,7 +670,7 @@ test("intake-triage.yml: a thin issue's refinement runs its model with no write 
   assert.equal(jobs["apply-verdict"].steps.find((s) => s.id === "verdict")?.env?.API_BUDGET_HOLD, "1", "a rate-guard stop holds the verdict green");
   // The credit gate is select-model-credential's start call; its next-leg
   // names the first leg, and a failed read (empty) runs the key.
-  const SELECT = /^melodic-software\/ci-workflows\/\.github\/actions\/select-model-credential@[0-9a-f]{40}$/;
+  const SELECT = /^melodic-software\/ci-workflows\/\.github\/actions\/select-model-credential@main$/;
   const creditRead = credit.steps.find((s) => s.id === "credit");
   assert.match(creditRead.uses, SELECT);
   assert.equal(creditRead["continue-on-error"], true);
@@ -787,7 +787,7 @@ test("intake-triage.yml: a thin issue's refinement runs its model with no write 
   const launcher = (job) => job.steps.find((s) => s.id === "run");
   for (const job of [model, sub, fallback]) {
     const run = launcher(job);
-    assert.match(run.uses, /^melodic-software\/ci-workflows\/\.github\/actions\/run-claude-cli@[0-9a-f]{40}$/);
+    assert.match(run.uses, /^melodic-software\/ci-workflows\/\.github\/actions\/run-claude-cli@main$/);
     assert.equal(run.with.role, "intake");
     assert.equal(run.with["permission-mode"], "dontAsk");
     assert.deepEqual(run.with.tools.trim().split("\n"), ["Read", "Grep", "Glob", "WebFetch"]);
@@ -2717,7 +2717,7 @@ test("pr-run-activity-read.yml: the run job can only read, and each launcher ste
   assert.deepEqual(jobs.run.permissions, { contents: "read", "pull-requests": "read" }, "read-only, no id-token");
   const step = (id) => jobs.run.steps.find((s) => s.id === id);
   const launcher = step("act-key").uses;
-  assert.match(launcher, /^melodic-software\/ci-workflows\/\.github\/actions\/run-claude-cli@[0-9a-f]{40}$/, "a full SHA pin of run-claude-cli");
+  assert.match(launcher, /^melodic-software\/ci-workflows\/\.github\/actions\/run-claude-cli@main$/, "run-claude-cli at main");
   for (const [id, input, secret] of [
     ["act-key", "api-key", "claude-api-key"],
     ["act-token", "subscription-token", "claude-code-oauth-token"],
@@ -2796,7 +2796,7 @@ test("every run-claude-cli step pin in this repo's workflows passes --permission
         if (!uses.includes("/run-claude-cli@")) continue;
         const sha = uses.slice(uses.indexOf("@") + 1);
         files.add(file);
-        assert.match(sha, /^[0-9a-f]{40}$/, `${file} ${id} ${step.id} pins a full SHA`);
+        assert.equal(sha, "main", `${file} ${id} ${step.id} runs the launcher at main`);
         pins.add(sha);
         const mode = String(step.with?.["permission-mode"] ?? "");
         if (/^[A-Za-z]+$/.test(mode)) modes.add(mode);
@@ -2824,8 +2824,8 @@ const STATUS_WRITE_RETRY_SECONDS = 7;
 test("report-ci-status's waits at ci-status's pin fit WAIT_BUDGET_SECONDS.step each and GH_READ_MARGIN_SECONDS together", async () => {
   const job = workflow("pr-require-checks.yml").jobs["ci-status"];
   const composite = ".github/actions/pr-require-checks/report-ci-status";
-  const [pin] = job.steps.map((step) => String(step.uses ?? "").match(new RegExp(`^melodic-software/ci-workflows/${composite}@([0-9a-f]{40})$`))?.[1]).filter(Boolean);
-  assert.ok(pin, "ci-status pins report-ci-status to a full SHA");
+  const [pin] = job.steps.map((step) => String(step.uses ?? "").match(new RegExp(`^melodic-software/ci-workflows/${composite}@(main)$`))?.[1]).filter(Boolean);
+  assert.ok(pin, "ci-status runs report-ci-status at main");
   const action = async (path) => parse(await fetchAtPin(pin, `${path}/action.yml`));
   const waits = {};
   let rerun = 0;
@@ -7880,7 +7880,7 @@ function assertFallbackPresence(job) {
 function assertHandoffEvidenceJob(job) {
   assert.deepEqual(job.permissions, { actions: "read", contents: "read" });
   const checkout = job.steps[1];
-  assert.match(String(checkout.uses), /^actions\/checkout@[0-9a-f]{40}$/);
+  assert.match(String(checkout.uses), /^actions\/checkout@v\d+$/);
   assertMainTip(job.steps, checkout, DEFAULT_BRANCH);
   assert.equal(checkout.with.path, ".base");
   assert.equal(checkout.with["persist-credentials"], false);
@@ -10349,7 +10349,7 @@ for (const [file, gateId, [keyId, subId, fbId], keyJob, marker] of [
       // nothing past its credential check: every later step but the budget
       // log has a condition, and the first ones read `present`.
       const credential = steps.find((s) => s.id === "credential");
-      assert.match(credential.uses, /^melodic-software\/ci-workflows\/\.github\/actions\/select-model-credential@[0-9a-f]{40}$/, id);
+      assert.match(credential.uses, /^melodic-software\/ci-workflows\/\.github\/actions\/select-model-credential@main$/, id);
       assert.equal(credential.with.leg, leg, id);
       assert.equal(credential.with.role, "maintenance", id);
       const after = steps.slice(steps.indexOf(credential) + 1);
@@ -10476,7 +10476,7 @@ test("pr-run-activity-read.yml: check-broker skips a credit-stopped key on the f
   const { jobs, on } = workflow("pr-run-activity-read.yml");
   assert.equal(on.workflow_call.inputs["key-credit-job"].default, "");
   const credit = jobs["check-broker"].steps.find((s) => s.id === "credit");
-  assert.match(credit.uses, /^melodic-software\/ci-workflows\/\.github\/actions\/select-model-credential@[0-9a-f]{40}$/);
+  assert.match(credit.uses, /^melodic-software\/ci-workflows\/\.github\/actions\/select-model-credential@main$/);
   assert.equal(credit.with.leg, "start");
   assert.equal(credit.with["key-job"], "${{ inputs.key-credit-job }}");
   assert.equal(credit.with["probe-minutes"], "0", "probing off");
