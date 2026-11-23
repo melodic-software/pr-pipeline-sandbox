@@ -708,7 +708,7 @@ test("both token-holding jobs read the carried reads from the last trusted run's
     ),
   );
   const upload = step("Upload the verdict reads for the next run");
-  assert.match(upload, /uses: actions\/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 /);
+  assert.match(upload, /uses: actions\/upload-artifact@v7\b/);
   assert.ok(upload.includes("name: pr-merge-run-cache\n") && upload.includes(`path: ${carried}\n`));
   assert.ok(upload.includes("retention-days: 1\n"));
   const scan = assertScanned("Upload the verdict reads for the next run", "always() && steps.carry.outputs.carried == 'true'");
@@ -737,7 +737,7 @@ test("enable-auto-merge uploads its verifier reads for the next run", () => {
   );
   assert.match(keep, /run: node \.base\/\.github\/scripts\/pr-merge\/carry-run-cache\.mjs\n/);
   const upload = step("Upload the verdict reads for the next run", list);
-  assert.match(upload, /uses: actions\/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 /);
+  assert.match(upload, /uses: actions\/upload-artifact@v7\b/);
   assert.ok(upload.includes("name: pr-merge-verify-run-cache\n") && upload.includes(`path: ${carried}\n`));
   assert.ok(upload.includes("retention-days: 1\n"));
   const scan = assertScanned("Upload the verdict reads for the next run", "always() && steps.carry.outputs.kept == 'true'", list);
@@ -783,7 +783,7 @@ test("the gate reads the head-ref map the last run uploaded and uploads the next
     ),
   );
   const upload = step("Upload them for the next run");
-  assert.match(upload, /uses: actions\/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 /);
+  assert.match(upload, /uses: actions\/upload-artifact@v7\b/);
   assert.ok(upload.includes("name: pr-merge-head-refs\n") && upload.includes(`path: ${mapOut}\n`));
   const scan = assertScanned("Upload them for the next run", "always() && steps.head-refs.outcome == 'success'");
   for (const block of [read, keep, scan, upload]) assert.match(block, /\n {8}continue-on-error: true\n/);
@@ -825,7 +825,7 @@ test("every post-merge check reads the lane records, and only the merge job uplo
     ),
   );
   const upload = step("Upload the lane records for the next run");
-  assert.match(upload, /uses: actions\/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 /);
+  assert.match(upload, /uses: actions\/upload-artifact@v7\b/);
   assert.ok(upload.includes("name: pr-merge-lane-records\n") && upload.includes(`path: ${out}\n`));
   assertScanned("Upload the lane records for the next run", "always() && steps.lane-records.outcome == 'success'");
   assert.doesNotMatch(jobBlock("dispatch-post-merge-runs"), /name: pr-merge-lane-records|lane-records\.mjs write/);
@@ -1672,7 +1672,7 @@ test("the budget comes from the pipeline config, rotation runs before the gate, 
   assert.match(step("Start after the candidate the last run reached"), /\n {8}continue-on-error: true\n/);
   const upload = step("Record where the gate stopped");
   assertScanned("Record where the gate stopped", "always() && steps.gate.outcome != 'skipped'");
-  assert.match(upload, /uses: actions\/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 /);
+  assert.match(upload, /uses: actions\/upload-artifact@v7\b/);
   assert.match(upload, /\n {10}name: pr-merge-gate-cursor\n/);
 });
 
@@ -1996,7 +1996,7 @@ test("the re-run record is named by run and attempt, uploaded only after a recor
   assert.match(rerun, /\n {10}GH_TOKEN: \$\{\{ github\.token \}\}\n/);
   const upload = step("Record the re-run", list);
   assertScanned("Record the re-run", "!cancelled() && steps.rerun.outputs.recorded == 'true'", list);
-  assert.match(upload, /uses: actions\/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 /);
+  assert.match(upload, /uses: actions\/upload-artifact@v7\b/);
   assert.match(upload, /\n {10}name: pr-merge-rerun-\$\{\{ steps\.post-merge\.outputs\.lane-rerun \}\}-attempt-2\n/);
 });
 
@@ -2145,7 +2145,7 @@ test("a red full run is sent to post-merge-file-demotion-issues.yml once, by its
   assert.ok(run.calls[0].includes("actions/workflows/pr-require-checks.yml/runs?event=workflow_dispatch&branch=main&created=%3E%3D"), run.calls[0]);
   const upload = step("Record the alert sent", earlySteps());
   assertScanned("Record the alert sent", "!cancelled() && steps.alert.outputs.run-id != ''", earlySteps());
-  assert.match(upload, /uses: actions\/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 /);
+  assert.match(upload, /uses: actions\/upload-artifact@v7\b/);
   assert.match(upload, /\n {10}name: pr-merge-alerted-\$\{\{ steps\.alert\.outputs\.run-id \}\}\n/);
 });
 
@@ -2565,7 +2565,7 @@ test("the merge job's check fails red on a rate-limit stop, after its outputs", 
 
 test("the merge job reads this run's report only when dispatch-post-merge-runs keeps one", () => {
   const read = step("Read this run's post-merge report");
-  assert.match(read, /uses: actions\/download-artifact@[0-9a-f]{40} /);
+  assert.match(read, /uses: actions\/download-artifact@v\d+\b/);
   // A pattern that matches nothing yet (dispatch-post-merge-runs still checking)
   // downloads nothing rather than failing the step.
   assert.match(read, /\n {10}pattern: pr-merge-post-merge-report\n {10}merge-multiple: true\n {10}path: \$\{\{ runner\.temp \}\}\/post-merge-kept\n/);

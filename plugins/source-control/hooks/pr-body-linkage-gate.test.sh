@@ -64,12 +64,12 @@ new_repo() {
   case "$gated" in
   yml | yaml)
     mkdir -p "$r/.github/workflows"
-    printf 'jobs:\n  ci-status:\n    steps:\n      - uses: melodic-software/ci-workflows/.github/actions/pr-require-checks/check-contract@5e18f3d6cebd6fa5e66b0941ee0f7ed6ba288d6c # v0.58.0\n' \
+    printf 'jobs:\n  ci-status:\n    steps:\n      - uses: melodic-software/ci-workflows/.github/actions/pr-require-checks/check-contract@main\n' \
       >"$r/.github/workflows/ci.$gated"
     ;;
   composite)
     mkdir -p "$r/.github/workflows"
-    printf 'jobs:\n  ci-status:\n    steps:\n      - uses: melodic-software/ci-workflows/.github/actions/pr-require-checks/report-ci-status@9c5bedfbfdbdfe733b9ce4cd7ca80c1574bd4cb8 # v0.76.3\n' \
+    printf 'jobs:\n  ci-status:\n    steps:\n      - uses: melodic-software/ci-workflows/.github/actions/pr-require-checks/report-ci-status@main\n' \
       >"$r/.github/workflows/pr-require-checks.yml"
     ;;
   nostep)

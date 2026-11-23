@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Fail when .ci-force-red exists
@@ -539,7 +539,7 @@ jobs:
       # credential.
       - name: Check out main's Node pin and verdict reader
         if: ${{ !cancelled() && github.event_name == 'merge_group' && steps.tip.outputs.sha != '' }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
@@ -565,7 +565,7 @@ jobs:
         id: base_config
         if: ${{ !cancelled() && github.event_name == 'merge_group' }}
         continue-on-error: true
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.merge_group.base_sha }}
           path: base-config

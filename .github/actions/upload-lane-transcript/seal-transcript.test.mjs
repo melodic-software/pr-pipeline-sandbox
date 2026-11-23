@@ -188,7 +188,7 @@ test("telemetry that would take the artifact past the puller's limit is left out
 
 test("the upload keeps only the sealed files, for 7 days, named by job and attempt", () => {
   const upload = ACTION.slice(ACTION.indexOf("uses: actions/upload-artifact@"));
-  assert.match(ACTION, /if: steps\.seal\.outputs\.file != ''\n\s+uses: actions\/upload-artifact@[0-9a-f]{40} /);
+  assert.match(ACTION, /if: steps\.seal\.outputs\.file != ''\n\s+uses: actions\/upload-artifact@v\d+\b/);
   assert.match(upload, /^ {8}name: lane-transcript-\$\{\{ inputs\.job-id \}\}-\$\{\{ github\.run_attempt \}\}$/m);
   assert.match(upload, /^ {8}path: \|\n {10}\$\{\{ steps\.seal\.outputs\.file \}\}\n {10}\$\{\{ steps\.seal-otel\.outputs\.file \}\}\n/m);
   // The issue's retention: 7 days (cant-fail-ok: the issue's stated contract).

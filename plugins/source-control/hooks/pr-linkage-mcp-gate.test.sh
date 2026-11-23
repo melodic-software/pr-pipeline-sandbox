@@ -42,7 +42,7 @@ mkdir -p "$GATED/.github/workflows" "$NOGATE" "$NOORIGIN/.github/workflows"
 CHECK_CONTRACT_WF='jobs:
   ci-status:
     steps:
-      - uses: melodic-software/ci-workflows/.github/actions/pr-require-checks/check-contract@5e18f3d6cebd6fa5e66b0941ee0f7ed6ba288d6c # v0.58.0
+      - uses: melodic-software/ci-workflows/.github/actions/pr-require-checks/check-contract@main
 '
 printf '%s' "$CHECK_CONTRACT_WF" >"$GATED/.github/workflows/ci.yml"
 printf '%s' "$CHECK_CONTRACT_WF" >"$NOORIGIN/.github/workflows/ci.yml"
@@ -52,7 +52,7 @@ git -C "$NOGATE" init -q
 git -C "$NOORIGIN" init -q
 COMPOSITE="$WORK/composite"
 mkdir -p "$COMPOSITE/.github/workflows"
-printf 'jobs:\n  ci-status:\n    steps:\n      - uses: melodic-software/ci-workflows/.github/actions/pr-require-checks/report-ci-status@9c5bedfbfdbdfe733b9ce4cd7ca80c1574bd4cb8 # v0.76.3\n' >"$COMPOSITE/.github/workflows/pr-require-checks.yml"
+printf 'jobs:\n  ci-status:\n    steps:\n      - uses: melodic-software/ci-workflows/.github/actions/pr-require-checks/report-ci-status@main\n' >"$COMPOSITE/.github/workflows/pr-require-checks.yml"
 git -C "$COMPOSITE" init -q
 git -C "$COMPOSITE" remote add origin https://github.com/acme-corp/widgets.git
 FIXTURE_RE='\.github/actions/pr-require-checks/(check-contract|report-ci-status)([@[:space:]]|$)'

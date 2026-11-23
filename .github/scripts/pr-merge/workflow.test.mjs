@@ -1426,7 +1426,7 @@ test("enable-auto-merge reads the lane's room from this run's dispatch-post-merg
   const dispatch = job("dispatch-post-merge-runs");
   const keep = /- name: Keep the post-merge report for enable-auto-merge\n([\s\S]*?)(?=\n {6}- name: |\n*$)/.exec(dispatch)?.[1];
   assert.ok(keep, "dispatch-post-merge-runs keeps its report");
-  assert.match(keep, /uses: actions\/upload-artifact@[0-9a-f]{40} /);
+  assert.match(keep, /uses: actions\/upload-artifact@v\d+\b/);
   // The directory holds post-merge.json, so the download below finds it at
   // post-merge/post-merge.json.
   assert.match(keep, /\n {10}name: pr-merge-post-merge-report\n {10}path: \$\{\{ runner\.temp \}\}\/post-merge-report\/\n {10}retention-days: 1\n/);
@@ -1445,7 +1445,7 @@ test("enable-auto-merge reads the lane's room from this run's dispatch-post-merg
   assert.match(keepStep[1], /^ {8}if: steps\.lane-token\.outputs\.token != '' && github\.event_name == 'workflow_dispatch' && inputs\.pr && steps\.precheck\.outputs\.uncovered != 'true'\n/m);
   const read = /- name: Read this run's post-merge report\n([\s\S]*?)(?=\n {6}- name: )/.exec(arm)?.[1];
   assert.ok(read, "a download of the report");
-  assert.match(read, /uses: actions\/download-artifact@[0-9a-f]{40} /);
+  assert.match(read, /uses: actions\/download-artifact@v\d+\b/);
   assert.match(read, /\n {10}name: pr-merge-post-merge-report\n/);
   // Not 'success': a step after the kept report can fail the job.
   assert.match(read, /needs\.dispatch-post-merge-runs\.result != 'skipped'/);
@@ -2182,14 +2182,14 @@ test("no token-holding job in pr-merge.yml restores a cache", () => {
   // The check sees a restore a token-holding job adds, directly or through a
   // local composite action, and ignores one in a job holding neither token.
   const withStep = (job, step) => merge.replace(new RegExp(`(\\n  ${job}:\\n[\\s\\S]*?\\n    steps:\\n)`), `$1${step}`);
-  const exact = "      - name: Restore\n        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n        with:\n          key: k\n";
+  const exact = "      - name: Restore\n        uses: actions/cache/restore@v6\n        with:\n          key: k\n";
   // No local action restores a cache today, so a fixture one stands in.
   const fixture = tempDir("pr-merge-composite-");
   mkdirSync(join(fixture, ".github/actions/restoring"), { recursive: true });
   writeFileSync(join(fixture, ".github/actions/restoring/action.yml"), `runs:\n  using: composite\n  steps:\n${exact.replace(/^ {6}/gm, "    ").replace("key: k\n", "key: k\n        restore-keys: k-\n")}`);
   const base = pathToFileURL(`${fixture}/`);
   const composite = "      - name: Count\n        uses: ./.base/.github/actions/restoring # zizmor: ignore[self-repository]\n";
-  const setupNode = "      - name: Node\n        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0\n        with:\n          node-version: 24\n";
+  const setupNode = "      - name: Node\n        uses: actions/setup-node@v7\n        with:\n          node-version: 24\n";
   const setupPython = "      - name: Python\n        uses: actions/setup-python@v6\n        with:\n          cache: pip\n";
   for (const job of ["merge", "enable-auto-merge"]) {
     for (const added of [exact, setupNode, setupPython]) {
@@ -2201,7 +2201,7 @@ test("no token-holding job in pr-merge.yml restores a cache", () => {
 });
 
 test("a token grant is found at any indentation", () => {
-  const restore = (pad) => `${pad}- name: Restore\n${pad}  uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n${pad}  with:\n${pad}    key: k\n${pad}    restore-keys: k-\n`;
+  const restore = (pad) => `${pad}- name: Restore\n${pad}  uses: actions/cache/restore@v6\n${pad}  with:\n${pad}    key: k\n${pad}    restore-keys: k-\n`;
   // Jobs at four spaces, their permissions at eight and ten.
   const wide = `on: push\njobs:\n    holder:\n        permissions:\n          id-token: write\n        steps:\n${restore("          ")}    other:\n        permissions:\n          contents: read\n        steps:\n${restore("          ")}`;
   assert.deepEqual(tokenJobRestores(wide).map((r) => [r.job, r.prefix]), [["holder", true]]);
@@ -2248,7 +2248,7 @@ test("enable-auto-merge reads the skip records only from a trusted run and uploa
   // A best-effort upload: neither it nor its scan can fail the job.
   for (const block of [scan, upload]) assert.ok(block.includes("\n        continue-on-error: true\n"), block);
   assert.ok(scan.includes("\n          path: ${{ runner.temp }}/verify-answers/eam-skip.json\n"), scan);
-  assert.match(upload, /\n {8}uses: actions\/upload-artifact@[0-9a-f]{40} /);
+  assert.match(upload, /\n {8}uses: actions\/upload-artifact@v\d+\b/);
   // Bounded, so the job's timeout stays above the sum of its steps'.
   assert.match(upload, /\n {8}timeout-minutes: [0-9]+\n/);
   assert.match(upload, /\n {10}name: pr-merge-verify-answers\n {10}path: \$\{\{ runner\.temp \}\}\/verify-answers\/eam-skip\.json\n {10}retention-days: 1\n {10}if-no-files-found: ignore\n/);
