@@ -116,7 +116,6 @@ test("the script fails open with exit 0 when no page can be reached", () => {
   try {
     const outputPath = path.join(dir, "output");
     writeFileSync(outputPath, "");
-    // A preload that makes every fetch throw, so the run needs no network.
     const preload = path.join(dir, "no-fetch.mjs");
     writeFileSync(preload, 'globalThis.fetch = async () => { throw new Error("offline"); };\n');
     const script = fileURLToPath(new URL("./check-upstream-status.mjs", import.meta.url));
@@ -165,10 +164,6 @@ test("every gate step fails open: continue-on-error, and no condition requires d
   }
 });
 
-// A hosted review caller's gate skip fails its check-kill-switch job with this
-// lane's error, so the run is a failed first attempt the lost-run reconciler
-// re-runs (reconcile.mjs `upstream`), the merge gate binds the re-run
-// (babysit_review_evidence UPSTREAM_STOP_RE) and ci-status names the stop.
 const HOSTED = [
   ["pr-review-hosted.yml", "review", "CLAUDE_REVIEW_DISABLED"],
   ["pr-review-security-hosted.yml", "security review", "CLAUDE_SECURITY_REVIEW_DISABLED"],

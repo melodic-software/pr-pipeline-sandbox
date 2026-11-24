@@ -18,9 +18,12 @@ source "$SCRIPT_DIR/../../../scripts/test-helpers.sh"
 REPO_LEVEL='repository (docs/conventions/source-control.yaml at main)'
 ERR="$TEST_TMPDIR/stderr"
 read_doc() { printf '%s' "$1" | bash "$SCRIPT" "${@:2}" --base main --default-branch main - 2>"$ERR"; }
-lines() { printf 'evidence_inline_max_captures\t%s\t%s\nevidence_record_fields\t%s\t%s' "$1" "$2" "$3" "$4"; }
+lines() {
+  printf 'evidence_inline_max_captures\t%s\t%s\nevidence_record_fields\t%s\t%s\nevidence_ocr_mpdecimate_hi\t%s\t%s' \
+    "$1" "$2" "$3" "$4" "${5:-256}" "${6:-default}"
+}
 
-assert_eq "no repository level gives both defaults" "$(lines 4 default false default)" "$(bash "$SCRIPT" 2>"$ERR")"
+assert_eq "no repository level gives every default, hi 256 included" "$(lines 4 default false default 256 default)" "$(bash "$SCRIPT" 2>"$ERR")"
 assert_eq "no repository level prints no notice" "" "$(cat "$ERR")"
 
 out=$(read_doc $'evidence_inline_max_captures: 6\nevidence_record_fields: true\n')
@@ -51,11 +54,21 @@ for bad in yes True 1; do
   assert_contains "record switch $bad prints a notice" "$(cat "$ERR")" "evidence_record_fields"
 done
 
+out=$(read_doc $'evidence_ocr_mpdecimate_hi: 768\n')
+assert_eq "the repository's mpdecimate threshold wins over 256" \
+  "$(lines 4 default false default 768 "$REPO_LEVEL")" "$out"
+
+for bad in 0 10000 2.5 high; do
+  out=$(read_doc "evidence_ocr_mpdecimate_hi: $bad"$'\n')
+  assert_eq "mpdecimate threshold $bad falls back to 256" \
+    "$(lines 4 default false default 256 "invalid value at $REPO_LEVEL (fell back to 256)")" "$out"
+  assert_contains "mpdecimate threshold $bad prints a notice" "$(cat "$ERR")" "evidence_ocr_mpdecimate_hi"
+done
+
 out=$(read_doc $'evidence_inline_max_captures:\n  - 4\n')
 assert_eq "a list is not a threshold" \
   "$(lines 4 "invalid value at $REPO_LEVEL (fell back to 4)" false default)" "$out"
 
-# A repository level that cannot be read or trusted is skipped with a notice.
 out=$(printf 'evidence_record_fields: true\n' | bash "$SCRIPT" --base stack/layer-2 --default-branch main - 2>"$ERR")
 assert_eq "a base other than the default branch leaves the repository level unread" \
   "$(lines 4 default false default)" "$out"
@@ -68,7 +81,6 @@ assert_contains "the parse failure is named" "$(cat "$ERR")" "does not parse"
 out=$(printf 'evidence_record_fields: t\000rue\n' | bash "$SCRIPT" --base main --default-branch main - 2>"$ERR")
 assert_eq "a NUL byte leaves the repository level unread" "$(lines 4 default false default)" "$out"
 
-# --http-response reads a `gh api -i` response: the status line decides.
 read_response() { printf '%s' "$1" | bash "$SCRIPT" --base main --default-branch main --http-response 2>"$ERR"; }
 out=$(read_response $'HTTP/2.0 200 OK\r\nContent-Type: application/vnd.github.raw\r\n\r\nevidence_inline_max_captures: 2\n')
 assert_eq "a 200 response is read as the document" "$(lines 2 "$REPO_LEVEL" false default)" "$out"
@@ -85,5 +97,8 @@ bash "$SCRIPT" --base main >/dev/null 2>&1
 assert_exit "--base without a file read is a usage error" 2 "$?"
 bash "$SCRIPT" "$TEST_TMPDIR/source-control.yaml" >/dev/null 2>&1
 assert_exit "a working-tree path is refused" 2 "$?"
+out=$(bash "$SCRIPT" --help 2>"$ERR")
+assert_exit "--help exits 0" 0 "$?"
+assert_contains "--help names the mpdecimate threshold" "$out" "evidence_ocr_mpdecimate_hi"
 
 [[ $FAILED -eq 0 ]] || exit 1

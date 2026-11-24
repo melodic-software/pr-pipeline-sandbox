@@ -63,7 +63,7 @@ When the target skill does not exist, create it before writing any reference fil
 
 For a web corpus, settle these before fetching anything, instead of surveying a book. Ask the user only for what you can't infer. Record the enumerated piece count in the progress file; it is the boundary the finished skill claims.
 
-1. **Who, and which corpus.** One person or company, and their primary published body of work. Pick the source they actually write in: essays site, blog archive, talk transcripts, newsletter archive, docs. A corpus is one place, taken whole. Never sample it and never pad it with what you remember about them. The reason the skill is trustworthy is that its boundary is exact. When the person names a practitioner but not where they publish, or you cannot tell whether a source is their own primary work, find and grade it with `/discovery:research` first.
+1. **Who, and which corpus.** One person or company, and their primary published body of work. Pick the source they actually write in: essays site, blog archive, talk transcripts, newsletter archive, docs. A corpus is one place, taken whole. Never sample it and never pad it with what you remember about them. The reason the skill is trustworthy is that its boundary is exact. When the person names a practitioner but not where they publish, or you cannot tell whether a source is their own primary work, find and grade it with `/discovery:research` (if enabled) first.
 2. **Source type decides how you collect.**
 
    ```text
@@ -235,6 +235,16 @@ When the target skill is one person's or company's corpus, its SKILL.md takes th
 ## Refresh a web corpus
 
 When the person publishes, add the piece to the corpus, write its note and add it to the index. Add its new arguments, with citations, to the theme references they belong in, and its coined terms to the glossary, so the skill can answer from the piece and not only list it. Re-read the core list to see if anything shifted. Update the count in the description and the counts in the Reference files section. A corpus skill with a stale count is a skill that lies about its own boundary. Run the visibility check again before the write.
+
+## Next
+
+/skill-quality:check
+
+## Related
+
+- Finding an author's primary corpus before distilling: /discovery:research.
+- Digesting a single vendor docs page: /knowledge:docpage-digest.
+- Extracting a DRM-protected Kindle book first: /kindle-dedrm:manage.
 
 ## Rules and warnings
 

@@ -10,20 +10,6 @@ metadata:
 
 **Arguments.** `[area-or-domain]`. e.g., /discovery:blindspot geofencing, /discovery:blindspot payments module, /discovery:blindspot <domain-vocabulary>
 
-## Repository context. Gather first
-
-Collect these with **individual** Bash calls, one command per call, never combined into a single
-invocation:
-
-- Current branch, `git branch --show-current`
-- Project root, `git rev-parse --show-toplevel`
-
-Treat a failure (not a repository, git unavailable) as an unknown value and carry on. Keep these as
-separate body Bash calls rather than pre-compute lines ([gather-block convention](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/gather-block/README.md#the-pre-compute-block-runs-as-one-shell-invocation),
-"The pre-compute block runs as one shell invocation").
-
-These values orient this session only; resolve files against the project root while working.
-
 ## Workflow
 
 This skill builds the user's knowledge, not the agent's: the deliverable is the user's
@@ -48,8 +34,7 @@ point rather than a fixed depth.
 3. **Output**. Blindspot cards, then one improved implementation prompt assembled from their
    prompt-fix lines (Output format below).
 4. **Escalate when depth warranted**. A domain too deep for a lightweight ladder gets a
-   recommendation to learn it in a structured way: `/education:teach topic <domain>` when it is
-   among the available skills, otherwise proper external research, `/discovery:research` invoked
+   recommendation to learn it in a structured way: `/education:teach topic <domain>` (if enabled), otherwise proper external research, `/discovery:research` invoked
    via the Skill tool.
 
 ## Output format
@@ -106,6 +91,12 @@ tool, to persist the `EXPLORE.md` artifact.
 - The scan doubles as stage-1 codebase exploration: `/discovery:explore <area>`.
 - The prompt is sharpened and ready to scope: `/planning:interview`.
 - Unsure where this leaves the work, or arrived mid-flow: `/session-flow:workflow`.
+
+## Related
+
+- Domain too deep for a lightweight ladder: /education:teach.
+- Needs multi-source external research: /discovery:research.
+- Explore divergent options before interviewing: /planning:brainstorm.
 
 ## Gotchas
 

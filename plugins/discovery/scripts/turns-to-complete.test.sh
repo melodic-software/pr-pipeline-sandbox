@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Black-box test for turns-to-complete.py.
-#
-# Builds fixture transcripts under its own mktemp dir; touches nothing else.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,10 +11,6 @@ ROOT="$WORK/projects"
 # shellcheck source=../lib/test-helpers.sh
 source "$SCRIPT_DIR/../lib/test-helpers.sh"
 
-# mkagent <name> <agentType> <date> <turns> [parallel] [running]
-# Writes <turns> assistant turns; with "parallel" each turn is three records
-# (thinking, text, tool_use) sharing one message.id. The last turn ends with
-# stop_reason end_turn unless "running" is given.
 mkagent() {
   local name="$1" type="$2" day="$3" turns="$4" parallel="${5:-}" running="${6:-}"
   local dir="$ROOT/proj/sess/subagents"
@@ -41,7 +34,6 @@ with open(path, "w") as fh:
 PY
 }
 
-# expect <label> <expected-exit> <grep-pattern-or-empty> <args...>
 expect() {
   local label="$1" want="$2" pattern="$3"
   shift 3
@@ -57,7 +49,6 @@ expect() {
   fi
 }
 
-# expect_absent <label> <pattern> <args...>
 expect_absent() {
   local label="$1" pattern="$2"
   shift 2

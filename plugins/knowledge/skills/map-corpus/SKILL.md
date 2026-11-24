@@ -105,7 +105,7 @@ Seeds come in three kinds, told apart by their normalized URL:
   (`sitemap.xml`, a markdown variant such as `sitemap.md` when the site serves one, or the
   location robots.txt declares). An origin seed where **neither rung resolves → stop loudly**:
   rung 3 (in-page link extraction) is deliberately absent. Its design is a **user-reserved**
-  decision, a presence-gated `/firecrawl:firecrawl map` seam with a documented in-skill fallback,
+  decision, a presence-gated `/firecrawl:firecrawl map` (if enabled) seam with a documented in-skill fallback,
   versus a recorded reason this skill reimplements in-page extraction (a bare unguarded
   cross-plugin reference is barred, and `dependencies` are reserved for hard requires). This stop
   is that decision's trigger: report it and ask, never crawl unasked. Full deferred-with-trigger
@@ -214,7 +214,7 @@ resources get digests); the parent's invariant governs each downstream run untou
    checklist takes its `verification` from the workflow result's page entry, which never says
    `verified`. An entry the workflow result lists under `deferred` or `rejected` was not run: write
    that entry's `verification` value, `unverified: not run: <reason>`, with that list's reason.
-5. Hand `mapper-handoff.md` to `/planning:interview`, invoked via the Skill tool, when enabled;
+5. Hand `mapper-handoff.md` to `/planning:interview` (if enabled), invoked via the Skill tool;
    otherwise present and stop.
 
 Emit a continuation prompt when pausing mid-pipeline (slug, first unticked phase, work root).
@@ -231,6 +231,17 @@ Emit a continuation prompt when pausing mid-pipeline (slug, first unticked phase
   is classified `companion` for the interview, never dispatched to sibling pipelines
   (cross-type routing and a shared ingest-slice contract are deferred:
   `${CLAUDE_PLUGIN_ROOT}/reference/ingest-deferred-decisions.md` §4–§5).
+
+## Next
+
+- Digest queued in-corpus pages: /knowledge:docpage-digest.
+- Walk mapper-handoff.md decisions after digests finish: /planning:interview.
+
+## Related
+
+- Single page or resource-seed-only list: /knowledge:docpage-digest.
+- Single public video: /knowledge:video-digest.
+- Auth-walled online course: /knowledge:course-digest.
 
 ## Gotchas
 

@@ -10,14 +10,11 @@ It posts only after the verifier passed for the PR's current head and only when 
 comment body finds nothing. Every refusal below posts nothing and names its reason in the report.
 
 Text and logs are the record; a capture shows what the text states and never stands in for it. A
-reader who opens no image, or a comment whose media did not upload, still has every result. For
-regulated teams this matches the preference for system logs and audit trails over screenshots in
-FDA's guidance "Computer Software Assurance for Production and Quality Management System Software",
-section (6) "Establishing the Appropriate Record"; the guidance is an analogy for such teams here,
-not a requirement this step meets.
+reader who opens no image, or a comment whose media did not upload, still has every result.
 
-Screenshots and recordings of a regulated product show synthetic data only, never real records:
-no step here checks a capture's image content for real records.
+Screenshots and recordings show synthetic data only, never real records.
+Step 5 reads each attached capture's text with OCR and leak-scans it, but OCR misses text on
+screens, so that scan is a backstop behind this rule and never shows a capture holds no real record.
 
 ## Contents
 
@@ -31,7 +28,7 @@ no step here checks a capture's image content for real records.
 |---|---|
 | `<pr>` | The pull request number. Resolve it once and pass it to every call below |
 | `--evidence <file>` | The `e2e-summary.json` an unattended `/testing:run-e2e` run wrote, or the `report.json` of one `/app-control:drive` run. Its `publishable` list names the only files this step may attach. Paths in it resolve against the file's own directory |
-| `--before <file>` | Optional: an evidence file of the same kind from a run on the PR's base commit. Its captures are the Before row of the small-change table. Its `publishable` list governs its captures as `--evidence`'s governs the head's, its paths resolving against the `--before` file's own directory, which must differ from the `--evidence` file's |
+| `--before <file>` | Optional, when the change has a driven UI or CLI: an evidence file of the same kind from a run on the PR's base commit. Two runs produce one: an `/app-control:drive` run on a worktree checked out at the PR's base commit, or the reproduction run's drive report from `/debugging:debug` (if enabled) when that run's recorded commit is the base commit; a report from any other commit is not a `--before` file. With none, the comment still leads with the text result. Its captures are the Before row of the small-change table. Its `publishable` list governs its captures as `--evidence`'s governs the head's, its paths resolving against the `--before` file's own directory, which must differ from the `--evidence` file's |
 | `--attach <path>` | Optional, repeatable: the captures to attach. Without it, every image and video in the `publishable` lists is attached |
 | `--summary <file>` | Optional: the run's text summary. Without it, the summary is the `entry_points` lines and the `capture` status of `e2e-summary.json`, or each step's `action`, `entry_point` and `outcome` from `report.json`, never its `observed` text, `command` or `process` |
 | `--verified-by <name>` | Optional: who ran the verification, for the record block (step 4). Without it, `not recorded` |
@@ -61,8 +58,8 @@ the PR body or the rows lands in the comment, so step 5 scans it with the rest o
      bash "<skill-dir>/scripts/read-evidence-layout.sh" --base "<base>" --default-branch "<default>" --http-response
    ```
 
-   It prints `evidence_inline_max_captures` and `evidence_record_fields`, each with the level that
-   supplied it; report both lines. A failed read leaves the defaults, so it never stops the step.
+   It prints `evidence_inline_max_captures`, `evidence_record_fields` and
+   `evidence_ocr_mpdecimate_hi`, each with the level that supplied it; report all three lines. A failed read leaves the defaults, so it never stops the step.
    Then run
    `bash "<skill-dir>/scripts/confirm-verdict.sh" show --head <head> --dir "<checkout>"`. Go on only when it prints
    `confirm: CONFIRMED for head <head>`. Any other line, a `NEEDS WORK` verdict included, posts
@@ -106,10 +103,7 @@ the PR body or the rows lands in the comment, so step 5 scans it with the rest o
      run did not pass, with `resolution not recorded`, or `none found in this run` when every one
      passed. In every table cell and column header, this block's and the capture table's alike,
      escape a `|` as `\|` and turn each line break into `<br>`. A missing value never stops the
-     step. The three
-     fields follow the record elements a regulated team keeps for an assurance activity (who ran
-     it, when, the issues it found and their resolution) in the FDA guidance's section (6) linked
-     above;
+     step;
    - **Layout.** The change is small when it has at most two sections (acceptance criteria, else
      entry point lines), its captures to attach, Before and After counted together, number at
      least one and at most `evidence_inline_max_captures` (default 4: one Before and one After for
@@ -187,6 +181,32 @@ the PR body or the rows lands in the comment, so step 5 scans it with the rest o
    the credential pattern), never the matched text. A `values:` source that fails or yields no
    value, or a scan that cannot run, posts nothing either. With `--before`, its file names a hub
    the same way, and the scan uses the values of both hubs when they differ.
+
+   Then scan the pixels of every capture to attach, the images and the videos steps 2 and 3 kept,
+   with the same scan. Pass the mask values on stdin through a quoted heredoc, one per line, so
+   the shell expands nothing in them. Quoting stops expansion but not termination: a value that
+   is the delimiter line would end the heredoc early, and the shell would run every later value
+   as a command. So pick a fresh delimiter for each run, `MASK_` and 16 random hex digits, and
+   check it against every value before writing the command; pick again when any value equals it:
+
+   ```bash
+   python3 "<skill-dir>/scripts/evidence-ocr.py" --mask-stdin \
+     --mpdecimate-hi <step 1's evidence_ocr_mpdecimate_hi> "<capture>"... <<'MASK_<random hex>'
+   <mask value>
+   MASK_<random hex>
+   ```
+
+   With no mask value, drop `--mask-stdin` and the heredoc; with no capture to attach, skip this
+   scan. The script reads each image, and each video frame ffmpeg's `mpdecimate` keeps, with
+   tesseract on this machine, upscaled and inverted as well. It scans each reading for the
+   credential pattern and for the mask values. It applies the pattern to each line as read, and
+   allows the spaces OCR puts around `=` and `:`, or a line break between a key and its value,
+   only when the value holds a digit: tesseract's sparse mode puts each block of screen text on
+   its own line, so a label such as `Password:` beside a plain word is not a secret.
+   It needs tesseract and an ffmpeg that has `-fps_mode`. Report the line it prints, which states
+   the images read and the seconds taken. Any non-zero exit posts nothing and the report names its
+   refusal: 1 ffmpeg or tesseract failed, 2 a usage error, 5 a hit, 6 a capture OCR read no text
+   from, 7 tesseract or ffmpeg not installed. Never leave the capture out to post the rest.
 6. **One comment per identity.** `gh pr comment --edit-last` edits the last comment of the
    account `gh` is logged in as, so that account must post nothing else on the PR. Read the login
    (`gh api user --jq .login`), then its comments on the PR in order, in step 1's repository
@@ -234,7 +254,7 @@ the PR body or the rows lands in the comment, so step 5 scans it with the rest o
 ## Report
 
 The comment URL and whether it was created, edited or reposted; the head it names; the layout
-(table or collapsed sections) and the two settings lines step 1 printed; each capture attached;
+(table or collapsed sections) and the three settings lines step 1 printed; the OCR scan's line; each capture attached;
 each one left out and why; the artifact line; or the refusal, with the step that refused.
 
 - **Pointer:** the [`gh pr comment` manual](https://cli.github.com/manual/gh_pr_comment) for

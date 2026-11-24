@@ -8,10 +8,13 @@ import { pathToFileURL } from "node:url";
 
 import {
   createGitHub,
+  paginate,
+} from "../../scripts/lib/github-client.mjs";
+import {
   isListed,
   loadTrustedActors,
-  paginate,
 } from "../check-trusted-trigger/check-trusted-trigger.mjs";
+import { trustedListPath } from "../../scripts/lib/trusted-actors.mjs";
 
 const PR_NUMBER = /^[1-9][0-9]{0,9}$/;
 const REPOSITORY = /^[A-Za-z0-9-]+\/(?!\.\.?$)[A-Za-z0-9_.-]+$/;
@@ -38,8 +41,6 @@ const prQuery = (...fields) => `query($owner: String!, $name: String!, $number: 
 }`;
 const CLOSING_ISSUES = prQuery(CLOSING_FIELD);
 const TITLE_RENAMES = prQuery(RENAMES_FIELD);
-// Both connections' first pages in one request; later pages of each are read
-// through its own query above.
 const CLOSING_AND_RENAMES = prQuery(CLOSING_FIELD, RENAMES_FIELD);
 const MAX_GRAPHQL_PAGES = 50;
 
@@ -159,13 +160,9 @@ export async function buildTrustedContext({ github, repository, prNumber, ids })
   await keep("review", await paginate(github, `${base}/pulls/${prNumber}/reviews`));
   await keep("review-comment", await paginate(github, `${base}/pulls/${prNumber}/comments`));
 
-  // A trusted PR's title may be kept, so its renames' first page comes in the
-  // closing issues' request; it is checked only when the title is weighed.
   const firstPages = await prPage(github, prTrusted ? CLOSING_AND_RENAMES : CLOSING_ISSUES, repository, prNumber, null);
   const references = await prConnection(github, CLOSING_ISSUES, "closingIssuesReferences", repository, prNumber, firstPages);
   for (const reference of references) {
-    // Only issues in the PR's own repository: an issue elsewhere sits under
-    // another repository's permissions and authors.
     if (reference?.repository?.nameWithOwner !== repository) {
       dropped["linked-issue"] += 1;
       continue;
@@ -178,8 +175,6 @@ export async function buildTrustedContext({ github, repository, prNumber, ids })
     await keep("linked-issue-comment", await paginate(github, `${issuePath}/comments`));
   }
 
-  // Text counts as written by its last editor too: keep an edited item only
-  // when that editor is listed.
   const editedByListed = await readEditors(github, ids, [
     ...(prTrusted ? [pull.node_id] : []),
     ...items.map((item) => item.nodeId),
@@ -308,7 +303,7 @@ export async function main({ env = process.env, github, log = console.log } = {}
     if (!PR_NUMBER.test(env.PR_NUMBER ?? "") || !REPOSITORY.test(env.REPOSITORY ?? "")) {
       throw new Error("pr-number or repository is malformed");
     }
-    const ids = loadTrustedActors(env.TRUSTED_ACTORS_PATH);
+    const ids = loadTrustedActors(trustedListPath(env, env.TRUSTED_ACTORS_PATH));
     const context = await buildTrustedContext({
       github: github ?? createGitHub({ token: env.GITHUB_TOKEN, apiUrl: env.GITHUB_API_URL }),
       repository: env.REPOSITORY,

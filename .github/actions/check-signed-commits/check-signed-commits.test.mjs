@@ -1,3 +1,4 @@
+// test-scope: .github/workflows/*.yml
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -5,7 +6,7 @@ import { afterEach, beforeEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { readOutputs } from "../check-kill-switch/fixtures/read-outputs.mjs";
-import { GitHubError } from "../check-trusted-trigger/check-trusted-trigger.mjs";
+import { GitHubError } from "../../scripts/lib/github-client.mjs";
 import { main, SIGNED_COMMITS_HOLD } from "./check-signed-commits.mjs";
 import { tempDir } from "../../../lib/test-tmp.mjs";
 
@@ -102,8 +103,6 @@ test("an unverified commit after the recorded head is reported and escalated", a
   ]);
 });
 
-// gate-source.mjs reads this first line as a hold for the lane fixers and
-// clear-escalations.
 test("the escalation comment opens with the hold marker, unverified or could not verify", async () => {
   assert.equal(SIGNED_COMMITS_HOLD, "<!-- check-signed-commits hold -->");
   const unverified = await check();
@@ -301,8 +300,6 @@ test("a refused label write on commits found unverified still exits non-zero", a
   assert.ok(lines.some((line) => /^::error::.*escalation failed.*status 403/.test(line)));
 });
 
-// Commits that could not be verified, as when the PR's head never matches its
-// branch, with none found unverified.
 function unverifiable() {
   const api = load();
   api.headRef.object.sha = "f".repeat(40);
@@ -404,12 +401,6 @@ test("a truncated comparison falls back to every PR commit", async () => {
   assert.equal(outputs.unverified, `${A} ${D}`);
 });
 
-// Each top-level job of a workflow file with its job-level permissions map,
-// whether it runs claude-code-action or this check, and the reusable workflow
-// it calls, if any. Reads the block layout these files use
-// (two-space job keys, a four-space `permissions:` key, six-space entries) and
-// throws on any line inside a permissions map it cannot read, so a new layout
-// fails the test instead of passing it unread.
 function workflowJobs(name) {
   const lines = readFileSync(path.join(HERE, "../../workflows", name), "utf8").split("\n");
   const jobs = new Map();
@@ -469,7 +460,6 @@ function workflowJobs(name) {
   return jobs;
 }
 
-// The write runner runs no model.
 test("pr-run-activity-write.yml: no job runs claude-code-action or run-claude-cli", () => {
   assert.deepEqual([...workflowJobs("pr-run-activity-write.yml")].filter(([, job]) => job.model).map(([name]) => name), []);
 });
@@ -492,8 +482,6 @@ for (const file of ["pr-run-activity-read.yml"]) {
   });
 }
 
-// The escalation adds a label and a comment with the report job's GITHUB_TOKEN,
-// which needs issues: write (README, "Job contract").
 for (const file of ["pr-run-activity-write.yml", "pr-run-activity-read.yml"]) {
   test(`${file}: the job that runs this check holds issues: write`, () => {
     const signed = [...workflowJobs(file)].filter(([, job]) => job.signed);
@@ -524,10 +512,6 @@ test("every job calling a runner that runs this check grants issues: write", () 
   assert.ok(callers.length > 0, "no job calls either runner");
 });
 
-// The read runner's report job runs this check only on a gated head: with no
-// head the run job gated nothing, so there is no lane commit to check. The
-// write runner keeps no such gate, since an empty recorded head there checks
-// every PR commit.
 test("pr-run-activity-read.yml runs this check only when a head was gated", () => {
   const text = readFileSync(path.join(HERE, "../../workflows/pr-run-activity-read.yml"), "utf8");
   const step = /- name: Check the lane's commits are signed\n([\s\S]*?)\n\s+uses:/.exec(text);

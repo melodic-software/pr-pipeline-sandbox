@@ -18,7 +18,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
-import { createGitHub, detailSuffix } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
+import { createGitHub, detailSuffix } from "../lib/github-client.mjs";
 import { KEPT_JOBS, keptJobsPath, shapeJobs } from "./resolve-pr.mjs";
 
 export { KEPT_JOBS, keptJobsPath, shapeJobs };
@@ -42,7 +42,6 @@ export function keptJobs(env, runId) {
     kept?.run_id === Number(runId) &&
     Array.isArray(kept.jobs) &&
     kept.jobs.every((job) => typeof job?.name === "string" && [job.conclusion, job.url].every((value) => value === null || typeof value === "string"));
-  // shapeJobs reads html_url, which the kept file names url.
   return valid ? shapeJobs(runId, kept.jobs.map((job) => ({ ...job, html_url: job.url }))) : null;
 }
 

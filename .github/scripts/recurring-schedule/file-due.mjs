@@ -20,9 +20,6 @@ import { budgetedClient } from "../lib/github-rest.mjs";
 
 export const RECURRING = "recurring";
 
-// A line of its own (issue-conventions.md "Recurring marker"). The shared
-// definition is .github/scripts/intake-triage/admit.mjs SCHEDULE_MARKER, which
-// does not export it; keep this copy identical.
 export const SCHEDULE_MARKER = /^<!-- recurring-schedule id=(\S+) -->\r?$/gm;
 export const scheduleIds = (body) => [...new Set([...String(body ?? "").matchAll(SCHEDULE_MARKER)].map((m) => m[1]))];
 
@@ -45,7 +42,6 @@ export function issueBody(row) {
   ].join("\n");
 }
 
-// Why a row cannot be filed, or null.
 function rowProblem(row) {
   if (!ID.test(String(row?.id ?? ""))) return "id is not a marker id";
   if (typeof row.title !== "string" || row.title === "") return "no title";

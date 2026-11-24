@@ -231,7 +231,7 @@ failed model or field read, or a value the model has no option for, makes the se
 
 | Section | Source | Notes |
 |---|---|---|
-| Queues | `gh issue list --label <queue>` counts, or with a Work status model the open-issue read ("Work status") | Defaults to the plugin's queue labels ([label taxonomy](../../reference/label-taxonomy.md)); live runs filter to labels that exist in the repo (pass `--queue-labels` to pin a custom set) |
+| Queues | `gh issue list --label <queue>` counts, or with a Work status model the open-issue read ("Work status") | Defaults to the plugin's queue labels ([label taxonomy](../../reference/label-taxonomy.md)); live runs filter to labels that exist in the repo (pass `--queue-labels` to pin a custom set). A live count leaves out a parent issue with sub-issues not yet completed, since its children carry its work, and the row shows it as `(+N with open sub-issues)` |
 | Stuck | one paged `gh api graphql` search per shown queue label (`is:open label:"<label>"`), with each result's `LABELED_EVENT` timeline items | Open issues **and** PRs (each line says `issue` or `PR`) whose newest labeled event for that label is older than `--stuck-days` (default 7), oldest first across all labels, one line each: number, title, label, days in stage. Lines are capped at `--stuck-limit` (default 20); past it the section says `PARTIAL`, and so it does for a search that reached GitHub's result cap. An item with no labeled event for the label among its last 100 timeline events is listed as `days unknown` after the dated ones, never dropped. The labels are the ones the Queues section shows. Read-only: it lists, it never moves or relabels an item |
 | Merge-ready PRs | `gh pr list` filtered to non-draft + `mergeStateStatus=CLEAN` (REST: `pulls` list plus one read per PR for `mergeable_state`) | A light glance signal; `reviewDecision` shown but not required (repos without required review leave it empty; the REST path reports `n/a`). One compare read per clean PR, capped at `--pr-limit`; `UNVERIFIED` marks a head behind its base, a comparison that could not be read, or a PR past the cap |
 | Parked decisions | open issues with the decision label (the tracker binding's `owner-decision` role label, default `needs-owner-decision`), as the Work status decides it | Surfaces each one's RECOMMENDED line, the uppercase marker wins over an incidental lowercase mention; a case-insensitive fallback catches lowercase markers; pass `--decision-label` to pin |
@@ -422,13 +422,15 @@ pin a custom comma-separated set; pass `--decision-label` to pin the parked-deci
 label. When none of the configured queue labels exist, the Queues section reports
 "no queue labels found" and the rest of the brief still renders.
 
-## Cross-references
+## Next
 
-- `/source-control:babysit-prs`, the **authoritative** PR merge gate and readiness
-  classification. The merge-ready list here is a fast gh-native glance, not a
-  substitute for that skill's per-PR gate.
-- `/harness-ops:observability`. Reads locally captured telemetry (OTEL store, hook-event JSONL,
-  ccusage). This skill instead reads GitHub-side queue and PR state.
+- Escalations, held PRs, or parked decisions surfaced: /work-items:attend-queue.
+- Merge-ready PRs needing authoritative gate check: /source-control:babysit-prs.
+
+## Related
+
+- Inspect local OTEL and hook telemetry stores: /harness-ops:observability.
+- Team DORA delivery trends: /work-items:measure-delivery.
 
 ## What this skill does not do
 
@@ -436,6 +438,6 @@ label. When none of the configured queue labels exist, the Queues section report
   budget, plan, policy or Azure setting change.
 - **Does not run in CI**. The Cost section reads with the operator's own `gh` and `az` logins;
   a runner would need credentials this skill never asks for.
-- **Does not classify PR merge-readiness authoritatively**. Invoke `/source-control:babysit-prs`
+- **Does not classify PR merge-readiness authoritatively**. Invoke `/source-control:babysit-prs` (if enabled)
   via the Skill tool.
-- **Does not read local telemetry stores**. Invoke `/harness-ops:observability` via the Skill tool.
+- **Does not read local telemetry stores**. Invoke `/harness-ops:observability` (if enabled) via the Skill tool.

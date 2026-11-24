@@ -1,6 +1,3 @@
-// clear-escalations.mjs and enable-auto-merge.mjs read a review lane's hold
-// from the issue timeline: a hold comment counts only when its lane's run
-// recorded it (lib/lane-binding.mjs), a legacy one while the cutoff is unset.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -19,7 +16,6 @@ const LEGACY = `${HOLD}\n\nclaude-lane: claude-review`;
 const AT = "2026-11-11T10:00:00Z";
 const comment = (id, body) => ({ event: "commented", id, user: ACTIONS, body, created_at: AT, updated_at: AT });
 const runs = () => ({ [RUN]: { path: CODE, artifacts: [{ name: "claude-lane-comments-claude-review-1", entries: [recordEntry(GENUINE, { kind: "issue_comment", id: 21 })] }] } });
-// A check-trusted-trigger client serving one timeline page.
 const github = (timeline) => async (_method, path) => {
   if (path.includes("/timeline")) {
     return timeline;

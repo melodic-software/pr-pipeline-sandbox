@@ -42,7 +42,7 @@ COUNTED_TRUST=""
 readonly FIELD_VALUE_PAGE=25
 readonly FIELD_EVENT_WINDOW=100
 # The job token's bot, the one bot-setters entry the trust list need not hold.
-readonly ACTIONS_BOT_ID=41898282 ACTIONS_BOT_LOGIN="github-actions[bot]"
+readonly ACTIONS_BOT_ID=41898282 ACTIONS_BOT_LOGIN="github-actions[bot]" STATUS_LANES_APP="melodic-automation-lanes[bot]"
 
 TRUST_TMP=""
 [[ -z "$COUNTED_TRUST" ]] || {
@@ -67,6 +67,19 @@ fetch_repo_file() {
   fi
 }
 
+fetch_standards_file() {
+  local errfile="$TRUST_TMP/err" sha
+  if [[ ! -s "$TRUST_TMP/standards.sha" ]]; then
+    if ! gh api "repos/$1/git/ref/heads/main" --jq .object.sha >"$TRUST_TMP/standards.sha" 2>"$errfile"; then
+      trust_fail "$(wit_map_gh_error "$(<"$errfile")")" "status_trust: $1 main unread: $(head -n 1 "$errfile")"
+    fi
+  fi
+  sha="$(<"$TRUST_TMP/standards.sha")"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || trust_fail "$EX_CONFIG" "status_trust: $1 main is not a commit"
+  [[ -s "$TRUST_TMP/standards.json" ]] || fetch_repo_file "$1" "$2?ref=$sha" "$TRUST_TMP/standards.json"
+  cp "$TRUST_TMP/standards.json" "$3"
+}
+
 # trust_context <repo>: set CONTEXT to {field, states, ready, people, bots} from <repo>'s
 # trust list and model: field the Work status field id, states the mapped option names, ready
 # the one state a bot-setters value never counts for (the model's ready-state, else
@@ -78,7 +91,12 @@ trust_context() {
   actors_path="$(jq -r '.trusted_actors' <<<"$WIT_GH_STATUS_TRUST")"
   model_path="$(jq -r '.model' <<<"$WIT_GH_STATUS_TRUST")"
   lanes="$(jq -r '.lanes_app' <<<"$WIT_GH_STATUS_TRUST")"
-  fetch_repo_file "$repo" "$actors_path" "$TRUST_TMP/actors.json"
+  if [[ "$actors_path" == standards:* ]]; then
+    actors_path="${actors_path#standards:}"
+    fetch_standards_file "${actors_path%%:*}" "${actors_path#*:}" "$TRUST_TMP/actors.json"
+  else
+    fetch_repo_file "$repo" "$actors_path" "$TRUST_TMP/actors.json"
+  fi
   fetch_repo_file "$repo" "$model_path" "$TRUST_TMP/model.yaml"
   actors="$(jq -ce '(if (.actors | type) == "array" then .actors else [] end) as $a
     | select(.version == 1 and all($a[]; type == "object" and (.id | type) == "number"
@@ -88,7 +106,7 @@ trust_context() {
     trust_fail "$EX_CONFIG" "status_trust: $model_path on $repo does not parse: $(tail -n 1 <<<"$records")"
   # shellcheck disable=SC2154  # WIT_DEFAULT_READY_STATE: lib/labels.sh, sourced through common.sh
   CONTEXT="$(jq -R -n -c --argjson actors "$actors" --arg lanes "$lanes" \
-    --argjson bot_id "$ACTIONS_BOT_ID" --arg bot_login "$ACTIONS_BOT_LOGIN" \
+    --argjson bot_id "$ACTIONS_BOT_ID" --arg bot_login "$ACTIONS_BOT_LOGIN" --arg lanes_bot "$STATUS_LANES_APP" \
     --arg default_ready "$WIT_DEFAULT_READY_STATE" '
     def ident: test("^[1-9][0-9]*$");
     [inputs | select(startswith("models.issue-status.")) | split("\t")
@@ -97,6 +115,7 @@ trust_context() {
     | ([$rows[] | select(.key == "ready-state") | .value] | first // "") as $ready_set
     | (if $ready_set == "" then $default_ready else $ready_set end) as $ready
     | [$rows[] | select(.key | startswith("options.")) | {id: (.key | ltrimstr("options.")), state: .value}] as $options
+    | any($rows[]; .key == "bot-setters" or (.key | startswith("bot-setters."))) as $explicit
     | [$rows[] | select(.key | startswith("bot-setters.")) | .key |= ltrimstr("bot-setters.")] as $setter_rows
     | (($setter_rows | length) / 2 | floor) as $count
     | [range($count) as $i | {id: ($setter_rows[] | select(.key == "\($i).id") | .value),
@@ -116,9 +135,11 @@ trust_context() {
         states: ($options | map(.state)),
         ready: $ready,
         people: [$actors[] | select(.kind == "human" or .login == $lanes) | .id],
-        bots: [$setters[] | (.id | tonumber) as $id | .login as $login
-          | select(($id == $bot_id and $login == $bot_login)
-              or any($actors[]; .kind == "bot" and .id == $id and .login == $login)) | $id]
+        bots: (if $explicit then [$setters[] | (.id | tonumber) as $id | .login as $login
+            | select(($id == $bot_id and $login == $bot_login)
+                or any($actors[]; .kind == "bot" and .id == $id and .login == $login)) | $id]
+          else [$bot_id] + [$actors[] | select(.kind == "bot" and (.login | type) == "string"
+            and (.login | startswith("melodic-")) and .login != $lanes_bot) | .id] end)
       } end' <<<"$records")" ||
     trust_fail "$EX_INTERNAL" "status_trust: $model_path on $repo could not be read"
   if jq -e 'has("error")' <<<"$CONTEXT" >/dev/null; then

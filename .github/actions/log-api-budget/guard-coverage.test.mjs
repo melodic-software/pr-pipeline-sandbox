@@ -1,4 +1,4 @@
-// test-scope: .github/*.mjs .github/*.cjs
+// test-scope: .github/*.mjs
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -57,10 +57,13 @@ const UNGUARDED = {
   ".github/scripts/pr-unblock/dependency-classify.mjs": { reason: "package registries, not the API", found: [CALL] },
   ".github/scripts/maintenance-reconcile-lost-runs/component-status.mjs": { reason: "the status pages, not the API", found: [CALL] },
   ".github/scripts/maintenance-monitor-signals/monitor.mjs": { reason: "githubstatus.com reads; its API calls go through lib/github-rest.mjs", found: [CALL] },
-  ".github/scripts/lib/ci-workflows-at-pin.mjs": { reason: "raw.githubusercontent.com reads from tests; no API call", found: [CALL] },
   ".github/actions/check-kill-switch/check-kill-switch.mjs": {
     reason: "reads only /rate_limit, which no pool counts (https://docs.github.com/en/rest/rate-limit/rate-limit), to decide the start gate",
     found: ["fetchImpl defaults to the global fetch", "fetchImpl defaults to the global fetch"],
+  },
+  ".github/scripts/maintenance-reconcile-lost-runs/reset-tick.mjs": {
+    reason: "reads only /rate_limit, which no pool counts (https://docs.github.com/en/rest/rate-limit/rate-limit), to pick the tick after the reset",
+    found: ["fetchImpl defaults to the global fetch"],
   },
   ".github/scripts/apply-patch/apply-patch.mjs": { reason: "its main runs from a directory copy after the head checkout replaced .base", found: ["globalThis.fetch"] },
   ".github/scripts/pr-unblock/address-feedback.mjs": {
@@ -80,7 +83,7 @@ const UNGUARDED = {
 
 test("every lane script that reaches GitHub gets its fetch from the rate guard, or is listed with its reason and exactly its raw fetches", () => {
   const root = new URL("../../../", import.meta.url).pathname;
-  const files = spawnSync("git", ["-C", root, "ls-files", ".github/*.mjs", ".github/*.js", ".github/*.cjs"], { encoding: "utf8" })
+  const files = spawnSync("git", ["-C", root, "ls-files", ".github/*.mjs", ".github/*.js"], { encoding: "utf8" })
     .stdout.split("\n")
     .filter((file) => file && !/\.test\.[cm]?js$/.test(file) && !file.includes("/node_modules/") && !file.includes("/fixtures/") && !file.includes("/probe/"));
   const raw = Object.fromEntries(

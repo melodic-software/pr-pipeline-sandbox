@@ -1,8 +1,3 @@
-// The one GitHub API rate guard. createGitHub and retryServerErrors
-// (check-trusted-trigger.mjs) send every attempt through a latch, so
-// budgetedFetch (request-budget.mjs) and every createGitHub caller share it;
-// api-budget.bash's gh wrapper is its shell twin.
-//
 // GitHub: "Continuing to make requests while you are rate limited may result
 // in the banning of your integration"
 // (https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#exceeding-the-rate-limit).
@@ -16,9 +11,9 @@
 // (API_BUDGET_HOLD=1, outage posture element 2), a notice names it and the
 // exit is the caller's. The stop also goes in the
 // job's stop file, so later steps, the gh wrapper's included, keep it. A response under the pool's
-// read-floor share of its planned budget left (planOf) logs a warning once;
+// read-floor share of the header's limit left logs a warning once;
 // belowFloor lets a caller skip a read it can do without. The stop reads only
-// the header's remaining and limit and GitHub's refusals, never the plan: a
+// the header's remaining and limit and GitHub's refusals: a
 // remaining at or under the pool's stop-floor share of the header's limit
 // stops the pool until its reset, as a remaining of 0 does.
 //
@@ -109,35 +104,24 @@ export const API_POOLS = Object.freeze(["github-token", "lanes-app", "graphql", 
 
 const DEFAULTS = new URL("./rate-limits.json", import.meta.url);
 
-// The values rate-limits.json ships, which the guard plans to when that file
-// cannot be read, so a checkout that misses it still keeps every floor
-// (rate-guard.test.mjs holds the two equal).
 const SHARES = { plan: 0.7, "writer-pause": 0.4, breaker: 0.2, "read-floor": 0.1, "stop-floor": 0.02 };
 export const BUILT_IN_LIMITS = Object.freeze({
-  "github-token": { ...SHARES, "limit-cap": 1000, pace: 0.2, "pace-pr-merge": 0.3, "start-gate": 0.1, "start-project": 0.3, "start-run-minutes": 21, "defer-project": 0.3, "defer-run-minutes": 15, "defer-run-minutes-pr-merge": 6 },
+  "github-token": { ...SHARES, pace: 0.2, "pace-pr-merge": 0.3, "start-gate": 0.1, "start-project": 0.3, "start-run-minutes": 21, "defer-project": 0.3, "defer-run-minutes": 15, "defer-run-minutes-pr-merge": 6, "defer-run-minutes-review": 11 },
   "lanes-app": SHARES,
   graphql: SHARES,
   "owner-token": SHARES,
   "content-creation": { ...SHARES, "per-minute": 80, "per-hour": 500 },
 });
 
-// Each field's check: the shares, then the counts. per-minute and per-hour
-// belong to content-creation alone.
 const SHARE = (value) => typeof value === "number" && value >= 0 && value <= 1;
 const COUNT = (value) => Number.isInteger(value) && value >= 1;
-// pace, optional, is pace.mjs's share for timer-driven lanes; stop-floor,
-// optional, the share of the header's limit left at which the latch stops;
-// start-gate, optional, check-kill-switch's share under which a lane does not
-// start, which that gate reads from rate-limits.json alone.
-const FIELDS = { plan: (value) => SHARE(value) && value > 0, "writer-pause": SHARE, breaker: SHARE, "read-floor": SHARE, "stop-floor": SHARE, "limit-cap": COUNT, pace: SHARE, "pace-pr-merge": SHARE, "start-gate": SHARE, "start-project": SHARE, "start-run-minutes": COUNT, "defer-project": SHARE, "defer-run-minutes": COUNT, "defer-run-minutes-pr-merge": COUNT };
+const FIELDS = { plan: (value) => SHARE(value) && value > 0, "writer-pause": SHARE, breaker: SHARE, "read-floor": SHARE, "stop-floor": SHARE, pace: SHARE, "pace-pr-merge": SHARE, "start-gate": SHARE, "start-project": SHARE, "start-run-minutes": COUNT, "defer-project": SHARE, "defer-run-minutes": COUNT, "defer-run-minutes-pr-merge": COUNT, "defer-run-minutes-review": COUNT };
 const CONTENT_FIELDS = { ...FIELDS, "per-minute": COUNT, "per-hour": COUNT };
 // Fields rate-limits.json holds that pr-pipeline.yaml's limits.api cannot set
 // (its schema rejects them): their one reader takes the file's value alone.
 export const FILE_ONLY_FIELDS = Object.freeze(["pace-pr-merge", "start-gate", "start-project", "start-run-minutes"]);
 const REQUIRED = ["plan", "writer-pause", "breaker", "read-floor"];
 
-// rate-limits.json, checked: every pool in API_POOLS and no other, each with
-// the four shares, and every field in its range. Throws on anything else.
 function readDefaults(path) {
   const defaults = JSON.parse(readFileSync(path, "utf8"));
   const pools = Object.keys(defaults ?? {});
@@ -312,7 +296,6 @@ export function recordReading({ token = process.env.API_BUDGET_TOKEN, dir = proc
     appendFileSync(join(dir, "api-budget", token), line);
     scriptCalls.count(token, line);
   } catch {
-    // A reading is never worth failing the job.
   }
 }
 
@@ -333,7 +316,6 @@ export function recordFailure({ method, url, status, dir = process.env.RUNNER_TE
     mkdirSync(join(dir, "lane-run-report"), { recursive: true });
     appendFileSync(join(dir, "lane-run-report", "api-failures.jsonl"), `${JSON.stringify({ method: String(method ?? "GET").toUpperCase(), path, status })}\n`);
   } catch {
-    // A report row is never worth failing the job.
   }
 }
 
@@ -371,15 +353,10 @@ if (/^[a-z][a-z0-9-]{0,39}$/.test(SCRIPT)) {
     try {
       writeSync(1, scriptCalls.line(SCRIPT));
     } catch {
-      // A count is never worth failing the job.
     }
   });
 }
 
-// The bucket a request's reading goes under: token when the client pins one;
-// else API_BUDGET_OVERRIDE_TOKEN for a request whose bearer is not the
-// step's own token (GH_TOKEN, else GITHUB_TOKEN), as babysit_gh.py buckets a
-// call carrying its own GH_TOKEN; else API_BUDGET_TOKEN.
 const bearerOf = (headers) => {
   const value = typeof headers?.get === "function" ? headers.get("authorization") : Object.entries(headers ?? {}).find(([name]) => name.toLowerCase() === "authorization")?.[1];
   return String(value ?? "").replace(/^(bearer|token)\s+/i, "");
@@ -426,11 +403,9 @@ export function recordContentWrite({ dir = process.env.RUNNER_TEMP, at }) {
     mkdirSync(join(dir, "api-budget"), { recursive: true });
     appendFileSync(join(dir, "api-budget", "content-creation"), `${at}\n`);
   } catch {
-    // A count is never worth failing the job.
   }
 }
 
-// A name-to-value reader over a Headers or a plain object of lower-case names.
 const headerReader = (headers) => (typeof headers?.get === "function" ? (name) => headers.get(name) : (name) => headers?.[name]);
 
 const intHeader = (get, name) => {
@@ -438,23 +413,6 @@ const intHeader = (get, name) => {
   return /^\d{1,12}$/.test(value) ? Number(value) : null;
 };
 
-// The budget a pool plans to: the header's limit, at most limitCap (null for
-// none). used is what the header says this window spent, and left what the
-// plan has after it, below zero once used passes the plan.
-export function planOf({ limit, remaining }, limitCap = null) {
-  const planned = limitCap === null ? limit : Math.min(limit, limitCap);
-  const used = limit - remaining;
-  return { planned, used, left: planned - used };
-}
-
-// One response's decision: latched (exhausted), the reset in epoch seconds
-// and where it came from, the pool to stop ("*" for every pool: a secondary
-// limit is not per resource), and low (under readFloor of the planned budget
-// left, planOf with limitCap). Only the header's remaining and GitHub's
-// refusals latch: a remaining of 0, or, with stopFloor, a remaining at or under
-// stopFloor of the header's limit whose header reset is still ahead.
-// headers is a Headers or a plain object of lower-case names; body is the
-// parsed body, or its text.
 const parseBody = (body) => {
   if (typeof body !== "string") {
     return body;
@@ -484,7 +442,7 @@ export function serverErrorHold({ status, headers, body }) {
   return !texts.some((text) => SIGNALS.message.test(text)) && !errors.some((error) => error?.type === SIGNALS.graphqlErrorType);
 }
 
-export function classify({ url, status, headers, body }, { now = Date.now(), readFloor = null, limitCap = null, stopFloor = null, floorGraceMs = 0 } = {}) {
+export function classify({ url, status, headers, body }, { now = Date.now(), readFloor = null, stopFloor = null, floorGraceMs = 0 } = {}) {
   const get = headerReader(headers);
   const graphqlPool = poolOf(url) === "graphql";
   const parsed = parseBody(body);
@@ -504,8 +462,7 @@ export function classify({ url, status, headers, body }, { now = Date.now(), rea
   const tooMany = status === 429;
   const floored = stopFloor !== null && limit > 0 && remaining !== null && reset !== null && reset * 1000 > now + floorGraceMs && remaining <= stopFloor * limit;
   const latched = remaining === 0 || floored || retryAfter !== null || message || graphql || tooMany;
-  const plan = limit > 0 && remaining !== null ? planOf({ limit, remaining }, limitCap) : null;
-  const low = readFloor !== null && plan !== null && plan.left < readFloor * plan.planned;
+  const low = readFloor !== null && limit > 0 && remaining !== null && remaining < readFloor * limit;
   if (!latched) {
     return { latched, low, reset_source: null, reset: null, pool: null };
   }
@@ -515,7 +472,6 @@ export function classify({ url, status, headers, body }, { now = Date.now(), rea
     (remaining === 0 || floored) && reset !== null ? [reset, "x-ratelimit-reset"] : null,
   ].filter(Boolean);
   const best = candidates.length ? candidates.reduce((top, next) => (next[0] > top[0] ? next : top)) : null;
-  // A header time already past would write a stop that lets the next call go.
   const [at, source] =
     best && best[0] > nowSeconds
       ? best
@@ -524,8 +480,6 @@ export function classify({ url, status, headers, body }, { now = Date.now(), rea
   // A secondary limit is not per resource, whatever remaining says.
   const every = retryAfter !== null || secondary || ((message || tooMany) && remaining !== 0);
   const pool = every ? "*" : /^[a-z_]+$/.test(resource) ? resource : poolOf(url);
-  // Stop-file readers take at most 12 digits, so a later stop is written at
-  // the largest they read.
   return { latched, low, reset_source: source, reset: Math.min(at, MAX_RESET), pool };
 }
 
@@ -560,8 +514,6 @@ export class RateLimitStop extends Error {
     );
     this.name = "RateLimitStop";
     this.status = 429;
-    // budgetedFetch's mark: a caller that defers its work on a rate limit
-    // defers on a refused call too.
     this.rateLimited = true;
     this.pool = pool;
     this.reset = reset;
@@ -652,9 +604,6 @@ function readCauses(path) {
     .map(([, pool, reset, cause]) => ({ pool, reset: Number(reset), cause }));
 }
 
-// The job's fallback file beside the stop file, which api-budget.bash writes
-// too: the `<pool> <reset epoch>` stops whose source is `fallback`, read by
-// STOP_LINE's rule; a missing or unreadable file holds none.
 function readFallbacks(path) {
   let text = "";
   try {
@@ -665,10 +614,6 @@ function readFallbacks(path) {
   return new Set(text.split("\n").slice(0, -1).filter((line) => STOP_LINE.test(line)));
 }
 
-// The 5xx when every stop of `pools` that ends at `at` has a cause line of its
-// own and each is a server error hold, else null: a stop with no cause line (a
-// stop an older writer left), or a rate limit among them, reads as a rate
-// limit, the safe reading.
 function serverHeld(causes, stops, pools, at) {
   const ending = at === null ? [] : [...new Set(pools)].filter((pool) => stops.get(pool) === at);
   let status = null;
@@ -703,10 +648,8 @@ export function createRateLimitLatch({
   const fallbacks = readFallbacks(fallbackFile);
   const low = new Map();
   const warned = new Set();
-  // The resets waited out, summed; the extra second only lands the call after one.
   let waited = 0;
   let config;
-  // A token-pinned guard plans to its own token's entry (entryOf).
   function margin(pool, key, token) {
     if (config === undefined) {
       try {
@@ -720,16 +663,13 @@ export function createRateLimitLatch({
     return typeof value === "number" ? value : null;
   }
 
-  // The epoch second the url's pool is stopped until, or null.
   function until(url) {
     const at = Math.max(stops.get("*") ?? 0, stops.get(poolOf(url)) ?? 0);
     return at * 1000 > now() ? at : null;
   }
 
-  // The pool whose stop holds url until `at`: its own, else "*".
   const heldBy = (url, at) => (stops.get(poolOf(url)) === at ? poolOf(url) : "*");
 
-  // The 5xx when url's stop is a server error hold, else null (serverHeld).
   const serverStatus = (url) => serverHeld(causes, stops, [poolOf(url), "*"], until(url));
 
   const resetMs = (url) => {
@@ -737,7 +677,6 @@ export function createRateLimitLatch({
     return at === null ? null : Math.max(0, at * 1000 - now());
   };
 
-  // Whether a call to url would wait out its pool's stop rather than be refused.
   const waits = (url) => {
     const reset = resetMs(url);
     return reset !== null && waited + reset < budgetMs + 1000;
@@ -773,21 +712,14 @@ export function createRateLimitLatch({
     throw stop;
   }
 
-  // resend: the client sends this request again if a rate limit refuses it
-  // and the latch would wait (retryServerErrors' resendLimited), so such a
-  // refusal fails nothing.
   async function observe(url, response, method = "GET", token = undefined, resend = false, floorGraceMs = 0) {
     const pool = poolOf(url);
     // classify reads the body of a 403, a 429 and a GraphQL answer; a 5xx's
     // body is read only for serverErrorHold's cause, never for the stop.
     const classifiesBody = SIGNALS.statuses.includes(response.status) || pool === "graphql";
     const needsBody = classifiesBody || response.status >= 500;
-    const limitCap = margin(pool, "limit-cap", token);
     const stopFloor = margin(pool, "stop-floor", token);
-    const options = { now: now(), readFloor: margin(pool, "read-floor", token), limitCap, stopFloor, floorGraceMs };
-    // The in-process stop holds either way; a later step only sees a
-    // recorded one, so a failed write is named. Each distinct stop is set
-    // and written once.
+    const options = { now: now(), readFloor: margin(pool, "read-floor", token), stopFloor, floorGraceMs };
     const recorded = new Map();
     const record = ({ pool: held, reset, reset_source }) => {
       const key = `${held} ${reset}`;
@@ -809,7 +741,6 @@ export function createRateLimitLatch({
             try {
               appendFileSync(fallbackFile, `${key}\n`);
             } catch {
-              // A later step names the stop without its fallback note.
             }
           }
         }
@@ -817,8 +748,6 @@ export function createRateLimitLatch({
       }
       return recorded.get(key);
     };
-    // A stop every body agrees on is set before any await, so a call in
-    // flight beside this one is refused while the body is read.
     const early = headerStop({ url, status: response.status, headers: response.headers }, options);
     if (early) {
       record(early);
@@ -834,16 +763,13 @@ export function createRateLimitLatch({
       const floored = !refused && stopFloor !== null && remaining > 0 && remaining <= stopFloor * limit;
       const server = !floored && serverErrorHold({ status: response.status, headers: response.headers, body });
       const cause = server ? `server-${response.status}` : "limit";
-      // Until the cause is in, a refusal reads this stop as a rate limit.
       causes.push({ pool: verdict.pool, reset: verdict.reset, cause });
       if (stopFile && !unrecorded) {
         try {
           appendFileSync(causeFile, `${verdict.pool} ${verdict.reset} ${cause}\n`);
         } catch {
-          // Read as a rate limit, the safe reading.
         }
       }
-      // A stop later steps cannot see is a fault, not a limit to hold on.
       const resent = !unrecorded && resend && waits(url) && refused;
       const outwaits = patient && !unrecorded && floored && waits(url);
       const holds = resent || outwaits || (hold && !unrecorded);
@@ -866,8 +792,7 @@ export function createRateLimitLatch({
       warned.add(pool);
       const get = headerReader(response.headers);
       const [limit, remaining] = ["limit", "remaining"].map((name) => Number(get(`x-ratelimit-${name}`)));
-      const { planned, left } = planOf({ limit, remaining }, limitCap);
-      log(`::warning::GitHub's ${pool} API has under its read floor left (${left} of the planned ${planned}; header remaining ${remaining} of ${limit}); reads continue`);
+      log(`::warning::GitHub's ${pool} API has under its read floor left (${remaining} of ${limit}); reads continue`);
     }
     return verdict;
   }

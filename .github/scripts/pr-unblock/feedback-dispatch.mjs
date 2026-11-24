@@ -185,9 +185,12 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-import { commitPulls, detailSuffix, errorLabel, responseDetail } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
+import { commitPulls, detailSuffix, errorLabel, responseDetail } from "../lib/github-client.mjs";
+import { trustedActorsPath, trustedListPath } from "../lib/trusted-actors.mjs";
 import { countRequests, DISPATCH_FLOOR_GRACE_MS, rateLimitLatch } from "../../actions/log-api-budget/rate-guard.mjs";
 import { postingRunId } from "../../actions/report-check-run/posting-run.mjs";
+import { LaneRunPending } from "../lib/lane-binding.mjs";
+import { ACTIONS_BOT_ID, FEEDBACK_HOLDS } from "../lib/lane-vocabulary.mjs";
 import { isPrUnblockTitle } from "../lib/run-title.mjs";
 import { LOOKBACK_HOURS, LOST } from "../maintenance-reconcile-lost-runs/infra-failure.mjs";
 import { tokenRefusal } from "../pr-merge/refire-refused.mjs";
@@ -219,7 +222,7 @@ export const DEFAULTS = Object.freeze({
   // The lanes each review workflow names in its reviewed-head marker
   // (melodic-software/ci-workflows pr-review-cli.yml).
   markerLanes: Object.freeze(["claude-review", "claude-security-review"]),
-  holdLabels: Object.freeze(["do-not-merge"]),
+  holdLabels: FEEDBACK_HOLDS,
   // claude[bot], which posted reviews before both lanes moved to pr-review-cli
   // (.github/standards/trusted-actors/trusted-actors.json). pr-review-cli posts
   // as github-actions[bot]; threadAuthors accepts those comments only when the
@@ -227,7 +230,7 @@ export const DEFAULTS = Object.freeze({
   // comment bound to its lane's run.
   reviewerId: 209825114,
   // github-actions[bot], which writes the reviewed-head markers.
-  markerAuthorId: 41898282,
+  markerAuthorId: ACTIONS_BOT_ID,
   // The GitHub Actions app: only a check run it created counts.
   appId: 15368,
 });
@@ -746,8 +749,10 @@ export async function dispatchFeedback({
     }
   }
   // Last, as it costs a full verifier read, and on a pass-only dispatch too: a
-  // later pass clears no cap, and a push past it could never merge, so
-  // pr-merge closes the pull request for a fresh attempt. It closes only the
+  // pass clears the cap only by superseding the head's FAIL
+  // (https://github.com/melodic-software/claude-code-plugins/issues/17646),
+  // and a push past it could never merge, so pr-merge closes the pull request
+  // for a fresh attempt. It closes only the
   // lanes App's: an adopted owner's is never skipped. A pass-only round skips
   // only on a cap the reader found: it only resolves notes a pass superseded,
   // and nothing sends it again, so a cap that could not be read (#11354)
@@ -776,11 +781,6 @@ export async function dispatchFeedback({
     return skip(`#${number} has no unresolved review thread, and the verifier read for an earlier FAIL ${readFailed ? "failed" : `could not count every FAIL (${capped})`}; a later pass inside the retry window reads it again`);
   }
   if (capped) {
-    // The cap never clears for the head: later runs skip it before any
-    // read. A sibling read that failed is read again next run.
-    if (capFinal(capped)) {
-      markHandled(record, settings.checkName, head);
-    }
     const warning = deadlineWarning(number, capped);
     if (warning) {
       log(warning);
@@ -928,7 +928,6 @@ export async function sweepReleased({ api, repository, appSenderId, log, setting
           taken.add(pull.number);
         }
       } catch (error) {
-        // One PR's failed read leaves the PRs after it to the sweep.
         log(`::warning::#${pull.number}: the sweep could not decide head ${pull.head.sha}: ${error.message}`);
       }
     }
@@ -1012,7 +1011,6 @@ async function sweepPulls(context, decide) {
     try {
       dispatched = await decide(pull);
     } catch (error) {
-      // One PR's failed read leaves the PRs after it to the sweep.
       log(`::warning::#${pull.number}: the sweep could not decide head ${pull.head.sha}: ${error.message}`);
     }
     if (dispatched !== null) {
@@ -1483,7 +1481,6 @@ const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $af
 }`;
 
 export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch: rawFetch = rateLimitLatch.guard(globalThis.fetch, { floorGraceMs: DISPATCH_FLOOR_GRACE_MS }), attemptTimeoutMs }) {
-  // Each request's rate-limit reading goes to the job-end api-calls notice.
   const fetch = countRequests(rawFetch);
   const [owner, name] = repository.split("/");
   const repo = `${apiUrl}/repos/${owner}/${name}`;
@@ -1694,6 +1691,7 @@ export async function resolveFeedbackSlot({ number, head, env, github, settings 
       LANE: settings.lane,
       ACTIVITY: settings.activity,
       BASE_PATH: env.BASE_PATH || ".base",
+      STANDARDS_DIR: env.STANDARDS_DIR,
       EVENT_NAME: "workflow_dispatch",
       PR_NUMBER: String(number),
       HEAD_SHA: head,
@@ -1732,7 +1730,7 @@ export async function main(env, deps = {}) {
 }
 
 async function dispatchTick(env, { api, actions, github, resolveSlot, verifyCapped, log = (line) => console.log(line), now = Date.now() }, tick, eventRun) {
-  const budget = api ? null : budgetedFetch({ log });
+  const budget = api ? null : budgetedFetch({ log, floorGraceMs: DISPATCH_FLOOR_GRACE_MS });
   const { record, text } = readRecord(env.DISPATCH_RECORD);
   const reads =
     api ??
@@ -1763,13 +1761,12 @@ async function dispatchTick(env, { api, actions, github, resolveSlot, verifyCapp
     api: client,
     repository: env.GITHUB_REPOSITORY,
     runId: env.GITHUB_RUN_ID,
-    // One read budget for every dispatch this pass decides.
     earlierFailReads: { left: EARLIER_FAIL_READS },
     verifyReads: new Map(),
     appSenderId: Number(env.APP_SENDER_ID),
     reviewerIds: reviewerIdsFrom(env.REVIEWER_IDS),
     // The base checkout's list, the one resolve-config reads beside it.
-    trustedHumans: trustedHumansFrom(env.TRUSTED_ACTORS || `${env.BASE_PATH || ".base"}/.github/standards/trusted-actors/trusted-actors.json`),
+    trustedHumans: trustedHumansFrom(trustedListPath(env, env.TRUSTED_ACTORS || trustedActorsPath(env.BASE_PATH))),
     humanGatedLabel: humanGatedLabelFrom(env.TRACKER_CONFIG || `${env.BASE_PATH || ".base"}/docs/conventions/work-items.yaml`),
     resolveSlot: resolveSlot ?? (({ number, head }) => resolveFeedbackSlot({ number, head, env, github })),
     adoption: await ownerAdoption(env, log),
@@ -1801,7 +1798,6 @@ async function dispatchTick(env, { api, actions, github, resolveSlot, verifyCapp
       const refire = swept.refireOf ? `refire-of${suffix}=${swept.refireOf}\n` : "";
       appendFileSync(env.GITHUB_OUTPUT, `run-id${suffix}=${swept.workflowRunId}\nupstream-run-id${suffix}=${swept.upstreamRunId}\n${refire}`);
     };
-    // A lost run is recovered only on a tick the sweep sent nothing on.
     const sweep = async () => (await sweepReleased({ ...common, onSent: write })) ?? recoverLost({ ...common, now });
     const swept = await sweep().finally(summary);
     if (swept !== null && sends === 0) {
@@ -1883,6 +1879,13 @@ const causeLabel = (error) => {
   const name = typeof cause.code !== "string" && typeof cause.name === "string" ? ` cause ${cause.name}` : "";
   return ` (${errorLabel(error)}${name})`;
 };
+export function failureOutcome(error, token) {
+  if (error instanceof LaneRunPending) {
+    return { line: `skip: ${error.message}; the next sweep tick decides this pull request`, code: 0 };
+  }
+  return { line: failureAnnotation(error, token), code: 1 };
+}
+
 // The line holds no token and no line break, whichever client threw.
 export const failureAnnotation = (error, token) => {
   const line = `::error::pr-feedback dispatch failed: ${error.message}${error.call ? ` on ${error.call}` : ""}${causeLabel(error)}${detailSuffix(error)}`;
@@ -1895,8 +1898,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       process.exitCode = code;
     },
     (error) => {
-      console.log(failureAnnotation(error, process.env.GITHUB_TOKEN));
-      process.exitCode = 1;
+      const { line, code } = failureOutcome(error, process.env.GITHUB_TOKEN);
+      console.log(line);
+      process.exitCode = code;
     },
   );
 }

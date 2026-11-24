@@ -1,10 +1,11 @@
+// test-scope: .github/actions/check-trusted-trigger/fixtures/trusted-actors.json
 import assert from "node:assert/strict";
 import { readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { GitHubError } from "../check-trusted-trigger/check-trusted-trigger.mjs";
+import { GitHubError } from "../../scripts/lib/github-client.mjs";
 import { isDecisionComment, main } from "./select-trusted-text.mjs";
 import { tempDir } from "../../../lib/test-tmp.mjs";
 
@@ -77,7 +78,6 @@ function fakeGitHub(routes) {
     if (body.query.includes("nodes(ids")) {
       return editNodes(routes["POST /graphql edits"], body.variables.ids);
     }
-    // Each connection the query asks for, from its own route, in one answer.
     const pullRequest = {};
     for (const [field, route] of [
       ["closingIssuesReferences", "POST /graphql closing"],
@@ -354,8 +354,6 @@ test("a closing issue in another repository is dropped and never read, even from
   assert.equal(context.dropped["linked-issue"], 1);
   assert.ok(!github.calls.some((call) => call.includes("melodic-software/standards")));
 });
-
-// Edit history: an item counts as written by whoever last edited it too.
 
 test("a listed author's comment last edited by an unlisted user is dropped", async () => {
   const api = load();

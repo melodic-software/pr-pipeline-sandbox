@@ -42,7 +42,7 @@ mkdir -p "$GATED/.github/workflows" "$NOGATE" "$NOORIGIN/.github/workflows"
 CHECK_CONTRACT_WF='jobs:
   ci-status:
     steps:
-      - uses: melodic-software/ci-workflows/.github/actions/pr-require-checks/check-contract@main
+      - uses: melodic-software/ci-workflows/.github/actions/pr-require-checks/check-contract@5e18f3d6cebd6fa5e66b0941ee0f7ed6ba288d6c # v0.58.0
 '
 printf '%s' "$CHECK_CONTRACT_WF" >"$GATED/.github/workflows/ci.yml"
 printf '%s' "$CHECK_CONTRACT_WF" >"$NOORIGIN/.github/workflows/ci.yml"
@@ -52,13 +52,12 @@ git -C "$NOGATE" init -q
 git -C "$NOORIGIN" init -q
 COMPOSITE="$WORK/composite"
 mkdir -p "$COMPOSITE/.github/workflows"
-printf 'jobs:\n  ci-status:\n    steps:\n      - uses: melodic-software/ci-workflows/.github/actions/pr-require-checks/report-ci-status@main\n' >"$COMPOSITE/.github/workflows/pr-require-checks.yml"
+printf 'jobs:\n  ci-status:\n    steps:\n      - uses: melodic-software/ci-workflows/.github/actions/pr-require-checks/report-ci-status@9c5bedfbfdbdfe733b9ce4cd7ca80c1574bd4cb8 # v0.76.3\n' >"$COMPOSITE/.github/workflows/pr-require-checks.yml"
 git -C "$COMPOSITE" init -q
 git -C "$COMPOSITE" remote add origin https://github.com/acme-corp/widgets.git
 FIXTURE_RE='\.github/actions/pr-require-checks/(check-contract|report-ci-status)([@[:space:]]|$)'
 export CLAUDE_PLUGIN_OPTION_LINKAGE_GATE_USES_PATTERN="$FIXTURE_RE"
 
-# run <expected-exit> <name> <payload-json>; the payload carries its own cwd.
 run() {
   local expected="$1" name="$2" payload="$3" rc=0
   bash "$HOOK" <<<"$payload" >/dev/null 2>&1 || rc=$?
@@ -189,7 +188,7 @@ done
 # exact-match fields are chomped. A CR inside owner is stripped and the call
 # gated. A tool_input that is not an object fails the batch and takes the
 # per-field fallback, whose verdict for an undeterminable target is allow.
-payload_raw_body() { # <cwd> <tool> <owner> <repo> <body-json>
+payload_raw_body() {
   jq -cn --arg d "$1" --arg t "$2" --arg o "$3" --arg r "$4" --argjson b "$5" \
     '{session_id:"test", cwd:$d, tool_name:$t, tool_input:{owner:$o, repo:$r, title:"t", body:$b}}'
 }
@@ -249,7 +248,6 @@ else
 fi
 rm -rf "$GATED/.claude"
 
-# Kill switch: disabled via the userConfig mirror allows a bad body through.
 rc=0
 CLAUDE_PLUGIN_OPTION_PR_LINKAGE_MCP_GATE_ENABLED=false \
   bash "$HOOK" <<<"$(payload "$GATED" $CREATE $OWNER $REPO "$BAD")" >/dev/null 2>&1 || rc=$?

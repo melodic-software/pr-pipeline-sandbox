@@ -10,7 +10,7 @@ metadata:
 
 ## Variables
 
-Arguments: `$ARGUMENTS`. `[stats|list|add|start|done|due|recheck|search|audit|publish-plan|link|view|edit|changes|labels|wayfind-labels|help] [args]`. The default action is stats.
+Arguments: `$ARGUMENTS`. `[stats|list|add|start|done|due|recheck|search|audit|publish-plan|link|view|edit|changes|labels|wayfind-labels|dossier-branches|help] [args]`. The default action is stats.
 
 ## Shared tracker context
 
@@ -39,7 +39,8 @@ actions below:
 - [`${CLAUDE_PLUGIN_ROOT}/reference/issue-conventions.md`](${CLAUDE_PLUGIN_ROOT}/reference/issue-conventions.md):
   the item shape `add` follows; its title rule points at the house style.
 - [`${CLAUDE_PLUGIN_ROOT}/reference/agent-brief.md`](${CLAUDE_PLUGIN_ROOT}/reference/agent-brief.md):
-  the brief template `add --agent-ready` uses instead of the default body.
+  the brief template `add --agent-ready` uses instead of the default body. `add --session-owned`
+  applies the session-owned role label instead, for an item the filing session works itself.
 - [`${CLAUDE_PLUGIN_ROOT}/reference/standing-item-preconditions.md`](${CLAUDE_PLUGIN_ROOT}/reference/standing-item-preconditions.md):
   the precondition `recheck` evaluates before advancing dates or closing the associated item.
 
@@ -57,12 +58,18 @@ For the multi-step actions (`add`, `start`, `done`, `recheck`), copy the matchin
 ([`${CLAUDE_PLUGIN_ROOT}/reference/tracker-seam.md`](${CLAUDE_PLUGIN_ROOT}/reference/tracker-seam.md)
 "Memory-tier writes" owns the slug and the self-ignore guard).
 Tick each step as completed. Single-action reads (`stats`, `list`, `search`, `due`, `view`, `changes`,
-`labels`, `wayfind-labels`), `audit` and `edit` don't need a checklist.
+`labels`, `wayfind-labels`), `dossier-branches`, `audit` and `edit` don't need a checklist.
 
 ## Next
 
 - A picked item: `/work-items:work`.
 - Raw intake: `/work-items:triage`.
+
+## Related
+
+- File a new bug report with severity rubric: /bugs:write.
+- Decompose a plan into slices: /work-items:decompose.
+- Sweep code TODO markers: /work-items:scan-todos.
 
 ## Action Router
 
@@ -86,6 +93,7 @@ Parse `$ARGUMENTS` to extract the action (first token) and remaining arguments.
 | `changes` | Change requests the tracker links as closing an item | [actions/changes.md](actions/changes.md) |
 | `labels` | The live label set, or which named labels are missing | [actions/labels.md](actions/labels.md) |
 | `wayfind-labels` | The wayfind label prefix and human-gated label the binding sets | [actions/wayfind-labels.md](actions/wayfind-labels.md) |
+| `dossier-branches` | Delete or report one item's remote dossier branch | [actions/dossier-branches.md](actions/dossier-branches.md) |
 | `help` | Show the action table above | *(inline)* |
 
 If `$ARGUMENTS` is empty, run `stats` (the default dashboard). If the action is unknown, show the

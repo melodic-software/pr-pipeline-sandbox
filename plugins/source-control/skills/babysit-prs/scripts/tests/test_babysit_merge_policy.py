@@ -90,6 +90,17 @@ RETIRED_SOURCE_CONTROL = ".claude/source-control.md"
 TRACKER_YAML = policy.tracker_binding.YAML_PATH
 # The YAML files `GhFake` answers absent when a test sets none.
 UNSET_YAML = (TEAM_YAML, policy.tracker_binding.YAML_PATH)
+STANDARDS_SHA = "5" * 40
+STANDARDS_REPO = "example-org/standards"
+OPTED_IN = f"trusted_actors_source: standards\n{policy.STANDARDS_REPO_KEY}: {STANDARDS_REPO}\n"
+STANDARDS_HEAD = {"ref": "refs/heads/main", "object": {"sha": STANDARDS_SHA}}
+dependabot = policy.dependabot
+
+
+def standards_cleared(case: unittest.TestCase) -> None:
+    """Empty the per-process standards reads for the rest of `case`."""
+    for cache in ("_READS_STANDARDS", "_STANDARDS_SHA", "_STANDARDS_TEXT"):
+        case.enterContext(mock.patch.object(policy, cache, type(getattr(policy, cache))()))
 
 
 def ok(payload: Any) -> subprocess.CompletedProcess[str]:
@@ -1245,6 +1256,12 @@ class ReadDemotion(unittest.TestCase):
         self.assertTrue(result.reason.startswith("demotion-unreadable"), result.reason)
 
 
+SETTLED_RUNS = (
+    f"repos/{REPO}/actions/workflows/pr-require-checks.yml/runs"
+    "?branch=main&created=2026-10-12T10:00:00Z..2026-10-12T11:00:00Z&per_page=100"
+)
+
+
 def green_run(**fields: Any) -> dict[str, Any]:
     """An attempt-1 green full run the lane's github-actions[bot] dispatched
     on main after the record, at `GREEN_HEAD`."""
@@ -1463,6 +1480,36 @@ class AutoClearOnGreen(unittest.TestCase):
             result.cleared_at, policy.datetime.fromisoformat("2026-10-12T11:00:00Z")
         )
 
+    def test_close_cleared_closing_a_recovered_record_leaves_the_floor(self) -> None:
+        green = policy.datetime.fromisoformat("2026-10-12T11:00:00Z")
+        closed_at = "2026-10-12T13:00:00Z"
+        for name, actor, floor in (
+            ("open, recovered by the 11:00 green", None, green),
+            ("close-cleared's github-actions[bot] close keeps the recovery", bot("github-actions"), green),
+            ("a User login github-actions with write is still not human", user("github-actions"), green),
+            ("a person's close moves the floor to the close", user(OPERATOR), policy.datetime.fromisoformat(closed_at)),
+        ):
+            with self.subTest(name):
+                issue = (
+                    {}
+                    if actor is None
+                    else {
+                        "state": "CLOSED",
+                        "timelineItems": {
+                            "nodes": [{"createdAt": closed_at, "actor": actor, "closer": None}]
+                        },
+                    }
+                )
+                self.fake(**issue)
+                result = policy.read_demotion(
+                    REPO,
+                    agent_identity=IDENTITY,
+                    permission=permissions({OPERATOR: "admin", "github-actions": "write"}),
+                    now=NOW,
+                )
+                self.assertFalse(result.active, result.reason)
+                self.assertEqual(result.cleared_at, floor)
+
     def test_a_record_cleared_early_reads_no_later_span(self) -> None:
         # However many green runs came since, a record main cleared in its
         # first span reads only that span: later spans would fail the read.
@@ -1484,6 +1531,120 @@ class AutoClearOnGreen(unittest.TestCase):
         self.assertEqual(
             result.cleared_at, policy.datetime.fromisoformat("2026-10-20T11:00:00Z")
         )
+
+    def closed(self, at: str = "2026-10-12T10:30:00Z") -> dict[str, Any]:
+        return {
+            "state": "CLOSED",
+            "timelineItems": {
+                "nodes": [{"createdAt": at, "actor": bot("github-actions"), "closer": None}]
+            },
+        }
+
+    def recoveries(self, write: bool = True) -> tuple[pathlib.Path, Any]:
+        path = pathlib.Path(tempfile.mkdtemp()) / "recoveries.json"
+        self.addCleanup(shutil.rmtree, path.parent)
+        env = {policy.RECOVERIES_ENV: str(path)}
+        if write:
+            env[policy.RECOVERIES_WRITE_ENV] = "true"
+        return path, mock.patch.dict(os.environ, env)
+
+    @staticmethod
+    def run_listings(gh: GhFake) -> list[Any]:
+        return [c for c in gh.calls if any("/runs?" in str(a) for a in c)]
+
+    def proving(self, *statuses: str) -> GhFake:
+        """A closed record's first read, the runs created up to its recovery
+        listed with `statuses`."""
+        gh = self.fake(**self.closed())
+        runs = [
+            {"id": n, "status": s, "updated_at": "2026-10-12T11:30:00Z"}
+            for n, s in enumerate(statuses or ("completed",))
+        ]
+        gh.rest[SETTLED_RUNS] = {"total_count": len(runs), "workflow_runs": runs}
+        return gh
+
+    def test_a_carried_recovery_answers_with_no_run_listing(self) -> None:
+        path, env = self.recoveries()
+        with env:
+            first = self.proving()
+            proven = read_demotion()
+            self.assertTrue(self.run_listings(first))
+            second = self.fake(runs=502, **self.closed())
+            carried = read_demotion()
+        self.assertEqual(self.run_listings(second), [])
+        self.assertEqual(
+            (carried.active, carried.cleared_at), (proven.active, proven.cleared_at)
+        )
+        self.assertEqual(
+            list(json.loads(path.read_text())["recoveries"].values()),
+            ["2026-10-12T11:00:00Z"],
+        )
+
+    def test_a_reopened_or_reclosed_record_walks_the_green_runs(self) -> None:
+        for name, issue in (
+            ("reopened", {"state": "OPEN", "timelineItems": {"nodes": []}}),
+            ("re-closed", self.closed("2026-10-13T08:00:00Z")),
+        ):
+            with self.subTest(name):
+                _, env = self.recoveries()
+                with env:
+                    self.proving()
+                    read_demotion()
+                    gh = self.fake(runs={"workflow_runs": []}, **issue)
+                    result = read_demotion()
+                self.assertTrue(self.run_listings(gh))
+                self.assertTrue(result.active, result.reason)
+
+    def test_a_recovery_with_an_earlier_run_still_going_is_not_kept(self) -> None:
+        path, env = self.recoveries()
+        with env:
+            self.proving("completed", "in_progress")
+            self.assertFalse(read_demotion().active)
+        self.assertEqual(json.loads(path.read_text())["recoveries"], {})
+
+    def test_a_run_finished_after_the_green_listing_keeps_nothing(self) -> None:
+        path, env = self.recoveries()
+        with env:
+            gh = self.proving()
+            gh.rest[SETTLED_RUNS]["workflow_runs"][0]["updated_at"] = "2099-01-01T00:00:00Z"
+            self.assertFalse(read_demotion().active)
+        self.assertEqual(json.loads(path.read_text())["recoveries"], {})
+
+    def test_an_unfinished_read_keeps_the_recoveries_it_never_reached(self) -> None:
+        path, env = self.recoveries()
+        with env:
+            self.proving()
+            read_demotion()
+            kept = json.loads(path.read_text())["recoveries"]
+            gh = self.fake(**self.closed())
+            gh.graphql["PolicyIssuesByAuthor"] = 502
+            self.assertTrue(read_demotion().active)
+        self.assertTrue(kept)
+        self.assertEqual(json.loads(path.read_text())["recoveries"], kept)
+
+    def test_the_write_switch_reads_true_without_case(self) -> None:
+        path, _ = self.recoveries()
+        with mock.patch.dict(
+            os.environ,
+            {policy.RECOVERIES_ENV: str(path), policy.RECOVERIES_WRITE_ENV: " TRUE "},
+        ):
+            self.proving()
+            read_demotion()
+        self.assertTrue(json.loads(path.read_text())["recoveries"])
+
+    def test_only_a_writer_keeps_recoveries_and_a_bad_file_is_none(self) -> None:
+        path, env = self.recoveries(write=False)
+        with env:
+            self.fake(**self.closed())
+            read_demotion()
+        self.assertFalse(path.exists())
+        for text in ("not json", json.dumps({"version": 1, "repo": "other/repo", "recoveries": {}})):
+            with self.subTest(text):
+                path.write_text(text)
+                with env:
+                    gh = self.fake(**self.closed())
+                    self.assertFalse(read_demotion().active)
+                self.assertTrue(self.run_listings(gh))
 
     def test_a_lane_closed_record_holds_while_main_is_still_red(self) -> None:
         # A lane takes up the record and may close it; with no later green
@@ -3572,7 +3733,12 @@ class RealResolver(unittest.TestCase):
         # the resolver's own check is the one that refuses there.
         with mock.patch.object(policy, "PROMOTION_RESOLVER", self.resolver):
             result = self.read()
-        self.assertEqual(result.reason, "lane-writable:promotion_evidence_checker")
+        self.assertEqual(
+            result.reason,
+            "writability-unverifiable-on-win32"
+            if sys.platform == "win32"
+            else "lane-writable:promotion_evidence_checker",
+        )
         self.assertFalse(result.promoted("C2"))
 
 
@@ -3661,9 +3827,9 @@ class ReadPromotion(unittest.TestCase):
         }
 
         def writable(path: pathlib.Path) -> bool:
-            if str(path) == absent:
+            if path == pathlib.Path(absent):
                 return policy._lane_writable(path)
-            return str(path) == creds_file
+            return path == pathlib.Path(creds_file)
 
         result, _ = self.run_resolver(payload, writable=writable)
         self.assertEqual(
@@ -3671,7 +3837,9 @@ class ReadPromotion(unittest.TestCase):
         )
         result, _ = self.run_resolver(
             payload,
-            writable=lambda p: policy._lane_writable(p) if str(p) == absent else False,
+            writable=lambda p: (
+                policy._lane_writable(p) if p == pathlib.Path(absent) else False
+            ),
         )
         self.assertIsNone(result.reason)
         self.assertTrue(result.promoted("C3"))
@@ -3697,7 +3865,7 @@ class ReadPromotion(unittest.TestCase):
             "cells": self.CELLS,
         }
         result, _ = self.run_resolver(
-            payload, writable=lambda p: str(p) == bound_file
+            payload, writable=lambda p: p == pathlib.Path(bound_file)
         )
         self.assertEqual(
             result.reason, "settings-lane-writable:promotion_evidence_max_age_hours"
@@ -5392,7 +5560,7 @@ class LocalEnabledSince(unittest.TestCase):
         # Before the clone read: one trees-API call per side.
         base = self.commit("tool.sh", "echo\n", "2026-10-01T00:00:00Z")
         (self.clone / "tool.sh").chmod(0o755)
-        self.git(self.clone, "add", "tool.sh")
+        self.git(self.clone, "update-index", "--chmod=+x", "tool.sh")
         self.git(self.clone, "commit", "-q", "-m", "x", date="2026-10-02T00:00:00Z")
         head = self.git(self.clone, "rev-parse", "HEAD")
         gh = self.local()
@@ -5418,6 +5586,7 @@ class LocalEnabledSince(unittest.TestCase):
         )
         blob = self.git(self.clone, "rev-parse", f"{head}:tool.sh")
         self.assertEqual([(f.blob, f.previous_blob) for f in files], [(blob, blob)])
+        self.assertEqual([f.diff_read for f in files], [False])
         self.assertEqual(
             gh.calls,
             [
@@ -5429,6 +5598,38 @@ class LocalEnabledSince(unittest.TestCase):
                 ]
             ],
         )
+
+    def test_a_no_patch_file_is_read_from_the_clone_diff_only_as_text(self) -> None:
+        base = self.commit("docs/big.md", "old\n", "2026-10-01T00:00:00Z")
+        self.commit("docs/big.md", "x" * 4000 + "\n", "2026-10-02T00:00:00Z")
+        (self.clone / "tool.bin").write_bytes(b"\0binary\n")
+        self.git(self.clone, "add", "tool.bin")
+        self.git(self.clone, "commit", "-q", "-m", "y", date="2026-10-03T00:00:00Z")
+        head = self.git(self.clone, "rev-parse", "HEAD")
+        gh = self.local()
+        gh.rest[f"repos/{REPO}/pulls/7/files?per_page=100"] = [
+            {"filename": "docs/big.md", "status": "modified", "additions": 1, "deletions": 1},
+            {"filename": "tool.bin", "status": "added", "additions": 0, "deletions": 0},
+            {
+                "filename": "docs/small.md",
+                "status": "added",
+                "additions": 1,
+                "deletions": 0,
+                "patch": "@@",
+            },
+        ]  # fmt: skip
+        pr = {
+            "number": 7,
+            "changed_files": 3,
+            "head": {"sha": head},
+            "base": {"sha": base},
+        }
+        files, _ = policy.changed_files(REPO, pr)
+        self.assertEqual(
+            [(f.path, f.diff_read) for f in files],
+            [("docs/big.md", True), ("tool.bin", False), ("docs/small.md", False)],
+        )
+        self.assertFalse(policy._diff_read("0" * 40, head, "docs/big.md"))
 
     def test_a_tree_missing_from_the_clone_reads_the_api(self) -> None:
         self.pipeline(PIPELINE, "2026-10-01T00:00:00Z")
@@ -5959,6 +6160,34 @@ class IssueHoldLabels(unittest.TestCase):
         )
         main = dataclasses.replace(base, base_sha="b" * 40, issue_holds=("b", "a"))
         self.assertEqual(policy.stricter_config(base, main).issue_holds, ("a", "b"))
+
+
+class BaselineFile(unittest.TestCase):
+    """`merge.baseline-file` is read through the merge config reader, unset is
+    None, and the stricter config keeps it only when both sides name it."""
+
+    FILE = "docs/upstream/claude-code-native-surfaces.min.json"
+
+    def test_the_configured_file_is_read(self) -> None:
+        text = LANE_PIPELINE.replace(
+            "  diff-check:", f"  baseline-file: {self.FILE}\n  diff-check:"
+        )
+        config_fake(self, text)
+        self.assertEqual(policy.read_config_at(REPO, SHA).baseline_file, self.FILE)
+
+    def test_unset_is_none(self) -> None:
+        config_fake(self, LANE_PIPELINE)
+        self.assertIsNone(policy.read_config_at(REPO, SHA).baseline_file)
+
+    def test_the_stricter_config_keeps_only_an_agreed_file(self) -> None:
+        base = policy.PipelineConfig(
+            SHA, "C2", "pr-merge", IDENTITY, None, (), None, baseline_file=self.FILE
+        )
+        for other, want in ((self.FILE, self.FILE), (None, None), ("docs/x", None)):
+            with self.subTest(other=other):
+                main = dataclasses.replace(base, base_sha="b" * 40, baseline_file=other)
+                self.assertEqual(policy.stricter_config(base, main).baseline_file, want)
+                self.assertEqual(policy.stricter_config(main, base).baseline_file, want)
 
 
 def refs_answer(*issues: dict[str, Any], pulls: tuple[int, ...] = ()) -> Any:
@@ -7412,6 +7641,114 @@ class AdoptIdleOwnerPullRequests(unittest.TestCase):
                 gh.rest[f"repos/{REPO}/contents?ref=trunk"] = []
                 self.assertEqual(policy.trusted_actors(REPO, "trunk"), expected)
 
+    def test_an_opted_in_repository_adopts_from_the_standards_list(self) -> None:
+        listing = {"version": 1, "actors": [{"id": 5, "login": "p", "kind": "human"}]}
+        ours = f"repos/{REPO}/contents/{policy.TRUSTED_ACTORS_PATH}?ref=trunk"
+        theirs = (
+            f"repos/{STANDARDS_REPO}/contents/"
+            f"{policy.STANDARDS_TRUSTED_ACTORS}?ref={STANDARDS_SHA}"
+        )
+        head = f"repos/{STANDARDS_REPO}/git/ref/heads/main"
+        none: tuple[tuple[int, ...], tuple[int, ...]] = ((), ())
+        for team, main, expected in (
+            (OPTED_IN, STANDARDS_HEAD, ((5,), (5,))),
+            (OPTED_IN, 502, none),
+            ("trusted_actors_source: standards\n", STANDARDS_HEAD, none),
+            ("trusted_actors_source: standards\nstandards_repository: nope\n", STANDARDS_HEAD, none),
+            (f"trusted_actors_source: standards\nstandards_repository: [{STANDARDS_REPO}]\n", STANDARDS_HEAD, none),
+            ("trusted_actors_source: other\n", STANDARDS_HEAD, none),
+            ("trusted_actors_source: [standards]\n", STANDARDS_HEAD, none),
+            ("trusted_actors_source: Standards\n", STANDARDS_HEAD, none),
+            ("trusted_actors_source:\n", STANDARDS_HEAD, none),
+            ("trusted_actors_source:\n  - standards\n", STANDARDS_HEAD, none),
+            ('"trusted_actors_source":\n  - standards\n', STANDARDS_HEAD, none),
+        ):  # fmt: skip
+            with self.subTest(team=team, main=main):
+                standards_cleared(self)
+                policy._TRUSTED_IDS.clear()
+                gh = GhFake().install(self)
+                gh.rest[f"repos/{REPO}/contents/{TEAM_YAML}?ref=trunk"] = file_payload(team)
+                gh.rest[ours] = 500
+                gh.rest[head] = main
+                gh.rest[theirs] = file_payload(json.dumps(listing))
+                self.assertEqual(policy.trusted_actors(REPO, "trunk"), expected)
+                self.assertNotIn(["api", ours], gh.calls)
+
+    def test_a_failed_read_of_the_team_yaml_reads_neither_list(self) -> None:
+        standards_cleared(self)
+        policy._TRUSTED_IDS.clear()
+        gh = GhFake().install(self)
+        gh.rest[f"repos/{REPO}/contents/{TEAM_YAML}?ref=trunk"] = 502
+        listing = {"version": 1, "actors": [{"id": 5, "login": "p", "kind": "human"}]}
+        ours = f"repos/{REPO}/contents/{policy.TRUSTED_ACTORS_PATH}?ref=trunk"
+        gh.rest[ours] = file_payload(json.dumps(listing))
+        gh.rest[f"repos/{STANDARDS_REPO}/git/ref/heads/main"] = STANDARDS_HEAD
+        self.assertEqual(policy.trusted_actors(REPO, "trunk"), ((), ()))
+        self.assertNotIn(["api", ours], gh.calls)
+        self.assertFalse(any(STANDARDS_REPO in c[1] for c in gh.calls))
+
+    def test_one_standards_commit_and_read_serve_every_repository(self) -> None:
+        standards_cleared(self)
+        policy._TRUSTED_IDS.clear()
+        gh = GhFake().install(self)
+        listing = {"version": 1, "actors": [{"id": 5, "login": "p", "kind": "human"}]}
+        head = f"repos/{STANDARDS_REPO}/git/ref/heads/main"
+        theirs = (
+            f"repos/{STANDARDS_REPO}/contents/"
+            f"{policy.STANDARDS_TRUSTED_ACTORS}?ref={STANDARDS_SHA}"
+        )
+        gh.rest[head] = STANDARDS_HEAD
+        gh.rest[theirs] = file_payload(json.dumps(listing))
+        for repo in (REPO, "owner/other"):
+            gh.rest[f"repos/{repo}/contents/{TEAM_YAML}?ref=trunk"] = file_payload(OPTED_IN)
+            self.assertEqual(policy.trusted_actors(repo, "trunk"), ((5,), (5,)))
+        self.assertEqual(gh.calls.count(["api", head]), 1)
+        self.assertEqual(gh.calls.count(["api", theirs]), 1)
+
+    def test_the_standards_commit_is_main_by_its_full_ref(self) -> None:
+        listing = {"version": 1, "actors": [{"id": 5, "login": "p", "kind": "human"}]}
+        branch = f"repos/{STANDARDS_REPO}/git/ref/heads/main"
+        short = f"repos/{STANDARDS_REPO}/commits/main"
+        theirs = f"repos/{STANDARDS_REPO}/contents/{policy.STANDARDS_TRUSTED_ACTORS}"
+        tag = "6" * 40
+        none: tuple[tuple[int, ...], tuple[int, ...]] = ((), ())
+        for head, contents, expected in (
+            (STANDARDS_HEAD, file_payload(json.dumps(listing)), ((5,), (5,))),
+            (404, file_payload(json.dumps(listing)), none),
+            (STANDARDS_HEAD, 502, none),
+        ):
+            with self.subTest(head=head, contents=contents):
+                standards_cleared(self)
+                policy._TRUSTED_IDS.clear()
+                gh = GhFake().install(self)
+                gh.rest[f"repos/{REPO}/contents/{TEAM_YAML}?ref=trunk"] = file_payload(OPTED_IN)
+                gh.rest[branch] = head
+                gh.rest[short] = {"sha": tag}
+                gh.rest[f"{theirs}?ref={STANDARDS_SHA}"] = contents
+                gh.rest[f"{theirs}?ref={tag}"] = file_payload(json.dumps(listing))
+                gh.rest[f"repos/{STANDARDS_REPO}/contents?ref={STANDARDS_SHA}"] = []
+                self.assertEqual(policy.trusted_actors(REPO, "trunk"), expected)
+                self.assertNotIn(["api", short], gh.calls)
+                self.assertFalse(any(tag in c[1] for c in gh.calls))
+
+    def test_an_unset_or_repository_source_reads_the_copy(self) -> None:
+        for team in (None, "trusted_actors_source: repository\n"):
+            with self.subTest(team=team):
+                standards_cleared(self)
+                policy._TRUSTED_IDS.clear()
+                gh = GhFake().install(self)
+                if team is not None:
+                    gh.rest[f"repos/{REPO}/contents/{TEAM_YAML}?ref=trunk"] = (
+                        file_payload(team)
+                    )
+                listing = {"version": 1, "actors": [{"id": 7, "login": "q", "kind": "bot"}]}
+                gh.rest[f"repos/{REPO}/contents/{policy.TRUSTED_ACTORS_PATH}?ref=trunk"] = (
+                    file_payload(json.dumps(listing))
+                )
+                gh.rest[f"repos/{REPO}/contents?ref=trunk"] = []
+                self.assertEqual(policy.trusted_actors(REPO, "trunk"), ((7,), ()))
+                self.assertFalse(any(STANDARDS_REPO in c[1] for c in gh.calls))
+
     def test_the_default_branch_head_decides_idle_hours(self) -> None:
         base = policy.PipelineConfig(SHA, "C2", None, IDENTITY, None, (), None)
         for ours, main in ((24, 48), (48, 24), (24, None), (None, 24)):
@@ -7636,7 +7973,7 @@ class ForeignPaths(unittest.TestCase):
 class AuthorReviewedPaths(unittest.TestCase):
     """Owner direction 2026-10-27: a trusted person's own pull request's
     `gate` paths only their own commits touched, on a head pr-verify passed,
-    clear on a clean security review (`babysit_risk.RiskInput.author_reviewed`);
+    clear on a clean security review (`diff_risk.RiskInput.author_reviewed`);
     the lanes App's, a bot's, a `trust` path and a lane's fix never do."""
 
     GATE = ".github/scripts/pr-merge/who.mjs"
@@ -10091,7 +10428,7 @@ class DependabotEligibility(unittest.TestCase):
                 self.lane_fix(gh, [path])
                 self.assertEqual(
                     self.eligibility(hold_majors=False).reason,
-                    f"dependabot-fix-content:fix-scope:{path}",
+                    f"dependabot-fix-content:fix-scope:{path};cdn-sync-author",
                 )
 
     PARENT = "d" * 40
@@ -10240,7 +10577,7 @@ class DependabotEligibility(unittest.TestCase):
                         ["package.json"],
                         modes={"package.json": {"type": kind, "mode": mode}},
                     ),
-                    "dependabot-fix-content:fix-mode:package.json",
+                    "dependabot-fix-content:fix-mode:package.json;cdn-sync-author",
                 )
         steal = {"test": "node t.js", "postinstall": "node steal.js"}
         self.assertEqual(
@@ -10248,7 +10585,8 @@ class DependabotEligibility(unittest.TestCase):
                 ["package.json"],
                 after={"package.json": self.pkg("^2.0.0", scripts=steal)},
             ),
-            "dependabot-fix-content:fix-content:package.json:package-json-key:scripts",
+            "dependabot-fix-content:fix-content:package.json:package-json-key:scripts"
+            ";cdn-sync-author",
         )
         self.assertEqual(
             self.lane_fix_reason(
@@ -10260,7 +10598,7 @@ class DependabotEligibility(unittest.TestCase):
                 },
             ),
             "dependabot-fix-content:fix-content:package-lock.json:"
-            "lock-resolved:node_modules/x",
+            "lock-resolved:node_modules/x;cdn-sync-author",
         )
         evil = "https://registry.npmjs.org/evilpkg/-/evilpkg-6.6.6.tgz"
         self.assertEqual(
@@ -10269,7 +10607,7 @@ class DependabotEligibility(unittest.TestCase):
                 after={"package-lock.json": self.lock("2.0.0", evil)},
             ),
             "dependabot-fix-content:fix-content:package-lock.json:"
-            "lock-resolved:node_modules/x",
+            "lock-resolved:node_modules/x;cdn-sync-author",
         )
 
     def test_a_lanes_app_install_script_pin_move_is_eligible_and_no_other_pin(
@@ -10298,7 +10636,7 @@ class DependabotEligibility(unittest.TestCase):
                 self.assertEqual(
                     reason(pin),
                     "dependabot-fix-content:fix-content:package.json:"
-                    "package-json-key:allowScripts",
+                    "package-json-key:allowScripts;cdn-sync-author",
                 )
 
     PIN_MESSAGE = (
@@ -10379,6 +10717,213 @@ class DependabotEligibility(unittest.TestCase):
             f"dependabot-review:commit-not-dependabot:{self.HEAD[:12]};"
             "review-verdict-head-moved",
         )
+
+    SYNC_MESSAGE = (
+        "Sync the CDN pins to the bumped manifest on "
+        "dependabot/npm_and_yarn/x-1.3.0 [dependabot skip]\n\n"
+        "Lane-Activity: pr-unblock/review-dependency\n"
+    )
+    CDN_TARGETS = ("plugins/example/reference/view.md", "docs/cdn.md")
+    PINS_URL = f"repos/{REPO}/contents/lib/cdn-pins/pins.json?ref={SHA}"
+
+    def cdn_sync(
+        self,
+        paths: list[str] | None = None,
+        *,
+        files: list[dict[str, Any]] | None = None,
+        detail: dict[str, Any] | None = None,
+        modes: dict[tuple[str, str], dict[str, Any]] | None = None,
+        pins: Any = None,
+    ) -> Any:
+        """A semver-patch Dependabot bump with the lanes App's CDN pins sync
+        commit (patch-rules.json row `cdn-pins-sync`) at the head, judged with
+        a merge verdict at the head. `modes` maps (commit, path) to a tree
+        entry, else a regular file; `pins` is the base's pins.json answer."""
+        paths = paths or ["lib/cdn-pins/pins.json", self.CDN_TARGETS[0]]
+        listing = files or [{"filename": p, "status": "modified"} for p in paths]
+        sync = dependabot_commit(
+            name="agent-lanes[bot]",
+            email="1+agent-lanes[bot]@users.noreply.github.com",
+            message=self.SYNC_MESSAGE,
+            login=IDENTITY,
+            sha=self.HEAD,
+        )
+        gh = self.fake(
+            commits=[dependabot_commit("semver-patch"), sync],
+            comments=[self.marker()],
+            pushes=self.PUSHES,
+            files=[{"filename": "package-lock.json"}]
+            + [{"filename": f["filename"]} for f in listing],
+        )
+        gh.rest[f"repos/{REPO}/commits/{self.HEAD}"] = {
+            "files": listing,
+            "parents": [{"sha": self.PARENT}],
+            "author": {"login": IDENTITY},
+            "committer": {"id": 19864447},
+            "commit": {
+                "message": self.SYNC_MESSAGE,
+                "verification": {"verified": True, "reason": "valid"},
+            },
+            **(detail or {}),
+        }
+        record = {
+            "packages": {"x": {"version": "1.3.0"}},
+            "targets": [{"path": p, "packages": ["x"]} for p in self.CDN_TARGETS],
+        }
+        gh.rest[self.PINS_URL] = (
+            file_payload(json.dumps(record)) if pins is None else pins
+        )
+        gh.rest[f"repos/{REPO}/contents?ref={SHA}"] = []
+
+        def tree(variables: dict[str, str]) -> dict[str, Any]:
+            ref, at = variables["e"].split(":", 1)
+            entries = [
+                {
+                    "name": f["filename"].rsplit("/", 1)[-1],
+                    **(modes or {}).get(
+                        (ref, f["filename"]), {"type": "blob", "mode": 0o100644}
+                    ),
+                }
+                for f in listing
+                if f["filename"].rpartition("/")[0] == at
+            ]
+            return {"repository": {"object": {"entries": entries}}}
+
+        gh.graphql["FixTree"] = tree
+        return self.eligibility()
+
+    def assert_sync_refused(self, result: Any, reason: str) -> None:
+        self.assertFalse(result.eligible)
+        self.assertRegex(str(result.reason), r"^dependabot-fix-content:fix-")
+        self.assertIn(f";{reason}", str(result.reason))
+
+    def test_the_lanes_app_cdn_pins_sync_commit_merges_on_a_verdict_at_the_head(
+        self,
+    ) -> None:
+        result = self.cdn_sync()
+        self.assertTrue(result.eligible, result.reason)
+        self.assertEqual(result.dependabot.tier, "review")
+        every = self.cdn_sync(["lib/cdn-pins/pins.json", *self.CDN_TARGETS])
+        self.assertTrue(every.eligible, every.reason)
+
+    def test_a_cdn_pins_sync_commit_is_only_the_base_registry_files_in_place(
+        self,
+    ) -> None:
+        pins, target = "lib/cdn-pins/pins.json", self.CDN_TARGETS[0]
+        self.assert_sync_refused(
+            self.cdn_sync([pins, target, "src/x.js"]), "cdn-sync-scope:src/x.js"
+        )
+        self.assert_sync_refused(
+            self.cdn_sync([pins, "lib/cdn-pins/sync.mjs"]),
+            "cdn-sync-scope:lib/cdn-pins/sync.mjs",
+        )
+        for listing in (
+            [{"filename": target, "status": "added"}],
+            [{"filename": target, "status": "removed"}],
+            [{"filename": target, "status": "renamed", "previous_filename": "a.md"}],
+        ):
+            with self.subTest(status=listing[0]["status"]):
+                self.assert_sync_refused(
+                    self.cdn_sync(files=listing), f"cdn-sync-status:{target}"
+                )
+        for ref, mode in (
+            (self.PARENT, 0o100755),
+            (self.HEAD, 0o100755),
+            (self.HEAD, 0o120000),
+        ):
+            with self.subTest(ref=ref[:1], mode=oct(mode)):
+                modes = {(ref, target): {"type": "blob", "mode": mode}}
+                self.assert_sync_refused(
+                    self.cdn_sync(modes=modes), f"cdn-sync-mode:{target}"
+                )
+        message = {
+            "commit": {
+                "message": "Sync the CDN pins",
+                "verification": {"verified": True, "reason": "valid"},
+            }
+        }
+        self.assert_sync_refused(self.cdn_sync(detail=message), "cdn-sync-message")
+
+    def test_a_cdn_pins_sync_commit_carries_the_sync_rows_subject_and_trailer(
+        self,
+    ) -> None:
+        ref = "dependabot/npm_and_yarn/x-1.3.0"
+        trailer = "\n\nLane-Activity: pr-unblock/review-dependency\n"
+        for label, text, reason in (
+            (
+                "another row's subject",
+                f"Fix the dependency update on {ref} [dependabot skip]{trailer}",
+                "cdn-sync-message",
+            ),
+            (
+                "another branch",
+                "Sync the CDN pins to the bumped manifest on main "
+                f"[dependabot skip]{trailer}",
+                "cdn-sync-message",
+            ),
+            (
+                "no trailer",
+                self.SYNC_MESSAGE.split("\n", 1)[0],
+                "cdn-sync-trailer",
+            ),
+            (
+                "another activity",
+                self.SYNC_MESSAGE.replace("review-dependency", "fix-ci-context"),
+                "cdn-sync-trailer",
+            ),
+        ):
+            with self.subTest(label):
+                detail = {
+                    "commit": {
+                        "message": text,
+                        "verification": {"verified": True, "reason": "valid"},
+                    }
+                }
+                self.assert_sync_refused(self.cdn_sync(detail=detail), reason)
+
+    def test_a_cdn_pins_sync_commit_is_the_lanes_apps_with_one_parent(
+        self,
+    ) -> None:
+        unsigned = {
+            "commit": {
+                "message": self.SYNC_MESSAGE,
+                "verification": {"verified": False, "reason": "unsigned"},
+            }
+        }
+        for label, detail in (
+            ("another author", {"author": {"login": "maintainer"}}),
+            ("no author account", {"author": None}),
+            ("a committer other than web-flow", {"committer": {"id": 5}}),
+            ("an unverified signature", unsigned),
+        ):
+            with self.subTest(label):
+                self.assert_sync_refused(
+                    self.cdn_sync(detail=detail), "cdn-sync-author"
+                )
+        two = self.cdn_sync(
+            detail={"parents": [{"sha": self.PARENT}, {"sha": "b" * 40}]}
+        )
+        self.assertEqual(
+            two.reason, f"dependabot-fix-content:commit-parents:{self.HEAD[:12]}"
+        )
+
+    def test_a_cdn_pins_sync_commit_refuses_when_the_base_registry_does_not_read(
+        self,
+    ) -> None:
+        for label, pins in (
+            ("absent", 404),
+            ("a failed read", 502),
+            ("not JSON", file_payload("{")),
+            ("an invalid target", file_payload('{"targets": [{"path": "../x"}]}')),
+            (
+                "a bump path target",
+                file_payload('{"targets": [{"path": "lib/cdn-pins/package.json"}]}'),
+            ),
+        ):
+            with self.subTest(label):
+                self.assert_sync_refused(
+                    self.cdn_sync(pins=pins), "cdn-sync-base-unreadable"
+                )
 
     def test_a_verdict_admits_no_other_second_commit_on_a_patch_bump(self) -> None:
         refused = f"commit-not-dependabot:{self.HEAD[:12]}"
@@ -10527,6 +11072,50 @@ class DependabotEligibility(unittest.TestCase):
                     "dependabot-review:dependabot-policy-unreadable;"
                     "review-verdict-missing",
                 )
+
+    def test_an_opted_in_repository_reads_the_standards_policy(self) -> None:
+        standards = f"repos/{STANDARDS_REPO}/contents/"
+        valid = file_payload(json.dumps({"autoMerge": {"reviewOnly": []}}))
+        for team, head, theirs, eligible in (
+            (OPTED_IN, STANDARDS_HEAD, valid, True),
+            (OPTED_IN, STANDARDS_HEAD, file_payload("{not json"), False),
+            (OPTED_IN, 502, valid, False),
+            (OPTED_IN, STANDARDS_HEAD, 502, False),
+            ("trusted_actors_source: elsewhere\n", STANDARDS_HEAD, valid, False),
+        ):
+            with self.subTest(team=team, head=head, theirs=theirs):
+                standards_cleared(self)
+                gh = self.fake()
+                ours = f"repos/{REPO}/contents/{POLICY}?ref={SHA}"
+                gh.rest[ours] = 500
+                gh.rest[f"repos/{REPO}/contents/{TEAM_YAML}?ref={SHA}"] = file_payload(team)
+                gh.rest[f"repos/{STANDARDS_REPO}/git/ref/heads/main"] = head
+                path = f"{dependabot.STANDARDS_POLICY}?ref={STANDARDS_SHA}"
+                gh.rest[standards + path] = theirs
+                gh.rest[f"{standards[:-1]}?ref={STANDARDS_SHA}"] = []
+                result = self.eligibility()
+                self.assertIs(result.eligible, eligible, result.reason)
+                self.assertNotIn(["api", ours], gh.calls)
+
+    def test_a_repository_source_reads_the_policy_copy(self) -> None:
+        standards_cleared(self)
+        gh = self.fake()
+        gh.rest[f"repos/{REPO}/contents/{TEAM_YAML}?ref={SHA}"] = file_payload(
+            "trusted_actors_source: repository\n"
+        )
+        self.assertTrue(self.eligibility().eligible)
+        self.assertFalse(any(STANDARDS_REPO in c[1] for c in gh.calls))
+
+    def test_a_failed_read_of_the_team_yaml_reads_neither_policy(self) -> None:
+        standards_cleared(self)
+        gh = self.fake()
+        ours = f"repos/{REPO}/contents/{POLICY}?ref={SHA}"
+        gh.rest[f"repos/{REPO}/contents/{TEAM_YAML}?ref={SHA}"] = 502
+        gh.rest[f"repos/{STANDARDS_REPO}/git/ref/heads/main"] = STANDARDS_HEAD
+        result = self.eligibility()
+        self.assertFalse(result.eligible, result.reason)
+        self.assertNotIn(["api", ours], gh.calls)
+        self.assertFalse(any(STANDARDS_REPO in c[1] for c in gh.calls))
 
     def moved_main(
         self, main_config: Any = None, main_policy: Any = None, **options: Any

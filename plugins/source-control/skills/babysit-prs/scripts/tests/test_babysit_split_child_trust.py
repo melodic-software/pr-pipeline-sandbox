@@ -1,6 +1,6 @@
-# test-scope: .github/scripts/intake-triage/split-child.vectors.json .github/scripts/intake-triage/admit.mjs .github/actions/resolve-config/admission-rules.json
+# test-scope: .github/scripts/intake-triage/split-child.vectors.json .github/scripts/intake-triage/admit.mjs .github/scripts/intake-triage/size-split.mjs .github/actions/resolve-config/admission-rules.json
 """The gate's split-child trust rule (`babysit_verify_evidence._trusted_spec`)
-agrees with Issue Triage's (admit.mjs splitChildBody, its one home).
+agrees with Issue Triage's (size-split.mjs splitChildBody, its one home).
 
 Expected values come from `.github/scripts/intake-triage/split-child.vectors.json`,
 the cases admit.test.mjs and resolve-pr.test.mjs also read: each case's
@@ -175,8 +175,12 @@ class FakeGitHub:
             answer = {"ref": f"refs/heads/{branch}", "object": self.tips[branch]}
             return subprocess.CompletedProcess(args, 0, json.dumps(answer), "")
         if args[:2] == ["api", "graphql"]:
-            if f"query={ve.OWN_AGENT_ISSUE_QUERY}" in args:
-                payload = {"data": {"repository": {"issue": {}}}}
+            if any(
+                f"query={query}" in args
+                for query in (ve.OWN_AGENT_ISSUE_QUERY, ve.BRIEFED_ISSUE_QUERY)
+            ):
+                empty = {"comments": {"totalCount": 0, "nodes": []}}
+                payload = {"data": {"repository": {"issue": empty}}}
                 return subprocess.CompletedProcess(args, 0, json.dumps(payload), "")
             assert any(a == f"query={ve.SPLIT_CHILD_QUERY}" for a in args), args
             if self.fail:
@@ -195,6 +199,9 @@ class FakeGitHub:
             for a in args
         ):
             return subprocess.CompletedProcess(args, 0, json.dumps(self.actors), "")
+        team = f"repos/{REPO}/contents/{ve.merge_policy.repo_config.YAML_CONFIG_PATH}?"
+        if any(a.startswith(team) for a in args):
+            return subprocess.CompletedProcess(args, 1, "", "gh: Not Found (HTTP 404)")
         raise AssertionError(f"unexpected gh call: {args}")
 
 

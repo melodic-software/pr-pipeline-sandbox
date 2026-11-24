@@ -154,7 +154,7 @@ config layers for the agent's role replaces that pin on the spawn: `retrieval` f
 `worker` for `researcher` and `intent-tracer`, `verifier` for `research-verifier`. Set it on the
 `research` workload to move these agents and the `research-sweep` stages without moving other
 plugins' agents in that role, for example
-`roles.worker.workloads.research.model: sonnet` in `.claude/multi-agent.local.yaml`. Layers and
+`roles.worker.workloads.research.model: sonnet` in `docs/conventions/multi-agent.local.yaml`. Layers and
 keys: the multi-agent plugin's `reference/config.md`. A layer value of `inherit` keeps the pin,
 because a spawn's `model` takes an alias only
 ([sub-agents: choose a model](https://code.claude.com/docs/en/sub-agents#choose-a-model)). With no such layer, or without `multi-agent`, the

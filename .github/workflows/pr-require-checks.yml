@@ -546,7 +546,6 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             /.node-version
-            /.github/actions/setup-pinned-node/
             /.github/actions/log-api-budget/rate-limits.json
             /plugins/source-control/skills/babysit-prs/scripts/*.py
             /plugins/source-control/skills/babysit-prs/scripts/verify-legacy-fails.json
@@ -555,7 +554,7 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Set up Node
         if: ${{ !cancelled() && github.event_name == 'merge_group' }}
-        uses: ./.base/.github/actions/setup-pinned-node # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/setup-pinned-node@main
         with:
           node-version-file: .base/.node-version
       # The hold rules and config at the group's base commit, so the queued

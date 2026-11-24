@@ -1,3 +1,4 @@
+// test-scope: .github/scripts/lib/* .github/scripts/apply-patch/*
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -6,11 +7,14 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { checkRow, createGitHubApi, CREDENTIAL_SHAPES, credentialIn, FROZEN_TIERS, generatedRegions, protectedRegions, leakedBlob, fixedThreadsFrom, hasConflictMarkers, keptThreadsFrom, loadRules, main, MAX_PATCH_BYTES, mergeFrom, patchProblem, push, pushReason, REFUSALS, refusalsOf, RULES_PATH, rowFor, select, sharedCopiesFrom } from "./apply-patch.mjs";
+import { buildTree, cdnPinsFrom, checkRow, createGitHubApi, CREDENTIAL_SHAPES, credentialIn, FROZEN_TIERS, generatedRegions, protectedRegions, leakedBlob, fixedThreadsFrom, hasConflictMarkers, keptThreadsFrom, loadRules, main, MAX_PATCH_BYTES, MAX_TREE_ENTRIES_PER_REQUEST, mergeFrom, patchProblem, push, pushReason, REFUSALS, refusalsOf, RULES_PATH, rowFor, select, sharedCopiesFrom } from "./apply-patch.mjs";
 import { PREDICATES } from "./predicates.mjs";
+import { cdnRequest } from "../pr-unblock/cdn-pins-sync.mjs";
+import { cdnSyncMessageRefusal } from "../pr-unblock/dependency-classify.mjs";
 import { createRateLimitLatch } from "../../actions/log-api-budget/rate-guard.mjs";
 import { CREDENTIAL_SHAPES as GATE_SHAPES, findSecret, scanLeak } from "../../../lib/publish-gate.mjs";
 import { tempDir } from "../../../lib/test-tmp.mjs";
+import { binary, lockOf, npmTarball, tarballUrl } from "../../../lib/cdn-pins/fixtures/npm-tarball.mjs";
 process.env.GIT_CONFIG_GLOBAL ??= "/dev/null";
 process.env.GIT_CONFIG_NOSYSTEM = "1";
 
@@ -246,6 +250,81 @@ test("a new executable bit the patch sets pushes with the mode it set", async (t
   assert.equal((await pushWith(fix, api)).outcome, "pushed");
   const { createCommit } = api.calls.find((call) => call.createCommit);
   assert.equal(git(fix.repo, ["ls-tree", createCommit.tree, "--", "README.md"]).split(" ")[0], "100755");
+});
+
+function traceTrees(api) {
+  const trees = [];
+  const build = api.createTree;
+  api.createTree = async (base, entries) => {
+    const sha = await build(base, entries);
+    trees.push({ base, entries, sha });
+    return sha;
+  };
+  return trees;
+}
+
+const manyFiles = (repo) => {
+  rmSync(join(repo, "notes.md"));
+  mkdirSync(join(repo, "data"));
+  for (let i = 0; i <= MAX_TREE_ENTRIES_PER_REQUEST; i++) {
+    writeFileSync(join(repo, `data/f${i}.txt`), `${i}\n`);
+  }
+};
+
+test("buildTree chains each chunk on the previous tree, deletions first, and ends on the tree one request builds", async (t) => {
+  const fix = repoWithPatch(t, () => {});
+  const headTree = git(fix.repo, ["rev-parse", `${fix.head}^{tree}`]);
+  const blob = (text) => git(fix.repo, ["hash-object", "-w", "--stdin"], text);
+  const entries = [
+    { path: "a.txt", mode: "100644", type: "blob", sha: blob("a\n") },
+    { path: "README.md", mode: "100644", type: "blob", sha: null },
+    { path: "b/c.txt", mode: "100644", type: "blob", sha: blob("c\n") },
+    { path: "notes.md", mode: "100644", type: "blob", sha: null },
+    { path: "d.txt", mode: "100644", type: "blob", sha: blob("d\n") },
+  ];
+  const api = fakeApi(fix.repo, fix.head);
+  const whole = await api.createTree(headTree, entries);
+  const trees = traceTrees(api);
+  assert.equal(await buildTree(api, headTree, entries, 2), whole);
+  assert.deepEqual(trees.map(({ entries: chunk }) => chunk.map((item) => item.path)), [["README.md", "notes.md"], ["a.txt", "b/c.txt"], ["d.txt"]]);
+  assert.deepEqual(trees.map(({ base }) => base), [headTree, trees[0].sha, trees[1].sha]);
+});
+
+test("buildTree sends entries that fit one chunk in one request, in their order, and none for no entries", async (t) => {
+  const fix = repoWithPatch(t, () => {});
+  const headTree = git(fix.repo, ["rev-parse", `${fix.head}^{tree}`]);
+  const entries = [
+    { path: "a.txt", mode: "100644", type: "blob", sha: git(fix.repo, ["hash-object", "-w", "--stdin"], "a\n") },
+    { path: "README.md", mode: "100644", type: "blob", sha: null },
+  ];
+  const api = fakeApi(fix.repo, fix.head);
+  const trees = traceTrees(api);
+  await buildTree(api, headTree, entries, 2);
+  assert.deepEqual(trees.map(({ base, entries: chunk }) => [base, chunk]), [[headTree, entries]]);
+  assert.equal(await buildTree(api, headTree, []), headTree);
+  assert.equal(trees.length, 1);
+});
+
+test("a patch with more paths than one tree request holds builds the tree in chunks and pushes it", async (t) => {
+  const fix = repoWithPatch(t, manyFiles);
+  const api = fakeApi(fix.repo, fix.head);
+  const trees = traceTrees(api);
+  assert.equal((await pushWith(fix, api)).outcome, "pushed");
+  assert.equal(trees.length, 2);
+  assert.ok(trees.every(({ entries }) => entries.length <= MAX_TREE_ENTRIES_PER_REQUEST));
+  assert.deepEqual(trees[0].entries[0], { path: "notes.md", mode: "100644", type: "blob", sha: null });
+  assert.equal(trees[1].base, trees[0].sha);
+  const { createCommit } = api.calls.find((call) => call.createCommit);
+  assert.equal(createCommit.tree, trees[1].sha);
+  assert.ok(api.calls.some((call) => call.updateRef));
+});
+
+test("a chunked tree build that ends on another tree throws and commits nothing", async (t) => {
+  const fix = repoWithPatch(t, manyFiles);
+  const api = fakeApi(fix.repo, fix.head, { tree: "f".repeat(40) });
+  await assert.rejects(pushWith(fix, api), /GitHub built tree f{40}, not the applied tree [0-9a-f]{40}; nothing is committed/);
+  assert.equal(api.calls.filter((call) => call === "createTree").length, 2);
+  assert.equal(api.calls.some((call) => call.createCommit || call.updateRef || call.createRef), false);
 });
 
 // A fix that makes two 100644 scripts executable and edits a test fixture,
@@ -1182,8 +1261,7 @@ test("a row with no requires list throws before any git or API work", async (t) 
   assert.deepEqual(api.calls, []);
 });
 
-// One blob per file plus seven calls, so the 300 cap bounds the writes.
-test("a fix-ci patch of 300 files pushes with 307 API calls, and one of 301 is refused with none", async (t) => {
+test("a fix-ci patch of 300 files pushes with 309 API calls, and one of 301 is refused with none", async (t) => {
   const files = (count) => (repo) => {
     mkdirSync(join(repo, "gen"));
     for (let i = 0; i < count; i += 1) {
@@ -1193,7 +1271,7 @@ test("a fix-ci patch of 300 files pushes with 307 API calls, and one of 301 is r
   const atCap = repoWithPatch(t, files(300));
   const api = fakeApi(atCap.repo, atCap.head);
   assert.equal((await pushWith(atCap, api, { row: row("ci-context") })).outcome, "pushed");
-  assert.equal(api.calls.length, 307);
+  assert.equal(api.calls.length, 309);
   const over = repoWithPatch(t, files(301));
   const refused = fakeApi(over.repo, over.head);
   assert.deepEqual(await pushWith(over, refused, { row: row("ci-context") }), { outcome: "escalate", escalationReason: "ci-fix-invalid" });
@@ -2158,7 +2236,7 @@ test("apply-patch loads from the staged layout its script activity runs in", asy
     mkdirSync(join(root, "pr-merge"));
     cpSync(join(here, "..", "pr-merge", "merge-holds.mjs"), join(root, "pr-merge", "merge-holds.mjs"));
     mkdirSync(join(root, "pr-unblock"));
-    for (const file of ["thread-scope.mjs", "dependency-classify.mjs", "escalation-routes.mjs", "escalation-routes.json"]) {
+    for (const file of ["thread-scope.mjs", "test-scope.mjs", "dependency-classify.mjs", "escalation-routes.mjs", "escalation-routes.json"]) {
       cpSync(join(here, "..", "pr-unblock", file), join(root, "pr-unblock", file));
     }
     const staged = await import(pathToFileURL(join(root, "base-script", "apply-patch.mjs")).href);
@@ -3437,7 +3515,7 @@ test("select under the merge-base row: a clean merge proceeds with no patch, an 
 // holds upload nothing, two files both sides changed that merged cleanly and
 // the one resolved conflict upload one blob each; the patch is the
 // resolution alone, so max-files counts one path.
-test("a merge with 400 base-side files, 2 clean two-sided merges and 1 resolution makes exactly 3 blobs, 1 tree, 1 commit and 1 ref update", async (t) => {
+test("a merge with 400 base-side files, 2 clean two-sided merges and 1 resolution makes exactly 3 blobs, 5 chained trees, 1 commit and 1 ref update", async (t) => {
   const many = Object.fromEntries(Array.from({ length: 400 }, (_, i) => [`gen/f${i}.txt`, `${i} from main\n`]));
   const fix = mergeFixture(t, {
     base: { "a.txt": "one\n", "two/x.txt": "1\n2\n3\n4\n5\n", "two/y.txt": "1\n2\n3\n4\n5\n" },
@@ -3447,7 +3525,7 @@ test("a merge with 400 base-side files, 2 clean two-sided merges and 1 resolutio
   });
   const api = fakeApi(fix.repo, fix.head);
   assert.equal((await mergePush(fix, api)).outcome, "pushed");
-  assert.deepEqual(callNames(api), ["getPull", "listLabels", "readBranch", "createBlob", "createBlob", "createBlob", "createTree", "createCommit", "updateRef", "readBranch"]);
+  assert.deepEqual(callNames(api), ["getPull", "listLabels", "readBranch", "createBlob", "createBlob", "createBlob", ...Array(5).fill("createTree"), "createCommit", "updateRef", "readBranch"]);
   const { createCommit } = api.calls.find((call) => call.createCommit);
   assert.deepEqual(createCommit.parents, [fix.head, fix.base]);
   assert.equal(git(fix.repo, ["rev-parse", `${createCommit.tree}:gen/f399.txt`]), git(fix.repo, ["rev-parse", `${fix.base}:gen/f399.txt`]));
@@ -3832,4 +3910,304 @@ test("shared-copies: main pushes the written patch on a clean merge, and the mer
   const emptyEnv = envFor(empty, "empty", { PATCH_FILE: join(out, "absent.diff"), PATCH_SHA256: "" });
   await main([], emptyEnv, { api: fakeApi(empty.repo, empty.head), cwd: empty.repo, gitBin: "git", log: () => {} });
   assert.match(readFileSync(emptyEnv.GITHUB_OUTPUT, "utf8"), /^commit=c{40}$/m);
+});
+
+const CDN_TEST_TARGET = "plugins/example/skills/report/reference/view.md";
+const CDN_TEST_UNCHANGED = "docs/unchanged.md";
+const CDN_TEST_PINS = "lib/cdn-pins/pins.json";
+const cdnTestRecord = (version, integrity) => ({
+  cdn: "https://cdn.jsdelivr.net/npm/",
+  packages: {
+    x: { version, file: "view.js", integrity },
+    y: { version: "1.0.0", file: "view.js", integrity: "sha256-unchanged" },
+  },
+  targets: [
+    { path: CDN_TEST_TARGET, packages: ["x"], integrity: true },
+    { path: CDN_TEST_UNCHANGED, packages: ["y"], integrity: true },
+  ],
+});
+const cdnTestView = (version, integrity, name = "x") => `https://cdn.jsdelivr.net/npm/${name}@${version}/view.js ${integrity}\n`;
+const writeRecord = (dir, record) => writeFileSync(join(dir, CDN_TEST_PINS), `${JSON.stringify(record, null, 2)}\n`);
+
+function cdnTestBase() {
+  const baseDir = tempDir("cdn-pins-base-");
+  mkdirSync(join(baseDir, "lib/cdn-pins"), { recursive: true });
+  cpSync(new URL("./fixtures/cdn-check.mjs", import.meta.url), join(baseDir, "lib/cdn-pins/sync.mjs"));
+  writeRecord(baseDir, cdnTestRecord("1.0.0", "sha256-before"));
+  return baseDir;
+}
+
+test("cdn-pins allows only the base registry and its targets, and fails closed without a registry", () => {
+  const allowed = PREDICATES["cdn-pins"]({ cdnPins: cdnPinsFrom(cdnTestBase()) });
+  assert.ok(allowed(CDN_TEST_PINS));
+  assert.ok(allowed(CDN_TEST_TARGET));
+  assert.equal(allowed("lib/cdn-pins/package.json"), false);
+  assert.equal(allowed("docs/unlisted.md"), false);
+  assert.throws(() => PREDICATES["cdn-pins"]({ cdnPins: cdnPinsFrom(tempDir("cdn-pins-absent-")) }), /needs the base pins.json/);
+});
+
+test("cdn-pins-sync checks the patched blobs and unchanged targets with the base script before pushing", async (t) => {
+  const baseDir = cdnTestBase();
+  for (const [why, version, hash, mode, headMode = 0o644] of [
+    ["matching sync", "2.0.0", "sha256-after", 0o644],
+    ["wrong hash", "2.0.0", "sha256-stale", 0o644],
+    ["wrong version", "3.0.0", "sha256-after", 0o644],
+    ["changed mode", "2.0.0", "sha256-after", 0o755],
+    ["executable on both sides", "2.0.0", "sha256-after", 0o755, 0o755],
+  ]) {
+    const fix = repoWithPatch(t, (repo) => {
+      writeRecord(repo, cdnTestRecord(version, "sha256-after"));
+      writeFileSync(join(repo, CDN_TEST_TARGET), cdnTestView(version, hash));
+      chmodSync(join(repo, CDN_TEST_TARGET), mode);
+    }, {
+      head: (repo) => {
+        for (const path of [CDN_TEST_PINS, CDN_TEST_TARGET, CDN_TEST_UNCHANGED]) {
+          mkdirSync(dirname(join(repo, path)), { recursive: true });
+        }
+        writeFileSync(join(repo, "lib/cdn-pins/package.json"), PKG("2.0.0", { dependencies: { x: "2.0.0", y: "1.0.0" } }));
+        writeRecord(repo, cdnTestRecord("1.0.0", "sha256-before"));
+        writeFileSync(join(repo, CDN_TEST_TARGET), cdnTestView("1.0.0", "sha256-before"));
+        chmodSync(join(repo, CDN_TEST_TARGET), headMode);
+        writeFileSync(join(repo, CDN_TEST_UNCHANGED), cdnTestView("1.0.0", "sha256-unchanged", "y"));
+      },
+    });
+    const api = fakeApi(fix.repo, fix.head);
+    const result = await pushWith(fix, api, {
+      row: row("cdn-pins-sync"),
+      context: { baseDir, cdnPins: cdnPinsFrom(baseDir) },
+    });
+    if (why === "matching sync") {
+      assert.equal(result.outcome, "pushed");
+      assert.match(api.calls.find((call) => call.createCommit).createCommit.message, /^Sync the CDN pins to the bumped manifest on feat\/x \[dependabot skip\]/);
+    } else {
+      assert.deepEqual(result, { outcome: "escalate", escalationReason: "dependency-pin-protected-path" }, why);
+      assert.deepEqual(api.calls, [], why);
+    }
+  }
+});
+
+test("pr-unblock.yml's CDN route end to end: the real sync script, the patch CLI and the cdn-pins-sync row push a commit both merge gates admit", async (t) => {
+  const sri = (body) => `sha256-${createHash("sha256").update(body).digest("base64")}`;
+  const cdn = "https://cdn.jsdelivr.net/npm/";
+  const bodies = { [`${cdn}x@1.0.0/view.js`]: "x one", [`${cdn}x@2.0.0/view.js`]: "x two", [`${cdn}y@1.0.0/view.js`]: "y one" };
+  const [xTarball, yTarball] = [npmTarball("view.js", "x two"), npmTarball("view.js", "y one")];
+  bodies[tarballUrl("x", "2.0.0")] = binary(xTarball);
+  const lockText = `${JSON.stringify(lockOf({ x: ["2.0.0", xTarball], y: ["1.0.0", yTarball] }))}\n`;
+  const record = (version) => ({
+    cdn,
+    packages: { x: { version, file: "view.js", integrity: sri(bodies[`${cdn}x@${version}/view.js`]) }, y: { version: "1.0.0", file: "view.js", integrity: sri("y one") } },
+    targets: [
+      { path: CDN_TEST_TARGET, packages: ["x"], integrity: true },
+      { path: CDN_TEST_UNCHANGED, packages: ["y"], integrity: true },
+    ],
+  });
+  const viewOf = (name, version) => cdnTestView(version, record(version).packages[name].integrity, name);
+  const script = join(REPO_ROOT, "lib/cdn-pins/sync.mjs");
+  const baseDir = tempDir("cdn-pins-base-");
+  mkdirSync(join(baseDir, "lib/cdn-pins"), { recursive: true });
+  cpSync(script, join(baseDir, "lib/cdn-pins/sync.mjs"));
+  writeRecord(baseDir, record("1.0.0"));
+  const fix = repoWithPatch(t, () => {}, {
+    head: (repo) => {
+      for (const path of [CDN_TEST_PINS, CDN_TEST_TARGET, CDN_TEST_UNCHANGED]) mkdirSync(dirname(join(repo, path)), { recursive: true });
+      writeFileSync(join(repo, "lib/cdn-pins/package.json"), `${JSON.stringify({ dependencies: { x: "2.0.0", y: "1.0.0" } })}\n`);
+      writeFileSync(join(repo, "lib/cdn-pins/package-lock.json"), lockText);
+      writeRecord(repo, record("1.0.0"));
+      writeFileSync(join(repo, CDN_TEST_TARGET), viewOf("x", "1.0.0"));
+      writeFileSync(join(repo, CDN_TEST_UNCHANGED), viewOf("y", "1.0.0"));
+    },
+  });
+  const readText = async (path) => git(fix.repo, ["show", `${fix.head}:${path}`]) + "\n";
+  const request = await cdnRequest({ files: [{ filename: "lib/cdn-pins/package.json" }], changedFiles: 1, baseDir, readText });
+  assert.deepEqual(Object.keys(request.files), [CDN_TEST_PINS, CDN_TEST_TARGET, CDN_TEST_UNCHANGED]);
+  assert.equal(request.lock, lockText);
+
+  const work = scratch(t);
+  const result = join(scratch(t), "cdn-pins-result");
+  const inputs = { ...request.files, "lib/cdn-pins/package.json": request.manifest, "lib/cdn-pins/package-lock.json": request.lock, "lib/cdn-pins/sync.mjs": request.script };
+  for (const [path, text] of Object.entries(inputs)) {
+    mkdirSync(dirname(join(work, path)), { recursive: true });
+    writeFileSync(join(work, path), text);
+  }
+  const fetchEnv = { ...process.env, CDN_PINS_FAKE_FETCH: JSON.stringify(bodies) };
+  const fakeFetch = join(REPO_ROOT, "lib/cdn-pins/fixtures/fake-fetch.mjs");
+  execFileSync(process.execPath, ["--import", fakeFetch, join(work, "lib/cdn-pins/sync.mjs"), "sync", work], { env: fetchEnv, encoding: "utf8" });
+  for (const [path, before] of Object.entries(request.files)) {
+    const synced = readFileSync(join(work, path), "utf8");
+    if (synced === before) continue;
+    mkdirSync(dirname(join(result, path)), { recursive: true });
+    writeFileSync(join(result, path), synced);
+  }
+  assert.equal(readFileSync(join(result, CDN_TEST_TARGET), "utf8"), viewOf("x", "2.0.0"));
+
+  const io = scratch(t);
+  writeFileSync(join(io, "request.json"), JSON.stringify(request));
+  const patchFile = join(io, "patch.diff");
+  execFileSync(process.execPath, [join(REPO_ROOT, ".github/scripts/pr-unblock/cdn-pins-sync.mjs"), "patch", join(io, "request.json"), result, patchFile]);
+  const text = readFileSync(patchFile, "utf8");
+  assert.doesNotMatch(text, /unchanged\.md/);
+
+  const workflow = readFileSync(join(REPO_ROOT, ".github/workflows/pr-unblock.yml"), "utf8");
+  const syncJob = workflow.split("\n  review-cdn-pins-sync:\n")[1].split(/\n {2}\S/)[0];
+  for (const [path, key] of [["package.json", "manifest"], ["package-lock.json", "lock"], ["sync.mjs", "script"]]) {
+    assert.match(syncJob, new RegExp(`^ {12}"lib/cdn-pins/${path.replace(".", "\\.")}": request\\.${key},$`, "m"));
+  }
+  const job = workflow.split("\n  apply-cdn-pins-sync:\n")[1].split(/\n {2}\S/)[0];
+  const [lane, activity] = [/^ {6}lane: (\S+)$/m, /^ {6}patch-activity: (\S+)$/m].map((pattern) => job.match(pattern)[1]);
+  assert.match(job, /^ {6}patch-prepare: cdn-pins-sync$/m);
+  const headRef = "dependabot/npm_and_yarn/lib/cdn-pins/x-2.0.0";
+  const api = fakeApi(fix.repo, fix.head);
+  const pushed = await pushWith({ ...fix, patchFile, sum: sha256(text) }, api, {
+    row: row("cdn-pins-sync"),
+    context: { baseDir, cdnPins: cdnPinsFrom(baseDir) },
+    headRef,
+    lane,
+    activity,
+  });
+  assert.equal(pushed.outcome, "pushed");
+  const { createCommit } = api.calls.find((call) => call.createCommit);
+  assert.equal(cdnSyncMessageRefusal(createCommit.message, headRef), null, createCommit.message);
+  assert.equal(git(fix.repo, ["cat-file", "blob", `${createCommit.tree}:${CDN_TEST_TARGET}`]) + "\n", viewOf("x", "2.0.0"));
+  assert.equal(JSON.parse(git(fix.repo, ["cat-file", "blob", `${createCommit.tree}:${CDN_TEST_PINS}`])).packages.x.version, "2.0.0");
+  assert.deepEqual(treePaths(fix, api), [`M\t${CDN_TEST_PINS}`, `M\t${CDN_TEST_TARGET}`]);
+});
+
+const SUITE = "tests/a.test.sh";
+const SUITE_TEXT = "#!/bin/bash\n# Checks a.\nset -e\necho ok\n";
+const scopeFixture = (t, edit, seed = () => {}) =>
+  repoWithPatch(t, edit, {
+    head: (repo) => {
+      mkdirSync(join(repo, "tests"));
+      writeFileSync(join(repo, SUITE), SUITE_TEXT);
+      seed(repo);
+    },
+  });
+const declare = (repo, text = "#!/bin/bash\n# Checks a.\n# test-scope: scripts/x.sh\nset -e\necho ok\n") => writeFileSync(join(repo, SUITE), text);
+
+function apiOnlyApi(repo, head, overrides = {}) {
+  const api = fakeApi(repo, head, overrides);
+  const read = (name, value) => (api.calls.push(name), value);
+  api.getCommit = async (sha) => read("getCommit", { tree: { sha: git(repo, ["rev-parse", `${sha}^{tree}`]) }, message: overrides.headMessage ?? git(repo, ["log", "-1", "--format=%B", sha]) });
+  api.getTree = async (sha) =>
+    read("getTree", {
+      tree: git(repo, ["ls-tree", sha])
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          const [[mode, type, item], path] = [line.slice(0, line.indexOf("\t")).split(" "), line.slice(line.indexOf("\t") + 1)];
+          return { path, mode, type, sha: item };
+        }),
+    });
+  api.getBlob = async (sha) => read("getBlob", { content: execFileSync("git", ["cat-file", "blob", sha], { cwd: repo }).toString("base64"), encoding: "base64" });
+  return api;
+}
+
+const scopePush = (t, fix, api, extra = {}) => pushWith(fix, api, { cwd: scratch(t), row: row("test-scope"), lane: "pr-unblock", activity: "fix-test-scope", ...extra });
+
+test("test-scope: the api-only row pushes a declaration from head blobs read over the API, with no head checkout", async (t) => {
+  const fix = scopeFixture(t, declare);
+  const api = apiOnlyApi(fix.repo, fix.head);
+  const result = await scopePush(t, fix, api);
+  assert.equal(result.outcome, "pushed");
+  const { createCommit } = api.calls.find((call) => call.createCommit);
+  assert.equal(git(fix.repo, ["cat-file", "blob", `${createCommit.tree}:${SUITE}`]), "#!/bin/bash\n# Checks a.\n# test-scope: scripts/x.sh\nset -e\necho ok");
+  assert.equal(git(fix.repo, ["cat-file", "blob", `${createCommit.tree}:README.md`]), "# r", "a path the patch does not touch keeps the head's blob");
+  assert.deepEqual(createCommit.parents, [fix.head]);
+  assert.match(createCommit.message, /^Declare the suites' test-scope reads on feat\/x\n\nLane-Activity: pr-unblock\/fix-test-scope\n$/);
+  assert.deepEqual(api.calls.find((call) => call.updateRef).updateRef, { ref: "heads/feat/x", sha: "c".repeat(40), force: false });
+  assert.ok(api.calls.includes("getBlob"), "the head blob came from the API");
+});
+
+test("test-scope: a patch that rewrites or drops a suite line is refused by the content rule", async (t) => {
+  const fix = scopeFixture(t, (repo) => declare(repo, "#!/bin/bash\n# Checks a.\n# test-scope: scripts/x.sh\necho ok\n"));
+  const api = apiOnlyApi(fix.repo, fix.head);
+  assert.deepEqual(await scopePush(t, fix, api), { outcome: "escalate", escalationReason: "test-scope-protected-path" });
+  assert.deepEqual(writes(api), []);
+});
+
+test("test-scope: a declaration below the leading comment block, which the selector never reads, is refused", async (t) => {
+  const fix = scopeFixture(t, (repo) => declare(repo, "#!/bin/bash\n# Checks a.\nset -e\n# test-scope: scripts/x.sh\necho ok\n"));
+  const api = apiOnlyApi(fix.repo, fix.head);
+  assert.equal((await scopePush(t, fix, api)).escalationReason, "test-scope-protected-path");
+  assert.deepEqual(writes(api), []);
+});
+
+test("test-scope: a // line in a shell suite, or a glob, is refused", async (t) => {
+  for (const line of ["// test-scope: scripts/x.sh", "# test-scope: scripts/*.sh", "# test-scope: scripts/x.sh scripts/y.sh"]) {
+    const fix = scopeFixture(t, (repo) => declare(repo, `#!/bin/bash\n# Checks a.\n${line}\nset -e\necho ok\n`));
+    const api = apiOnlyApi(fix.repo, fix.head);
+    assert.equal((await scopePush(t, fix, api)).escalationReason, "test-scope-protected-path", line);
+    assert.deepEqual(writes(api), [], line);
+  }
+});
+
+test("test-scope: a suite under .github/ or a file that is no suite is outside the row's allow", async (t) => {
+  for (const [path, text] of [
+    [".github/scripts/b.test.sh", "# test-scope: scripts/x.sh\nset -e\n"],
+    ["scripts/x.sh", "#!/bin/sh\n# test-scope: README.md\nfoo=1\n"],
+  ]) {
+    const fix = scopeFixture(t, (repo) => {
+      mkdirSync(join(repo, dirname(path)), { recursive: true });
+      writeFileSync(join(repo, path), text);
+    }, (repo) => {
+      mkdirSync(join(repo, dirname(path)), { recursive: true });
+      writeFileSync(join(repo, path), text.replace(/^.*test-scope.*\n/m, ""));
+    });
+    const api = apiOnlyApi(fix.repo, fix.head);
+    assert.equal((await scopePush(t, fix, api)).escalationReason, "test-scope-protected-path", path);
+    assert.deepEqual(writes(api), [], path);
+  }
+});
+
+test("test-scope: a pull request Dependabot opened, or one held by a label, gets no push", async (t) => {
+  const fix = scopeFixture(t, declare);
+  const dependabot = apiOnlyApi(fix.repo, fix.head, { pull: { draft: false, head: { repo: { full_name: "o/r" } }, user: { login: "dependabot[bot]", type: "Bot" } } });
+  assert.deepEqual(await scopePush(t, fix, dependabot), { outcome: "held" });
+  assert.deepEqual(writes(dependabot), []);
+  const held = apiOnlyApi(fix.repo, fix.head, { labels: [{ name: "needs-session" }] });
+  assert.deepEqual(await scopePush(t, fix, held, { holdLabels: ["do-not-merge", "needs-session"] }), { outcome: "held" });
+  assert.deepEqual(writes(held), []);
+});
+
+test("test-scope: a head that is the activity's own commit, or that moved, gets no push", async (t) => {
+  const fix = scopeFixture(t, declare);
+  const own = apiOnlyApi(fix.repo, fix.head, { headMessage: "Declare the suites' test-scope reads on feat/x\n\nLane-Activity: pr-unblock/fix-test-scope\n" });
+  assert.deepEqual(await scopePush(t, fix, own), { outcome: "not-applicable" });
+  assert.deepEqual(writes(own), []);
+  const moved = apiOnlyApi(fix.repo, fix.head);
+  assert.deepEqual(await scopePush(t, fix, moved, { patchHeadSha: "e".repeat(40) }), { outcome: "superseded" });
+  assert.deepEqual(writes(moved), []);
+});
+
+test("test-scope: a tree GitHub built without the patched blob is never committed", async (t) => {
+  const fix = scopeFixture(t, declare);
+  const api = apiOnlyApi(fix.repo, fix.head, { tree: git(fix.repo, ["rev-parse", `${fix.head}^{tree}`]) });
+  await assert.rejects(scopePush(t, fix, api), /without the patched "tests\/a\.test\.sh"; nothing is committed/);
+  assert.equal(api.calls.some((call) => call.createCommit), false);
+});
+
+test("checkRow refuses api-only on a row that takes a moved head or names no refusing content rule", () => {
+  assert.throws(() => checkRow(row("test-scope", { "skip-moved-head": false })), /sets api-only but/);
+  assert.throws(() => checkRow(row("test-scope", { "content-rule": "protected-content" })), /sets api-only but/);
+  assert.equal(checkRow(row("test-scope")).name, "test-scope");
+});
+
+test("PREDICATES test-suites admits a suite outside .github/ the selector reads test-scope lines from, and nothing else", () => {
+  const admits = PREDICATES["test-suites"]({});
+  for (const path of ["tests/a.test.sh", "x/b.test.mjs", "x/c.test.js", "x/D.Tests.ps1", "x/test_e.py"]) {
+    assert.equal(admits(path), true, path);
+  }
+  for (const path of [".github/scripts/a.test.mjs", ".GitHub/x/a.test.sh", "scripts/x.sh", "x/e_test.py", "CODEOWNERS"]) {
+    assert.equal(admits(path), false, path);
+  }
+});
+
+test("test-scope: a declaration that also sets the executable bit is refused", async (t) => {
+  const fix = scopeFixture(t, (repo) => {
+    declare(repo);
+    chmodSync(join(repo, SUITE), 0o755);
+  });
+  const api = apiOnlyApi(fix.repo, fix.head);
+  assert.equal((await scopePush(t, fix, api)).escalationReason, "test-scope-protected-path");
+  assert.deepEqual(writes(api), []);
 });

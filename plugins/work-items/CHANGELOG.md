@@ -3,6 +3,133 @@
 All notable changes to the `work-items` plugin are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this plugin uses semantic versioning.
 
+## [15.14.9] - 2026-11-24
+
+### Changed
+
+- The bug root-cause gate names `/testing:fix-failing diagnose` for a failing test.
+
+## [15.14.8] - 2026-11-24
+
+### Changed
+
+- Skill bodies mark each mention of another plugin's skill "(if enabled)", so a profile that switches that plugin off leaves no dead reference.
+
+## [15.14.7] - 2026-11-23
+
+### Changed
+
+- name a person's call the approve step, not admission, in triage and work-loop
+
+  Admission is the check with no model that follows the triage verdict, so a
+  label a person applied or removed is now described as someone allowed to
+  approve work.
+
+- The track `edit` and `view` actions say "map", not "decision map", as wayfind's own vocabulary rule says.
+
+## [15.14.6] - 2026-11-23
+
+### Changed
+
+- Skills now list their context-dependent links under `## Related`, and `setup` and `morning-brief` name their successors under `## Next`, matching the committed skill-link table. The `morning-brief` `## Cross-references` section became those two sections.
+
+## [15.14.5] - 2026-11-23
+
+### Fixed
+
+- The shared config resolver reads the personal override (`<home>/<plugin>.local.*`) from the repository's main checkout when it runs in a linked worktree that has no personal file of its own, so personal settings no longer drop in worktrees.
+- The rendered-views medium resolver checks a personal publishing medium's trust (untracked, gitignored, no symlink) on the file the value was read from, so a value from the main checkout is checked in the main checkout.
+
+## [15.14.4] - 2026-11-23
+
+### Changed
+
+- measure-delivery: `merge-risk-failures.mjs` reads a record's first line through an exported `parseRecordMarker`, which runs the shared post-merge record vectors. No behavior changes.
+
+## [15.14.3] - 2026-11-22
+
+### Fixed
+
+- Creating a tracker item, with or without `--repo`, now exits `3` when GitHub reports you cannot push to the resolved repository, so someone else's public repository never receives your issues. Inside GitHub Actions the check is skipped, so lanes whose token cannot push keep filing; reads and lists still resolve.
+
+## [15.14.2] - 2026-11-22
+
+### Changed
+
+- `get-statuses` under Work status trust derives the bot setters from the trust list when the model sets no `bot-setters`: github-actions[bot] plus every `kind: bot` entry whose login starts with `melodic-`, other than `melodic-automation-lanes[bot]`. A model that sets `bot-setters` keeps that explicit list, each entry counting while the trust list holds it as that bot.
+
+## [15.14.1] - 2026-11-22
+
+### Fixed
+
+- In a fork checkout, the GitHub tracker adapter no longer follows `gh`'s default repository, which a stock `gh repo clone` of a fork records as upstream. With no `--repo`, it resolves the repository with the same `target-repo.sh` that `/source-control:pull-request` uses (canonical `lib/target-repo.sh`): the pushable fork wins, and remotes naming two or more GitHub repositories with no fork and no `gh repo set-default` exit `3` with that fix, instead of creating or listing items on whichever repository `gh` picks by remote name. Each resolution prints `target repository: <owner>/<repo>` on stderr.
+
+## [15.14.0] - 2026-11-21
+
+### Added
+
+- `/work-items:track add --session-owned`: the ownership choice for a session filing work it will do itself. It applies the session-owned role label, resolved from `config.role_labels["session-owned"]` (default `session-owned`) as the human-gated role label is, so the software-factory lanes skip the item, and it leaves off the `needs-triage` floor. It cannot be combined with `--agent-ready`, and a label missing from the live set stops the action before anything is created.
+
+## [15.13.0] - 2026-11-21
+
+### Added
+
+- A fifth canonical role, `session-owned` (default label `session-owned`, remapped through `config.role_labels["session-owned"]`): a local Claude Code session owns the item and does it itself. `list-frontier --autonomous` excludes an item carrying it, so `/work-items:work-loop` never admits one; the interactive frontier keeps it for the owning session. The binding exports it as `WIT_SESSION_OWNED_LABEL`, and the label taxonomy, tracker seam, schema and CONTRACT name it.
+
+### Changed
+
+- `decompose`: an item's `## Decisions` lines carry the options the source records as rejected, each with its reason, so a picker does not reopen a settled choice. Only recorded options are listed.
+
+## [15.12.3] - 2026-11-21
+
+### Fixed
+
+- `morning-brief` Queues counts and the `track stats` totals leave out an open parent issue whose sub-issues are not all completed, so a split parent no longer counts beside the children that carry its work. A Queues row shows such parents as `(+N with open sub-issues)`, and `stats` lists them on a Containers line. The live count reads `subIssuesSummary` (`gh` 2.94 or later) ([#17859](https://github.com/melodic-software/claude-code-plugins/issues/17859)).
+
+## [15.12.2] - 2026-11-21
+
+### Fixed
+
+- `work-loop` standing mode says a `/loop` created on Claude Code 2.1.330 or later runs up to 30 days and an older one still ends at 7 days, and points at the 2.1.330 changelog entry beside the scheduled-tasks section. The restart-request handling on an expiry hit is unchanged ([#17833](https://github.com/melodic-software/claude-code-plugins/issues/17833)).
+
+## [15.12.1] - 2026-11-21
+
+### Changed
+
+- the shared prerequisites checker gains a latest-release mode
+
+## [15.12.0] - 2026-11-21
+
+### Added
+
+- **`/work-items:track dossier-branches <item-id>` deletes or reports one item's remote dossier branch.** It runs the dossier-branch step, now kept in one shared reference file that the container close also cites. Attended, the step shows the commits the default branch cannot reach and deletes only what the user confirms; unattended, it deletes nothing and lists the branch as due. More than one matching branch, or a branch that is the head of an open pull request, is only reported ([#17037](https://github.com/melodic-software/claude-code-plugins/issues/17037)).
+
+### Changed
+
+- **`/work-items:decompose` reads a `Source map: #<n>` line.** It accepts the line only when the named item carries the wayfind map label, and then treats the map as the source item: the container, or each item when there is no container, gets the map as its parent. When decompose publishes from a map with no container, it runs the dossier-branch step for the map's branch at the end of publish, since no close ritual will run for it ([#17037](https://github.com/melodic-software/claude-code-plugins/issues/17037)).
+
+## [15.11.0] - 2026-11-21
+
+### Added
+
+- `/work-items:ship run` takes a non-container parent: an item with no spec-container label that
+  has open sub-items, such as the source item decompose attaches items to when its container offer
+  is declined. The run works the parent's ready children as per-item PRs and says so in the item
+  list it shows for approval, without writing a shape line onto the parent. Once every child is
+  closed, an open parent closes through "Decomposed parent close" and a closed one needs nothing.
+  `status` stays container-only. A new eval case, `sh-run-non-container-parent-per-item`, covers a
+  run over such a parent with two ready children.
+
+### Changed
+
+- Repaired two links in the work skill's candidate-discovery context that pointed at an unresolvable `<plugin-root>` placeholder target.
+
+## [15.10.2] - 2026-11-21
+
+### Changed
+
+- Shared `lane-binding.mjs` synced where this plugin carries it: a lane run still going now throws a typed `LaneRunPending`; no other change to this plugin.
+
 ## [15.10.1] - 2026-11-20
 
 ### Changed

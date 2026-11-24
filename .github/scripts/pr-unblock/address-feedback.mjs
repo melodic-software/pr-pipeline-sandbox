@@ -48,10 +48,12 @@ import { appendFileSync, lstatSync, readdirSync, readFileSync, writeFileSync } f
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { ACTIONS_BOT_ID } from "../lib/lane-vocabulary.mjs";
 import { runAsScript } from "../lib/run-main.mjs";
 import { bindingOf, FOOTER as LANE_FOOTER, laneChecker, laneFooter, withoutBinding, withoutLaneFooters } from "../lib/lane-binding.mjs";
 import { commentItems, FAILING, gateSource, laneHold, latestRuns, listLabelEvents, prHold, ROUND_MARKER } from "./gate-source.mjs";
 import { retryFetch } from "../lib/retry-fetch.mjs";
+import { loadTrustedList, readRawTrustedActors, trustedActorsPath, trustedListPath } from "../lib/trusted-actors.mjs";
 import { BODY_HOLD, LANE_HOLD, refsIssue, trackerBindingText } from "../pr-merge/merge-holds.mjs";
 import { copyPathsOf, isProtectedPath, namedInScope, prPathsOf, sharedCopyPairs } from "./thread-scope.mjs";
 import { retryRung, ROUTES, stopSkip } from "./escalation-routes.mjs";
@@ -76,8 +78,7 @@ export const roundLine = (round, max) => `round ${round} of max ${max}`;
 export { ROUND_MARKER };
 // The activity select decides, as escalation-routes.json names it.
 const ACTIVITY = "address-feedback";
-// github-actions[bot], the author of the review lanes' reviewed-head markers.
-export const MARKER_AUTHOR_ID = 41898282;
+export const MARKER_AUTHOR_ID = ACTIONS_BOT_ID;
 // Listed review bots no comment can summon: github-advanced-security[bot],
 // which posts code scanning (CodeQL) alerts after each analysis of a pushed
 // head. requestSkip asks only that a trusted person or the lanes App opened
@@ -123,10 +124,6 @@ export function planLanes(paths, root = ROOT) {
   );
 }
 
-// The job ids of a plan's lanes: test-bash, test-python and test-node in
-// pr-require-checks.yml (a matrix lane once per leg its bash_legs or
-// python_legs lists, as `<lane> (<leg>)`), and each pr-test-platforms.yml job
-// it names. An unreadable leg list throws.
 const legs = (value) => {
   const list = JSON.parse(value || "[0]");
   if (!Array.isArray(list) || list.length === 0 || !list.every((leg) => Number.isSafeInteger(leg) && leg >= 0)) {
@@ -135,10 +132,9 @@ const legs = (value) => {
   return list;
 };
 export function coveringLanes(plan) {
-  const matrix = ["bash", "python"].filter((lane) => plan[lane] === "true").flatMap((lane) => legs(plan[`${lane}_legs`]).map((leg) => `test-${lane} (${leg})`));
-  const node = plan.node === "true" ? ["test-node"] : [];
+  const matrix = ["bash", "python", "node"].filter((lane) => plan[lane] === "true").flatMap((lane) => legs(plan[`${lane}_legs`]).map((leg) => `test-${lane} (${leg})`));
   const windows = JSON.parse(plan.windows_jobs || "[]");
-  return [...matrix, ...node, ...(Array.isArray(windows) ? windows.filter((job) => typeof job === "string") : [])];
+  return [...matrix, ...(Array.isArray(windows) ? windows.filter((job) => typeof job === "string") : [])];
 }
 
 // A test lane's check-run name: every test job in pr-require-checks.yml and
@@ -1148,11 +1144,7 @@ const touchesProtected = (files) => files.length >= FILES_CAP || files.some((fil
 // The rounds the PR has had: round markers or model check runs on its
 // commits, whichever count more, and those check runs.
 async function roundsSoFar(api, pr, issueComments, appId) {
-  const commits = await api.listPullCommits(pr);
-  const checkRuns = [];
-  for (const commit of commits) {
-    checkRuns.push(await api.listCheckRuns(commit.sha, MODEL_CHECK));
-  }
+  const checkRuns = await api.listModelRounds(pr, MODEL_CHECK);
   return { rounds: Math.max(countRounds(issueComments, appId), countCheckRounds(checkRuns)), checkRuns };
 }
 
@@ -1227,9 +1219,9 @@ export async function linkedSpec(env, log) {
   }
   try {
     const { linkedIssues } = await import("../pr-verify/resolve-pr.mjs");
-    const { createGitHub, loadTrustedList } = await import("../../actions/check-trusted-trigger/check-trusted-trigger.mjs");
+    const { createGitHub } = await import("../lib/github-client.mjs");
     const { loadRules } = await import("../intake-triage/admit.mjs");
-    const trusted = loadTrustedList(env.TRUSTED_ACTORS_PATH || ".base/.github/standards/trusted-actors/trusted-actors.json");
+    const trusted = loadTrustedList(trustedListPath(env, env.TRUSTED_ACTORS_PATH || trustedActorsPath()));
     const api = (keepGraphQLErrors) => createGitHub({ token: env.GITHUB_TOKEN, apiUrl: env.GITHUB_API_URL, keepGraphQLErrors });
     const identity = String(env.LANE_IDENTITY ?? "").trim().toLowerCase().replace(/\[bot\]$/, "");
     const taskList = loadRules(new URL("../../actions/resolve-config/admission-rules.json", import.meta.url).pathname)["task-list"];
@@ -1357,9 +1349,6 @@ export async function select({
     // The merge gate refuses the head verify:earlier-fail, so a round must
     // move it; the FAIL's notes come from its verdict artifact, since their
     // threads are resolved (#12809).
-    // Its feedback-already-addressed stop releases the head (a reply job's
-    // lane-stopped), so a stop of this head already queued for a session
-    // builder stands down here too, before any read or model turn.
     if (earlierFailHeads.length > 0 && sessionQueued({ labels: pull.labels, issueComments, headSha, isLanesApp })) {
       return { decision: "skip", skipReason: "awaiting-session", threads: kept };
     }
@@ -1649,6 +1638,68 @@ export function refreshableSections(body, names = []) {
     .map(({ heading, text }) => ({ heading, text }));
 }
 
+const TEMPLATE_DIRS = [".github", "", "docs"];
+const TEMPLATE_NAME = "pull_request_template.md";
+
+export function templateHeadings(text) {
+  return bodySections(String(text ?? "").replace(/<!--[\s\S]*?-->/g, ""))
+    .sections.map((section) => section.heading.trim())
+    .filter((heading) => HEADING_NAME.test(heading));
+}
+
+export function localTemplate(root) {
+  for (const dir of TEMPLATE_DIRS) {
+    let names;
+    try {
+      names = readdirSync(join(root, dir));
+    } catch {
+      continue;
+    }
+    const name = names.find((entry) => entry.toLowerCase() === TEMPLATE_NAME);
+    if (name && lstatSync(join(root, dir, name)).isFile()) {
+      return readFileSync(join(root, dir, name), "utf8");
+    }
+  }
+  return null;
+}
+
+export async function orgTemplate(readPath, owner) {
+  const base = `/repos/${encodeURIComponent(owner)}/.github/contents`;
+  for (const dir of TEMPLATE_DIRS) {
+    let entries;
+    try {
+      entries = await readPath(dir ? `${base}/${dir}` : base);
+    } catch (error) {
+      if (error.status === 404) {
+        continue;
+      }
+      throw error;
+    }
+    const entry = Array.isArray(entries) ? entries.find((item) => item.type === "file" && String(item.name).toLowerCase() === TEMPLATE_NAME) : undefined;
+    if (entry) {
+      return Buffer.from((await readPath(`${base}/${entry.path}`)).content ?? "", "base64").toString("utf8");
+    }
+  }
+  return null;
+}
+
+export async function bodySectionNames({ listed, root, readPath, owner, log = () => {} }) {
+  const names = String(listed ?? "").split("\n").filter((name) => name.trim() !== "");
+  if (names.length > 0) {
+    return names;
+  }
+  const local = templateHeadings(localTemplate(root));
+  if (local.length > 0) {
+    return local;
+  }
+  try {
+    return templateHeadings(await orgTemplate(readPath, owner));
+  } catch (error) {
+    log(`body refresh off: the ${owner}/.github pull request template is unreadable (${error.message})`);
+    return null;
+  }
+}
+
 /** The read-only body view's caps: code points per section, and sections. A PR body holds at most 65,536 characters, so the view stays far under the thread file's 1 MiB cap. */
 export const BODY_VIEW_LIMITS = { text: 8000, sections: 30 };
 // biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are what it replaces
@@ -1750,6 +1801,26 @@ const RESOLVE_MUTATION = `mutation($id: ID!) {
   resolveReviewThread(input: { threadId: $id }) { thread { isResolved } }
 }`;
 
+const GITHUB_ACTIONS_APP_ID = 15368;
+const ROUNDS_QUERY = `query($owner: String!, $name: String!, $pr: Int!, $check: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      commits(first: 100) {
+        pageInfo { hasNextPage }
+        nodes {
+          commit {
+            oid
+            checkSuites(first: 5, filterBy: { appId: ${GITHUB_ACTIONS_APP_ID}, checkName: $check }) {
+              pageInfo { hasNextPage }
+              nodes { checkRuns(first: 10, filterBy: { checkName: $check, checkType: ALL }) { pageInfo { hasNextPage } nodes { databaseId name conclusion completedAt } } }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
 const THREADS_QUERY = `query($owner: String!, $name: String!, $pr: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $pr) {
@@ -1820,6 +1891,15 @@ export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch: 
     return data.data;
   }
   const encodePath = (path) => path.split("/").map(encodeURIComponent).join("/");
+  const checkRunsNamed = async (sha, check) =>
+    (await requestData(`${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(check)}&filter=all&per_page=100`)).check_runs ?? [];
+  const eachCommit = async (shas, check) => {
+    const runs = [];
+    for (const sha of shas) {
+      runs.push(await checkRunsNamed(sha, check));
+    }
+    return runs;
+  };
   return {
     getPull: async (pr) => requestData(`${repo}/pulls/${pr}`),
     // A GraphQL answer whole, errors kept for the caller to judge
@@ -1850,6 +1930,28 @@ export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch: 
     // Written or edited since `since` (GitHub's since query value) when given.
     listReviewComments: (pr, since) => paginate(`pulls/${pr}/comments${since === undefined ? "" : `?since=${encodeURIComponent(since)}`}`),
     listPullCommits: (pr) => paginate(`pulls/${pr}/commits`),
+    async listModelRounds(pr, check) {
+      const commits = (await graphql(ROUNDS_QUERY, { owner, name, pr, check })).repository.pullRequest.commits;
+      if (commits.pageInfo.hasNextPage) {
+        return eachCommit((await paginate(`pulls/${pr}/commits`)).map((commit) => commit.sha), check);
+      }
+      const runs = [];
+      for (const { commit } of commits.nodes) {
+        const suites = commit.checkSuites;
+        runs.push(
+          suites.pageInfo.hasNextPage || suites.nodes.some((suite) => suite.checkRuns.pageInfo.hasNextPage)
+            ? await checkRunsNamed(commit.oid, check)
+            : [...new Map(suites.nodes.flatMap((suite) => suite.checkRuns.nodes).map((run) => [run.databaseId, run])).values()].map((run) => ({
+                id: run.databaseId,
+                name: run.name,
+                app: { slug: "github-actions" },
+                conclusion: String(run.conclusion ?? "").toLowerCase() || null,
+                completed_at: run.completedAt,
+              })),
+        );
+      }
+      return runs;
+    },
     // A commit's statuses, newest first (fix-ci-context.mjs weakenStopped).
     listCommitStatuses: (sha) => paginate(`commits/${sha}/statuses`),
     // A branch's repository activity, newest first, read by cursor to its end
@@ -1863,10 +1965,7 @@ export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch: 
       };
       return branchActivity(read, `${owner}/${name}`, branch);
     },
-    async listCheckRuns(sha, name) {
-      const url = `${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}&filter=all&per_page=100`;
-      return (await requestData(url)).check_runs ?? [];
-    },
+    listCheckRuns: checkRunsNamed,
     // Every check run on a commit, re-runs and a contract-only run's skips
     // included (failingChecks prefers a real result over a skip), up to 300
     // (fix-ci-context.mjs).
@@ -1911,7 +2010,7 @@ export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch: 
     // over 1 MB (docs.github.com/en/rest/repos/contents#get-repository-content,
     // as of 2026-10-21; recheck when that section changes its size limits);
     // null when the path is absent.
-    async getText(path, ref) {
+    async getText(path, ref, { exactUtf8 = false } = {}) {
       const url = `${repo}/contents/${encodePath(path)}?ref=${encodeURIComponent(ref)}`;
       const response = await fetch(url, { headers: { ...headers, Accept: "application/vnd.github.raw+json" } });
       if (response.status === 404) {
@@ -1920,7 +2019,7 @@ export function createGitHubApi({ token, repository, apiUrl, graphqlUrl, fetch: 
       if (!response.ok) {
         throw new Error(`GET ${url} returned ${response.status}`);
       }
-      return response.text();
+      return exactUtf8 ? new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await response.arrayBuffer()) : response.text();
     },
     async listThreads(pr) {
       const nodes = [];
@@ -2072,7 +2171,7 @@ export function maxRoundsFrom(value) {
   return value === undefined || value === "" ? DEFAULT_MAX_ROUNDS : positive(value, "REVIEW_ROUNDS");
 }
 
-const readActors = (path) => JSON.parse(readFileSync(path, "utf8")).actors ?? [];
+const readActors = (path) => readRawTrustedActors(path).actors ?? [];
 
 // The ids of the people on the base's trusted-actors list.
 export function trustedHumansFrom(trustedActorsPath) {
@@ -2109,11 +2208,11 @@ export const HOLD_LINE = /(?:^|(?<=[\r\n]))[^\S\r\n]*hold:/i;
 export async function ownerAdoption(env, log = () => {}) {
   try {
     const { adoptionFromBase } = await import(new URL("../../actions/resolve-config/resolve-config.mjs", import.meta.url).href);
-    const idleHours = adoptionFromBase({ BASE_PATH: env.BASE_PATH || ".base" })["idle-hours"];
+    const idleHours = adoptionFromBase({ BASE_PATH: env.BASE_PATH || ".base", STANDARDS_DIR: env.STANDARDS_DIR })["idle-hours"];
     if (idleHours === undefined) {
       return NO_ADOPTION;
     }
-    return { ownerIds: trustedHumansFrom(env.TRUSTED_ACTORS || `${env.BASE_PATH || ".base"}/.github/standards/trusted-actors/trusted-actors.json`), idleHours };
+    return { ownerIds: trustedHumansFrom(trustedListPath(env, env.TRUSTED_ACTORS || trustedActorsPath(env.BASE_PATH))), idleHours };
   } catch (error) {
     log(`::warning::cannot read the base adoption section or trusted-actors list (${error.message}); no owner PR is served this run`);
     return NO_ADOPTION;
@@ -2171,7 +2270,7 @@ export function pullFromFile(path, pr, headSha) {
   }
 }
 
-export async function main(argv, env, { api, actions, log = (line) => console.log(line) } = {}) {
+export async function main(argv, env, { api, actions, plan, log = (line) => console.log(line) } = {}) {
   const command = argv[0];
   need(env, ["GITHUB_TOKEN", "GITHUB_REPOSITORY", "GITHUB_OUTPUT", "PR_NUMBER", "HEAD_SHA", "APP_SENDER_ID"]);
   const pr = positive(env.PR_NUMBER, "PR_NUMBER");
@@ -2207,7 +2306,7 @@ export async function main(argv, env, { api, actions, log = (line) => console.lo
       humanGatedLabel: humanGatedLabelFrom(env.TRACKER_CONFIG || ".base/docs/conventions/work-items.yaml"),
       maxRounds: maxRoundsFrom(env.REVIEW_ROUNDS),
       adoption: await ownerAdoption(env, log),
-      ci: ({ headSha, files }) => ciSnapshot({ api: client, headSha, files }),
+      ci: ({ headSha, files }) => ciSnapshot({ api: client, headSha, files, plan }),
       earlierFailHeads,
       // Loaded only for such a round: it reads pr-verify's scripts.
       readFailNotes: async ({ heads, files }) => {
@@ -2266,7 +2365,8 @@ export async function main(argv, env, { api, actions, log = (line) => console.lo
     // pr_body_refresh from the base's source-control.yaml (unset is on), and
     // its pr_body_required_sections list.
     if (result.file && env.BODY_REFRESH !== "false") {
-      const sections = refreshableSections(result.body, String(env.BODY_SECTIONS ?? "").split("\n"));
+      const names = await bodySectionNames({ listed: env.BODY_SECTIONS, root: ".base", readPath: client.readPath, owner: env.GITHUB_REPOSITORY.split("/")[0], log });
+      const sections = names === null ? [] : refreshableSections(result.body, names);
       if (sections.length > 0) {
         result.file.body_sections = sections;
       }

@@ -67,7 +67,7 @@ on:
         description: What to unblock.
         required: false
         type: choice
-        options: [resolve-conflicts, address-feedback, review-dependency, fix-ci, sync-shared-copies]
+        options: [resolve-conflicts, address-feedback, review-dependency, fix-ci, sync-shared-copies, fix-test-scope]
         default: resolve-conflicts
       dispatcher-run-id:
         description: The dispatcher run that sent this dispatch; empty for a human dispatch.
@@ -121,6 +121,7 @@ jobs:
       actions: read # the dispatcher run's file and head
     outputs:
       stale: ${{ steps.current.outputs.stale }}
+      standards-sha: ${{ steps.standards.outputs.sha }}
     # Each guarded API call's rate-limit reading, for the job-end api-budget
     # notice (.github/actions/log-api-budget).
     env:
@@ -129,16 +130,9 @@ jobs:
       - name: Resolve main's tip
         id: tip
         if: inputs.dispatcher-run-id != ''
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         if: inputs.dispatcher-run-id != ''
         uses: actions/checkout@v7
@@ -146,6 +140,13 @@ jobs:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Resolve the standards commit
+        id: standards
+        if: inputs.dispatcher-run-id != ''
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+        with:
+          checkout: 'false'
 
       - name: Compare the dispatcher file with the tip's
         id: current
@@ -212,6 +213,7 @@ jobs:
       # true when another lane's escalation put the human-gated label on, so
       # apply-conflict-patch pushes past it (lane-hold.mjs).
       lane-escalated: ${{ steps.hold.outputs.lane-escalated }}
+      standards-sha: ${{ steps.standards.outputs.sha }}
     # Each guarded API call's rate-limit reading, for the job-end api-budget
     # notice (.github/actions/log-api-budget).
     env:
@@ -219,22 +221,21 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+        with:
+          ref: ${{ needs.check-dispatcher-current.outputs.standards-sha }}
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -308,6 +309,7 @@ jobs:
           head-sha: ${{ steps.head.outputs.sha }}
           prepare-supported: "true"
           applied-by-supported: patch
+          standards-path: ${{ steps.standards.outputs.path }}
 
       # The human-gated label holds the PR unless another lane's escalation
       # put it on; do-not-merge stays with the slot's labels-absent. A GitHub
@@ -327,6 +329,7 @@ jobs:
           # A rate limit past the guard's budget refuses the read with a
           # notice, and the step holds.
           API_BUDGET_HOLD: "1"
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: node .base/.github/scripts/pr-unblock/lane-hold.mjs
 
       # The base every merge of this round uses: the default branch tip now,
@@ -349,21 +352,10 @@ jobs:
         env:
           BIN: ${{ runner.temp }}/merge-base-bin
           RESOLVED: ${{ runner.temp }}/resolved-config.json
-        run: |
-          mkdir -p "$BIN"
-          for file in .base/.github/scripts/merge-base/prepare.sh \
-            .base/plugins/source-control/scripts/resolve-version-bump-conflict.sh; do
-            name=$(basename "$file" .sh)
-            cp "$file" "$BIN/$name.sh"
-            sum=$(sha256sum <"$BIN/$name.sh")
-            echo "$name-sha256=${sum%% *}" >>"$GITHUB_OUTPUT"
-          done
-          no_progress=$(jq -r '.loop["no-progress"] // empty' "$RESOLVED")
-          if ! [[ $no_progress =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::the resolved config holds no loop.no-progress"
-            exit 1
-          fi
-          echo "no-progress=$no_progress" >>"$GITHUB_OUTPUT"
+        run: >-
+          bash .base/.github/scripts/merge-base/stage-bin.sh
+          .base/.github/scripts/merge-base/prepare.sh
+          .base/plugins/source-control/scripts/resolve-version-bump-conflict.sh
 
       # Full history: the merge needs the merge base and the pinned base. No
       # credentials stay behind, and no head code runs.
@@ -473,16 +465,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -536,7 +521,7 @@ jobs:
   resolve-conflicts:
     name: Resolve Conflicts
     needs: resolve-conflicts-select
-    if: ${{ !cancelled() && needs.resolve-conflicts-select.outputs.proceed == 'true' }}
+    if: ${{ !cancelled() && needs.resolve-conflicts-select.outputs.proceed == 'true' && vars.CLAUDE_API_KEYS_DISABLED != 'true' }}
     permissions:
       actions: read # the read runner's key-credit gate lists the credit-stop markers
       contents: read
@@ -589,16 +574,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -697,16 +675,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -850,22 +821,21 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+        with:
+          ref: ${{ needs.resolve-conflicts-select.outputs.standards-sha }}
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -889,6 +859,7 @@ jobs:
         env:
           SCAN_REFUSED_DIR: ${{ runner.temp }}/scan-refused
           SCAN_REFUSED_READ: ${{ steps.scan-refused.outcome }}
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: node .base/.github/scripts/pr-unblock/conflict-scan-refusal.mjs
 
       - name: Log the API budget at the end
@@ -963,22 +934,21 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+        with:
+          ref: ${{ needs.check-dispatcher-current.outputs.standards-sha }}
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -1054,6 +1024,7 @@ jobs:
           output-path: ${{ runner.temp }}/resolved-config.json
           pr-number: ${{ inputs.pr-number }}
           head-sha: ${{ steps.head.outputs.sha }}
+          standards-path: ${{ steps.standards.outputs.path }}
 
       # The human-gated label holds the PR unless pr-merge's shared-copy
       # refusal at this head put it on; with no such refusal
@@ -1073,6 +1044,7 @@ jobs:
           # A rate limit past the guard's budget refuses the read with a
           # notice, and the step holds.
           API_BUDGET_HOLD: "1"
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: node .base/.github/scripts/pr-unblock/lane-hold.mjs
 
       - name: Pin the base
@@ -1092,21 +1064,10 @@ jobs:
         env:
           BIN: ${{ runner.temp }}/merge-base-bin
           RESOLVED: ${{ runner.temp }}/resolved-config.json
-        run: |
-          mkdir -p "$BIN"
-          for file in .base/.github/scripts/merge-base/prepare.sh \
-            .base/plugins/source-control/scripts/resolve-version-bump-conflict.sh; do
-            name=$(basename "$file" .sh)
-            cp "$file" "$BIN/$name.sh"
-            sum=$(sha256sum <"$BIN/$name.sh")
-            echo "$name-sha256=${sum%% *}" >>"$GITHUB_OUTPUT"
-          done
-          no_progress=$(jq -r '.loop["no-progress"] // empty' "$RESOLVED")
-          if ! [[ $no_progress =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::the resolved config holds no loop.no-progress"
-            exit 1
-          fi
-          echo "no-progress=$no_progress" >>"$GITHUB_OUTPUT"
+        run: >-
+          bash .base/.github/scripts/merge-base/stage-bin.sh
+          .base/.github/scripts/merge-base/prepare.sh
+          .base/plugins/source-control/scripts/resolve-version-bump-conflict.sh
 
       - name: Check out the PR head
         if: steps.base-sha.outcome == 'success'
@@ -1206,8 +1167,9 @@ jobs:
         id: scan-upload
         if: >-
           steps.sync.outputs.state == 'written'
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/sync-shared-copies-patch/patch.diff
 
       - name: Upload the patch
@@ -1254,16 +1216,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -1353,6 +1308,271 @@ jobs:
       # which gate-recheck.mjs reads again right before the push.
       patch-human-gate: lane-escalation
 
+  fix-test-scope-select:
+    name: Fix Test Scope Select
+    needs: check-dispatcher-current
+    if: >-
+      inputs.pr-number != '' && inputs.activity == 'fix-test-scope'
+      && format('{0}', github.event.sender.id) != vars.AUTOMATION_LANES_APP_SENDER_ID
+      && needs.check-dispatcher-current.outputs.stale != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      proceed: >-
+        ${{ steps.build.outputs.state == 'written' && 'true'
+        || (steps.head.outputs.applicable == 'false' || steps.slot.outputs.applies == 'false' || steps.locate.outputs.skip-reason != '' || steps.locate.outputs.escalation-reason != '' || steps.build.outputs.skip-reason != '' || steps.build.outputs.escalation-reason != '') && 'false' || '' }}
+      apply: ${{ steps.build.outputs.apply == 'true' && 'true' || 'false' }}
+      head-sha: ${{ steps.head.outputs.sha }}
+      patch-sha256: ${{ steps.build.outputs.sha256 }}
+      patch-attempt: ${{ steps.build.outputs.state == 'written' && github.run_attempt || '' }}
+      escalation-reason: ${{ steps.locate.outputs.escalation-reason || steps.build.outputs.escalation-reason || '' }}
+      skip-reason: >-
+        ${{ steps.head.outputs.applicable == 'false' && 'not-applicable'
+        || steps.slot.outputs.applies == 'false' && steps.slot.outputs.skip-reason
+        || steps.locate.outputs.skip-reason || steps.build.outputs.skip-reason || '' }}
+    env:
+      API_BUDGET_TOKEN: github-token
+    steps:
+      - name: Resolve main's tip
+        id: tip
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
+      - name: Check out the default branch tip
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.tip.outputs.sha }}
+          path: .base
+          persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+        with:
+          ref: ${{ needs.check-dispatcher-current.outputs.standards-sha }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Check the kill switch
+        id: kill
+        uses: ./.base/.github/actions/check-kill-switch # zizmor: ignore[self-repository]
+        with:
+          value: ${{ vars.CLAUDE_LANES_DISABLED }}
+          repo-value: ${{ vars.CLAUDE_LANES_REPO_DISABLED }}
+
+      - name: Read the PR head
+        id: head
+        if: steps.kill.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # shellcheck source=/dev/null
+          { . .base/.github/actions/log-api-budget/api-budget.bash 2>/dev/null && api_budget_wrap_gh github-token; } || true
+          # shellcheck source=/dev/null
+          . .base/.github/scripts/pr-unblock/read-pr-head.bash
+          if ! [[ $PR_NUMBER =~ ^[1-9][0-9]{0,9}$ ]]; then
+            echo "::error::the pr-number input is not a PR number"
+            exit 1
+          fi
+          read_pr_fields "$PR_NUMBER" '.head.sha, .base.ref, .head.repo.full_name, .user.login' || exit 1
+          { read -r sha && read -r base && read -r head_repo && read -r author; } <<<"$pr_fields" || true
+          if ! [[ ${sha:-} =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::the PR names no head SHA"
+            exit 1
+          fi
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          if [[ ${head_repo:-} != "$GITHUB_REPOSITORY" || ${base:-} != "$DEFAULT_BRANCH" || ${author:-} == 'dependabot[bot]' ]]; then
+            echo "::notice::fix-test-scope works only same-repository pull requests into the default branch that Dependabot did not open"
+            echo "applicable=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "applicable=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve the slot
+        id: slot
+        if: steps.head.outcome == 'success' && steps.head.outputs.applicable == 'true'
+        uses: ./.base/.github/actions/resolve-config # zizmor: ignore[self-repository]
+        with:
+          lane: pr-unblock
+          activity: fix-test-scope
+          base-path: .base
+          output-path: ${{ runner.temp }}/resolved-config.json
+          pr-number: ${{ inputs.pr-number }}
+          head-sha: ${{ steps.head.outputs.sha }}
+          standards-path: ${{ steps.standards.outputs.path }}
+
+      - name: Find the failed selection trace
+        id: locate
+        if: steps.slot.outputs.applies == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          HEAD_SHA: ${{ steps.head.outputs.sha }}
+          BASE_DIR: ${{ github.workspace }}/.base
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
+        run: node .base/.github/scripts/pr-unblock/declare-test-scope.mjs locate
+
+      - name: Download the selection trace
+        if: steps.locate.outputs.run-id != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: selection-trace-${{ steps.locate.outputs.run-id }}-${{ steps.locate.outputs.run-attempt }}
+          path: ${{ runner.temp }}/selection-trace
+          run-id: ${{ steps.locate.outputs.run-id }}
+          github-token: ${{ github.token }}
+
+      - name: Check out the PR head
+        if: steps.locate.outputs.run-id != ''
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.head.outputs.sha }}
+          path: head
+          persist-credentials: false
+
+      - name: Build the test-scope declarations
+        id: build
+        if: steps.locate.outputs.run-id != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          HEAD_SHA: ${{ steps.head.outputs.sha }}
+          TRACE_DIR: ${{ runner.temp }}/selection-trace
+          HEAD_DIR: ${{ github.workspace }}/head
+          BASE_DIR: ${{ github.workspace }}/.base
+          PATCH_OUT: ${{ runner.temp }}/declare-test-scope-patch/patch.diff
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
+        run: |
+          mkdir -p "$(dirname "$PATCH_OUT")"
+          node .base/.github/scripts/pr-unblock/declare-test-scope.mjs build
+
+      - name: Scan the upload for credentials
+        id: scan-upload
+        if: steps.build.outputs.state == 'written'
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
+        with:
+          gate-path: .base/lib/publish-gate.mjs
+          path: ${{ runner.temp }}/declare-test-scope-patch/patch.diff
+
+      - name: Upload the patch
+        if: (steps.build.outputs.state == 'written') && steps.scan-upload.outputs.clean == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: patch-pr-unblock-fix-test-scope-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/declare-test-scope-patch/patch.diff
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Log the API budget at the end
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: ./.base/.github/actions/log-api-budget # zizmor: ignore[self-repository]
+        with:
+          tokens: github-token
+
+  fix-test-scope-not-run:
+    name: Fix Test Scope Not Run
+    needs: fix-test-scope-select
+    if: >-
+      ${{ !cancelled() && inputs.activity == 'fix-test-scope'
+      && (needs.fix-test-scope-select.outputs.proceed != '' || needs.fix-test-scope-select.result == 'failure')
+      && needs.fix-test-scope-select.outputs.head-sha != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      contents: read
+    env:
+      API_BUDGET_TOKEN: github-token
+    steps:
+      - name: Resolve main's tip
+        id: tip
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
+      - name: Check out the default branch tip
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.tip.outputs.sha }}
+          path: .base
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Read the stop's skip reason
+        id: stop
+        env:
+          REASON: ${{ needs.fix-test-scope-select.outputs.escalation-reason }}
+        run: echo "skip=$(node .base/.github/scripts/pr-unblock/escalation-routes.mjs skip)" >>"$GITHUB_OUTPUT"
+
+      - name: Post the fix-test-scope check run
+        uses: ./.base/.github/actions/report-check-run # zizmor: ignore[self-repository]
+        with:
+          lane: pr-unblock
+          activity: fix-test-scope
+          run-result: ${{ needs.fix-test-scope-select.result == 'failure' && 'failure' || 'skipped' }}
+          not-run-reason: >-
+            ${{ needs.fix-test-scope-select.result != 'failure'
+            && (needs.fix-test-scope-select.outputs.proceed == 'true' && 'no-model-turn'
+            || needs.fix-test-scope-select.outputs.skip-reason
+            || steps.stop.outputs.skip) || '' }}
+          head-sha: ${{ needs.fix-test-scope-select.outputs.head-sha }}
+          can-commit: "false"
+          base-path: .base
+          head-sha-fallback: ${{ needs.fix-test-scope-select.outputs.head-sha }}
+          github-token: ${{ github.token }}
+
+      - name: Log the API budget at the end
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: ./.base/.github/actions/log-api-budget # zizmor: ignore[self-repository]
+        with:
+          tokens: github-token
+
+  apply-test-scope:
+    name: Apply Test Scope
+    needs: fix-test-scope-select
+    if: ${{ !cancelled() && needs.fix-test-scope-select.outputs.proceed == 'true' && needs.fix-test-scope-select.outputs.apply == 'true' }}
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+      checks: write
+      issues: write
+      id-token: write
+    concurrency:
+      group: pr-pipeline-write-${{ inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-write.yml # zizmor: ignore[self-repository]
+    with:
+      role: pr-unblock
+      lane: pr-unblock
+      activity: apply-test-scope
+      pr-number: ${{ inputs.pr-number }}
+      dispatcher-run-id: ${{ inputs.dispatcher-run-id }}
+      trusted-base: default-tip
+      patch-state: written
+      patch-sha256: ${{ needs.fix-test-scope-select.outputs.patch-sha256 }}
+      patch-attempt: ${{ needs.fix-test-scope-select.outputs.patch-attempt }}
+      patch-activity: fix-test-scope
+      patch-prepare: test-scope
+      patch-head-sha: ${{ needs.fix-test-scope-select.outputs.head-sha }}
+
   # address-feedback is five jobs, so no model ever holds a write token. This
   # one runs only base code with a read-only token and checks out no PR head.
   # Before any model turn it reads the PR head, resolves the slot (draft and
@@ -1407,6 +1627,7 @@ jobs:
       # The artifact name's attempt, so a re-run of a later job alone still
       # finds it.
       context-attempt: ${{ steps.upload.outcome == 'success' && github.run_attempt || '' }}
+      standards-sha: ${{ steps.standards.outputs.sha }}
     # Each guarded API call's rate-limit reading, for the job-end api-budget
     # notice (.github/actions/log-api-budget).
     env:
@@ -1414,22 +1635,21 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+        with:
+          ref: ${{ needs.check-dispatcher-current.outputs.standards-sha }}
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -1492,6 +1712,7 @@ jobs:
           head-sha: ${{ steps.head.outputs.sha }}
           prepare-supported: "true"
           applied-by-supported: patch feedback-replies
+          standards-path: ${{ steps.standards.outputs.path }}
 
       - name: Select the review threads
         id: select
@@ -1505,7 +1726,7 @@ jobs:
           PULL_FILE: ${{ runner.temp }}/pr-head.json
           APP_SENDER_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
           FEEDBACK_DIR: ${{ runner.temp }}/feedback-context
-          TRUSTED_ACTORS: .base/.github/standards/trusted-actors/trusted-actors.json
+          TRUSTED_ACTORS: ${{ steps.standards.outputs.path }}/components/trusted-actors/trusted-actors.json
           TRACKER_CONFIG: .base/docs/conventions/work-items.yaml
           RESOLVED: ${{ runner.temp }}/resolved-config.json
           # A pass-only round (address-feedback.mjs select), sent only by a
@@ -1516,6 +1737,7 @@ jobs:
           # refusal, read from their verdict artifacts (earlier-fail-notes.mjs).
           VERIFY_EARLIER_FAIL_HEADS: ${{ inputs.verify-earlier-fail-heads }}
           DISPATCHER_RUN_ID: ${{ inputs.dispatcher-run-id }}
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: |
           mkdir -p "$FEEDBACK_DIR"
           REVIEW_ROUNDS=$(jq -r '.loop["review-rounds"]' "$RESOLVED")
@@ -1547,8 +1769,9 @@ jobs:
         id: scan-upload
         if: >-
           steps.select.outputs.proceed == 'true' || steps.select.outputs.resolve-only == 'true'
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: |
             ${{ runner.temp }}/feedback-context/threads.json
             ${{ runner.temp }}/feedback-context/run.json
@@ -1596,16 +1819,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -1663,7 +1879,7 @@ jobs:
   address-feedback:
     name: Address Feedback
     needs: address-feedback-select
-    if: ${{ !cancelled() && needs.address-feedback-select.outputs.proceed == 'true' }}
+    if: ${{ !cancelled() && needs.address-feedback-select.outputs.proceed == 'true' && vars.CLAUDE_API_KEYS_DISABLED != 'true' }}
     permissions:
       actions: read # the read runner's key-credit gate lists the credit-stop markers
       contents: read
@@ -1716,16 +1932,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -1825,16 +2034,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -2049,22 +2251,21 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+        with:
+          ref: ${{ needs.address-feedback-select.outputs.standards-sha }}
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -2111,7 +2312,8 @@ jobs:
           # staged as contract.json: a quote from it may settle an intent or
           # design question.
           PR_NUMBER: ${{ inputs.pr-number }}
-          TRUSTED_ACTORS_PATH: .base/.github/standards/trusted-actors/trusted-actors.json
+          TRUSTED_ACTORS_PATH: ${{ steps.standards.outputs.path }}/components/trusted-actors/trusted-actors.json
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: |
           LANE_IDENTITY=$(yq '.merge."agent-identity" // ""' .base/docs/conventions/pr-pipeline.yaml)
           export LANE_IDENTITY
@@ -2127,6 +2329,7 @@ jobs:
           model-route: adjudicate-feedback
           base-path: .base
           output-path: ${{ runner.temp }}/adjudicate-models.json
+          standards-path: ${{ steps.standards.outputs.path }}
 
       # Which legs can run, never a secret's value (ci-workflows
       # select-model-credential, one call per leg for the whole job). The key
@@ -2244,8 +2447,10 @@ jobs:
       - name: Upload disputed thread 0's sealed transcript
         if: always() && steps.judge-0.outputs.execution-file != ''
         continue-on-error: true
-        uses: ./.base/.github/actions/upload-lane-transcript # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/upload-lane-transcript@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
+          hide-trace-ids: "true"
           execution-file: ${{ steps.judge-0.outputs.execution-file }}
           public-key: ${{ vars.LANE_TRANSCRIPT_PUBLIC_KEY }}
           job-id: ${{ github.job }}-0
@@ -2326,8 +2531,10 @@ jobs:
       - name: Upload disputed thread 0's sealed transcript on the subscription
         if: always() && steps.judge-0-subscription.outputs.execution-file != ''
         continue-on-error: true
-        uses: ./.base/.github/actions/upload-lane-transcript # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/upload-lane-transcript@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
+          hide-trace-ids: "true"
           execution-file: ${{ steps.judge-0-subscription.outputs.execution-file }}
           public-key: ${{ vars.LANE_TRANSCRIPT_PUBLIC_KEY }}
           job-id: ${{ github.job }}-0-subscription
@@ -2408,8 +2615,10 @@ jobs:
       - name: Upload disputed thread 0's sealed transcript on the fallback token
         if: always() && steps.judge-0-fallback.outputs.execution-file != ''
         continue-on-error: true
-        uses: ./.base/.github/actions/upload-lane-transcript # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/upload-lane-transcript@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
+          hide-trace-ids: "true"
           execution-file: ${{ steps.judge-0-fallback.outputs.execution-file }}
           public-key: ${{ vars.LANE_TRANSCRIPT_PUBLIC_KEY }}
           job-id: ${{ github.job }}-0-fallback
@@ -2499,8 +2708,10 @@ jobs:
       - name: Upload disputed thread 1's sealed transcript
         if: always() && steps.judge-1.outputs.execution-file != ''
         continue-on-error: true
-        uses: ./.base/.github/actions/upload-lane-transcript # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/upload-lane-transcript@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
+          hide-trace-ids: "true"
           execution-file: ${{ steps.judge-1.outputs.execution-file }}
           public-key: ${{ vars.LANE_TRANSCRIPT_PUBLIC_KEY }}
           job-id: ${{ github.job }}-1
@@ -2581,8 +2792,10 @@ jobs:
       - name: Upload disputed thread 1's sealed transcript on the subscription
         if: always() && steps.judge-1-subscription.outputs.execution-file != ''
         continue-on-error: true
-        uses: ./.base/.github/actions/upload-lane-transcript # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/upload-lane-transcript@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
+          hide-trace-ids: "true"
           execution-file: ${{ steps.judge-1-subscription.outputs.execution-file }}
           public-key: ${{ vars.LANE_TRANSCRIPT_PUBLIC_KEY }}
           job-id: ${{ github.job }}-1-subscription
@@ -2663,8 +2876,10 @@ jobs:
       - name: Upload disputed thread 1's sealed transcript on the fallback token
         if: always() && steps.judge-1-fallback.outputs.execution-file != ''
         continue-on-error: true
-        uses: ./.base/.github/actions/upload-lane-transcript # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/upload-lane-transcript@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
+          hide-trace-ids: "true"
           execution-file: ${{ steps.judge-1-fallback.outputs.execution-file }}
           public-key: ${{ vars.LANE_TRANSCRIPT_PUBLIC_KEY }}
           job-id: ${{ github.job }}-1-fallback
@@ -2754,8 +2969,10 @@ jobs:
       - name: Upload disputed thread 2's sealed transcript
         if: always() && steps.judge-2.outputs.execution-file != ''
         continue-on-error: true
-        uses: ./.base/.github/actions/upload-lane-transcript # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/upload-lane-transcript@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
+          hide-trace-ids: "true"
           execution-file: ${{ steps.judge-2.outputs.execution-file }}
           public-key: ${{ vars.LANE_TRANSCRIPT_PUBLIC_KEY }}
           job-id: ${{ github.job }}-2
@@ -2836,8 +3053,10 @@ jobs:
       - name: Upload disputed thread 2's sealed transcript on the subscription
         if: always() && steps.judge-2-subscription.outputs.execution-file != ''
         continue-on-error: true
-        uses: ./.base/.github/actions/upload-lane-transcript # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/upload-lane-transcript@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
+          hide-trace-ids: "true"
           execution-file: ${{ steps.judge-2-subscription.outputs.execution-file }}
           public-key: ${{ vars.LANE_TRANSCRIPT_PUBLIC_KEY }}
           job-id: ${{ github.job }}-2-subscription
@@ -2918,8 +3137,10 @@ jobs:
       - name: Upload disputed thread 2's sealed transcript on the fallback token
         if: always() && steps.judge-2-fallback.outputs.execution-file != ''
         continue-on-error: true
-        uses: ./.base/.github/actions/upload-lane-transcript # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/upload-lane-transcript@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
+          hide-trace-ids: "true"
           execution-file: ${{ steps.judge-2-fallback.outputs.execution-file }}
           public-key: ${{ vars.LANE_TRANSCRIPT_PUBLIC_KEY }}
           job-id: ${{ github.job }}-2-fallback
@@ -2975,8 +3196,9 @@ jobs:
         if: always() && steps.credit-marker.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 1
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/key-credit-stop/run-id
 
       - name: Upload the key's credit-stop marker
@@ -2997,6 +3219,7 @@ jobs:
         env:
           OUT_DIR: ${{ runner.temp }}/adjudicate
           VERDICTS_FILE: ${{ runner.temp }}/adjudication/verdicts.json
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: |
           mkdir -p "$(dirname "$VERDICTS_FILE")"
           node .base/.github/scripts/pr-unblock/adjudicate-feedback.mjs collect
@@ -3005,8 +3228,9 @@ jobs:
         id: scan-upload
         if: >-
           always() && steps.collect.outcome == 'success'
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/adjudication/verdicts.json
 
       # overwrite: false, so a copy the model job's head code uploaded first
@@ -3188,6 +3412,9 @@ jobs:
       relock-state: ${{ steps.upload-relock.outcome == 'success' && 'written' || '' }}
       relock-sha256: ${{ steps.upload-relock.outcome == 'success' && steps.select.outputs.relock-sha256 || '' }}
       relock-attempt: ${{ steps.upload-relock.outcome == 'success' && github.run_attempt || '' }}
+      cdn-sync-state: ${{ steps.upload-cdn-sync.outcome == 'success' && 'written' || '' }}
+      cdn-sync-sha256: ${{ steps.upload-cdn-sync.outcome == 'success' && steps.select.outputs.cdn-sync-sha256 || '' }}
+      cdn-sync-attempt: ${{ steps.upload-cdn-sync.outcome == 'success' && github.run_attempt || '' }}
     # Each guarded API call's rate-limit reading, for the job-end api-budget
     # notice (.github/actions/log-api-budget).
     env:
@@ -3195,22 +3422,21 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+        with:
+          ref: ${{ needs.check-dispatcher-current.outputs.standards-sha }}
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -3269,6 +3495,7 @@ jobs:
           head-sha: ${{ steps.head.outputs.sha }}
           prepare-supported: "true"
           applied-by-supported: patch dependency-verdict
+          standards-path: ${{ steps.standards.outputs.path }}
 
       - name: Select the dependency pull request
         id: select
@@ -3279,17 +3506,20 @@ jobs:
           HEAD_SHA: ${{ steps.head.outputs.sha }}
           APP_SENDER_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
           DEPENDENCY_DIR: ${{ runner.temp }}/dependency-context
-          TRUSTED_ACTORS: .base/.github/standards/trusted-actors/trusted-actors.json
+          TRUSTED_ACTORS: ${{ steps.standards.outputs.path }}/components/trusted-actors/trusted-actors.json
           # The content rule's ecosystems and directories, read from the base.
           DEPENDABOT_CONFIG: .base/.github/dependabot.yml
           # The review-only dependencies, read from the base.
-          DEPENDABOT_POLICY: .base/.github/standards/dependabot-policy/policy.json
+          DEPENDABOT_POLICY: ${{ steps.standards.outputs.path }}/components/dependabot-policy/policy.json
           RESOLVED: ${{ runner.temp }}/resolved-config.json
           # A stale install-script pin's patch (install-script-pin.mjs).
           PIN_PATCH_FILE: ${{ runner.temp }}/dependency-pin/patch.diff
           RELOCK_DIR: ${{ runner.temp }}/dependency-relock
+          BASE_DIR: .base
+          CDN_SYNC_DIR: ${{ runner.temp }}/cdn-pins-request
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: |
-          mkdir -p "$DEPENDENCY_DIR" "$(dirname "$PIN_PATCH_FILE")" "$RELOCK_DIR"
+          mkdir -p "$DEPENDENCY_DIR" "$(dirname "$PIN_PATCH_FILE")" "$RELOCK_DIR" "$CDN_SYNC_DIR"
           DEPENDENCY_REVIEW_ROUNDS=$(jq -r '.loop["dependency-review-rounds"] // empty' "$RESOLVED")
           export DEPENDENCY_REVIEW_ROUNDS
           DEPENDENCY_FILE="$DEPENDENCY_DIR/dependency.json" CONTEXT_RUN_FILE="$DEPENDENCY_DIR/context.json" \
@@ -3308,8 +3538,9 @@ jobs:
         id: scan-upload
         if: >-
           steps.select.outputs.proceed == 'true'
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: |
             ${{ runner.temp }}/dependency-context/dependency.json
             ${{ runner.temp }}/dependency-context/context.json
@@ -3330,8 +3561,9 @@ jobs:
       - name: Scan the pin patch for credentials
         id: scan-pin
         if: steps.select.outputs.pin-state == 'written'
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/dependency-pin/patch.diff
 
       # Named as the push job's patch-activity reads it: no model job runs in
@@ -3349,8 +3581,9 @@ jobs:
       - name: Scan the relock request for credentials
         id: scan-relock
         if: steps.select.outputs.relock-state == 'written'
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/dependency-relock
 
       - name: Upload the relock request
@@ -3360,6 +3593,24 @@ jobs:
         with:
           name: dependency-relock-request-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dependency-relock
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Scan the CDN sync request for credentials
+        id: scan-cdn-sync
+        if: steps.select.outputs.cdn-sync-state == 'written'
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
+        with:
+          gate-path: .base/lib/publish-gate.mjs
+          path: ${{ runner.temp }}/cdn-pins-request
+
+      - name: Upload the CDN sync request
+        id: upload-cdn-sync
+        if: (steps.select.outputs.cdn-sync-state == 'written') && steps.scan-cdn-sync.outputs.clean == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cdn-pins-request-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cdn-pins-request
           retention-days: 1
           if-no-files-found: error
 
@@ -3393,16 +3644,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -3446,7 +3690,7 @@ jobs:
   review-dependency:
     name: Review Dependency
     needs: review-dependency-select
-    if: ${{ !cancelled() && needs.review-dependency-select.outputs.proceed == 'true' }}
+    if: ${{ !cancelled() && needs.review-dependency-select.outputs.proceed == 'true' && vars.CLAUDE_API_KEYS_DISABLED != 'true' }}
     permissions:
       actions: read # the read runner's key-credit gate lists the credit-stop markers
       contents: read
@@ -3498,16 +3742,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -3606,16 +3843,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -3813,16 +4043,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -3868,8 +4091,9 @@ jobs:
       - name: Scan the relock patch for credentials
         id: scan-pin
         if: steps.patch.outputs.pin-sha256 != ''
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/dependency-pin/patch.diff
 
       - name: Upload the relock patch
@@ -3909,6 +4133,183 @@ jobs:
       patch-attempt: ${{ needs.review-dependency-relock-patch.outputs.pin-attempt }}
       patch-activity: review-dependency
       patch-prepare: dependency-relock
+      patch-head-sha: ${{ needs.review-dependency-select.outputs.head-sha }}
+
+  review-cdn-pins-sync:
+    name: Review CDN Pins Sync
+    needs: review-dependency-select
+    if: ${{ !cancelled() && needs.review-dependency-select.outputs.cdn-sync-state == 'written' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    outputs:
+      result-attempt: ${{ steps.upload-result.outcome == 'success' && github.run_attempt || '' }}
+    steps:
+      - name: Download the CDN sync request
+        uses: actions/download-artifact@v8
+        with:
+          name: cdn-pins-request-${{ needs.review-dependency-select.outputs.cdn-sync-attempt }}
+          path: ${{ runner.temp }}/cdn-pins-request
+
+      - name: Sync the CDN pins
+        env:
+          CDN_SYNC_IMAGE: node:24.21.0-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
+          REQUEST_SHA256: ${{ needs.review-dependency-select.outputs.cdn-sync-sha256 }}
+        run: |
+          request="$RUNNER_TEMP/cdn-pins-request"
+          result="$RUNNER_TEMP/cdn-pins-result"
+          sum=$(sha256sum <"$request/request.json")
+          [[ ${sum%% *} == "$REQUEST_SHA256" ]]
+          mkdir "$result"
+          docker run --rm -i --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
+            -v "$request:/request:ro" -v "$result:/result" "$CDN_SYNC_IMAGE" node --input-type=module <<'JS'
+          import { execFileSync } from "node:child_process";
+          import { copyFileSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+          import { dirname, join } from "node:path";
+
+          const request = JSON.parse(readFileSync("/request/request.json", "utf8"));
+          const work = mkdtempSync("/tmp/cdn-pins-");
+          const script = join(work, "lib/cdn-pins/sync.mjs");
+          const inputs = {
+            ...request.files,
+            "lib/cdn-pins/package.json": request.manifest,
+            "lib/cdn-pins/package-lock.json": request.lock,
+            "lib/cdn-pins/sync.mjs": request.script,
+          };
+          for (const [path, text] of Object.entries(inputs)) {
+            const dest = join(work, path);
+            mkdirSync(dirname(dest), { recursive: true });
+            writeFileSync(dest, text);
+          }
+          execFileSync(process.execPath, [script, "sync", work], { stdio: "inherit" });
+          for (const [path, before] of Object.entries(request.files)) {
+            const synced = join(work, path);
+            if (!lstatSync(synced).isFile()) throw new Error(`${path} is not a regular sync result`);
+            if (readFileSync(synced).equals(Buffer.from(before))) continue;
+            const dest = join("/result", path);
+            mkdirSync(dirname(dest), { recursive: true });
+            copyFileSync(synced, dest);
+          }
+          JS
+
+      - name: Upload the synced CDN pins
+        id: upload-result
+        uses: actions/upload-artifact@v7
+        with:
+          name: cdn-pins-result-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cdn-pins-result
+          retention-days: 1
+          if-no-files-found: error
+
+  review-cdn-pins-sync-patch:
+    name: Review CDN Pins Sync Patch
+    needs: [review-dependency-select, review-cdn-pins-sync]
+    if: ${{ !cancelled() && needs.review-dependency-select.outputs.cdn-sync-state == 'written' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      pin-state: ${{ steps.upload-pin.outcome == 'success' && 'written' || '' }}
+      pin-sha256: ${{ steps.upload-pin.outcome == 'success' && steps.patch.outputs.pin-sha256 || '' }}
+      pin-attempt: ${{ steps.upload-pin.outcome == 'success' && github.run_attempt || '' }}
+      escalation-reason: ${{ steps.upload-pin.outcome != 'success' && 'dependency-pin-invalid' || '' }}
+    steps:
+      - name: Resolve main's tip
+        id: tip
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
+      - name: Check out the default branch tip
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.tip.outputs.sha }}
+          path: .base
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Download the CDN sync request
+        uses: actions/download-artifact@v8
+        with:
+          name: cdn-pins-request-${{ needs.review-dependency-select.outputs.cdn-sync-attempt }}
+          path: ${{ runner.temp }}/cdn-pins-request
+
+      - name: Download the synced CDN pins
+        id: download-result
+        if: needs.review-cdn-pins-sync.outputs.result-attempt != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: cdn-pins-result-${{ needs.review-cdn-pins-sync.outputs.result-attempt }}
+          path: ${{ runner.temp }}/cdn-pins-result
+
+      - name: Build the CDN pins patch
+        id: patch
+        if: steps.download-result.outcome == 'success'
+        env:
+          REQUEST_SHA256: ${{ needs.review-dependency-select.outputs.cdn-sync-sha256 }}
+        run: |
+          sum=$(sha256sum <"$RUNNER_TEMP/cdn-pins-request/request.json")
+          if [[ ${sum%% *} != "$REQUEST_SHA256" ]]; then
+            echo "::error::the CDN sync request is not the one the select job wrote"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/dependency-pin"
+          node .base/.github/scripts/pr-unblock/cdn-pins-sync.mjs patch "$RUNNER_TEMP/cdn-pins-request/request.json" \
+            "$RUNNER_TEMP/cdn-pins-result" "$RUNNER_TEMP/dependency-pin/patch.diff" || exit 0
+          sum=$(sha256sum <"$RUNNER_TEMP/dependency-pin/patch.diff")
+          echo "pin-sha256=${sum%% *}" >>"$GITHUB_OUTPUT"
+
+      - name: Scan the CDN pins patch for credentials
+        id: scan-pin
+        if: steps.patch.outputs.pin-sha256 != ''
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
+        with:
+          gate-path: .base/lib/publish-gate.mjs
+          path: ${{ runner.temp }}/dependency-pin/patch.diff
+
+      - name: Upload the CDN pins patch
+        id: upload-pin
+        if: (steps.patch.outputs.pin-sha256 != '') && steps.scan-pin.outputs.clean == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: patch-pr-unblock-review-dependency-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dependency-pin/patch.diff
+          retention-days: 1
+          if-no-files-found: error
+
+  apply-cdn-pins-sync:
+    name: Apply CDN Pins Sync
+    needs: [review-dependency-select, review-cdn-pins-sync-patch]
+    if: ${{ !cancelled() && needs.review-cdn-pins-sync-patch.outputs.pin-state == 'written' }}
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+      checks: write
+      issues: write
+      id-token: write
+    concurrency:
+      group: pr-pipeline-write-${{ inputs.pr-number }}
+      queue: max
+    uses: ./.github/workflows/pr-run-activity-write.yml # zizmor: ignore[self-repository]
+    with:
+      role: pr-unblock
+      lane: pr-unblock
+      activity: apply-dependency-patch
+      pr-number: ${{ inputs.pr-number }}
+      dispatcher-run-id: ${{ inputs.dispatcher-run-id }}
+      trusted-base: default-tip
+      patch-state: written
+      patch-sha256: ${{ needs.review-cdn-pins-sync-patch.outputs.pin-sha256 }}
+      patch-attempt: ${{ needs.review-cdn-pins-sync-patch.outputs.pin-attempt }}
+      patch-activity: review-dependency
+      patch-prepare: cdn-pins-sync
       patch-head-sha: ${{ needs.review-dependency-select.outputs.head-sha }}
 
   # The verdict job, a script with no model: it holds pull-requests and
@@ -4009,22 +4410,21 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+        with:
+          ref: ${{ needs.check-dispatcher-current.outputs.standards-sha }}
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -4057,6 +4457,7 @@ jobs:
           APP_SENDER_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
           CONTEXT_FILE: ${{ runner.temp }}/ci-context/context.json
           BASE_PATH: .base
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: |
           mkdir -p "$RUNNER_TEMP/ci-context"
           # The listed review bots' ids (review-threads.reviewer-ids), one per line.
@@ -4068,8 +4469,9 @@ jobs:
         id: scan-upload
         if: >-
           steps.context.outputs.proceed == 'true'
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/ci-context/context.json
 
       - name: Upload the context
@@ -4113,16 +4515,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -4166,7 +4561,7 @@ jobs:
   fix-ci:
     name: Fix CI
     needs: fix-ci-context
-    if: ${{ !cancelled() && needs.fix-ci-context.outputs.proceed == 'true' }}
+    if: ${{ !cancelled() && needs.fix-ci-context.outputs.proceed == 'true' && vars.CLAUDE_API_KEYS_DISABLED != 'true' }}
     permissions:
       actions: read # the read runner's key-credit gate lists the credit-stop markers
       contents: read
@@ -4221,16 +4616,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -4332,16 +4720,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -4524,16 +4905,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -4631,16 +5005,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -4765,16 +5132,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -4855,18 +5215,22 @@ jobs:
       - apply-dependency-patch
       - apply-dependency-pin
       - review-dependency-relock-patch
+      - review-cdn-pins-sync-patch
       - apply-dependency-relock
+      - apply-cdn-pins-sync
       - apply-dependency-verdict
       - fix-ci-context
       - apply-patch
       - apply-patch-rung-up
       - sync-shared-copies-select
       - apply-shared-copies
+      - fix-test-scope-select
+      - apply-test-scope
     if: >-
       ${{ !cancelled()
       && (needs.resolve-conflicts-select.outputs.head-sha || needs.address-feedback-select.outputs.head-sha
       || needs.review-dependency-select.outputs.head-sha || needs.fix-ci-context.outputs.head-sha
-      || needs.sync-shared-copies-select.outputs.head-sha || '') != ''
+      || needs.sync-shared-copies-select.outputs.head-sha || needs.fix-test-scope-select.outputs.head-sha || '') != ''
       && (needs.resolve-conflicts-select.outputs.escalation-reason != ''
       || needs.apply-conflict-patch.outputs.escalation-reason != ''
       || needs.check-conflict-scan-refusal.outputs.escalation-reason != ''
@@ -4877,11 +5241,15 @@ jobs:
       || needs.apply-dependency-verdict.outputs.escalation-reason != ''
       || needs.apply-dependency-pin.outputs.escalation-reason != ''
       || needs.review-dependency-relock-patch.outputs.escalation-reason != ''
+      || needs.review-cdn-pins-sync-patch.outputs.escalation-reason != ''
       || needs.apply-dependency-relock.outputs.escalation-reason != ''
+      || needs.apply-cdn-pins-sync.outputs.escalation-reason != ''
       || needs.fix-ci-context.outputs.escalation-reason != ''
       || needs.apply-patch.outputs.escalation-reason != ''
       || needs.sync-shared-copies-select.outputs.escalation-reason != ''
       || needs.apply-shared-copies.outputs.escalation-reason != ''
+      || needs.fix-test-scope-select.outputs.escalation-reason != ''
+      || needs.apply-test-scope.outputs.escalation-reason != ''
       || needs.apply-patch.outputs.rung-up == 'true'
       && !(needs.apply-patch-rung-up.result == 'success'
       && needs.apply-patch-rung-up.outputs.escalation-reason == ''
@@ -4891,9 +5259,11 @@ jobs:
       || needs.apply-dependency-verdict.result == 'success' && needs.apply-dependency-verdict.outputs.skip-reason == ''
       || needs.apply-dependency-pin.result == 'success' && needs.apply-dependency-pin.outputs.skip-reason == ''
       || needs.apply-dependency-relock.result == 'success' && needs.apply-dependency-relock.outputs.skip-reason == ''
+      || needs.apply-cdn-pins-sync.result == 'success' && needs.apply-cdn-pins-sync.outputs.skip-reason == ''
       || needs.apply-patch.result == 'success' && needs.apply-patch.outputs.skip-reason == ''
       || needs.apply-patch-rung-up.result == 'success' && needs.apply-patch-rung-up.outputs.skip-reason == ''
       || needs.apply-shared-copies.result == 'success' && needs.apply-shared-copies.outputs.skip-reason == ''
+      || needs.apply-test-scope.result == 'success' && needs.apply-test-scope.outputs.skip-reason == ''
       || needs.address-feedback-select.result == 'success' && needs.address-feedback-select.outputs.stop-resolved == 'true'
       || needs.fix-ci-context.result == 'success' && needs.fix-ci-context.outputs.stop-resolved == 'true') }}
     runs-on: ubuntu-24.04
@@ -4912,16 +5282,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -4953,8 +5316,10 @@ jobs:
             || needs.apply-feedback-patch.outputs.pushed-commit || needs.address-feedback-select.outputs.head-sha
             || needs.apply-dependency-patch.outputs.pushed-commit || needs.apply-dependency-pin.outputs.pushed-commit
             || needs.apply-dependency-relock.outputs.pushed-commit
+            || needs.apply-cdn-pins-sync.outputs.pushed-commit
             || needs.review-dependency-select.outputs.head-sha
-            || needs.fix-ci-context.outputs.head-sha || needs.sync-shared-copies-select.outputs.head-sha }}
+            || needs.fix-ci-context.outputs.head-sha || needs.sync-shared-copies-select.outputs.head-sha
+            || needs.fix-test-scope-select.outputs.head-sha }}
           ESCALATION_REASON: >-
             ${{ needs.resolve-conflicts-select.outputs.escalation-reason
             || needs.apply-conflict-patch.outputs.escalation-reason
@@ -4966,7 +5331,9 @@ jobs:
             || needs.apply-dependency-verdict.outputs.escalation-reason
             || needs.apply-dependency-pin.outputs.escalation-reason
             || needs.review-dependency-relock-patch.outputs.escalation-reason
+            || needs.review-cdn-pins-sync-patch.outputs.escalation-reason
             || needs.apply-dependency-relock.outputs.escalation-reason
+            || needs.apply-cdn-pins-sync.outputs.escalation-reason
             || needs.fix-ci-context.outputs.escalation-reason
             || needs.apply-patch.outputs.escalation-reason
             || needs.apply-patch-rung-up.outputs.escalation-reason
@@ -4974,7 +5341,9 @@ jobs:
             && !(needs.apply-patch-rung-up.result == 'success' && needs.apply-patch-rung-up.outputs.patch-skip-reason == '')
             && 'ci-fix-escalated'
             || needs.sync-shared-copies-select.outputs.escalation-reason
-            || needs.apply-shared-copies.outputs.escalation-reason || '' }}
+            || needs.apply-shared-copies.outputs.escalation-reason
+            || needs.fix-test-scope-select.outputs.escalation-reason
+            || needs.apply-test-scope.outputs.escalation-reason || '' }}
           ACTIVITY: ${{ inputs.activity }}
           TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: bash .base/.github/scripts/pr-unblock/report-escalation.sh "$([ -n "$ESCALATION_REASON" ] && echo status || echo clear)"
@@ -5000,31 +5369,18 @@ jobs:
       - apply-dependency-patch
       - apply-dependency-pin
       - review-dependency-relock-patch
+      - review-cdn-pins-sync-patch
       - apply-dependency-relock
+      - apply-cdn-pins-sync
       - apply-dependency-verdict
       - fix-ci-context
       - apply-patch
       - apply-patch-rung-up
       - sync-shared-copies-select
       - apply-shared-copies
+      - fix-test-scope-select
+      - apply-test-scope
       - report-stop-status
-    # A reply job that failed with no reason (its lane token, a script error)
-    # stops as feedback-publish-failed, derived here from its result. When
-    # report-stop-status withheld that stop's status, because the feedback
-    # sweep sends a workflow-modified refusal again, no comment posts either;
-    # a skipped or failed report-stop-status leaves the output empty, so the
-    # comment posts.
-    # escalation-reason is set only by the write runner's own steps, the
-    # base's reply, verdict and apply-patch scripts, and the base scripts of
-    # resolve-conflicts-select, check-conflict-scan-refusal, address-feedback-select,
-    # review-dependency-select, fix-ci-context and sync-shared-copies-select.
-    # At most one escalates: one activity runs per dispatch, a reply, verdict
-    # or push job runs only after a select job proceeded, and a select job,
-    # or fix-ci-context, escalates only before any model turn. A rung-up stop
-    # escalates here too unless apply-patch-rung-up applied the retry's patch
-    # cleanly: its own reason, else ci-fix-escalated. On a cancelled run this
-    # always() branch fires, but the write workflow's run job skips, so no
-    # label is applied and ci-status stays red.
     if: >-
       ${{ (!cancelled() && needs.report-stop-status.outputs.status-withheld != 'true'
       && (needs.resolve-conflicts-select.outputs.escalation-reason != ''
@@ -5037,11 +5393,15 @@ jobs:
       || needs.apply-dependency-verdict.outputs.escalation-reason != ''
       || needs.apply-dependency-pin.outputs.escalation-reason != ''
       || needs.review-dependency-relock-patch.outputs.escalation-reason != ''
+      || needs.review-cdn-pins-sync-patch.outputs.escalation-reason != ''
       || needs.apply-dependency-relock.outputs.escalation-reason != ''
+      || needs.apply-cdn-pins-sync.outputs.escalation-reason != ''
       || needs.fix-ci-context.outputs.escalation-reason != ''
       || needs.apply-patch.outputs.escalation-reason != ''
       || needs.sync-shared-copies-select.outputs.escalation-reason != ''
-      || needs.apply-shared-copies.outputs.escalation-reason != ''))
+      || needs.apply-shared-copies.outputs.escalation-reason != ''
+      || needs.fix-test-scope-select.outputs.escalation-reason != ''
+      || needs.apply-test-scope.outputs.escalation-reason != ''))
       || (always() && needs.apply-patch.outputs.rung-up == 'true'
       && !(needs.apply-patch-rung-up.result == 'success'
       && needs.apply-patch-rung-up.outputs.escalation-reason == ''
@@ -5073,13 +5433,17 @@ jobs:
         || needs.apply-dependency-verdict.outputs.escalation-reason
         || needs.apply-dependency-pin.outputs.escalation-reason
         || needs.review-dependency-relock-patch.outputs.escalation-reason
+        || needs.review-cdn-pins-sync-patch.outputs.escalation-reason
         || needs.apply-dependency-relock.outputs.escalation-reason
+        || needs.apply-cdn-pins-sync.outputs.escalation-reason
         || needs.fix-ci-context.outputs.escalation-reason
         || needs.apply-patch.outputs.escalation-reason
         || needs.apply-patch-rung-up.outputs.escalation-reason
         || needs.apply-patch.outputs.rung-up == 'true' && 'ci-fix-escalated'
         || needs.sync-shared-copies-select.outputs.escalation-reason
-        || needs.apply-shared-copies.outputs.escalation-reason || '' }}
+        || needs.apply-shared-copies.outputs.escalation-reason
+        || needs.fix-test-scope-select.outputs.escalation-reason
+        || needs.apply-test-scope.outputs.escalation-reason || '' }}
       dispatcher-run-id: ${{ inputs.dispatcher-run-id }}
       expected-upstream-head: >-
         ${{ inputs.activity == 'address-feedback' && inputs.dispatcher-run-id != ''
@@ -5112,16 +5476,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -5130,15 +5487,13 @@ jobs:
           sparse-checkout: |
             .github/scripts/lib/handoff-evidence.sh
             .github/actions/log-api-budget
-            .github/actions/scan-upload
-            .github/actions/setup-pinned-node
             .node-version
             lib/publish-gate.mjs
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
       - name: Set up Node
-        uses: ./.base/.github/actions/setup-pinned-node # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/setup-pinned-node@main
         with:
           node-version-file: .base/.node-version
 
@@ -5166,8 +5521,9 @@ jobs:
         if: steps.credit-marker-resolve-conflicts.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 1
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/key-credit-stop-resolve-conflicts/run-id
 
       - name: Upload resolve-conflicts's credit-stop marker
@@ -5206,8 +5562,9 @@ jobs:
         if: steps.credit-marker-address-feedback.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 1
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/key-credit-stop-address-feedback/run-id
 
       - name: Upload address-feedback's credit-stop marker
@@ -5246,8 +5603,9 @@ jobs:
         if: steps.credit-marker-review-dependency.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 1
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/key-credit-stop-review-dependency/run-id
 
       - name: Upload review-dependency's credit-stop marker
@@ -5286,8 +5644,9 @@ jobs:
         if: steps.credit-marker-fix-ci.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 1
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/key-credit-stop-fix-ci/run-id
 
       - name: Upload fix-ci's credit-stop marker
@@ -5326,8 +5685,9 @@ jobs:
         if: steps.credit-marker-fix-ci-rung-up.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 1
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/key-credit-stop-fix-ci-rung-up/run-id
 
       - name: Upload fix-ci-rung-up's credit-stop marker

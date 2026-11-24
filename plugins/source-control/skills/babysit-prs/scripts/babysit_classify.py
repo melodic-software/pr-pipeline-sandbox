@@ -35,7 +35,6 @@ from typing import Any
 
 from babysit_util import is_json_object
 
-# --- Finding + approval heuristics -------------------------------------------
 
 BLOCKING_TEXT_RE = re.compile(
     r"\b(p0|p1|p2|high[- ]severity|not approving|changes requested|"
@@ -145,9 +144,6 @@ class FeedbackConfig:
 
 
 DEFAULT_FEEDBACK_CONFIG = FeedbackConfig()
-
-
-# --- Authorship: self / bot / human ------------------------------------------
 
 
 def normalize_login_set(logins: Any) -> frozenset[str]:
@@ -275,9 +271,6 @@ def body_text(item: dict[str, Any]) -> str:
     return "\n".join(value for value in values if isinstance(value, str))
 
 
-# --- Finding heuristics -------------------------------------------------------
-
-
 def _redact_negated_severity(text: str) -> str:
     """Redact negated findings ahead of a STRUCTURED-severity scan.
 
@@ -309,9 +302,6 @@ def has_blocking_severity(text: str) -> bool:
     `BLOCKING_TEXT_RE`'s imperative terms.
     """
     return bool(BLOCKING_SEVERITY_RE.search(_redact_negated_severity(text)))
-
-
-# --- Approval verdict --------------------------------------------------------
 
 
 def approval_downgrade(text: str) -> bool:
@@ -465,7 +455,7 @@ def comment_surface(comment: dict[str, Any]) -> str:
     its rows cannot offset -- and its findings cannot be offset by -- a known
     surface. That is the fail-closed direction for unknown provenance and it
     preserves the "no signal = PR-level lifetime" model `thread_is_open`
-    documents; uniform unsignalled input collapses to one bucket, identical to a
+    documents; uniform unsignaled input collapses to one bucket, identical to a
     flat count.
     """
     if "in_review_thread" in comment:
@@ -577,7 +567,7 @@ def count_effective_classified(
     PR-level, or isolated unknown) and capped within each bucket -- a
     classification can only offset a finding on its own surface. Resolved/outdated
     thread comments are already discounted by `thread_is_open` inside both
-    counters, so they contribute to no bucket. On unsignalled input (every comment
+    counters, so they contribute to no bucket. On unsignaled input (every comment
     in one bucket, the bash-degrade shape) this collapses to
     `min(classified, findings)`, keeping the Python count convergent with the bash
     degrade's own cap.

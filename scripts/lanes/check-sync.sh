@@ -52,6 +52,7 @@ SYNCED=(
   .github/scripts/maintenance-monitor-signals/issues.mjs
   .github/scripts/maintenance-reconcile-lost-runs/component-status.mjs
   .github/scripts/maintenance-reconcile-lost-runs/infra-failure.mjs
+  .github/scripts/pr-dispatch-feedback/rerun-ci-status.sh
   .github/scripts/pr-review-main/split-diff.py
   .github/scripts/pr-review-main/write-verdict.mjs
   .github/scripts/recurring-schedule/file-due.mjs

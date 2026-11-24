@@ -107,22 +107,20 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: main
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: main
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+
       - name: Write the source-control trust settings
         uses: melodic-software/ci-workflows/.github/actions/apply-claude-managed-settings@main
         with:
@@ -132,7 +130,7 @@ jobs:
         run: echo "main tip $(git -C .base rev-parse HEAD)"
 
       - name: Set up Node
-        uses: ./.base/.github/actions/setup-pinned-node # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/setup-pinned-node@main
         with:
           node-version-file: .base/.node-version
 
@@ -175,7 +173,7 @@ jobs:
           require-pr: false
           require-kind: human
           dispatched-workflow: .github/workflows/pr-unblock.yml
-          trusted-actors-path: .base/.github/standards/trusted-actors/trusted-actors.json
+          standards-path: ${{ steps.standards.outputs.path }}
           denied-actor-ids: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
           triggering-actor: ${{ github.triggering_actor }}
 
@@ -300,6 +298,7 @@ jobs:
           APP_SENDER_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
           RUN_IDS_FILE: ${{ runner.temp }}/pr-unblock-run-ids
           DISPATCH_RECORD: ${{ runner.temp }}/pr-unblock-dispatch-record.json
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: node .base/.github/scripts/pr-unblock/dispatch.mjs
 
       - name: Save the dispatch record
@@ -339,8 +338,9 @@ jobs:
         id: scan-upload
         if: >-
           always() && steps.record.outputs.name != '' && steps.record.outcome == 'success'
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/pr-unblock-dispatched.json
 
       - name: Record the dispatched runs
@@ -410,8 +410,12 @@ jobs:
           path: .base
           persist-credentials: false
 
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+
       - name: Set up Node
-        uses: ./.base/.github/actions/setup-pinned-node # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/setup-pinned-node@main
         with:
           node-version-file: .base/.node-version
 
@@ -441,6 +445,7 @@ jobs:
           SENDER_ID: ${{ github.event.sender.id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           RUN_IDS_FILE: ${{ runner.temp }}/pr-refine-run-id
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: node .base/.github/scripts/pr-unblock/refine-event-dispatch.mjs
 
       # Named from the commit this file ran from and the id the dispatch API
@@ -469,8 +474,9 @@ jobs:
         id: scan-upload
         if: >-
           always() && steps.record.outputs.name != '' && steps.record.outcome == 'success'
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/pr-unblock-target-dispatched.json
 
       - name: Record the dispatched run
@@ -515,8 +521,9 @@ jobs:
         id: scan-upload-2
         if: >-
           always() && steps.record-2.outputs.name != '' && steps.record-2.outcome == 'success'
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/pr-unblock-target-dispatched-2.json
 
       - name: Record the second dispatched run

@@ -16,7 +16,7 @@ reported. `<checkout>` is the checkout of the PR's repository the session works 
 defines it, so neither the repository nor the branch depends on the shell's directory.
 
 ```bash
-REPO=$(bash "<skill-dir>/scripts/target-repo.sh" --dir "<checkout>") || exit 1
+REPO=$(bash "<skill-dir>/scripts/target-repo.sh" --dir "<checkout>" --write) || exit 1
 export GH_REPO="$REPO"
 BRANCH=$(git -C "<checkout>" branch --show-current)
 PR_NUMBER=$(gh pr view "$BRANCH" -R "$REPO" --json number -q '.number' 2>/dev/null)
@@ -37,33 +37,36 @@ bash "<skill-dir>/scripts/check-ready-holds.sh" "$PR_NUMBER" --unattended  # no 
 
 Exit 0: no hold. Exit 3: held or superseded, one reason per line on stdout. Exit 2: a `gh` read
 or a parse failed, so no hold was ruled out. Exit 1: a bad argument. Exit 5: `gh` or `jq` is
-missing. The script reads the title, body, labels and closing issue
-references with `gh pr view`, and each closing issue's state over REST.
+missing. The script reads the title, body, labels, URL and closing issue
+references with `gh pr view`, and each closing issue's state over REST. On a `do-not-merge` label
+it also reads, over REST, the PR's label events, its comments, the trusted list on the base
+repository's default branch (the component in the repository `standards_repository` names, at
+the commit its `main` names, when the base repository's `docs/conventions/source-control.yaml`
+sets `trusted_actors_source: standards`; else its `.github/standards/trusted-actors/trusted-actors.json`)
+and the lanes App's
+login from the `issue_status_app_login` setting, to tell an eval-only hold from any other. A failed
+read leaves the label holding.
 
 ## Read the pre-ready steps at the base
 
 The PR's own base branch, in the PR's own base repository. The repository comes from the PR's
 URL, which names the base repository, never from gh's `{owner}/{repo}` default: in a fork
 checkout with no upstream remote, that default resolves to the fork the PR's author controls.
-`-f ref=` with `-X GET` sends the branch name as an encoded query parameter. `-i` puts the status
-line on stdout, where the reader reads it: only a 404 means no file, and any other failure (auth,
-5xx, no response) fails closed.
-
-The reader honors the list only when the base is the base repository's default branch, read from
-that same repository. A failed lookup leaves the value empty and the reader fails closed on it: on
-error `gh api` prints the error body to stdout, so each lookup clears its value on a non-zero exit.
+Given `--repo`, the reader fetches the file at the base itself (`gh api -i -X GET` with
+`-f ref=`) and reads the base repository's default branch from that same repository, so nothing
+is piped into it and the caller supplies no default branch. Only a 404 means no file; any other
+failure (auth, 5xx, no response, an unread default branch) fails closed. It honors the list only
+when the base is that default branch. A failed lookup below leaves its value empty, and the reader
+fails closed on it.
 
 ```bash
 BASE=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName') || BASE=""
 BASE_REPO=$(gh pr view "$PR_NUMBER" --json url -q '.url | split("/")[3:5] | join("/")') || BASE_REPO=""
-DEFAULT_BRANCH=$(gh api "repos/$BASE_REPO" --jq '.default_branch') || DEFAULT_BRANCH=""
-PRE_READY_RESPONSE=$(gh api -i -X GET "repos/$BASE_REPO/contents/docs/conventions/source-control.yaml" \
-  -f ref="$BASE" -H "Accept: application/vnd.github.raw")
-printf '%s' "$PRE_READY_RESPONSE" |
-  bash "<skill-dir>/scripts/read-pre-ready.sh" --base "$BASE" --default-branch "$DEFAULT_BRANCH" --http-response
+bash "<skill-dir>/scripts/read-pre-ready.sh" --repo "$BASE_REPO" --base "$BASE"
 ```
 
-On a 404, gh also prints `gh: Not Found (HTTP 404)` to stderr; that line is expected.
+`verify-gate.sh record --from-pre-ready` (2.5.3) takes the same `--repo` and `--base` and runs
+this same read itself.
 
 ## Record the head before the refresh
 
@@ -206,8 +209,9 @@ COMMENT=$(bash "<skill-dir>/scripts/ready-skip-comment.sh" --login "$LOGIN" \
 printf '%s\n' "$COMMENT" | gh pr comment "$PR_NUMBER" -R "$REPO" --body-file -
 ```
 
-`check-ready-holds.sh` reads the title, body, labels and closing issue references, never
-comments, so the comment cannot set or lift a hold there.
+`check-ready-holds.sh` reads comments only for `pr-hold` reason lines, and the skip comment
+cannot carry one: the script strips `<` and `>` from the reason. So the comment cannot set or lift
+a hold there.
 
 ## Wait for the push's CI run
 
