@@ -88,6 +88,13 @@ jobs:
       issues: read # the PR's labels, comments and label events
       pull-requests: read # the PR and its files
     steps:
+      # The trusted-actor list's source: the steps below read it under this
+      # checkout, else the base commit's synced copy.
+      - name: Check out the run's standards commit
+        id: standards
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
+        continue-on-error: true
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
       - name: Aggregate lane results
         env:
           FORCE_RED: ${{ needs.check-force-red.result }}
@@ -182,8 +189,9 @@ jobs:
       # ONLY A TRUSTED PERSON LIFTS A REVIEW-LANE HOLD. Removing the human-gated
       # label approves a pull request, so once a review lane has held it (a
       # hold comment as the step above reads them), the first removal of the
-      # label after the newest hold comment must be by a `human` of the base
-      # commit's .github/standards/trusted-actors/trusted-actors.json. A later
+      # label after the newest hold comment must be by a `human` of the
+      # trusted-actor list (standards' components/trusted-actors, else the base
+      # commit's .github/standards/trusted-actors copy). A later
       # removal is of a later label, such as an escalation clear-escalations
       # lifts. A bot or another account lifting the hold, or no recorded
       # removal, fails; adding the label back and having a trusted person
@@ -203,6 +211,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HUMAN_GATED: ${{ steps.human_gated.outputs.label }}
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: |
           if [[ ! $BASE_SHA =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::the base commit '$BASE_SHA' is not a commit SHA."
@@ -238,15 +247,24 @@ jobs:
             echo "No review lane has held #$PR_NUMBER."
             exit 0
           fi
-          for attempt in 1 2 3; do
-            if actors=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$GITHUB_REPOSITORY/contents/.github/standards/trusted-actors/trusted-actors.json?ref=$BASE_SHA"); then
-              break
-            fi
-            [ "$attempt" -lt 3 ] || { echo "::error::could not read the trusted-actor list at $BASE_SHA; re-run this run."; exit 1; }
-            sleep $((attempt * 5))
-          done
+          # The trusted-actor list: standards' when the run checked it out, else
+          # the base commit's synced copy.
+          if [ -n "${STANDARDS_DIR:-}" ]; then
+            actors=$(cat "$STANDARDS_DIR/components/trusted-actors/trusted-actors.json") || {
+              echo "::error::could not read the trusted-actor list in the standards checkout; re-run this run."
+              exit 1
+            }
+          else
+            for attempt in 1 2 3; do
+              if actors=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$GITHUB_REPOSITORY/contents/.github/standards/trusted-actors/trusted-actors.json?ref=$BASE_SHA"); then
+                break
+              fi
+              [ "$attempt" -lt 3 ] || { echo "::error::could not read the trusted-actor list at $BASE_SHA; re-run this run."; exit 1; }
+              sleep $((attempt * 5))
+            done
+          fi
           humans=$(jq -er '[.actors[] | select(.kind == "human") | .id | numbers | tostring] | select(length > 0) | join(" ")' <<<"$actors") || {
-            echo "::error::the trusted-actor list at $BASE_SHA names no person."
+            echo "::error::the trusted-actor list (standards, else the base commit's copy) names no person."
             exit 1
           }
           # A trusted person adding the label back starts a new hold that person's
@@ -520,8 +538,20 @@ jobs:
             fi
             return 0
           }
+          # trusted_list prints the trusted-actor list's path: under the run's
+          # standards checkout ($STANDARDS_DIR) when the step has one, else the
+          # hold config's copy under $BASE_CONFIG; it fails with neither.
+          trusted_list() {
+            if [ -n "${STANDARDS_DIR:-}" ]; then
+              printf '%s\n' "$STANDARDS_DIR/components/trusted-actors/trusted-actors.json"
+            elif [ -d "${BASE_CONFIG:-}" ]; then
+              printf '%s\n' "$BASE_CONFIG/.github/standards/trusted-actors/trusted-actors.json"
+            else
+              return 1
+            fi
+          }
           echo $(($(date +%s) + GH_READ_JOB_SECONDS - GH_READ_MARGIN_SECONDS)) >"$RUNNER_TEMP/gh-read.deadline"
-          { echo 'exec 9>&2'; declare -f gh_read pr_read pr_read_file pr_read_put; } >"$RUNNER_TEMP/gh-read.sh"
+          { echo 'exec 9>&2'; declare -f gh_read pr_read pr_read_file pr_read_put trusted_list; } >"$RUNNER_TEMP/gh-read.sh"
       - name: Resolve main's tip
         id: tip
         if: ${{ !cancelled() && github.event_name == 'merge_group' }}
@@ -590,6 +620,7 @@ jobs:
           API_BUDGET_TOKEN: github-token
           GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           BASE_CONFIG: ${{ steps.base_config.outcome == 'success' && format('{0}/base-config', github.workspace) || '' }}
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: |
           . "$RUNNER_TEMP/gh-read.sh"
           if [[ ! ${LANES_APP_ID:-} =~ ^[1-9][0-9]*$ ]]; then
@@ -601,7 +632,7 @@ jobs:
           if [ ! -d "${BASE_CONFIG:-}" ] ||
             ! identity=$(yq -er '.merge."agent-identity"' "$BASE_CONFIG/docs/conventions/pr-pipeline.yaml") ||
             ! want=$(jq -er --arg login "$identity" '[.actors[] | select(.login == $login) | .id | numbers]
-              | if length == 1 then .[0] else error("not one entry") end' "$BASE_CONFIG/.github/standards/trusted-actors/trusted-actors.json"); then
+              | if length == 1 then .[0] else error("not one entry") end' "$(trusted_list)"); then
             echo "::error::cannot read merge.agent-identity's trusted-actor id from the hold config at the group's base commit; re-run this run."
             exit 1
           fi
@@ -638,15 +669,19 @@ jobs:
             echo "::error::the base commit '$BASE_SHA' is not a commit SHA."
             exit 1
           fi
-          # The module, pr-pipeline.yaml and the trusted-actor list come from the
-          # hold config checkout: no contents read. A file missing there fails
-          # closed.
-          for file in .github/scripts/pr-merge/merge-holds.mjs docs/conventions/pr-pipeline.yaml .github/standards/trusted-actors/trusted-actors.json; do
+          # The module and pr-pipeline.yaml come from the hold config checkout
+          # and the trusted-actor list from trusted_list, as the checks above
+          # read them: no contents read. A file missing there fails closed.
+          for file in .github/scripts/pr-merge/merge-holds.mjs docs/conventions/pr-pipeline.yaml; do
             if [ ! -s "$BASE_CONFIG/$file" ] || ! cp "$BASE_CONFIG/$file" "$RUNNER_TEMP/${file##*/}"; then
               echo "::error::could not read $file in the hold config at the group's base commit; re-run this run."
               exit 1
             fi
           done
+          if ! list=$(trusted_list) || [ ! -s "$list" ] || ! cp "$list" "$RUNNER_TEMP/trusted-actors.json"; then
+            echo "::error::could not read the trusted-actor list (standards, else the hold config); re-run this run."
+            exit 1
+          fi
           jq -r '.body // ""' <<<"$pull" >"$RUNNER_TEMP/pr-body.txt"
           config=docs/conventions/pr-pipeline.yaml
           yq -o=json '.merge."diff-check"."denied-paths" // []' "$RUNNER_TEMP/pr-pipeline.yaml" >"$RUNNER_TEMP/denied-paths.json" || {
