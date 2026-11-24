@@ -1,8 +1,5 @@
 [default.extend-identifiers]
 abd = "abd"
-
-[files]
-extend-exclude = [
-  # A recorded GitHub API response, byte-copied from claude-code-plugins.
-  ".github/scripts/lib/fixtures/standards-list-commits.json",
-]
+# A GitHub node_id (base64) in the synced fixture
+# .github/scripts/lib/fixtures/standards-list-commits.json.
+MDQ6VXNlcjE5ODY0NDQ3 = "MDQ6VXNlcjE5ODY0NDQ3"
