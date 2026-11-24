@@ -84,12 +84,12 @@ jobs:
     timeout-minutes: 20
     permissions:
       actions: read # the review lanes' runs and jobs
-      contents: read # docs/conventions/work-items.yaml and trusted-actors.json at the base
+      contents: read # docs/conventions/work-items.yaml at the base
       issues: read # the PR's labels, comments and label events
       pull-requests: read # the PR and its files
     steps:
-      # The trusted-actor list's source: the steps below read it under this
-      # checkout, else the base commit's synced copy.
+      # The trusted-actor list's only source: the steps below read it under
+      # this checkout and fail closed without it, never the synced copy.
       - name: Check out the run's standards commit
         id: standards
         if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
@@ -190,8 +190,8 @@ jobs:
       # label approves a pull request, so once a review lane has held it (a
       # hold comment as the step above reads them), the first removal of the
       # label after the newest hold comment must be by a `human` of the
-      # trusted-actor list (standards' components/trusted-actors, else the base
-      # commit's .github/standards/trusted-actors copy). A later
+      # trusted-actor list in the run's standards checkout (components/
+      # trusted-actors; never the base commit's synced copy). A later
       # removal is of a later label, such as an escalation clear-escalations
       # lifts. A bot or another account lifting the hold, or no recorded
       # removal, fails; adding the label back and having a trusted person
@@ -247,24 +247,14 @@ jobs:
             echo "No review lane has held #$PR_NUMBER."
             exit 0
           fi
-          # The trusted-actor list: standards' when the run checked it out, else
-          # the base commit's synced copy.
-          if [ -n "${STANDARDS_DIR:-}" ]; then
-            actors=$(cat "$STANDARDS_DIR/components/trusted-actors/trusted-actors.json") || {
-              echo "::error::could not read the trusted-actor list in the standards checkout; re-run this run."
-              exit 1
-            }
-          else
-            for attempt in 1 2 3; do
-              if actors=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$GITHUB_REPOSITORY/contents/.github/standards/trusted-actors/trusted-actors.json?ref=$BASE_SHA"); then
-                break
-              fi
-              [ "$attempt" -lt 3 ] || { echo "::error::could not read the trusted-actor list at $BASE_SHA; re-run this run."; exit 1; }
-              sleep $((attempt * 5))
-            done
+          # The trusted-actor list from the run's standards checkout only: the
+          # base commit's synced copy can still name an actor standards removed.
+          if [ -z "${STANDARDS_DIR:-}" ] || ! actors=$(cat "$STANDARDS_DIR/components/trusted-actors/trusted-actors.json"); then
+            echo "::error::could not read the trusted-actor list in the standards checkout; re-run this run."
+            exit 1
           fi
           humans=$(jq -er '[.actors[] | select(.kind == "human") | .id | numbers | tostring] | select(length > 0) | join(" ")' <<<"$actors") || {
-            echo "::error::the trusted-actor list (standards, else the base commit's copy) names no person."
+            echo "::error::the trusted-actor list in the standards checkout names no person."
             exit 1
           }
           # A trusted person adding the label back starts a new hold that person's
@@ -538,17 +528,12 @@ jobs:
             fi
             return 0
           }
-          # trusted_list prints the trusted-actor list's path: under the run's
-          # standards checkout ($STANDARDS_DIR) when the step has one, else the
-          # hold config's copy under $BASE_CONFIG; it fails with neither.
+          # trusted_list prints the trusted-actor list's path under the run's
+          # standards checkout ($STANDARDS_DIR), and fails without one: the hold
+          # config's synced copy can still name an actor standards removed.
           trusted_list() {
-            if [ -n "${STANDARDS_DIR:-}" ]; then
-              printf '%s\n' "$STANDARDS_DIR/components/trusted-actors/trusted-actors.json"
-            elif [ -d "${BASE_CONFIG:-}" ]; then
-              printf '%s\n' "$BASE_CONFIG/.github/standards/trusted-actors/trusted-actors.json"
-            else
-              return 1
-            fi
+            [ -n "${STANDARDS_DIR:-}" ] || return 1
+            printf '%s\n' "$STANDARDS_DIR/components/trusted-actors/trusted-actors.json"
           }
           echo $(($(date +%s) + GH_READ_JOB_SECONDS - GH_READ_MARGIN_SECONDS)) >"$RUNNER_TEMP/gh-read.deadline"
           { echo 'exec 9>&2'; declare -f gh_read pr_read pr_read_file pr_read_put trusted_list; } >"$RUNNER_TEMP/gh-read.sh"
@@ -679,7 +664,7 @@ jobs:
             fi
           done
           if ! list=$(trusted_list) || [ ! -s "$list" ] || ! cp "$list" "$RUNNER_TEMP/trusted-actors.json"; then
-            echo "::error::could not read the trusted-actor list (standards, else the hold config); re-run this run."
+            echo "::error::could not read the trusted-actor list from the standards checkout; re-run this run."
             exit 1
           fi
           jq -r '.body // ""' <<<"$pull" >"$RUNNER_TEMP/pr-body.txt"
