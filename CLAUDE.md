@@ -10,8 +10,9 @@ This rule is for whoever merges a full resync PR, one that copies every
 
 Admin-merge such a PR only when all three of these hold:
 
-1. `ci-status` fails only because both review lanes report `failure-class=partial`: the diff is
-   larger than one review can read.
+1. `ci-status` fails only because every review lane reports `failure-class=partial` or
+   `failure-class=timeout`: the diff is larger than one review can read, or than one review leg
+   can finish in its time limit.
 2. `scripts/lanes/check-sync.sh <claude-code-plugins sha> --repo <claude-code-plugins clone>`
    reports no difference except the PINNED files.
 3. No workflow run on the PR head ended in `startup_failure`. A copied file can match its source
@@ -19,4 +20,5 @@ Admin-merge such a PR only when all three of these hold:
    repository's callers do not grant.
 
 Before merging, comment on the PR showing that all three hold: link the runs for conditions 1 and
-3, and paste the `check-sync.sh` output for condition 2, which runs only locally.
+3, naming each review lane's failure class, and paste the `check-sync.sh` output for condition 2,
+which runs only locally.
