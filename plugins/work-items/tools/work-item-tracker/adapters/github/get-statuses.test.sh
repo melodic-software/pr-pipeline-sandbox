@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# test-scope: plugins/work-items/tools/work-item-tracker/adapters/github/fixtures/standards-ref-heads-main.json plugins/work-items/tools/work-item-tracker/adapters/github/fixtures/standards-trusted-actors.json
 # shellcheck disable=SC2154  # FAILED/CASE_NUM initialized by the sourced helper
 # Offline: get-statuses against a gh stub. The plain answer's shape is the GraphQL
 # Issue.issueFieldValues read of one issue (melodic-software/claude-code-plugins,
@@ -17,8 +18,8 @@ S="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/get-statuses.sh"
 source "$(dirname "$S")/../../lib/verb-test-helpers.sh"
 
 assert_help "$S"
-assert_usage_error "$S" github:o/r#1                       # no --field
-assert_usage_error "$S" --field                            # no value
+assert_usage_error "$S" github:o/r#1
+assert_usage_error "$S" --field
 assert_usage_error "$S" --field "Work status" --bogus
 assert_usage_error "$S" --field "Work status" local-markdown:x#1
 
@@ -38,6 +39,13 @@ done
 printf '%s\n' "$args" >>"$GH_STUB_LOG"
 [[ -z "${GH_STUB_ERR:-}" ]] || { printf '%s\n' "$GH_STUB_ERR" >&2; exit 1; }
 case "$*" in
+*acme/standards/git/ref/heads/main*)
+  [[ -n "${GH_STUB_STD_COMMIT:-}" ]] || { printf 'gh: Not Found (HTTP 404)\n' >&2; exit 1; }
+  jq -r .object.sha "$GH_STUB_STD_COMMIT"
+  exit 0
+  ;;
+*acme/standards/commits/main*) printf '%s\n' ffffffffffffffffffffffffffffffffffffffff; exit 0 ;;
+*acme/standards/contents/components/trusted-actors/trusted-actors.json\?ref=*) src="$GH_STUB_ACTORS" ;;
 *contents/trust/actors.json*) src="$GH_STUB_ACTORS" ;;
 *contents/trust/model.yaml*) src="$GH_STUB_MODEL" ;;
 *) src="$GH_STUB_ANSWER" ;;
@@ -65,8 +73,6 @@ cat >"$PLAIN_ANSWER" <<'JSON'
   "i3":null}}}
 JSON
 
-# Ids: 100 a listed human; 200 the lanes App; 300 a bot-setter listed with its login;
-# 400 a bot-setter the list holds under another login; 999 an account the list lacks.
 ACTORS="$TMP_ROOT/actors.json"
 cat >"$ACTORS" <<'JSON'
 {
@@ -75,7 +81,8 @@ cat >"$ACTORS" <<'JSON'
     { "id": 100, "login": "alice", "kind": "human" },
     { "id": 200, "login": "lanes-app[bot]", "kind": "bot" },
     { "id": 300, "login": "melodic-x[bot]", "kind": "bot" },
-    { "id": 400, "login": "melodic-y[bot]", "kind": "bot" }
+    { "id": 400, "login": "other-y[bot]", "kind": "bot" },
+    { "id": 500, "login": "melodic-automation-lanes[bot]", "kind": "bot" }
   ]
 }
 JSON
@@ -84,13 +91,6 @@ cat >"$MODEL" <<'YAML'
 models:
   issue-status:
     field-id: 777
-    bot-setters:
-      - id: 41898282
-        login: "github-actions[bot]"
-      - id: 300
-        login: "melodic-x[bot]"
-      - id: 400
-        login: "melodic-z[bot]"
     options:
       "1": needs-human
       "2": agent-ready
@@ -164,20 +164,33 @@ answer "$TRUSTED" \
   "i5=$(issue agent-ready "$(ev add 100 needs-human)" "$(ev change 200 agent-ready)")" \
   "i6=$(issue "" "$(ev add 100 needs-human)" "$(ev remove 300)")" \
   "i7=$(issue needs-human "$(ev add 999 needs-human)" "$(ev add 100 ready 888)")" \
-  "i8=$(issue "" "$(ev add 100 needs-human)" "$(ev remove 999)")"
+  "i8=$(issue "" "$(ev add 100 needs-human)" "$(ev remove 999)")" \
+  "i9=$(issue ready "$(ev add 100 needs-owner-decision)" "$(ev change 500 ready)")" \
+  "i10=$(issue ready "$(ev add 100 needs-human)" "$(ev change 41898282 ready)")"
 ids=()
-for n in 1 2 3 4 5 6 7 8; do ids+=("github:o/r#$n"); done
+for n in 1 2 3 4 5 6 7 8 9 10; do ids+=("github:o/r#$n"); done
 BINDING="$TRUST_BINDING" ANSWER="$TRUSTED" run --field "Work status" "${ids[@]}"
 assert_eq "trusted read → exit 0" "0" "$RC"
 st() { jq -r --arg id "github:o/r#$1" '.statuses[$id] | tostring' <<<"$OUT"; }
 assert_eq "a human's hold stands over an unlisted account's ready" "needs-human" "$(st 1)"
 assert_eq "a bot-setter's agent-ready does not count, so the human's hold stands" "needs-human" "$(st 2)"
-assert_eq "a bot-setter the list holds with the same id and login counts for ready" "ready" "$(st 3)"
-assert_eq "a bot-setter the list holds under another login does not count" "needs-owner-decision" "$(st 4)"
+assert_eq "a listed melodic- bot counts for ready" "ready" "$(st 3)"
+assert_eq "a listed bot with no melodic- prefix does not count" "needs-owner-decision" "$(st 4)"
 assert_eq "the lanes App's agent-ready counts" "agent-ready" "$(st 5)"
 assert_eq "a counted removal reads null" "null" "$(st 6)"
 assert_eq "an unlisted account's hold alone reads null; another field's event is not read" "null" "$(st 7)"
 assert_eq "an uncounted removal leaves the counted hold standing" "needs-human" "$(st 8)"
+assert_eq "melodic-automation-lanes[bot] is no bot setter" "needs-owner-decision" "$(st 9)"
+assert_eq "github-actions[bot] counts for ready without a list entry" "ready" "$(st 10)"
+
+LISTED_MODEL="$TMP_ROOT/listed-model.yaml"
+awk '{ print } /^    field-id: 777$/ { print "    bot-setters:\n      - id: 400\n        login: \"other-y[bot]\"\n      - id: 999\n        login: \"stranger[bot]\"" }' "$MODEL" >"$LISTED_MODEL"
+BINDING="$TRUST_BINDING" ANSWER="$TRUSTED" MODEL_FILE="$LISTED_MODEL" run --field "Work status" "${ids[@]}"
+assert_eq "a model with bot-setters → exit 0" "0" "$RC"
+assert_eq "an explicit bot-setter the list holds as that bot counts, without the melodic- prefix" "ready" "$(st 4)"
+assert_eq "a derived-only melodic- bot the explicit list leaves out does not count" "needs-human" "$(st 3)"
+assert_eq "an explicit bot-setter the list does not hold does not count" "needs-human" "$(st 1)"
+assert_eq "github-actions[bot] the explicit list leaves out does not count" "needs-human" "$(st 10)"
 
 assert_contains "the trusted query, passed as a file, reads the field events" "$(cat "$LOG")" "timelineItems(last: 100"
 assert_contains "the trusted query defines its fragments" "$(cat "$LOG")" "fragment who on Actor"
@@ -218,7 +231,7 @@ bad="$TMP_ROOT/bad-model-field.yaml"
 sed 's/field-id: 777/field-id: abc/' "$MODEL" >"$bad"
 MODEL_FILE="$bad" trust_fails 3 "a model whose field-id is not an id"
 bad="$TMP_ROOT/bad-model-setter.yaml"
-sed '/login: "melodic-x\[bot\]"/d' "$MODEL" >"$bad"
+sed '/login: "other-y\[bot\]"/d' "$LISTED_MODEL" >"$bad"
 MODEL_FILE="$bad" trust_fails 3 "a bot-setter without a login"
 bad="$TMP_ROOT/bad-model-options.yaml"
 sed '/"[0-9]": /d' "$MODEL" >"$bad"
@@ -255,6 +268,38 @@ assert_eq "below the window, a value with no counted event reads null" "0|null" 
 unmapped="$TMP_ROOT/unmapped.json"
 answer "$unmapped" "i1=$(issue confirmed "$(ev add 100 confirmed)")"
 ANSWER="$unmapped" trust_fails 1 "a counted state the model does not map"
+
+STD_FIX="$(cd "$(dirname "$S")" && pwd)/fixtures"
+STD_COMMIT="$STD_FIX/standards-ref-heads-main.json"
+STD_LIST="$STD_FIX/standards-trusted-actors.json"
+STD_SHA="$(jq -r .object.sha "$STD_COMMIT")"
+STD_HUMAN="$(jq -r '[.actors[] | select(.kind == "human")][0].id' "$STD_LIST")"
+STD_OUTSIDER="$(jq -r '[.actors[].id] | max + 1' "$STD_LIST")"
+STD_PATH=components/trusted-actors/trusted-actors.json
+STD_BINDING="$(trust_binding "{\"trusted_actors\":\"standards:acme/standards:$STD_PATH\",\"model\":\"trust/model.yaml\",\"lanes_app\":\"lanes-app[bot]\"}")"
+STD_ANSWER="$TMP_ROOT/std-answer.json"
+answer "$STD_ANSWER" \
+  "i1=$(issue ready "$(ev add "$STD_HUMAN" needs-human)" "$(ev change "$STD_OUTSIDER" ready)")" \
+  "i3=$(issue ready "$(ev add "$STD_HUMAN" needs-human)" "$(ev change "$STD_HUMAN" ready)")"
+GH_STUB_STD_COMMIT="$STD_COMMIT" ACTORS_FILE="$STD_LIST" BINDING="$STD_BINDING" ANSWER="$STD_ANSWER" run --field "Work status" "${ids[@]}" "github:p/q#1"
+assert_eq "a standards list → exit 0" "0" "$RC"
+assert_eq "a standards list decides as the repository's would" "ready|needs-human" "$(st 3)|$(st 1)"
+assert_eq "standards main is resolved once for every repository, by its full ref" "1" "$(grep -c 'acme/standards/git/ref/heads/main' "$LOG")"
+assert_eq "standards main is never read as commits/main, which a tag named main answers" "0" "$(grep -c 'acme/standards/commits/' "$LOG")"
+assert_eq "the standards list is read once, at that commit" "1" "$(grep -c "acme/standards/contents/$STD_PATH?ref=$STD_SHA" "$LOG")"
+assert_eq "the item repository's list is not read" "0" "$(grep -c 'contents/trust/actors.json' "$LOG")"
+assert_contains "the model is still read from the item repository" "$(cat "$LOG")" "repos/o/r/contents/trust/model.yaml"
+NOT_A_SHA="$TMP_ROOT/not-a-sha.json"
+jq '.object.sha = "not-a-sha"' "$STD_COMMIT" >"$NOT_A_SHA"
+ANSWER="$STD_ANSWER" BINDING="$STD_BINDING" trust_fails 5 "standards main unread"
+GH_STUB_STD_COMMIT="$NOT_A_SHA" ACTORS_FILE="$STD_LIST" BINDING="$STD_BINDING" trust_fails 3 "standards main that is not a commit"
+GH_STUB_STD_COMMIT="$STD_COMMIT" ACTORS_FILE=404 BINDING="$STD_BINDING" trust_fails 3 "a standards list that is absent"
+BINDING="$(trust_binding '{"trusted_actors":"standards:acme/standards:../actors.json","model":"trust/model.yaml","lanes_app":"a[bot]"}')" \
+  trust_fails 3 "a standards path that leaves the repository"
+for bad in "standards:$STD_PATH" "standards:not a repo:$STD_PATH" "standards:acme:$STD_PATH" "standards:acme/standards:"; do
+  BINDING="$(trust_binding "{\"trusted_actors\":\"$bad\",\"model\":\"trust/model.yaml\",\"lanes_app\":\"a[bot]\"}")" \
+    trust_fails 3 "a standards source with no valid <owner>/<repo>:<path> ($bad)"
+done
 
 # --- status_trust governs Work status alone: another field reads plain ---
 PRIORITY="$TMP_ROOT/priority.json"

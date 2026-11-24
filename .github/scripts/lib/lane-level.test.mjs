@@ -6,7 +6,6 @@ import { apiLimits } from "../../actions/log-api-budget/rate-guard.mjs";
 
 const VECTORS = JSON.parse(readFileSync(new URL("./lane-level.vectors.json", import.meta.url), "utf8"));
 
-// A vector's config overrides the base per block and per pool.
 function configOf(override = {}) {
   const base = VECTORS.config;
   const api = { ...base.api };
@@ -25,7 +24,6 @@ test("the vectors file holds well-formed vectors covering every reason", () => {
   assert.deepEqual([...reasons].sort(), ["ceiling", "hold", "hot", "missing-data", "no-demand", "no-fit", "step-down", "step-up", "streak"]);
 });
 
-// The truth table exercises the numbers that ship, not numbers of its own.
 test("the vectors' base config is the shipped lane-level and lanes-app defaults", () => {
   const shipped = apiLimits({ resolvedPath: "" });
   assert.deepEqual(VECTORS.config["lane-level"], { ...LANE_LEVEL_DEFAULTS, pools: [...LANE_LEVEL_DEFAULTS.pools] });

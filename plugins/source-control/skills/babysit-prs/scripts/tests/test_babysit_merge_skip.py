@@ -300,8 +300,6 @@ class TheKeyCoversEveryInput(unittest.TestCase):
             {"id": 4, "name": f"pr-verify-7-{HEAD}-pass", "expired": True},
             {"id": 5, "name": "pr-merge-gate-cursor", "expired": False},
             {"id": 6, "name": f"pr-verify-7-{HEAD}-fail-i3.7", "expired": False},
-            # Not verdict names: a pass carries no issues, and issues are
-            # ascending and listed once.
             {"id": 7, "name": f"pr-verify-7-{HEAD}-pass-i3", "expired": False},
             {"id": 8, "name": f"pr-verify-7-{HEAD}-pass-notes-i3", "expired": False},
             {"id": 9, "name": f"pr-verify-7-{HEAD}-fail-i7.3", "expired": False},
@@ -339,7 +337,6 @@ class ARefsPullRequestIsNeverSkipped(unittest.TestCase):
         refs["closingIssuesReferences"] = {"totalCount": 0, "nodes": []}
         refs["body"] = "Refs: #3\n\nPart one."
         self.assertIsNone(skip.pr_state(refs))
-        # No issue at all, or a closing one beside a Refs line, keeps a key.
         refs["body"] = "Part one."
         self.assertIsNotNone(skip.pr_state(refs))
         closing = _node()
@@ -783,10 +780,62 @@ class FilterThenRecordEndToEnd(unittest.TestCase):
 
     def test_the_main_inputs_name_each_path_or_absent(self) -> None:
         inputs = skip.main_inputs(self.base)
-        self.assertEqual(set(inputs), set(skip.MAIN_PATHS))
+        self.assertEqual(set(inputs), {*skip.MAIN_PATHS, skip.STANDARDS_INPUT})
         self.assertRegex(inputs["docs/conventions/pr-pipeline.yaml"], r"^[0-9a-f]{40}$")
         self.assertEqual(inputs["docs/conventions/source-control.yaml"], "absent")
+        self.assertEqual(inputs[skip.STANDARDS_INPUT], "unread")
         self.assertNotIn(".claude/source-control.md", inputs)
+
+    def test_an_opted_in_clone_keys_on_the_standards_list(self) -> None:
+        (self.base / "docs/conventions/source-control.yaml").write_text(
+            "trusted_actors_source: standards\nstandards_repository: example-org/standards\n"
+        )
+        _git(self.base, "-c", "user.email=t@t", "-c", "user.name=t", "add", ".")
+        _git(self.base, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "c")
+        read = skip.merge_policy
+        seen = []
+        for text in ('{"version": 1}', '{"version": 1, "actors": []}'):
+            with mock.patch.object(read, "standards_file", return_value=text) as standards:
+                seen.append(skip.main_inputs(self.base)[skip.STANDARDS_INPUT])
+            standards.assert_called_once_with(
+                "example-org/standards", read.STANDARDS_TRUSTED_ACTORS
+            )
+        self.assertRegex(seen[0], r"^[0-9a-f]{64}$")
+        self.assertNotEqual(seen[0], seen[1])
+        failed = read.PolicyReadError("standards main could not be resolved")
+        with (
+            mock.patch.object(read, "standards_file", side_effect=failed),
+            self.assertRaisesRegex(RuntimeError, "standards main"),
+        ):
+            skip.main_inputs(self.base)
+        (self.base / "docs/conventions/source-control.yaml").write_text(
+            "trusted_actors_source: standards\n"
+        )
+        _git(self.base, "-c", "user.email=t@t", "-c", "user.name=t", "add", ".")
+        _git(self.base, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "c")
+        with self.assertRaisesRegex(RuntimeError, "standards_repository"):
+            skip.main_inputs(self.base)
+
+    def test_a_repository_or_unknown_source_keys_unread_or_raises(self) -> None:
+        for team, expected in (
+            ("trusted_actors_source: repository\n", "unread"),
+            ("standards_repository: example-org/standards\n", "unread"),
+            ("trusted_actors_source: elsewhere\n", None),
+            ("trusted_actors_source: [standards]\n", None),
+        ):
+            with self.subTest(team=team):
+                (self.base / "docs/conventions/source-control.yaml").write_text(team)
+                _git(self.base, "-c", "user.email=t@t", "-c", "user.name=t", "add", ".")
+                _git(self.base, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "c")
+                read = skip.merge_policy
+                with mock.patch.object(read, "standards_file") as standards:
+                    if expected is None:
+                        with self.assertRaisesRegex(RuntimeError, "trusted_actors_source"):
+                            skip.main_inputs(self.base)
+                    else:
+                        inputs = skip.main_inputs(self.base)
+                        self.assertEqual(inputs[skip.STANDARDS_INPUT], expected)
+                standards.assert_not_called()
 
 
 class TheReaderListingRaisesOnAFailedRead(unittest.TestCase):

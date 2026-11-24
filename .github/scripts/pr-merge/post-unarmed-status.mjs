@@ -23,7 +23,8 @@
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
-import { createGitHub } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
+import { createGitHub } from "../lib/github-client.mjs";
+import { ACTIONS_BOT_ID } from "../lib/lane-vocabulary.mjs";
 import { UNARMED_CONTEXT } from "./enable-auto-merge.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -31,16 +32,10 @@ const SHA = /^[0-9a-f]{40}$/;
 const STATES = new Set(["failure", "success"]);
 // GitHub's limit on a status description.
 const DESCRIPTION_CHARS = 140;
-// Statuses read and written in one run at most (judgment: more open lane
-// pull requests than this is a run to look at).
 export const MAX_STATUSES = 100;
-// The GitHub Actions bot's user id, which every GITHUB_TOKEN posts as
-// (fix-ci-dispatch.mjs ACTIONS_BOT_ID).
-const ACTIONS_BOT_ID = 41898282;
 
 const escapeCommand = (text) => String(text).replaceAll(/[\r\n%]/g, " ");
 
-// The statuses `text` hands on, well-formed only, one per head (its last).
 export function parse(text) {
   let list;
   try {
@@ -57,8 +52,6 @@ export function parse(text) {
   return [...byHead.values()].slice(0, MAX_STATUSES);
 }
 
-// Whether `status` changes what its head shows, given the head's newest
-// status in the context (`current`, undefined for none).
 export const changes = (status, current) =>
   current === undefined ? status.state === "failure" : current.state !== status.state || current.description !== status.description;
 
@@ -77,8 +70,6 @@ export async function main({ env = process.env, github } = {}) {
         // Newest first, so the first in the context is the one shown.
         const listed = await github("GET", `/repos/${repo}/commits/${status.sha}/statuses?per_page=100`);
         const newest = (Array.isArray(listed) ? listed : []).find((item) => item?.context === UNARMED_CONTEXT);
-        // Another creator's status in the context is not this job's: never
-        // read it as already shown.
         const current = newest?.creator?.id === ACTIONS_BOT_ID ? newest : undefined;
         if (!changes(status, current)) {
           continue;

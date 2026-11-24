@@ -1,3 +1,4 @@
+// test-scope: docs/upstream/*
 // Expected values come from the verdict rules in
 // docs/conventions/pr-pipeline/README.md ("Verifier verdict"): only a successful pr-require-checks pull_request run of this
 // repository starts a verdict, for exactly one open same-repository PR into
@@ -21,13 +22,14 @@ import { fileURLToPath } from "node:url";
 
 import { createHash } from "node:crypto";
 
-import { createGitHub, GitHubError } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
+import { createGitHub, GitHubError } from "../lib/github-client.mjs";
 import { createRateLimitLatch } from "../../actions/log-api-budget/rate-guard.mjs";
 import { CARRY_MAX, carryMain, closing, CONTRACT_LINE, CONTRACT_STEP, DO_NOT_MERGE_LINE, DRAFT_STEP, failureAnnotation, HOLD_STEP, linkedIssues, main, packReads, ratedBy, RELINK_QUERY, resolvePull, SIBLINGS_MAX, siblingNumbers, takeReads, upstreamPages, vendoredRows } from "./resolve-pr.mjs";
 import { KEPT_JOBS, keptJobs, shapeJobs } from "./upstream-jobs.mjs";
 import { artifactName } from "./write-verdict.mjs";
 import { bodyVersion, loadRules, REFINE_MARKER, splitItemsLine } from "../intake-triage/admit.mjs";
 import { holds, labelHolds } from "../pr-merge/merge-holds.mjs";
+import { recordBody } from "../lib/admission-record.mjs";
 import { tempDir } from "../../../lib/test-tmp.mjs";
 
 const REPO = "example-org/example-repo";
@@ -117,8 +119,12 @@ const ciStatusJobs = (draftStep) => ({
 const DRAFT_JOBS = ciStatusJobs("success");
 const READY_JOBS = ciStatusJobs("skipped");
 
-function fake({ run = upstream(), pulls = [pull()], artifacts = [], runs = {}, onMain = [MAIN], issues = [ISSUE], edit = { lastEditedAt: null, editor: null }, restFails = false, associated = [], body: prBody = null, refs = {}, queries = [], renames = [], relink, jobs = READY_JOBS, jobsOf = {}, upstreamRuns, upstreamTotal, commentPages = {}, changed, texts = {} } = {}) {
+function fake({ run = upstream(), pulls = [pull()], artifacts = [], runs = {}, onMain = [MAIN], issues = [ISSUE], edit = { lastEditedAt: null, editor: null }, restFails = false, associated = [], body: prBody = null, refs = {}, queries = [], renames = [], relink, jobs = READY_JOBS, jobsOf = {}, upstreamRuns, upstreamTotal, commentPages = {}, changed, texts = {}, prFiles = [{ filename: "docs/a.md", status: "modified" }] } = {}) {
   const github = async (method, apiPath, body) => {
+    if (apiPath === `/repos/${REPO}/pulls/41/files?per_page=100`) {
+      if (prFiles === null) throw new Error(`GET ${apiPath} failed with status 502`);
+      return prFiles;
+    }
     // GET /compare/{base}...{head}: the pull request's changed files, as
     // `files` holds them; with none given the read fails.
     if (apiPath === `/repos/${REPO}/compare/${BASE}...${HEAD}`) {
@@ -1273,7 +1279,7 @@ test("do-not-merge still fails ci-status and the merge queue", () => {
   const step = (name) => new RegExp(`^ {6}- name: ${name}\\n((?: {8}.*\\n|\\n)*)`, "m").exec(workflow)?.[1] ?? "";
   const report = step("Aggregate lane results");
   assert.match(report, /^ {8}id: report$/m);
-  assert.match(report, /^ {8}uses: melodic-software\/ci-workflows\/\.github\/actions\/pr-require-checks\/report-ci-status@main$/m);
+  assert.match(report, /^ {8}uses: melodic-software\/ci-workflows\/\.github\/actions\/pr-require-checks\/report-ci-status@main\b/m);
   assert.doesNotMatch(report, /do-not-merge-label|continue-on-error/m);
   const fail = step(CONTRACT_STEP);
   assert.match(fail, /^ {8}if: \$\{\{ !cancelled\(\) && \(steps\.report\.outputs\.contract != 'success' \|\| steps\.report\.outputs\.draft != 'success'\) \}\}$/m);
@@ -1372,6 +1378,20 @@ test("a PR the lanes App did not open is not judged", async () => {
   assert.equal(await reason({ pulls: [HUMAN_PR] }, { verifyAuthors: "lane" }), "author-not-lane", "lane named");
   // The workflow passes an unset identity as an empty string.
   assert.equal(await reason({ pulls: [pull()] }, { laneIdentity: "" }), "author-not-lane", "no identity");
+});
+
+test("the lanes App's PR changing only merge.baseline-file is not judged; any other file or author, or no file set, is", async () => {
+  const file = "docs/upstream/claude-code-native-surfaces.min.json";
+  const baseline = { filename: file, status: "modified" };
+  const app = { laneAppId: 337595936, baselineFile: file };
+  assert.equal(await reason({ prFiles: [baseline] }, app), "native-baseline");
+  assert.equal(await reason({ prFiles: [baseline, { filename: "docs/a.md", status: "added" }] }, app), "ok");
+  assert.equal(await reason({ prFiles: [{ ...baseline, status: "renamed", previous_filename: "docs/upstream/old.json" }] }, app), "ok");
+  assert.equal(await reason({ pulls: [pull({ user: { id: 6, login: LANE, type: "Bot" } })], prFiles: [baseline] }, app), "ok");
+  assert.equal(await reason({ prFiles: [baseline] }, { laneAppId: 337595936 }), "ok");
+  assert.equal(await reason({ prFiles: [baseline] }, { ...app, baselineFile: "" }), "ok");
+  assert.equal(await reason({ prFiles: [baseline] }, { ...app, baselineFile: "docs/upstream/other.json" }), "ok");
+  await assert.rejects(resolve({ prFiles: null }, app), /pulls\/41\/files/);
 });
 
 test("a PR the lanes App opened is judged, matched across login spellings", async () => {
@@ -2288,6 +2308,58 @@ test("a split record holds only under the issue lane's configured web hosts", as
   }
 });
 
+test("a done-when item an owner's body starts with `Person check:` reaches the verifier as a person check", async () => {
+  const lanes = { __typename: "Bot", login: "melodic-automation-lanes", databaseId: 337595936 };
+  const outsider = { __typename: "User", login: "outsider", databaseId: 200 };
+  const marked = "Person check: the owner reads the summary and agrees.";
+  const body = ["## Done when", "", "- [ ] Line 9 says 27 checks.", `- [ ] ${marked}`, "- [ ] Tests pass."].join("\n");
+  const entry = async (overrides = {}, nodes = []) =>
+    (await resolve({ issues: [{ ...ISSUE, body, ...overrides, comments: { totalCount: nodes.length, nodes } }] }, { laneAppId: lanes.databaseId, taskList: TASK_LIST })).specText[0];
+  const edited = (editor) => ({ lastEditedAt: "2026-10-16T00:00:00Z", editor });
+
+  assert.deepEqual((await entry()).person_checks, [marked], "an owner's never-edited body");
+  assert.deepEqual((await entry(edited(ISSUE.author))).person_checks, [marked], "an owner's body an owner last edited");
+  for (const [why, overrides] of [
+    ["a body another User wrote", { author: outsider }],
+    ["an owner's body another User last edited", edited(outsider)],
+    ["an owner's body the lanes App last edited", edited(lanes)],
+    ["a body the lanes App filed", { author: lanes }],
+  ]) {
+    assert.equal((await entry(overrides)).person_checks, undefined, why);
+  }
+  for (const text of ["Line 9 says 27 checks.", "person check: the owner reads the summary.", "Then, Person check: the owner reads the summary.", "Person check the owner reads the summary."]) {
+    assert.equal((await entry({ body: `## Done when\n\n- [ ] ${text}` })).person_checks, undefined, `not marked: ${text}`);
+  }
+});
+
+test("owner-marked person checks join the refinement's, once each, in body order", async () => {
+  const lanes = { __typename: "Bot", login: "melodic-automation-lanes", databaseId: 337595936 };
+  const marked = "Person check: the owner reads the summary and agrees.";
+  const split = (text, items) => ({
+    databaseId: 5,
+    createdAt: "2026-10-15T00:00:00Z",
+    updatedAt: "2026-10-15T00:00:00Z",
+    body: `${REFINE_MARKER}\n${bodyVersion(text)}\n${splitItemsLine(items)}\n**Refinement.**`,
+    author: lanes,
+    lastEditedAt: null,
+    editor: null,
+  });
+  const entry = async (body, nodes) =>
+    (await resolve({ issues: [{ ...ISSUE, body, comments: { totalCount: nodes.length, nodes } }] }, { laneAppId: lanes.databaseId, taskList: TASK_LIST })).specText[0];
+
+  const both = ["## Done when", "", `- [ ] ${marked}`, "- [ ] Line 9 says 27 checks.", "- [ ] Run it on a Windows 11 host.", "- [ ] Tests pass."].join("\n");
+  const merged = await entry(both, [split(both, [3])]);
+  assert.deepEqual(merged.person_checks, [marked, "Run it on a Windows 11 host."]);
+  assert.equal(merged.comments.length, 1, "the standing split refinement still reaches the verifier");
+
+  const same = ["## Done when", "", "- [ ] Line 9 says 27 checks.", "- [ ] Person check: run it on a Windows 11 host.", "- [ ] Tests pass."].join("\n");
+  assert.deepEqual((await entry(same, [split(same, [2])])).person_checks, ["Person check: run it on a Windows 11 host."], "an item both name is listed once");
+
+  const stale = await entry(both, [split(`${both}\n- [ ] Added since.`, [3])]);
+  assert.deepEqual(stale.person_checks, [marked], "a split record for another body adds nothing");
+  assert.deepEqual(stale.comments, [], "the owner's mark does not let a split refinement that does not stand reach the verifier");
+});
+
 test("main identifies the lanes App by merge.agent-identity's id on the trusted list", async () => {
   const dir = tempDir("pr-verify-");
   const actors = path.join(dir, "trusted-actors.json");
@@ -2544,11 +2616,7 @@ for (const vector of VECTORS.cases) {
   test(`split-child vector: ${vector.name}`, async () => {
     const appId = "app_id" in vector ? vector.app_id : VECTORS.app_id;
     const body = await specBody(childNode(vector), parentNode(vector), appId === null ? {} : { laneAppId: appId });
-    const { child } = vector;
-    const ownAgent =
-      (child.labels ?? []).filter((name) => /^source:/i.test(name)).length === 1 &&
-      appId !== null && child.author.type === "Bot" && child.author.id === appId && !child.body.startsWith("<!-- intake-triage size-split child -->") && (child.last_edited_at === null || child.editor?.id === appId);
-    assert.deepEqual(body, [[8, vector.expect.trusted || ownAgent ? child.body : null]], vector.expect.reason);
+    assert.deepEqual(body, [[8, vector.expect.trusted ? vector.child.body : null]], vector.expect.reason);
   });
 }
 
@@ -2567,6 +2635,106 @@ test("an own-agent filing's body is spec only while no other account edited it, 
     ["no source label", node(app, null, []), null],
     ["two source labels", node(app, null, ["source: improvement-find", "source: upstream"]), null],
     ["a malformed source label", node(app, null, ["source:improvement-find"]), null],
+  ]) {
+    assert.deepEqual(await specBody(issue, null), [[8, expected]], name);
+  }
+});
+
+test("a lanes App filing is spec once its admission record names it as it is and no one holds it", async () => {
+  const BODY = "## Done when\n\n- [ ] Line 3 says nineteen.";
+  const TITLE = "Fix line 3";
+  const app = { __typename: "Bot", login: "some-app", databaseId: VECTORS.app_id };
+  const human = { __typename: "User", login: "someone", databaseId: VECTORS.humans[0] };
+  const record = (author, text = { title: TITLE, body: BODY }, edited = null) => ({
+    databaseId: 900,
+    createdAt: "2026-11-17T00:00:00Z",
+    updatedAt: edited ?? "2026-11-17T00:00:00Z",
+    lastEditedAt: edited,
+    body: recordBody({ actorId: VECTORS.app_id, ...text }),
+    author,
+    editor: edited ? author : null,
+  });
+  const node = ({ comments = [record(app)], labels = [], body = BODY, author = app, editor = null, total } = {}) => ({
+    ...ISSUE,
+    number: 8,
+    title: TITLE,
+    body,
+    lastEditedAt: editor ? "2026-11-18T00:00:00Z" : null,
+    author,
+    editor,
+    labels: { totalCount: total ?? labels.length, nodes: labels.map((name) => ({ name })) },
+    comments: { totalCount: comments.length, nodes: comments },
+  });
+  for (const [name, issue, expected] of [
+    ["briefed, no hold", node(), BODY],
+    ["no admission record", node({ comments: [] }), null],
+    ["the record in a listed human's comment", node({ comments: [record(human)] }), null],
+    ["the record in github-actions[bot]'s comment", node({ comments: [record({ __typename: "Bot", login: "github-actions", databaseId: 41898282 })] }), null],
+    ["the body edited after the record", node({ body: `${BODY}\n- [ ] More.`, editor: human }), null],
+    ["the record names another title", node({ comments: [record(app, { title: "Other", body: BODY })] }), null],
+    ["an edited record", node({ comments: [record(app, undefined, "2026-11-17T01:00:00Z")] }), null],
+    ["held needs-human", node({ labels: ["needs-human"] }), null],
+    ["held Needs-Owner-Decision", node({ labels: ["Needs-Owner-Decision"] }), null],
+    ["provenance: untrusted", node({ labels: ["provenance: untrusted"] }), null],
+    ["a hold: body line", node({ body: `${BODY}\nHold: wait for the owner`, comments: [record(app, { title: TITLE, body: `${BODY}\nHold: wait for the owner` })] }), null],
+    ["labels not read whole", node({ total: 60 }), null],
+    ["filed by a listed human's bot twin, not the App", node({ author: { __typename: "Bot", login: "other", databaseId: 99 } }), null],
+  ]) {
+    assert.deepEqual(await specBody(issue, null), [[8, expected]], name);
+  }
+});
+
+// https://github.com/melodic-software/architecture/pull/167
+test("a lanes App filing is spec once intake-triage's ready verdict names it as it is and no one holds it", async () => {
+  const BODY = "## Done when\n\n- [ ] Line 3 says nineteen.";
+  const TITLE = "Fix line 3";
+  const sha = (text) => createHash("sha256").update(text, "utf8").digest("hex");
+  const app = { __typename: "Bot", login: "some-app", databaseId: VECTORS.app_id };
+  const human = { __typename: "User", login: "someone", databaseId: VECTORS.humans[0] };
+  const stampOf = (title, body) => `<!-- intake-triage judged title_sha256:${sha(title)} body_sha256:${sha(body)} -->`;
+  const MOVED = "The latest triage verdict holds nothing: admission moved the issue to `needs-owner-decision`; its comment says why.";
+  const verdict = ({ author = app, line = MOVED, stamp = stampOf(TITLE, BODY), editor = null, id = 901 } = {}) => ({
+    databaseId: id,
+    createdAt: "2026-11-17T00:00:00Z",
+    updatedAt: editor ? "2026-11-17T01:00:00Z" : "2026-11-17T00:00:00Z",
+    lastEditedAt: editor ? "2026-11-17T01:00:00Z" : null,
+    body: ["<!-- intake-triage verdict -->", line, ...(stamp ? [stamp] : [])].join("\n"),
+    author,
+    editor,
+  });
+  const node = ({ comments = [verdict()], labels = [], body = BODY } = {}) => ({
+    ...ISSUE,
+    number: 8,
+    title: TITLE,
+    body,
+    lastEditedAt: null,
+    author: app,
+    editor: null,
+    labels: { totalCount: labels.length, nodes: labels.map((name) => ({ name })) },
+    comments: { totalCount: comments.length, nodes: comments },
+  });
+  const held = `${BODY}\nHold: wait for the owner`;
+  for (const [name, issue, expected] of [
+    ["admission moved it, the verdict held nothing", node(), BODY],
+    ["the verdict left it at ready", node({ comments: [verdict({ line: "The latest triage verdict holds nothing: the issue is at `status: ready`." })] }), BODY],
+    ["the App edited its own verdict", node({ comments: [verdict({ editor: app })] }), BODY],
+    ["no verdict", node({ comments: [] }), null],
+    ["a verdict for older text", node({ body: `${BODY}\n- [ ] More.` }), null],
+    ["a verdict naming another title", node({ comments: [verdict({ stamp: stampOf("Other", BODY) })] }), null],
+    ["an unstamped verdict", node({ comments: [verdict({ stamp: null })] }), null],
+    ["triage held it", node({ comments: [verdict({ line: "The triage verdict left this issue at `needs-owner-decision`:\n\n- flagged: intent\n" })] }), null],
+    ["a person's Work status holds it", node({ comments: [verdict({ line: "The latest triage verdict holds nothing: a person set the Work status to `needs-human`, which holds the issue." })] }), null],
+    ["admission did not finish", node({ comments: [verdict({ line: "The latest triage verdict holds nothing: admission did not finish, so the issue's status is not settled." })] }), null],
+    ["a blocked-by edge is missing", node({ comments: [verdict({ line: "The latest triage verdict holds nothing: a blocked-by edge is missing, so the issue carries no `status:` label and admission waits for intake to run again, which the hourly triage sweep starts." })] }), null],
+    ["briefed but held needs-human", node({ labels: ["needs-human"] }), null],
+    ["briefed but provenance: untrusted", node({ labels: ["provenance: untrusted"] }), null],
+    ["briefed but a hold: body line", node({ body: held, comments: [verdict({ stamp: stampOf(TITLE, held) })] }), null],
+    ["a verdict-shaped comment by a listed human", node({ comments: [verdict({ author: human })] }), null],
+    ["a verdict-shaped comment by github-actions[bot]", node({ comments: [verdict({ author: { __typename: "Bot", login: "github-actions", databaseId: 41898282 } })] }), null],
+    ["a verdict-shaped comment by another bot", node({ comments: [verdict({ author: { __typename: "Bot", login: "other", databaseId: 99 } })] }), null],
+    ["the App's verdict last edited by a listed human", node({ comments: [verdict({ editor: human })] }), null],
+    ["a stamped App verdict after the one apply-verdict edits", node({ comments: [verdict({ stamp: null }), verdict({ id: 902 })] }), null],
+    ["a malformed App admission record beside the verdict", node({ comments: [{ ...verdict({ id: 903 }), body: "<!-- issue-admission-record -->\n{}" }, verdict()] }), null],
   ]) {
     assert.deepEqual(await specBody(issue, null), [[8, expected]], name);
   }

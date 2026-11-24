@@ -1,8 +1,3 @@
-// The Work status writer (models.issue-status). An issue's Work status field
-// is its state: writeState and statusWriter set it to a named state, and a
-// write that does not land throws StatusWriteError. Imports nothing outside
-// node at load, so a job that installs no resolve-config dependencies can
-// still import FIELD_API; its writer then throws on every call.
 export const FIELD_API = { "X-GitHub-Api-Version": "2026-03-10" };
 
 // The wait between a restart's clear and its set. GitHub can stamp the removal
@@ -13,8 +8,8 @@ export const RESTART_GAP_MS = 3000;
 
 // The statuses GitHub answers a field value that names no option with.
 const NAME_REFUSED = new Set([400, 422]);
-// The state whose write starts the issue lane.
 const AGENT_READY = "agent-ready";
+const HOST_RUN_OR_PARK_STOP_STATE = "confirmed";
 const fold = (name) => String(name).toLowerCase();
 const notFound = (error) => error?.status === 404 || /\bstatus 404\b/.test(String(error?.message ?? error));
 const titleCased = (name) => name.charAt(0).toUpperCase() + name.slice(1);
@@ -146,9 +141,15 @@ export async function writeState({ github, repository, number, state, config, cu
 // removal that fails throws, so agent-ready is never set over a status label
 // left on, and a `set` whose field write then fails puts the removed labels
 // back.
+// A `set` that writes confirmed or a hold removes the agent-ready label after
+// the field write lands (dropAgentReadyLabel), so label queries stop reading
+// the issue as lane-ready
+// (https://github.com/melodic-software/claude-code-plugins/issues/17860); a
+// removal that fails is logged, not thrown. A queue
+// state keeps the label: admission reads its `unlabeled` event as a stop.
 // A config that cannot be read makes every call throw StatusWriteError; a
 // trusted-actor list that cannot be read, every call that reads the field.
-export async function statusWriter({ env, github, repository, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) {
+export async function statusWriter({ env, github, repository, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), log = console.log }) {
   let config;
   let trustedActors;
   let failure;
@@ -159,8 +160,6 @@ export async function statusWriter({ env, github, repository, sleep = (ms) => ne
     failure = new StatusWriteError(`models.issue-status could not be read: ${error?.message ?? error}`, { cause: error });
   }
   const wrote = new Map();
-  // The field's trusted state, and whether it is a hold a listed human set.
-  // Only a field read needs the trusted-actor list, so a plain `set` writes without it.
   const readField = async (number) => {
     try {
       const { fieldStatusSetter, HOLD_STATES, loadTrustedActors } = await import("./read-status.mjs");
@@ -183,7 +182,7 @@ export async function statusWriter({ env, github, repository, sleep = (ms) => ne
     let names;
     let holds;
     try {
-      const { paginate } = await import("../check-trusted-trigger/check-trusted-trigger.mjs");
+      const { paginate } = await import("../../scripts/lib/github-client.mjs");
       ({ HOLD_STATES: holds } = await import("./read-status.mjs"));
       names = (await paginate(github, path)).map((label) => String(label?.name ?? label));
     } catch (error) {
@@ -214,9 +213,6 @@ export async function statusWriter({ env, github, repository, sleep = (ms) => ne
     }
     return { removed };
   };
-  // Puts `removed` back on the issue after its agent-ready write failed: with
-  // no trusted field state, the labels alone carry the issue's state
-  // (read-status.mjs statusLabels). Throws `error`, naming a failed put-back.
   const restoreAndThrow = async (number, removed, error) => {
     if (removed.length > 0) {
       try {
@@ -227,12 +223,23 @@ export async function statusWriter({ env, github, repository, sleep = (ms) => ne
     }
     throw error;
   };
+  const dropAgentReadyLabel = async (number) => {
+    for (const name of config?.labels?.[AGENT_READY] ?? []) {
+      try {
+        await github("DELETE", `/repos/${repository}/issues/${number}/labels/${encodeURIComponent(name)}`);
+      } catch (error) {
+        if (!notFound(error)) {
+          log(`::warning title=write-status::#${number}'s \`${name}\` label was not removed after its Work status left agent-ready: ${String(error?.message ?? error).replaceAll(/[\r\n%]/g, " ")}`);
+        }
+      }
+    }
+  };
+  const stopsLane = async (state) => state === HOST_RUN_OR_PARK_STOP_STATE || (await import("./read-status.mjs")).HOLD_STATES.includes(state);
   const set = async (number, state, { fields, keepHold, releases, from } = {}) => {
     if (failure) {
       throw failure;
     }
     const fresh = keepHold || Array.isArray(from);
-    // A person may set a hold after any write, this process's own included.
     if (fresh) {
       const now = await readField(number);
       if (keepHold && now.personHold && now.state !== releases) {
@@ -261,6 +268,9 @@ export async function statusWriter({ env, github, repository, sleep = (ms) => ne
       await restoreAndThrow(number, removed, error);
     }
     wrote.set(number, result.option);
+    if (result.outcome === "written" && (await stopsLane(state))) {
+      await dropAgentReadyLabel(number);
+    }
     return result;
   };
   const leaveAgentReady = async (number, state, { orUnset = false } = {}) => {

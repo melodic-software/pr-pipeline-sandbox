@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-# Black-box contract test for check-source-applicability.py.
-#
-# Self-contained and cwd-independent; mutates only its own guarded mktemp dir.
-#
-# The cases that matter are the ones where a wrong answer is invisible: a source
-# written for an older version must never pass as current evidence for a claim
-# about a newer one, and a slice this gate cannot read must never pass at all.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,9 +14,6 @@ trap 'rm -rf "$WORK"' EXIT
 # shellcheck source=../lib/test-helpers.sh
 source "$SCRIPT_DIR/../lib/test-helpers.sh"
 
-# run <expected-exit> <label> [--err <stderr-substring>] [args...]
-# --err also requires stderr to contain the substring, so a case fails for its
-# intended rule rather than for any violation at all.
 run() {
   local expected="$1" label="$2" want_err=""
   shift 2
@@ -44,7 +34,6 @@ run() {
   fi
 }
 
-# src <role> <published> <applies_to> <standing> [dated_by]; "-" or no argument omits that key.
 src() {
   printf '      - url: "https://example.test/doc"\n'
   printf '        tier: 1\n        pool: "docs"\n        measures: "m"\n'
@@ -55,7 +44,6 @@ src() {
   if [[ -n "${5+x}" && "${5:-}" != - ]]; then printf '        dated_by: %s\n' "$5"; fi
 }
 
-# claim <applies_to or -> <sources text>
 claim() {
   printf '  - claim: "c"\n    confidence: HIGH\n    tiers: [1, 2]\n'
   if [[ "$1" != - ]]; then printf '    applies_to: %s\n' "$1"; fi
@@ -63,7 +51,6 @@ claim() {
   printf '    inference: "i"\n    qualifiers: []\n'
 }
 
-# mkslice <name> <evidence_use or -> <claims text>; prints the slice dir.
 mkslice() {
   local d="$WORK/$1"
   mkdir -p "$d"
@@ -80,8 +67,6 @@ mkslice() {
 PRIMARY="$(src primary 2025-01-01 'ExampleLib 9' current)"
 V9='ExampleLib 9'
 
-# one_source <name> <role> <published> <applies_to> <standing> [claim-applies_to]
-# A slice with the standard primary plus one extra source on a claim.
 one_source() {
   local c="${6:-$V9}"
   local p="$PRIMARY"
@@ -90,8 +75,6 @@ one_source() {
 $(src "$2" "$3" "$4" "$5")")"
 }
 
-# --- clean slices -----------------------------------------------------------
-
 clean="$(mkslice clean - "$(claim "$V9" "$PRIMARY
 $(src corroborator 2024-06 'ExampleLib 8-10' current)")")"
 run 0 "clean slice, internal" "$clean"
@@ -99,16 +82,11 @@ clean_pub="$(mkslice clean-pub publish "$(claim "$V9" "$PRIMARY
 $(src corroborator 2024 'ExampleLib 9' current)")")"
 run 0 "clean slice, publish" "$clean_pub"
 
-# The coverage ledger lives in the same slice and has no front matter. A
-# case-insensitive sidecar match (pathlib's glob on Windows) would read it as a
-# RESEARCH-*.md sidecar and grade every bounded-corpus run ungradeable.
 with_ledger="$(mkslice with-ledger - "$(claim "$V9" "$PRIMARY
 $(src corroborator 2024-06 'ExampleLib 8-10' current)")")"
 printf '%s\n' '| # | Corpus item | Depth criterion | Done |' '|---|---|---|---|' \
   '| 1 | alpha | its reference read end to end | [x] |' >"$with_ledger/research-checklist.md"
 run 0 "a lowercase research-checklist.md ledger is not a sidecar" "$with_ledger"
-
-# --- published (R2) ---------------------------------------------------------
 
 PUB_BAD='source 2: published missing, invalid or in the future'
 DERIVES_HIST='standing is current but derives historical'
@@ -118,8 +96,6 @@ run 1 "missing published" --err "$PUB_BAD" "$(one_source pub-missing corroborato
 run 1 "bad published" --err "$PUB_BAD: 2025-02-30" "$(one_source pub-bad corroborator 2025-02-30 "$V9" current)"
 run 1 "non-date published" --err "$PUB_BAD: soon" "$(one_source pub-word corroborator soon "$V9" current)"
 run 1 "future published" --err "$PUB_BAD: 2999-01-01" "$(one_source pub-future corroborator 2999-01-01 "$V9" current)"
-
-# --- applies_to (R1, R3) ----------------------------------------------------
 
 run 1 "missing claim applies_to" --err 'claim 1: applies_to missing or unparsable: None' \
   "$(mkslice claim-at-missing - "$(claim - "$PRIMARY")")"
@@ -132,8 +108,6 @@ run 1 "unparsable source applies_to" --err 'source 2: applies_to missing or unpa
 run 1 "inverted source range" --err 'source 2: applies_to missing or unparsable: ExampleLib 10-8' \
   "$(one_source src-at-inverted corroborator 2025-01-01 'ExampleLib 10-8' historical)"
 
-# --- standing and role (R4, R5) ---------------------------------------------
-
 run 1 "bad standing" --err 'source 2: standing must be current or historical: stale' \
   "$(one_source bad-standing corroborator 2025-01-01 "$V9" stale)"
 run 1 "missing standing" --err 'source 2: standing must be current or historical: None' \
@@ -145,8 +119,6 @@ run 1 "two primaries" --err 'expected exactly one primary source, found 2' \
 run 1 "zero primaries" --err 'expected exactly one primary source, found 0' \
   "$(mkslice zero-primaries - "$(claim "$V9" "$(src corroborator 2025-01-01 "$V9" current)")")"
 
-# --- primary (R7) -----------------------------------------------------------
-
 run 1 "undated primary on versioned claim" --err 'source 1: primary source must be dated' \
   "$(mkslice undated-primary - "$(claim "$V9" "$(src primary undated "$V9" current)")")"
 run 1 "undated primary on version-independent claim, internal" --err 'source 1: primary source must be dated' \
@@ -154,8 +126,6 @@ run 1 "undated primary on version-independent claim, internal" --err 'source 1: 
 run 1 "historical primary" --err 'source 1: primary source must be current' \
   "$(mkslice historical-primary - "$(claim "$V9" "$(src primary 2025-01-01 'ExampleLib 2' historical)")")"
 
-# An undated primary is one fault: "must be dated" fires, "must be current"
-# does not, and a stored label that already says historical adds nothing more.
 undated_hist="$(mkslice undated-primary-hist - "$(claim "$V9" "$(src primary undated "$V9" historical)")")"
 out="$(python3 "$SUT" "$undated_hist" 2>"$WORK/stderr")"
 err="$(cat "$WORK/stderr")"
@@ -172,10 +142,6 @@ else
   fail "undated primary stored current should report two violations: $out / $err"
 fi
 
-# A MEDIUM or LOW claim is a Gap, and Gaps stay in the sidecar header
-# (artifact-shape.md), so the accepted-claim primary rules (R5's count, R7)
-# skip it. Every source it does carry is still graded, so its labels stay
-# honest. Confidence is the only marker: HIGH, or no confidence at all, gets R7.
 gap() { claim "$@" | sed "s/confidence: HIGH/confidence: ${GAP_LEVEL:-LOW}/"; }
 run 0 "LOW gap claim keeps a historical primary" \
   "$(mkslice gap-historical - "$(gap "$V9" "$(src primary 2025-01-01 'ExampleLib 2' historical)")")"
@@ -189,8 +155,6 @@ run 1 "HIGH (single source) claim gets R7" --err 'source 1: primary source must 
   "$(mkslice single-historical - "$(GAP_LEVEL='HIGH (single source)' gap "$V9" "$(src primary 2025-01-01 'ExampleLib 2' historical)")")"
 run 1 "claim with no confidence gets R7" --err 'source 1: primary source must be current' \
   "$(mkslice no-confidence-historical - "$(claim "$V9" "$(src primary 2025-01-01 'ExampleLib 2' historical)" | sed '/confidence:/d')")"
-
-# --- derived standing (R6) --------------------------------------------------
 
 run 1 "old-major source stored current on newer-major claim" --err "source 2: $DERIVES_HIST" \
   "$(one_source old-major-current corroborator 2020-01-01 'ExampleLib 2' current)"
@@ -245,8 +209,6 @@ run 1 "undated current corroborator on version-independent claim, publish" \
 run 0 "versioned source covers a version-independent claim" \
   "$(one_source vi-claim-versioned corroborator 2025-01-01 'OtherLib 3' current version-independent)"
 
-# --- evidence_use -----------------------------------------------------------
-
 run 1 "--expect-evidence-use publish against index without evidence_use" \
   --err 'index records internal, caller expects publish' "$clean" --expect-evidence-use publish
 run 0 "--expect-evidence-use internal against index without evidence_use" \
@@ -268,8 +230,6 @@ printf -- '---\ntopic: t\nevidence_use:\n---\n' >"$empty_mode/RESEARCH.md"
 run 2 "empty evidence_use in the index" --err 'evidence_use must be internal or publish' "$empty_mode"
 run 0 "quoted evidence_use in the index" "$(mkslice quoted-mode '"publish"' "$(claim "$V9" "$PRIMARY")")"
 
-# --- parsing ----------------------------------------------------------------
-
 run 0 "quoted values parse" "$(mkslice quoted - "$(claim '"ExampleLib 9"' "$(src "'primary'" '"2025-01-01"' "'ExampleLib 8+'" '"current"')")")"
 run 0 "trailing comments ignored" "$(mkslice comments - "$(claim "ExampleLib 9   # target" "$(src primary 2025-01-01 'ExampleLib 9 # same' current)")")"
 
@@ -284,7 +244,6 @@ bom="$(mkslice bom - "$(claim "$V9" "$PRIMARY")")"
 { printf '\xef\xbb\xbf'; cat "$bom/RESEARCH-s.md"; } >"$bom/bom.tmp" && mv "$bom/bom.tmp" "$bom/RESEARCH-s.md"
 run 0 "BOM sidecar parses" "$bom"
 
-# An all-Gap run: every sidecar says claims: [] and the slice still passes.
 no_claims="$WORK/no-claims"
 mkdir -p "$no_claims"
 printf -- '---\ntopic: t\n---\n' >"$no_claims/RESEARCH.md"
@@ -292,13 +251,10 @@ printf -- '---\ntopic: t\nclaims: []\n---\n' >"$no_claims/RESEARCH-a.md"
 printf -- '---\ntopic: t\nclaims:\n---\n' >"$no_claims/RESEARCH-b.md"
 run 0 "sidecars with empty claims lists" "$no_claims"
 
-# A bad sidecar in a sub-slice is never read.
 nested="$(mkslice nested - "$(claim "$V9" "$PRIMARY")")"
 mkdir -p "$nested/sub"
 printf 'no front matter\n' >"$nested/sub/RESEARCH-x.md"
 run 0 "sub-slices are not recursed into" "$nested"
-
-# --- ungradeable ------------------------------------------------------------
 
 run 2 "missing slice" "$WORK/does-not-exist"
 no_index="$(mkslice no-index - "$(claim "$V9" "$PRIMARY")")"
@@ -358,8 +314,6 @@ run 2 "no args"
 run 2 "unknown flag" "$clean" --strict
 run 2 "two slice dirs" "$clean" "$clean_pub"
 
-# --- summary lines ----------------------------------------------------------
-
 out="$(python3 "$SUT" "$clean" 2>/dev/null)"
 want='status=pass evidence_use=internal claims=1 sources=2 historical=0'
 if [[ "$out" == "$want" ]]; then
@@ -390,8 +344,6 @@ if [[ "$out" == "status=ungradeable" ]]; then
 else
   fail "ungradeable summary line: got '$out'"
 fi
-
-# --- dated_by (R8) ----------------------------------------------------------
 
 dated_slice() {
   mkslice "$1" - "$(claim "$V9" "$PRIMARY

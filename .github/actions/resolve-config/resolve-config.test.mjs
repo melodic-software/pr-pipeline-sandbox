@@ -37,9 +37,6 @@ function place(root, relative, source) {
   copyFileSync(source, join(root, relative));
 }
 
-// A workspace whose `.base/` holds the config, the live schema and the fixture
-// vocabulary. `head` puts a config at the workspace root, where the PR head
-// would be checked out.
 function workspace({
   config = "valid.yaml",
   configPath = CONFIG_PATH,
@@ -88,7 +85,6 @@ function workspace({
   };
 }
 
-// Reads the delimited GITHUB_OUTPUT form back into an object.
 function readOutputs(path) {
   const outputs = {};
   const lines = readFileSync(path, "utf8").split("\n");
@@ -103,7 +99,6 @@ function readOutputs(path) {
   return outputs;
 }
 
-// A fake API: each route is a path prefix and its response; every call is logged.
 function fakeGitHub(routes) {
   const calls = [];
   const github = async (method, path) => {
@@ -140,12 +135,10 @@ function pullRoutes({ changedFiles, files, labels = [] }) {
   };
 }
 
-// valid.yaml's pr-run-checks lane has a paths predicate, so it reads the PR.
 const srcChanged = () =>
   fakeGitHub(pullRoutes({ changedFiles: 1, files: [{ filename: "src/a.js" }] }))
     .github;
 
-// Exit 1, no file, no outputs, and an error annotation naming the cause.
 async function assertFailsRed(t, env, cause, github = noApi) {
   const log = t.mock.method(console, "log", () => {});
   const code = await main({ env, github });
@@ -169,8 +162,6 @@ async function assertFailsRed(t, env, cause, github = noApi) {
     `expected an error matching ${cause}, got ${messages.join(" | ")}`,
   );
 }
-
-// A valid run
 
 test("a valid config writes ResolvedConfig and the selected activity's outputs", async () => {
   const { env } = workspace();
@@ -253,9 +244,6 @@ for (const mode of ["bypassPermissions", "acceptEdits", "default", "plan"]) {
   });
 }
 
-// A script's write-runner checkout: head unless the leaf sets base; a skill
-// has none, and setting one on a skill or to another value fails the schema.
-// The key is inserted after `after`, a line of the leaf.
 const withCheckout = (checkout, { activity = "run-tests", after = "    script: scripts/run-tests.sh\n" } = {}) => {
   const { env } = workspace();
   env.ACTIVITY = activity;
@@ -297,8 +285,6 @@ test("without an activity only enabled and slots are output", async () => {
     null,
   );
 });
-
-// Base vs head
 
 function runCli(root, env) {
   const result = spawnSync(process.execPath, [CLI], {
@@ -347,7 +333,48 @@ test("a config symlink that leaves base-path fails red", async (t) => {
   await assertFailsRed(t, env, /outside base-path/);
 });
 
-// Every rejection fails red with no file
+const STANDARDS_VOCABULARY = "components/github-actions-conventions/vocabulary.json";
+
+function standardsCheckout(root, { vocabulary = true } = {}) {
+  const dir = join(root, "standards");
+  mkdirSync(dir, { recursive: true });
+  if (vocabulary) {
+    place(dir, STANDARDS_VOCABULARY, join(FIXTURES, "vocabulary.json"));
+  }
+  return dir;
+}
+
+test("with standards-path set, the vocabulary is read from the standards checkout, not base-path", async () => {
+  const { root, env } = workspace({ vocabulary: false });
+  assert.equal(await main({ env: { ...env, STANDARDS_DIR: standardsCheckout(root) }, github: srcChanged() }), 0);
+});
+
+test("with standards-path set, base-path's vocabulary is never read", async (t) => {
+  const { root, env } = workspace();
+  await assertFailsRed(t, { ...env, STANDARDS_DIR: standardsCheckout(root, { vocabulary: false }) }, /vocabulary is missing/);
+});
+
+test("an empty standards-path reads the vocabulary under base-path", async () => {
+  const { env } = workspace();
+  assert.equal(await main({ env: { ...env, STANDARDS_DIR: "" }, github: srcChanged() }), 0);
+});
+
+test("a vocabulary symlink that leaves standards-path fails red", async (t) => {
+  const { root, base, env } = workspace();
+  const dir = standardsCheckout(root, { vocabulary: false });
+  mkdirSync(dirname(join(dir, STANDARDS_VOCABULARY)), { recursive: true });
+  symlinkSync(join(base, VOCABULARY_PATH), join(dir, STANDARDS_VOCABULARY));
+  await assertFailsRed(t, { ...env, STANDARDS_DIR: dir }, /outside standards-path/);
+});
+
+test("with standards-path set, the trusted-actor list is read from it: a symlink there that leaves standards-path fails red", async (t) => {
+  const { root, env } = workspace({ vocabulary: false });
+  const dir = standardsCheckout(root);
+  const actors = join(dir, "components/trusted-actors/trusted-actors.json");
+  mkdirSync(dirname(actors), { recursive: true });
+  symlinkSync(join(FIXTURES, "vocabulary.json"), actors);
+  await assertFailsRed(t, { ...env, STANDARDS_DIR: dir }, /trusted-actors\.json resolves outside standards-path/);
+});
 
 const REJECTIONS = [
   [
@@ -483,8 +510,6 @@ test("an error message cannot start a second workflow command", async (t) => {
     /no lane `x%0A::set-output/,
   );
 });
-
-// Changed paths from pulls/{n}/files
 
 test("a paths predicate reads the PR's changed files through the API", async () => {
   const { env } = workspace();
@@ -626,9 +651,6 @@ test("a config with no predicate makes no API call", async () => {
   assert.deepEqual(calls, []);
 });
 
-// Labels, events and work classes
-
-// Gives valid.yaml's fix-prose activity (lane pr-refine) a predicate.
 function withPredicate(env, predicate) {
   const config = join(env.BASE_PATH, CONFIG_PATH);
   writeFileSync(
@@ -671,7 +693,6 @@ test("on workflow_dispatch, labels come from the PR and the event maps to dispat
   assert.equal(readOutputs(env.GITHUB_OUTPUT).applies, "true");
 });
 
-// An issues lane: the event payload is the issue, and there is no PR.
 function issueEvent(env, issue) {
   writeFileSync(env.EVENT_PATH, JSON.stringify({ action: "labeled", issue }));
   env.EVENT_NAME = "issues";
@@ -717,8 +738,6 @@ test("on an issues event, labels-absent reads the issue's labels now", async () 
   assert.deepEqual(calls, ["GET /repos/melodic-software/claude-code-plugins/issues/7"]);
 });
 
-// No predicate reads a work class: an agent-ready issue with no class and
-// one with a structural class both apply, read now from the issue.
 test("an agent-ready issue applies whatever work class it carries, or none", async () => {
   for (const labelsNow of [["agent-ready"], ["agent-ready", "work-class: structural"]]) {
     const { env } = workspace();
@@ -732,8 +751,6 @@ test("an agent-ready issue applies whatever work class it carries, or none", asy
   }
 });
 
-// The work-class keys are gone, so a config that still gates on a class fails
-// the schema rather than gating nothing in silence.
 test("an admission or work-classes predicate fails the schema", async (t) => {
   for (const predicate of [
     { admission: { classes: ["work-class: read-only"] } },
@@ -746,7 +763,6 @@ test("an admission or work-classes predicate fails the schema", async (t) => {
   }
 });
 
-// valid.yaml's fix-prose (lane pr-refine) with prepare: merge-base and `extra`.
 function withPrepare(env, extra = "") {
   const config = join(env.BASE_PATH, CONFIG_PATH);
   writeFileSync(
@@ -788,8 +804,6 @@ test("a leaf with prepare that does not apply resolves without prepare support",
   assert.equal(await main({ env, github: noApi }), 0);
   assert.equal(readOutputs(env.GITHUB_OUTPUT).applies, "false");
 });
-
-// mergeable, labels-absent and draft, from GET /pulls/{n}
 
 const GATED_HEAD = "a".repeat(40);
 const OTHER_HEAD = "b".repeat(40);
@@ -998,9 +1012,6 @@ test("on a pull_request event, draft comes from the payload without an API call"
   assert.deepEqual(calls, []);
 });
 
-// applied-by and the patch rules (README.md, Activities and Patch rules). The
-// producer is fix-ci in pr-unblock, whose apply-patch slot needs it; the live
-// vocabulary, since the fixture lacks the verb "apply".
 const LIVE_VOCABULARY = join(HERE, "../../standards/github-actions-conventions/vocabulary.json");
 function withAppliedBy(env) {
   writeFileSync(
@@ -1041,7 +1052,6 @@ test("a leaf without applied-by resolves whatever applied-by-supported says", as
   assert.equal(await main({ env, github: noApi }), 0);
 });
 
-// The rule files the run reads beside resolve-config.mjs, with one replaced.
 const rulesWith = (name, value) => (relative) =>
   relative === name ? value : JSON.parse(readFileSync(join(HERE, relative), "utf8"));
 

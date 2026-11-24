@@ -1,22 +1,14 @@
 # Repository-context probes: why each one is shaped as it is
 
-Detail behind the `## Repository context. Gather first` section in [SKILL.md](../SKILL.md). The
-hub keeps the commands, the probe list and the combination table; this file keeps the reasons.
+Detail behind the `## Repository context. Probe the config layers` section in
+[SKILL.md](../SKILL.md). The hub keeps the commands, the probe list and the combination table; this
+file keeps the reasons.
 
-## The two pipes in the git calls
+## Why probes 2 to 4 omit `--exclude-standard`
 
-**The two pipes are the bound and belong in the command.** A read-time cap ("read only the summary
-line") comes too late for whatever the command has already returned inline; `head` and `tail`
-truncate before the result exists. What a result returns inline, and when it arrives as a saved file
-instead, is [Tools reference § Output limits](https://code.claude.com/docs/en/tools-reference#output-limits).
-These are ordinary body Bash calls, not pre-compute, so the one-invocation composition that applies
-to the `## Pre-computed context` block does not apply here.
-
-## Why probes 2 and 3 omit `--exclude-standard`
-
-Probes 2 and 3 deliberately omit `--exclude-standard`, so a gitignored file is still listed: the
-personal override is expected to be gitignored, and an untracked team file has to be *seen* before it
-can be reported as untracked.
+Probes 2 to 4 deliberately omit `--exclude-standard`, so a gitignored file is still listed: the
+personal override and its old location are expected to be gitignored, and an untracked team file
+has to be *seen* before it can be reported as untracked.
 
 ## Why probe 2 exists, and what a nonzero exit means
 
@@ -31,7 +23,7 @@ case as unknown is exactly what readmits a file the resolution rules exclude.
 
 ## Why the git lines stay out of pre-compute
 
-Keep the repository-context git lines out of `## Pre-computed context`, so the skill stays
+Keep the probe git lines out of `## Pre-computed context`, so the skill stays
 invocable from inside a worktree. The composition record is the
 [gather-block convention](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/gather-block/README.md#the-pre-compute-block-runs-as-one-shell-invocation).
 
@@ -43,8 +35,8 @@ invocable from inside a worktree. The composition record is the
 
 **Every repo-scoped probe anchors at the repository root**, via the `:/` magic pathspec, never at
 the session's current directory. A session started in a subdirectory would otherwise look for
-`<cwd>/docs/conventions/source-control.yaml` and `<cwd>/.claude/source-control.local.md` and report
-both repo-scoped layers absent, silently dropping the team convention
+`<cwd>/docs/conventions/source-control.yaml` and `<cwd>/docs/conventions/source-control.local.yaml`
+and report both repo-scoped layers absent, silently dropping the team convention
 and `trailer_policy`, and producing a commit with the wrong subject shape or attribution. Never
 substitute a resolved root path into a probe instead: a repository root containing `$(…)`, a
 backtick, or a double quote is *not* made safe by wrapping the substituted text in double quotes

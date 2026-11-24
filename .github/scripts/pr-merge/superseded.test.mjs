@@ -16,7 +16,7 @@ import { dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { GitHubError } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
+import { GitHubError } from "../lib/github-client.mjs";
 import { main } from "./superseded.mjs";
 import { tempDir } from "../../../lib/test-tmp.mjs";
 
@@ -30,8 +30,6 @@ const LISTING = `/repos/${REPO}/actions/workflows/pr-merge.yml/runs?status=pendi
 const dir = tempDir("superseded-");
 after(() => rmSync(dir, { recursive: true, force: true }));
 
-// `actor` started the run and `rerunner` (its triggering_actor) started
-// attempt `attempt`.
 const pending = (id, event, actor = OWNER, { rerunner = actor, branch = "main", attempt = 1 } = {}) => ({
   id,
   event,
@@ -43,13 +41,10 @@ const pending = (id, event, actor = OWNER, { rerunner = actor, branch = "main", 
 });
 
 const jobsOf = (id) => `/repos/${REPO}/actions/runs/${id}/jobs?filter=latest&per_page=100`;
-// Each job's display name in pr-merge.yml, which the jobs API lists it by.
 const NAMES = { merge: "Merge", "enable-auto-merge": "Enable Auto Merge" };
 const waiting = (job = "merge", status = "pending") => [{ name: NAMES[job], status }];
 
 let n = 0;
-// `jobs` maps a run id to its jobs read; a run missing from it has `job`
-// waiting. `jobsFail` is thrown by every jobs read.
 async function check({ event = "schedule", runs = [], fail, body, job, jobs = {}, jobsFail, env: extra = {} } = {}) {
   n += 1;
   const output = join(dir, `output-${n}`);
@@ -124,8 +119,6 @@ test("a pending run a listed human started by hand supersedes a pull_request_tar
   assert.equal(run.superseded, true);
 });
 
-// An event run gates only its own pull request (pr-merge.yml EVENT_PR), so
-// another event's run does not do this one's work.
 test("a pending pull_request_target run supersedes no other pull_request_target run", async () => {
   const run = await check({ event: "pull_request_target", runs: [pending(600, "pull_request_target")] });
   assert.equal(run.superseded, false);
@@ -215,7 +208,6 @@ test("an unknown current event, or an unknown job, does its work without a listi
   assert.deepEqual(run.calls, []);
 });
 
-// Run 40113925144 above: pending only because another of its jobs waits.
 test("a pending run whose merge job already ran supersedes nothing", async () => {
   const run = await check({
     runs: [pending(600, "schedule", QUEUE_BOT)],
@@ -283,9 +275,6 @@ test("enable-auto-merge: a waiting merge job, or an enable-auto-merge job a cond
   }
 });
 
-// A re-run keeps its event, and the who step lets a scheduled run's later
-// attempt on only when a listed human started that attempt; a scheduled run's
-// actor is whoever last changed the schedule, often a bot.
 test("a scheduled run counts on its first attempt, or on a later one a listed human started", async () => {
   const first = await check({ runs: [pending(600, "schedule", QUEUE_BOT)] });
   assert.equal(first.superseded, true);
@@ -304,10 +293,8 @@ test("a repository name GitHub cannot hold reads nothing and runs the job", asyn
   assert.deepEqual(run.calls, []);
 });
 
-// pr-verify's wake: a PR-scoped dispatch (pr-merge.yml run-name
-// `pr-merge: arm #<pr>`) that github-actions[bot] starts with its GITHUB_TOKEN.
 const ACTIONS_BOT = { id: 41898282, login: "github-actions[bot]" };
-const scoped = (id, pr, actor = ACTIONS_BOT, options = {}) => ({ ...pending(id, "workflow_dispatch", actor, options), display_title: `pr-merge: arm #${pr}` });
+const scoped = (id, pr, actor = ACTIONS_BOT, options = {}) => ({ ...pending(id, "workflow_dispatch", actor, options), display_title: `PR Merge: arm #${pr}` });
 
 test("a PR-scoped dispatch, the bot's or a listed human's, supersedes no sweep", async () => {
   for (const event of ["schedule", "workflow_dispatch"]) {
@@ -332,16 +319,13 @@ test("a PR-scoped run is superseded by a newer dispatch for the same pull reques
   assert.equal(same.superseded, true);
   assert.match(same.stdout, /run 600 \(workflow_dispatch\)/);
   assert.equal((await check({ job: "enable-auto-merge", event: "workflow_dispatch", runs: [scoped(600, 42, OWNER)], env })).superseded, true, "a listed human's");
-  const titled = await check({ job: "enable-auto-merge", event: "workflow_dispatch", runs: [{ ...scoped(600, 42), display_title: "PR Merge: arm #42" }], env });
-  assert.equal(titled.superseded, true, "the Title Case run-name");
   for (const [why, other] of [
-    ["another pull request, Title Case", { ...scoped(600, 43), display_title: "PR Merge: arm #43" }],
     ["another pull request", scoped(600, 43)],
     ["a re-run", scoped(600, 42, ACTIONS_BOT, { attempt: 2 })],
     ["re-run by another bot", scoped(600, 42, ACTIONS_BOT, { rerunner: LANES_BOT })],
     ["another bot's", scoped(600, 42, LANES_BOT)],
     ["another branch", scoped(600, 42, ACTIONS_BOT, { branch: "fix/other" })],
-    ["not a number", { ...scoped(600, 42), display_title: "pr-merge: arm #42 " }],
+    ["not a number", { ...scoped(600, 42), display_title: "PR Merge: arm #42 " }],
   ]) {
     const run = await check({ job: "enable-auto-merge", event: "workflow_dispatch", runs: [other], env });
     assert.equal(run.superseded, false, why);

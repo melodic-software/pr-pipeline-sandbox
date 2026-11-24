@@ -94,6 +94,7 @@ jobs:
       # A finished parent's sub-issues, each closed as completed by a trusted
       # close, for report-outcome's verified-done close.
       verify-close: ${{ steps.blockers.outputs.verify-close }}
+      standards-sha: ${{ steps.standards.outputs.sha }}
     env:
       API_BUDGET_TOKEN: github-token
       npm_config_audit: "false"
@@ -120,16 +121,9 @@ jobs:
 
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
 
       - name: Check out the default branch tip
         uses: actions/checkout@v7
@@ -137,6 +131,10 @@ jobs:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -167,7 +165,7 @@ jobs:
         if: steps.kill.outputs.proceed == 'true'
         uses: ./.base/.github/actions/check-trusted-trigger # zizmor: ignore[self-repository]
         with:
-          trusted-actors-path: .base/.github/standards/trusted-actors/trusted-actors.json
+          standards-path: ${{ steps.standards.outputs.path }}
           denied-actor-ids: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
           lanes-app-id: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
           triggering-actor: ${{ github.triggering_actor }}
@@ -182,8 +180,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
-          TRUSTED_ACTORS_PATH: .base/.github/standards/trusted-actors/trusted-actors.json
+          TRUSTED_ACTORS_PATH: ${{ steps.standards.outputs.path }}/components/trusted-actors/trusted-actors.json
           LANES_APP_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: node .base/.github/scripts/work-resolve-issue/check-blockers.mjs
 
       # Skips the run while Actions or npm installs report a degraded
@@ -241,21 +240,15 @@ jobs:
       timeout-minutes: ${{ steps.dimensions.outputs.timeout-minutes }}
       issue-dimensions: ${{ steps.dimensions.outputs.issue-dimensions }}
       skip-reason: ${{ steps.dimensions.outputs.skip-reason }}
-      skip-key: ${{ steps.credit.outcome == 'success' && steps.credit.outputs.skip-key || '' }}
+      skip-key: ${{ steps.credit.outcome != 'skipped' && vars.CLAUDE_API_KEYS_DISABLED == 'true' && 'true' || steps.credit.outcome == 'success' && steps.credit.outputs.skip-key || '' }}
+      key-off: ${{ vars.CLAUDE_API_KEYS_DISABLED == 'true' }}
     steps:
       - name: Resolve main's tip
         id: tip
         continue-on-error: true
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         if: steps.tip.outputs.sha != ''
         continue-on-error: true
@@ -264,6 +257,14 @@ jobs:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        if: steps.tip.outputs.sha != ''
+        continue-on-error: true
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+        with:
+          ref: ${{ needs.check-admission.outputs.standards-sha }}
 
       # A switch that is on skips every API step below and leaves the job
       # green with no `capped`, so resolve-issue skips; work-unblock's sweep
@@ -289,6 +290,14 @@ jobs:
       # run reads again (element 3). No stored state decides the pause. Its
       # queued cap (`admission-open`) gates only new agent-ready labels in
       # work-unblock, never this run: a queued issue leaves the count by running.
+      - name: Set up Node
+        id: node
+        if: steps.kill.outputs.proceed != 'false'
+        continue-on-error: true
+        uses: melodic-software/ci-workflows/.github/actions/setup-pinned-node@main
+        with:
+          node-version-file: .base/.node-version
+
       - name: Check the WIP cap
         id: wip
         if: steps.kill.outputs.proceed != 'false'
@@ -297,6 +306,8 @@ jobs:
         with:
           # Only capped leaves this job, so the admission reads are skipped.
           reads: pause
+          node-setup: ${{ steps.node.outcome }}
+          standards-path: ${{ steps.standards.outputs.path }}
 
       # The check names its own hold; this names one it could not, when it
       # failed or never ran.
@@ -304,16 +315,6 @@ jobs:
         if: steps.kill.outputs.proceed != 'false' && steps.wip.outputs.capped != 'true' && steps.wip.outputs.capped != 'false'
         run: echo "::notice title=WIP cap hold::the WIP cap check did not finish, so the pause is unknown and this run starts no work; work-unblock's next sweep re-fires it and the check reads again"
 
-      # The key-credit gate, read before the slot queue: a credit stop inside
-      # vars.KEY_CREDIT_WINDOW_HOURS skips resolve-issue, so the run queues
-      # once, for resolve-issue-subscription, instead of once per leg. Every
-      # failure leaves skip-key empty and the key runs, re-reading its credit
-      # in its own check-broker. On a skip, resolve-issue-subscription runs
-      # with fallback credit-stop, and its check-broker writes the skipped key
-      # leg's lane record and re-checks the blockers in the slot.
-      # The decision comes before the first slot wait, so a window that
-      # expires during that wait still sends the run to the subscription,
-      # which costs plan capacity, not correctness.
       - name: Read the key's credit history
         id: credit
         if: steps.wip.outputs.capped == 'false'
@@ -350,6 +351,7 @@ jobs:
           # What the read runner hands on for resolve-issue.
           applied-by-supported: patch work-outcome
           split-child: ${{ needs.check-admission.outputs.split-child }}
+          standards-path: ${{ steps.standards.outputs.path }}
 
       # SLOTS is the effective lane level: the published level variable,
       # clamped to limits.lane-level's floor and ceiling, or its default when
@@ -488,16 +490,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -559,16 +554,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -577,15 +565,13 @@ jobs:
           sparse-checkout: |
             .github/scripts/lib/handoff-evidence.sh
             .github/actions/log-api-budget
-            .github/actions/scan-upload
-            .github/actions/setup-pinned-node
             .node-version
             lib/publish-gate.mjs
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
       - name: Set up Node
-        uses: ./.base/.github/actions/setup-pinned-node # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/setup-pinned-node@main
         with:
           node-version-file: .base/.node-version
 
@@ -613,8 +599,9 @@ jobs:
         if: steps.credit-marker-resolve-issue.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 1
-        uses: ./.base/.github/actions/scan-upload # zizmor: ignore[self-repository]
+        uses: melodic-software/ci-workflows/.github/actions/scan-upload@main
         with:
+          gate-path: .base/lib/publish-gate.mjs
           path: ${{ runner.temp }}/key-credit-stop-resolve-issue/run-id
 
       - name: Upload resolve-issue's credit-stop marker
@@ -637,11 +624,6 @@ jobs:
         with:
           tokens: github-token
 
-  # The subscription fallback, a second call on new VMs in the same slot: it
-  # runs on resolve-issue-handoff's read, passing fallback handoff, the one
-  # fact that read attests, or as the first call in the slot when pick-slot's
-  # key-credit gate skipped resolve-issue, passing fallback credit-stop. It
-  # holds the OAuth token alone.
   resolve-issue-subscription:
     name: Resolve Issue Subscription
     needs: [check-admission, pick-slot, resolve-issue, resolve-issue-handoff]
@@ -667,7 +649,7 @@ jobs:
       lane: work-resolve-issue
       role: issue-lane
       activity: resolve-issue
-      fallback: ${{ needs.resolve-issue.result == 'skipped' && 'credit-stop' || 'handoff' }}
+      fallback: ${{ needs.resolve-issue.result == 'skipped' && (needs.pick-slot.outputs.key-off == 'true' && 'no-key' || 'credit-stop') || 'handoff' }}
       fallback-ready: ${{ needs.resolve-issue-handoff.outputs.fallback-ready }}
       issue-number: ${{ format('{0}', github.event.issue.number) }}
       trusted-base: default-tip
@@ -705,16 +687,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -809,16 +784,9 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
@@ -907,22 +875,19 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -935,7 +900,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
-          TRUSTED_ACTORS_PATH: .base/.github/standards/trusted-actors/trusted-actors.json
+          TRUSTED_ACTORS_PATH: ${{ steps.standards.outputs.path }}/components/trusted-actors/trusted-actors.json
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: node .base/.github/scripts/work-resolve-issue/check-human-pull.mjs
 
       - name: Log the API budget at the end
@@ -1017,22 +983,19 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -1049,6 +1012,7 @@ jobs:
           PRUNE_BRANCHES: ${{ needs.resolve-issue-fallback.result != 'skipped' && needs.resolve-issue-fallback.outputs.scan-prune-branches || needs.resolve-issue-fallback.result == 'skipped' && needs.resolve-issue-subscription.result != 'skipped' && needs.resolve-issue-subscription.outputs.scan-prune-branches || needs.resolve-issue-fallback.result == 'skipped' && needs.resolve-issue-subscription.result == 'skipped' && needs.resolve-issue.outputs.scan-prune-branches || '' }}
           REUSE_BRANCH: ${{ needs.resolve-issue-fallback.result != 'skipped' && needs.resolve-issue-fallback.outputs.scan-reuse-branch || needs.resolve-issue-fallback.result == 'skipped' && needs.resolve-issue-subscription.result != 'skipped' && needs.resolve-issue-subscription.outputs.scan-reuse-branch || needs.resolve-issue-fallback.result == 'skipped' && needs.resolve-issue-subscription.result == 'skipped' && needs.resolve-issue.outputs.scan-reuse-branch || '' }}
           RESUME_BRANCH: ${{ needs.resolve-issue-fallback.result != 'skipped' && needs.resolve-issue-fallback.outputs.scan-resume-branch || needs.resolve-issue-fallback.result == 'skipped' && needs.resolve-issue-subscription.result != 'skipped' && needs.resolve-issue-subscription.outputs.scan-resume-branch || needs.resolve-issue-fallback.result == 'skipped' && needs.resolve-issue-subscription.result == 'skipped' && needs.resolve-issue.outputs.scan-resume-branch || '' }}
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: node .base/.github/scripts/work-resolve-issue/prune-branches.mjs
 
       - name: Log the API budget at the end
@@ -1086,22 +1050,21 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+        with:
+          ref: ${{ needs.run-checks.outputs.standards-sha }}
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -1127,6 +1090,7 @@ jobs:
           RUNNER_CHECKS: ${{ needs.run-checks.result == 'success' && needs.run-checks.outputs.checks || '' }}
           RESOLVE_RESULT: ${{ needs.resolve-issue-fallback.result != 'skipped' && needs.resolve-issue-fallback.result || needs.resolve-issue-subscription.result != 'skipped' && needs.resolve-issue-subscription.result || needs.resolve-issue.result }}
           REPORT_RESULT: ${{ needs.report-outcome.outputs.skip-reason == 'kill-switch' && 'stopped' || needs.report-outcome.result }}
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: node .base/.github/scripts/work-resolve-issue/post-statuses.mjs
 
       - name: Log the API budget at the end
@@ -1164,6 +1128,7 @@ jobs:
       issues: read # resolve-config reads the issue's labels for labels-absent
     outputs:
       checks: ${{ steps.run-checks.outputs.checks }}
+      standards-sha: ${{ steps.standards.outputs.sha }}
     # Each guarded API call's rate-limit reading, for the job-end api-budget
     # notice (.github/actions/log-api-budget).
     env:
@@ -1172,22 +1137,21 @@ jobs:
     steps:
       - name: Resolve main's tip
         id: tip
-        env:
-          TIP_BRANCH: ${{ github.event.repository.default_branch }}
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          until sha=$(timeout 60 git -C "$RUNNER_TEMP" ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$TIP_BRANCH" |
-              awk -v ref="refs/heads/$TIP_BRANCH" '$2 == ref { print $1 }') && [[ $sha =~ ^[0-9a-f]{40}$ ]]; do
-            ((++i < 3)) || { echo "::error::the tip of $TIP_BRANCH did not resolve"; exit 1; }
-            sleep "$((RANDOM % (2 * i + 1)))"
-          done
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+        uses: melodic-software/ci-workflows/.github/actions/resolve-branch-tip@main
+        with:
+          branch: ${{ github.event.repository.default_branch }}
       - name: Check out the default branch tip
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.tip.outputs.sha }}
           path: .base
           persist-credentials: false
+
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+        with:
+          ref: ${{ needs.check-admission.outputs.standards-sha }}
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -1204,6 +1168,7 @@ jobs:
           base-path: .base
           split-child: ${{ needs.check-admission.outputs.split-child }}
           output-path: ${{ runner.temp }}/resolved-config.json
+          standards-path: ${{ steps.standards.outputs.path }}
 
       # For lane.json, which names the branch. A skill run reaches this job
       # only when the scan uploaded the outcome; a reuse may have none.

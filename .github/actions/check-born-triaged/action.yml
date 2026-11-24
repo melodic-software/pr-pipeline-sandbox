@@ -2,8 +2,8 @@ name: Check Born Triaged
 description: >
   Decide whether an issue skips intake because another skill routes it or
   /work-items:decompose published it already triaged. skip=true when the issue
-  carries the tracker binding's container label or a label starting with its
-  wayfind prefix; or, with born-triaged true, when it carries the born-triaged
+  carries the tracker binding's container label, its session-owned role label,
+  or a label starting with its wayfind prefix; or, with born-triaged true, when it carries the born-triaged
   marker, its author is a listed human or the lanes App (by numeric id), and it
   has an Issue Type and a status (a Work status field a trusted account set, or
   a status label; agent-ready alone counts only while the field is not
@@ -23,6 +23,13 @@ inputs:
     description: Path to the trusted-actor list, read from a default-branch checkout.
     required: false
     default: .base/.github/standards/trusted-actors/trusted-actors.json
+  standards-path:
+    description: >
+      A melodic-software/standards checkout (download-standards' `path`
+      output), checked out before any head code ran. When set, the list is
+      read from it and trusted-actors-path is ignored.
+    required: false
+    default: ""
   lanes-app-id:
     description: The lanes App bot's numeric user id. Empty trusts listed humans only.
     required: false
@@ -70,6 +77,7 @@ runs:
       env:
         ISSUE_NUMBER: ${{ inputs.issue-number }}
         TRUSTED_ACTORS_PATH: ${{ inputs.trusted-actors-path }}
+        STANDARDS_DIR: ${{ inputs.standards-path }}
         LANES_APP_ID: ${{ inputs.lanes-app-id }}
         BORN_TRIAGED: ${{ inputs.born-triaged }}
         TRACKER_CONFIG: ${{ inputs.tracker-config }}

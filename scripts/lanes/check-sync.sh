@@ -47,11 +47,15 @@ SYNCED=(
   # Modules the synced scripts and tests import from outside those folders.
   .github/recurring-schedule.json
   .github/requirements-relock.txt
+  .github/lane-registry.json
   .github/scripts/intake-triage/admit.mjs
+  .github/scripts/intake-triage/issue-spec.mjs
+  .github/scripts/intake-triage/size-split.mjs
   .github/scripts/lane-run-report/post.mjs
   .github/scripts/maintenance-monitor-signals/issues.mjs
   .github/scripts/maintenance-reconcile-lost-runs/component-status.mjs
   .github/scripts/maintenance-reconcile-lost-runs/infra-failure.mjs
+  .github/scripts/pr-dispatch-feedback/rerun-ci-status.sh
   .github/scripts/pr-review-main/split-diff.py
   .github/scripts/pr-review-main/write-verdict.mjs
   .github/scripts/recurring-schedule/file-due.mjs
@@ -82,6 +86,7 @@ SYNCED=(
   package-lock.json
   package.json
   plugins/multi-agent/reference/defaults.yaml
+  scripts/ci-deps
   # Whole plugins: the babysit-prs scripts, the work-item tracker, the issue
   # lane's skill, the research/doc skills (discovery, knowledge) and the
   # fix-docs audit skill (ai-slop), with everything they read inside their

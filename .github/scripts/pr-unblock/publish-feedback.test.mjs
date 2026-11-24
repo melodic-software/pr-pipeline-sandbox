@@ -1,14 +1,17 @@
+// test-scope: .github/scripts/lib/* .github/scripts/pr-unblock/*
+// test-scope: docs/upstream/*
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { isEscalationReply } from "./address-feedback.mjs";
 import { gateLines, sectionRefusal } from "./address-feedback.mjs";
 import { followUpBullet, main, publish, refreshedBody, renderReply, takeBodyRecord, undisposedLines, withFollowUp } from "./publish-feedback.mjs";
+import { stage } from "../../actions/collect-base-activity/stage-closure.mjs";
 import { tempDir } from "../../../lib/test-tmp.mjs";
 
 // Ids from .github/standards/trusted-actors/trusted-actors.json and the
@@ -1627,17 +1630,11 @@ test("lineChanged reads a patch's new-side hunks", async () => {
   assert.equal(lineChanged(undefined, 1), false);
 });
 
-// collect-base-activity runs a script activity from a copy of its own
-// directory under $RUNNER_TEMP, beside a copy of the shared ../lib modules and
-// merge-holds.mjs in ../pr-merge, so every import must resolve inside those.
-test("the script loads from a copy of its own directory, the shared lib and the staged merge-holds alone", async () => {
+test("the script loads from its staged closure", async () => {
   const root = tempDir("base-activity-");
   try {
-    cpSync(dirname(fileURLToPath(import.meta.url)), join(root, "base-script"), { recursive: true });
-    cpSync(fileURLToPath(new URL("../lib", import.meta.url)), join(root, "lib"), { recursive: true });
-    mkdirSync(join(root, "pr-merge"));
-    cpSync(fileURLToPath(new URL("../pr-merge/merge-holds.mjs", import.meta.url)), join(root, "pr-merge", "merge-holds.mjs"));
-    const module = await import(pathToFileURL(join(root, "base-script", "publish-feedback.mjs")).href);
+    stage(fileURLToPath(new URL("../../..", import.meta.url)), ".github/scripts/pr-unblock/publish-feedback.mjs", root);
+    const module = await import(pathToFileURL(join(root, ".github/scripts/pr-unblock/publish-feedback.mjs")).href);
     assert.equal(typeof module.main, "function");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1903,14 +1900,14 @@ test("an earlier-fail round whose push fixes a named note ends as a pushed fix d
   assert.equal(api.markers().length, 1);
 });
 
-test("an earlier-fail round that pushes nothing and reports every note already addressed escalates feedback-already-addressed for a session", async () => {
+test("an earlier-fail round that pushes nothing and reports every note already addressed escalates feedback-already-addressed, queued for no session", async () => {
   const api = fakeApi({ compare: { status: "identical", commits: [], files: [] } });
   const result = await run(api, lines(noteReply("VNOTE_1", "already-addressed", "src/a.js:3"), noteReply("VNOTE_2", "already-addressed", "docs/b.md:1")), notesRun(NOW));
   assert.equal(result.escalationReason, "feedback-already-addressed");
   assert.equal(result.skipReason, undefined);
   assert.deepEqual(api.posted(), []);
   const { ROUTES } = await import("./escalation-routes.mjs");
-  assert.deepEqual([ROUTES[result.escalationReason].route, ROUTES[result.escalationReason].label], ["fail", "needs-session"]);
+  assert.deepEqual([ROUTES[result.escalationReason].route, ROUTES[result.escalationReason].label], ["fail", undefined], "pr-verify judges the head itself, so no session is queued");
   assert.match(ROUTES[result.escalationReason].why, /verify:earlier-fail/);
   assert.match(ROUTES[result.escalationReason].why, /already addressed/);
 });

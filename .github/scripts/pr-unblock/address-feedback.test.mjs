@@ -1,13 +1,16 @@
+// test-scope: .github/actions/resolve-config/package.json
+// test-scope: .github/scripts/pr-unblock/* docs/upstream/* .github/scripts/lib/conflict-record.mjs
 import assert from "node:assert/strict";
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { bodyView, ciSnapshot, claimsSecurity, copyPathsFor, coveringLanes, createGitHubApi, currentThreads, earlierFailHeadsFrom, main, maxRoundsFrom, needsPerson, planLanes, refreshableSections, runRecord, scanRefusal, select, trustedHumansFrom, VERIFY_NOTE_MARKER } from "./address-feedback.mjs";
+import { bodySectionNames, bodyView, ciSnapshot, claimsSecurity, copyPathsFor, coveringLanes, createGitHubApi, currentThreads, earlierFailHeadsFrom, localTemplate, main, maxRoundsFrom, needsPerson, planLanes, refreshableSections, runRecord, scanRefusal, select, templateHeadings, trustedHumansFrom, VERIFY_NOTE_MARKER } from "./address-feedback.mjs";
 import { failingChecks } from "./gate-source.mjs";
 import { escalationRoute, ROUTES } from "./escalation-routes.mjs";
+import { stage } from "../../actions/collect-base-activity/stage-closure.mjs";
 import { tempDir } from "../../../lib/test-tmp.mjs";
 
 // Ids from .github/standards/trusted-actors/trusted-actors.json and the
@@ -20,6 +23,7 @@ const HUMAN = 153232337;
 const STRANGER = 4242;
 const HEAD = "a".repeat(40);
 const OLD_HEAD = "b".repeat(40);
+const noPlan = () => ({});
 const ROUND = "<!-- pr-unblock:address-feedback-round -->";
 const marker = (lane, sha) => `<!-- claude-lane-reviewed-head lane=${lane} sha=${sha} -->\n${lane} has reviewed this pull request.`;
 const INJECTION =
@@ -78,7 +82,14 @@ function fakeApi(overrides = {}) {
     },
     listPullCommits: async () => Object.keys(overrides.checks ?? { [HEAD]: [] }).map((sha) => ({ sha })),
     listCheckRuns: async (sha) => (overrides.checks ?? {})[sha] ?? [],
+    listModelRounds: async () => Object.values(overrides.checks ?? { [HEAD]: [] }),
     createIssueComment: async (pr, body) => posted.push({ pr, body }),
+    async readPath(path) {
+      if (!Object.hasOwn(overrides.paths ?? {}, path)) {
+        throw Object.assign(new Error(`GET ${path} returned 404`), { status: 404 });
+      }
+      return overrides.paths[path];
+    },
   };
 }
 
@@ -611,9 +622,9 @@ test("a thread read that fails throws, so main writes no outputs and resolves no
   writeFileSync(actors, JSON.stringify({ actors: [{ id: REVIEWER, login: "claude[bot]", kind: "bot" }] }));
   const env = { GITHUB_TOKEN: "t", GITHUB_REPOSITORY: "o/r", GITHUB_OUTPUT: join(dir, "out"), PR_NUMBER: "42", HEAD_SHA: HEAD, APP_SENDER_ID: String(APP), THREAD_FILE: join(dir, "t.json"), RUN_FILE: join(dir, "r.json"), TRUSTED_ACTORS: actors };
   const broken = { ...fakeApi(), listThreads: async () => Promise.reject(new Error("GraphQL: timeout")) };
-  await assert.rejects(main(["select"], env, { api: broken, log: () => {} }), /timeout/);
+  await assert.rejects(main(["select"], env, { plan: noPlan, api: broken, log: () => {} }), /timeout/);
   assert.throws(() => readFileSync(env.GITHUB_OUTPUT, "utf8"));
-  await main(["select"], { ...env, GITHUB_OUTPUT: join(dir, "resolved") }, { api: fakeApi({ threads: [] }), log: () => {} });
+  await main(["select"], { ...env, GITHUB_OUTPUT: join(dir, "resolved") }, { plan: noPlan, api: fakeApi({ threads: [] }), log: () => {} });
   assert.match(readFileSync(join(dir, "resolved"), "utf8"), /^skip-reason=stop-resolved\n(?:.*\n)*stop-resolved=true$/m);
 });
 
@@ -1071,7 +1082,6 @@ test("once the fresh fixer's round ran, the code lane's findings escalate feedba
     assert.equal(result.maxRounds, 4);
     assert.equal(result.file, undefined);
   }
-  // The fresh fixer's own round still runs, and says which round it is.
   const fresh = await capped({ rounds: 3 });
   assert.equal(fresh.decision, "proceed");
   assert.equal(fresh.maxRounds, 4);
@@ -1163,7 +1173,7 @@ test("main select writes outputs and the thread file; escalation writes no threa
     RUN_FILE: join(dir, `${name}.run.json`),
     TRUSTED_ACTORS: actors,
   });
-  await main(["select"], env("ok"), { api: fakeApi(), log: () => {} });
+  await main(["select"], env("ok"), { plan: noPlan, api: fakeApi(), log: () => {} });
   assert.equal(readFileSync(join(dir, "ok.out"), "utf8"), "proceed=true\nhuman-gate=\nmodel-rung=\nskip-reason=\nescalation-reason=\nnot-run-detail=\nstop-resolved=false\nperson-opened=false\n");
   const okFile = JSON.parse(readFileSync(join(dir, "ok.json"), "utf8"));
   assert.equal(okFile.threads[0].id, "PRRT_1");
@@ -1179,21 +1189,20 @@ test("main select writes outputs and the thread file; escalation writes no threa
   );
 
   // The people on the list come from TRUSTED_ACTORS.
-  await main(["select"], env("decided"), { api: fakeApi(escalated()), log: () => {} });
+  await main(["select"], env("decided"), { plan: noPlan, api: fakeApi(escalated()), log: () => {} });
   assert.equal(readFileSync(join(dir, "decided.out"), "utf8"), "proceed=true\nhuman-gate=\nmodel-rung=\nskip-reason=\nescalation-reason=\nnot-run-detail=\nstop-resolved=false\nperson-opened=false\n");
   assert.equal(JSON.parse(readFileSync(join(dir, "decided.json"), "utf8")).threads[0].comments[2].direction, true);
 
-  // The human-gated label comes from TRACKER_CONFIG; a fix request sets human-gate=fix-request.
   const tracker = join(dir, "tracker.json");
   writeFileSync(tracker, JSON.stringify({ config: { role_labels: { "human-gated": "status: blocked-human" } } }));
   const gatedEnv = { ...env("gated"), TRACKER_CONFIG: tracker };
-  await main(["select"], gatedEnv, { api: fakeApi({ ...escalated({ replies: [[102, HUMAN, REQUEST]] }), labels: ["status: blocked-human"] }), log: () => {} });
+  await main(["select"], gatedEnv, { plan: noPlan, api: fakeApi({ ...escalated({ replies: [[102, HUMAN, REQUEST]] }), labels: ["status: blocked-human"] }), log: () => {} });
   assert.equal(readFileSync(join(dir, "gated.out"), "utf8"), "proceed=true\nhuman-gate=fix-request\nmodel-rung=\nskip-reason=\nescalation-reason=\nnot-run-detail=\nstop-resolved=false\nperson-opened=false\n");
   const heldEnv = { ...env("held"), TRACKER_CONFIG: tracker };
-  await main(["select"], heldEnv, { api: fakeApi({ ...escalated(), labels: ["status: blocked-human"] }), log: () => {} });
+  await main(["select"], heldEnv, { plan: noPlan, api: fakeApi({ ...escalated(), labels: ["status: blocked-human"] }), log: () => {} });
   assert.equal(readFileSync(join(dir, "held.out"), "utf8"), "proceed=false\nhuman-gate=\nmodel-rung=\nskip-reason=awaiting-human\nescalation-reason=\nnot-run-detail=\nstop-resolved=false\nperson-opened=false\n");
 
-  await main(["select"], env("esc"), { api: fakeApi({ files: [{ filename: ".github/workflows/x.yml" }] }), log: () => {} });
+  await main(["select"], env("esc"), { plan: noPlan, api: fakeApi({ files: [{ filename: ".github/workflows/x.yml" }] }), log: () => {} });
   assert.equal(
     readFileSync(join(dir, "esc.out"), "utf8"),
     "proceed=false\nhuman-gate=\nmodel-rung=\nskip-reason=lane-stopped\nescalation-reason=feedback-protected-path\nnot-run-detail=\nstop-resolved=false\nperson-opened=false\n",
@@ -1211,7 +1220,7 @@ test("main select writes outputs and the thread file; escalation writes no threa
       ...[1, 2].map((n) => ({ id: 10 + n, user: { id: APP }, body: `${ROUND}\nround ${n}`, created_at: at(10) })),
     ],
   });
-  await main(["select"], { ...env("bound"), REVIEW_ROUNDS: "1" }, { api: bound, log: () => {} });
+  await main(["select"], { ...env("bound"), REVIEW_ROUNDS: "1" }, { plan: noPlan, api: bound, log: () => {} });
   assert.equal(
     readFileSync(join(dir, "bound.out"), "utf8"),
     "proceed=false\nhuman-gate=\nmodel-rung=\nskip-reason=lane-stopped\nescalation-reason=feedback-not-converging\nnot-run-detail=round 2 of max 2\nstop-resolved=false\nperson-opened=false\n",
@@ -1244,7 +1253,7 @@ test("main select takes the head step's PR read for this PR and head, and reads 
   const go = async (name, path) => {
     const api = counted();
     const env = { GITHUB_TOKEN: "t", GITHUB_REPOSITORY: "o/r", GITHUB_OUTPUT: join(dir, `${name}.out`), PR_NUMBER: "42", HEAD_SHA: HEAD, APP_SENDER_ID: String(APP), THREAD_FILE: join(dir, `${name}.json`), RUN_FILE: join(dir, `${name}.run.json`), TRUSTED_ACTORS: actors, ...(path === undefined ? {} : { PULL_FILE: path }) };
-    await main(["select"], env, { api, log: () => {} });
+    await main(["select"], env, { plan: noPlan, api, log: () => {} });
     return { reads: api.pullReads, out: readFileSync(join(dir, `${name}.out`), "utf8") };
   };
   const same = { number: 42, head: { sha: HEAD }, user: { id: APP, type: "Bot" }, labels: [], body: "" };
@@ -1277,7 +1286,7 @@ test("main select takes the head step's PR read for this PR and head, and reads 
   writeFileSync(tracker, JSON.stringify({ config: { role_labels: { "human-gated": "status: blocked-human" } } }));
   const api = counted();
   const held = join(dir, "held.out");
-  await main(["select"], { GITHUB_TOKEN: "t", GITHUB_REPOSITORY: "o/r", GITHUB_OUTPUT: held, PR_NUMBER: "42", HEAD_SHA: HEAD, APP_SENDER_ID: String(APP), THREAD_FILE: join(dir, "held.json"), RUN_FILE: join(dir, "held.run.json"), TRUSTED_ACTORS: actors, TRACKER_CONFIG: tracker, PULL_FILE: pullFile("held", { ...same, labels: [{ name: "status: blocked-human" }] }) }, { api, log: () => {} });
+  await main(["select"], { GITHUB_TOKEN: "t", GITHUB_REPOSITORY: "o/r", GITHUB_OUTPUT: held, PR_NUMBER: "42", HEAD_SHA: HEAD, APP_SENDER_ID: String(APP), THREAD_FILE: join(dir, "held.json"), RUN_FILE: join(dir, "held.run.json"), TRUSTED_ACTORS: actors, TRACKER_CONFIG: tracker, PULL_FILE: pullFile("held", { ...same, labels: [{ name: "status: blocked-human" }] }) }, { plan: noPlan, api, log: () => {} });
   assert.equal(api.pullReads, 0);
   assert.match(readFileSync(held, "utf8"), /^skip-reason=awaiting-human$/m);
 });
@@ -1293,7 +1302,7 @@ test("main select needs RUN_FILE beside THREAD_FILE, and no LANE_BRANCH", async 
     THREAD_FILE: join(tmpdir(), "unused.json"),
     TRUSTED_ACTORS: join(tmpdir(), "unused-actors.json"),
   };
-  await assert.rejects(main(["select"], env, { api: fakeApi() }), /RUN_FILE is not set/);
+  await assert.rejects(main(["select"], env, { plan: noPlan, api: fakeApi() }), /RUN_FILE is not set/);
 });
 
 test("run.json carries each kept thread's named_paths and no comment body", () => {
@@ -1320,8 +1329,8 @@ test("main refuses bad inputs and any subcommand but select", async () => {
     APP_SENDER_ID: String(APP),
   };
   const api = fakeApi();
-  await assert.rejects(main(["select"], { ...env, HEAD_SHA: "x" }, { api }), /HEAD_SHA/);
-  await assert.rejects(main(["select"], { ...env, PR_NUMBER: "0" }, { api }), /PR_NUMBER/);
+  await assert.rejects(main(["select"], { ...env, HEAD_SHA: "x" }, { plan: noPlan, api }), /HEAD_SHA/);
+  await assert.rejects(main(["select"], { ...env, PR_NUMBER: "0" }, { plan: noPlan, api }), /PR_NUMBER/);
   await assert.rejects(main(["record-round"], env, { api }), /usage/);
   assert.equal(api.posted.length, 0);
 });
@@ -1382,18 +1391,11 @@ test("listActivity rejects when a later page answers an error, never returning t
   }
 });
 
-// apply-dependency-verdict.mjs runs from $RUNNER_TEMP/base-script, a copy of
-// this directory, with the shared modules in $RUNNER_TEMP/lib and
-// merge-holds.mjs staged beside it in $RUNNER_TEMP/pr-merge
-// (collect-base-activity).
 test("listActivity loads its cursor reader from the staged layout a script activity runs in", async () => {
   const root = tempDir("base-activity-");
   try {
-    cpSync(dirname(fileURLToPath(import.meta.url)), join(root, "base-script"), { recursive: true });
-    cpSync(fileURLToPath(new URL("../lib", import.meta.url)), join(root, "lib"), { recursive: true });
-    mkdirSync(join(root, "pr-merge"));
-    cpSync(fileURLToPath(new URL("../pr-merge/merge-holds.mjs", import.meta.url)), join(root, "pr-merge", "merge-holds.mjs"));
-    const { createGitHubApi: staged } = await import(pathToFileURL(join(root, "base-script", "address-feedback.mjs")).href);
+    stage(fileURLToPath(new URL("../../..", import.meta.url)), ".github/scripts/pr-unblock/apply-dependency-verdict.mjs", root);
+    const { createGitHubApi: staged } = await import(pathToFileURL(join(root, ".github/scripts/pr-unblock/address-feedback.mjs")).href);
     const api = staged({ token: "tok", repository: "o/r", apiUrl: "https://api", graphqlUrl: "https://gql", fetch: activityFetch([rows(100), rows(1)]) });
     assert.equal((await api.listActivity("b")).length, 101);
   } finally {
@@ -1662,7 +1664,6 @@ test("a Codex-started thread on a marker-confirmed head is worked like the revie
   const replied = await codexRun(fakeApi(botThread({ replies: [[101, CODEX, "finding 101"]] })));
   assert.equal(replied.decision, "proceed");
   assert.deepEqual(replied.file.threads[0].comments.map((row) => [row.id, row.author]), [[100, "reviewer"], [101, "reviewer"]]);
-  // The reply job's re-read keeps it too.
   const { kept } = await currentThreads({ api: fakeApi(botThread()), pr: 42, reviewerId: REVIEWER, reviewerIds: [CODEX], appId: APP, trustedHumans: new Set([HUMAN]) });
   assert.deepEqual(kept.map((row) => row.id), ["PRRT_1"]);
 });
@@ -1689,7 +1690,6 @@ test("a Codex root carries the security-review lane's state: clear once the lane
   assert.equal(await stateOf(lanesMarked()), "pending");
   // A marker for another head, or the code lane's marker, does not clear it.
   assert.equal(await stateOf(lanesMarked(securityMarked(OLD_HEAD))), "pending");
-  // The reply job's re-read carries the same state.
   const { kept } = await currentThreads({ api: codexAt(lanesMarked(securityMarked())), pr: 42, reviewerId: REVIEWER, reviewerIds: [CODEX], appId: APP, trustedHumans: new Set([HUMAN]) });
   assert.equal(kept[0].comments[0].security, "clear");
   // The reviewer bot's own finding carries none.
@@ -1777,7 +1777,7 @@ test("at the round cap a Codex finding is a bot finding: it gets the fresh fixer
 
 test("at the round cap a Codex finding goes to a person when the security-review lane held its head, and to a session when a person directed it", async () => {
   const held = codexAt(lanesMarked(securityMarked(), securityHold(HEAD)));
-  const heldResult = await codexRun({ ...held, listPullCommits: async () => Object.keys(modelRounds(2)).map((sha) => ({ sha })), listCheckRuns: async (sha) => modelRounds(2)[sha] ?? [] }, { maxRounds: 2 });
+  const heldResult = await codexRun({ ...held, listPullCommits: async () => Object.keys(modelRounds(2)).map((sha) => ({ sha })), listCheckRuns: async (sha) => modelRounds(2)[sha] ?? [], listModelRounds: async () => Object.values(modelRounds(2)) }, { maxRounds: 2 });
   assert.deepEqual([heldResult.decision, heldResult.escalationReason], ["escalate", "feedback-round-cap-security"]);
   // A write-access fix request older than the newest round directed it.
   const directed = await codexRun(fakeApi({ ...botThread({ replies: [[101, HUMAN, REQUEST]] }), checks: modelRounds(2) }), { maxRounds: 2 });
@@ -1891,7 +1891,6 @@ test("a Codex thread answering a trusted person's @codex request is worked as to
     assert.deepEqual(result.file.threads.map((row) => row.id), ["PRRT_1"], label);
     assert.deepEqual(lines, [], label);
   }
-  // The reply job's re-read keeps it too.
   const { kept } = await currentThreads({ api: askedBy([codexAsk()]), pr: 42, reviewerId: REVIEWER, reviewerIds: [CODEX], appId: APP, trustedHumans: new Set([HUMAN]) });
   assert.deepEqual(kept.map((row) => row.id), ["PRRT_1"]);
 });
@@ -2244,22 +2243,21 @@ test("an earlier-fail round keeps the thread rules first: kept threads, untaken 
   assert.deepEqual([capped.decision, capped.escalationReason], ["escalate", "feedback-verifier-open"]);
 });
 
-// The reply job's feedback-already-addressed stop is lane-stopped, which
-// releases the head for the dispatcher; with that stop queued for a session
-// builder on this head, the next round stands down before any read or model.
-test("an earlier-fail round whose already-addressed stop on this head is queued for a session stands down", async () => {
+test("an earlier-fail round stands down only on this head's stop queued for a session", async () => {
   let reads = 0;
   const readFailNotes = async () => {
     reads += 1;
     return NOTES;
   };
-  const queued = { threads: [resolvedNote], labels: ["needs-session"], issueComments: [reviewedHead, laneStopped("feedback-already-addressed")] };
+  const queued = { threads: [resolvedNote], labels: ["needs-session"], issueComments: [reviewedHead, laneStopped("feedback-protected-path")] };
   const result = await runEarlier(fakeApi(queued), { readFailNotes });
   assert.deepEqual([result.decision, result.skipReason], ["skip", "awaiting-session"]);
   assert.equal(reads, 0);
-  // A stop on an older head does not hold this one.
-  const older = await runEarlier(fakeApi({ ...queued, issueComments: [reviewedHead, laneStopped("feedback-already-addressed", { head: OLD_HEAD })] }), { readFailNotes });
+  const older = await runEarlier(fakeApi({ ...queued, issueComments: [reviewedHead, laneStopped("feedback-protected-path", { head: OLD_HEAD })] }), { readFailNotes });
   assert.equal(older.decision, "proceed");
+  const addressed = await runEarlier(fakeApi({ ...queued, issueComments: [reviewedHead, laneStopped("feedback-already-addressed")] }), { readFailNotes });
+  assert.equal(addressed.decision, "proceed", "an already-addressed stop is not queued for a session");
+  assert.equal(reads, 2);
 });
 
 test("main select takes the FAILed heads only from a dispatcher's model round, as other heads' commit ids", async (t) => {
@@ -2286,7 +2284,7 @@ test("main select takes the FAILed heads only from a dispatcher's model round, a
     ["self", { VERIFY_EARLIER_FAIL_HEADS: HEAD }],
     ["twice", { VERIFY_EARLIER_FAIL_HEADS: `${OLD_HEAD} ${OLD_HEAD}` }],
   ]) {
-    await assert.rejects(main(["select"], env(name, extra), { api: fakeApi(), log: () => {} }), /VERIFY_EARLIER_FAIL_HEADS|earlier FAILed heads/, name);
+    await assert.rejects(main(["select"], env(name, extra), { plan: noPlan, api: fakeApi(), log: () => {} }), /VERIFY_EARLIER_FAIL_HEADS|earlier FAILed heads/, name);
   }
   assert.deepEqual(earlierFailHeadsFrom({ VERIFY_EARLIER_FAIL_HEADS: "" }), []);
   assert.deepEqual(earlierFailHeadsFrom({ HEAD_SHA: HEAD, DISPATCHER_RUN_ID: "1", VERIFY_EARLIER_FAIL_HEADS: `${OLD_HEAD} ${"c".repeat(40)}` }), [OLD_HEAD, "c".repeat(40)]);
@@ -2321,31 +2319,31 @@ test("main select with a pass head lists the stale fail-note threads for the rep
   const api = (threads) => ({ listThreads: async () => threads });
   const out = (name) => (existsSync(join(dir, `${name}.out`)) ? readFileSync(join(dir, `${name}.out`), "utf8") : "");
 
-  await main(["select"], env("pass"), { api: api([note("PRRT_old"), note("PRRT_now", HEAD), note("PRRT_done", OLD, true)]), log: () => {} });
+  await main(["select"], env("pass"), { plan: noPlan, api: api([note("PRRT_old"), note("PRRT_now", HEAD), note("PRRT_done", OLD, true)]), log: () => {} });
   assert.equal(out("pass"), "resolve-only=true\n");
   assert.equal(readFileSync(join(dir, "pass.run.json"), "utf8"), `{"version":1,"head_sha":"${HEAD}","pr_paths":[],"threads":[],"stale_notes":["PRRT_old"]}\n`);
   assert.deepEqual(JSON.parse(readFileSync(join(dir, "pass.json"), "utf8")).threads, []);
 
   // The PR moved past the passing head: nothing to do, and no output, so
   // neither a model job nor a neutral check runs.
-  await main(["select"], env("moved", { VERIFY_PASS_HEAD: "c".repeat(40) }), { api: api([note("PRRT_old")]), log: () => {} });
+  await main(["select"], env("moved", { VERIFY_PASS_HEAD: "c".repeat(40) }), { plan: noPlan, api: api([note("PRRT_old")]), log: () => {} });
   assert.equal(out("moved"), "");
 
   // Only a dispatcher sends a pass head.
-  await assert.rejects(main(["select"], env("human", { DISPATCHER_RUN_ID: "" }), { api: api([note("PRRT_old")]), log: () => {} }), /dispatcher/);
-  await assert.rejects(main(["select"], env("bad", { VERIFY_PASS_HEAD: "main" }), { api: api([note("PRRT_old")]), log: () => {} }), /VERIFY_PASS_HEAD/);
+  await assert.rejects(main(["select"], env("human", { DISPATCHER_RUN_ID: "" }), { plan: noPlan, api: api([note("PRRT_old")]), log: () => {} }), /dispatcher/);
+  await assert.rejects(main(["select"], env("bad", { VERIFY_PASS_HEAD: "main" }), { plan: noPlan, api: api([note("PRRT_old")]), log: () => {} }), /VERIFY_PASS_HEAD/);
 
   // A same-head FAIL the gate's reader found superseded (the dispatcher's
   // verify-superseded-head) adds its notes, and run.json names that head for
   // the reply job's re-check; a FAIL not superseded there, or one superseded
   // at another head, adds none.
   const threads = [note("PRRT_old"), note("PRRT_now", HEAD), note("PRRT_done", OLD, true)];
-  await main(["select"], env("superseded", { VERIFY_SUPERSEDED_HEAD: HEAD }), { api: api(threads), log: () => {} });
+  await main(["select"], env("superseded", { VERIFY_SUPERSEDED_HEAD: HEAD }), { plan: noPlan, api: api(threads), log: () => {} });
   assert.equal(out("superseded"), "resolve-only=true\n");
   assert.equal(readFileSync(join(dir, "superseded.run.json"), "utf8"), `{"version":1,"head_sha":"${HEAD}","pr_paths":[],"threads":[],"stale_notes":["PRRT_old","PRRT_now"],"superseded_head":"${HEAD}"}\n`);
-  await main(["select"], env("elsewhere", { VERIFY_SUPERSEDED_HEAD: OLD }), { api: api(threads), log: () => {} });
+  await main(["select"], env("elsewhere", { VERIFY_SUPERSEDED_HEAD: OLD }), { plan: noPlan, api: api(threads), log: () => {} });
   assert.equal(readFileSync(join(dir, "elsewhere.run.json"), "utf8"), `{"version":1,"head_sha":"${HEAD}","pr_paths":[],"threads":[],"stale_notes":["PRRT_old"]}\n`);
-  await assert.rejects(main(["select"], env("bad-superseded", { VERIFY_SUPERSEDED_HEAD: "main" }), { api: api(threads), log: () => {} }), /VERIFY_SUPERSEDED_HEAD/);
+  await assert.rejects(main(["select"], env("bad-superseded", { VERIFY_SUPERSEDED_HEAD: "main" }), { plan: noPlan, api: api(threads), log: () => {} }), /VERIFY_SUPERSEDED_HEAD/);
 });
 
 // A rerun of a pass-only round after its stale notes were resolved by hand
@@ -2370,7 +2368,7 @@ async function passOnlyWithoutStale(t, api) {
     VERIFY_PASS_HEAD: HEAD,
     DISPATCHER_RUN_ID: "5000",
   };
-  await main(["select"], env, { api, log: () => {} });
+  await main(["select"], env, { plan: noPlan, api, log: () => {} });
   assert.equal(existsSync(env.RUN_FILE), false);
   return existsSync(env.GITHUB_OUTPUT) ? readFileSync(env.GITHUB_OUTPUT, "utf8") : "";
 }
@@ -2470,7 +2468,7 @@ test("on an owner PR a thread a person opened is never kept", async () => {
 // The head's covering check runs, for a tests-only finding (#10075): the
 // lanes come from scripts/plan-test-lanes.sh, never from a list here.
 // Leg names follow pr-require-checks.yml's matrix (`leg` over bash_legs).
-const PLAN = { bash: "true", bash_legs: "[0,1]", python: "false", node: "true", windows_jobs: '["test-windows-lib"]' };
+const PLAN = { bash: "true", bash_legs: "[0,1]", python: "false", node: "true", node_legs: "[0]", windows_jobs: '["test-windows-lib"]' };
 const checkRun = (id, name, conclusion = "success", extra = {}) => ({
   id,
   name,
@@ -2480,12 +2478,12 @@ const checkRun = (id, name, conclusion = "success", extra = {}) => ({
   app: { slug: "github-actions" },
   ...extra,
 });
-const GREEN = [checkRun(1, "Test Bash (0)"), checkRun(2, "Test Bash (1)"), checkRun(3, "Test Node"), checkRun(4, "Test Windows Lib"), checkRun(5, "Lint Shell", "failure")];
+const GREEN = [checkRun(1, "Test Bash (0)"), checkRun(2, "Test Bash (1)"), checkRun(3, "Test Node (0)"), checkRun(4, "Test Windows Lib"), checkRun(5, "Lint Shell", "failure")];
 const snapshot = (runs, { plan = () => PLAN, complete = true } = {}) =>
   ciSnapshot({ api: { listCommitCheckRuns: async () => Object.assign([...runs], { complete }) }, headSha: HEAD, files: [{ filename: "src/a.js" }], plan });
 
 test("coveringLanes names each lane the plan selects: a matrix lane by its job name, each Windows job by its own", () => {
-  assert.deepEqual(coveringLanes(PLAN), ["test-bash (0)", "test-bash (1)", "test-node", "test-windows-lib"]);
+  assert.deepEqual(coveringLanes(PLAN), ["test-bash (0)", "test-bash (1)", "test-node (0)", "test-windows-lib"]);
   assert.deepEqual(coveringLanes({ bash: "false", python: "true", python_legs: "[0]", node: "false", windows_jobs: "[]" }), ["test-python (0)"]);
   assert.throws(() => coveringLanes({ bash: "true", bash_legs: '["x"]', python: "false", node: "false" }), /legs/);
   assert.deepEqual(coveringLanes({ bash: "false", python: "false", node: "false", windows_jobs: "[]" }), []);
@@ -2494,12 +2492,12 @@ test("coveringLanes names each lane the plan selects: a matrix lane by its job n
 test("ciSnapshot is green only when every covering check's latest real run passed, and cites those runs", async () => {
   const green = await snapshot(GREEN);
   assert.equal(green.state, "green");
-  assert.deepEqual(green.runs.map((run) => run.name), ["Test Bash (0)", "Test Bash (1)", "Test Node", "Test Windows Lib"]);
+  assert.deepEqual(green.runs.map((run) => run.name), ["Test Bash (0)", "Test Bash (1)", "Test Node (0)", "Test Windows Lib"]);
   assert.equal(green.runs[0].url, "https://github.com/o/r/actions/runs/1/job/1");
   // A contract-only re-run's skip does not hide the real result.
-  assert.equal((await snapshot([...GREEN, checkRun(9, "Test Node", "skipped")])).state, "green");
+  assert.equal((await snapshot([...GREEN, checkRun(9, "Test Node (0)", "skipped")])).state, "green");
   // A run another app posted under a lane's name counts for nothing.
-  assert.equal((await snapshot([...GREEN, checkRun(10, "Test Node", "failure", { app: { slug: "other" } })])).state, "green");
+  assert.equal((await snapshot([...GREEN, checkRun(10, "Test Node (0)", "failure", { app: { slug: "other" } })])).state, "green");
 });
 
 test("ciSnapshot is red when a covering check failed, and unsettled when one was cancelled", async () => {
@@ -2534,10 +2532,10 @@ test("ciSnapshot is unsettled when a test lane the plan does not name ran, even 
 test("ciSnapshot is unsettled when a covering check is pending, missing or skipped, or nothing can be read", async () => {
   const without = (name) => GREEN.filter((run) => run.name !== name);
   for (const [label, runs, options] of [
-    ["pending", [...without("Test Node"), checkRun(8, "Test Node", null)], {}],
+    ["pending", [...without("Test Node (0)"), checkRun(8, "Test Node (0)", null)], {}],
     ["missing", without("Test Windows Lib"), {}],
     ["a planned leg missing", without("Test Bash (1)"), {}],
-    ["skipped", [...without("Test Node"), checkRun(8, "Test Node", "skipped")], {}],
+    ["skipped", [...without("Test Node (0)"), checkRun(8, "Test Node (0)", "skipped")], {}],
     ["incomplete listing", GREEN, { complete: false }],
     ["no covering lane", GREEN, { plan: () => ({ bash: "false", python: "false", node: "false", windows_jobs: "[]" }) }],
     ["plan failed", GREEN, { plan: () => { throw new Error("exit 2"); } }],
@@ -2550,10 +2548,10 @@ test("ciSnapshot is unsettled when a covering check is pending, missing or skipp
 
 // A head tested before the rename shows each lane by its job id.
 test("ciSnapshot reads a head whose lanes show their job ids, and takes a lane's display-named run over its id-named one", async () => {
-  const byId = [checkRun(1, "test-bash (0)"), checkRun(2, "test-bash (1)"), checkRun(3, "test-node"), checkRun(4, "test-windows-lib")];
+  const byId = [checkRun(1, "test-bash (0)"), checkRun(2, "test-bash (1)"), checkRun(3, "test-node (0)"), checkRun(4, "test-windows-lib")];
   const green = await snapshot(byId);
   assert.equal(green.state, "green");
-  assert.deepEqual(green.runs.map((run) => run.name), ["test-bash (0)", "test-bash (1)", "test-node", "test-windows-lib"]);
+  assert.deepEqual(green.runs.map((run) => run.name), ["test-bash (0)", "test-bash (1)", "test-node (0)", "test-windows-lib"]);
   assert.equal((await snapshot([...byId, checkRun(5, "test-python (0)", "failure")])).state, "red");
   assert.equal((await snapshot([...byId, checkRun(5, "test-python (0)")])).state, "unsettled", "an unplanned lane ran");
   // A stale id-named failure beside the lane's display-named pass is not red.
@@ -2590,11 +2588,20 @@ test("ciSnapshot plans from every changed path, rename sources included", async 
   assert.deepEqual(seen, [".github/workflows/x.yml", "docs/new.md", "docs/old.md"]);
 });
 
-const PLAN_SCRIPT = new URL("../../../scripts/plan-test-lanes.sh", import.meta.url);
-test("planLanes runs the repository's scripts/plan-test-lanes.sh over the paths", { skip: !existsSync(PLAN_SCRIPT) && "no scripts/plan-test-lanes.sh in this repository" }, () => {
-  const plan = planLanes(["scripts/plan-test-lanes.sh"]);
-  assert.equal(plan.bash, "true");
-  assert.ok(coveringLanes(plan).includes("test-bash (0)"));
+test("planLanes runs the root's scripts/plan-test-lanes.sh over the paths and reads its key=value lines", () => {
+  const root = tempDir("address-feedback-plan-");
+  mkdirSync(join(root, "scripts"));
+  writeFileSync(join(root, "scripts", "plan-test-lanes.sh"), '[ "$1 $2" = "-- a.sh" ] || exit 1\necho "plan for $2"\necho bash=true\necho \'bash_legs=[0]\'\n');
+  const plan = planLanes(["a.sh"], root);
+  assert.deepEqual(plan, { bash: "true", bash_legs: "[0]" });
+  assert.deepEqual(coveringLanes(plan), ["test-bash (0)"]);
+});
+
+test("scripts/plan-test-lanes.sh still prints the <lane>, <lane>_legs and windows_jobs lines planLanes reads", () => {
+  const planner = readFileSync(new URL("../../../scripts/plan-test-lanes.sh", import.meta.url), "utf8");
+  assert.match(planner, /printf "%s=true\\n%s_legs=\[%s\]\\n/);
+  assert.match(planner, /printf "%s=false\\n%s_legs=\[0\]\\n/);
+  assert.match(planner, /echo "windows_jobs=\$\(json_on /);
 });
 
 test("select records the ci snapshot for run.json; with no snapshot function it records none", async () => {
@@ -2749,6 +2756,75 @@ test("refreshableSections offers the listed sections only, never Follow-ups, a g
   assert.deepEqual(refreshableSections(null, ["Summary"]), []);
 });
 
+const ORG_TEMPLATE = [
+  "Closes #",
+  "",
+  "<!--",
+  "Every `##` section below must be filled with real content.",
+  "## Not a section",
+  "-->",
+  "",
+  "## Summary",
+  "",
+  "<!-- What changes and why. -->",
+  "",
+  "## Fix",
+  "",
+  "```",
+  "## Code, not a heading",
+  "```",
+  "",
+  "## Verification",
+  "",
+  "## Related",
+  "",
+].join("\n");
+const ORG_SECTIONS = ["Summary", "Fix", "Verification", "Related"];
+
+test("templateHeadings reads the template's ## headings outside comments and fences", () => {
+  assert.deepEqual(templateHeadings(ORG_TEMPLATE), ORG_SECTIONS);
+  assert.deepEqual(templateHeadings(null), []);
+});
+
+test("localTemplate takes .github over the root over docs, matching the name in any case", (t) => {
+  const dir = tempDir("address-feedback-template-");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  assert.equal(localTemplate(dir), null);
+  mkdirSync(join(dir, "docs"));
+  writeFileSync(join(dir, "docs", "pull_request_template.md"), "## Docs\n");
+  assert.equal(localTemplate(dir), "## Docs\n");
+  writeFileSync(join(dir, "pull_request_template.md"), "## Root\n");
+  assert.equal(localTemplate(dir), "## Root\n");
+  mkdirSync(join(dir, ".github"));
+  writeFileSync(join(dir, ".github", "PULL_REQUEST_TEMPLATE.md"), "## Hidden folder\n");
+  assert.equal(localTemplate(dir), "## Hidden folder\n");
+});
+
+test("bodySectionNames takes the listed sections, then the base's template, then the owner's default template", async (t) => {
+  const dir = tempDir("address-feedback-names-");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const org = fakeApi({
+    paths: {
+      "/repos/o/.github/contents/.github": [{ type: "file", name: "PULL_REQUEST_TEMPLATE.md", path: ".github/PULL_REQUEST_TEMPLATE.md" }],
+      "/repos/o/.github/contents/.github/PULL_REQUEST_TEMPLATE.md": { content: Buffer.from(ORG_TEMPLATE).toString("base64") },
+    },
+  });
+  const names = (listed, readPath = org.readPath, log) => bodySectionNames({ listed, root: dir, readPath, owner: "o", log });
+  assert.deepEqual(await names("Fix\nVerification\n"), ["Fix", "Verification"], "an explicit list wins");
+  assert.deepEqual(await names(""), ORG_SECTIONS, "no list and no base template: the owner's default template");
+  assert.deepEqual(await names("", fakeApi().readPath), [], "no template anywhere: every section, as with no list");
+  const logged = [];
+  const failing = async () => {
+    throw Object.assign(new Error("GET returned 502"), { status: 502 });
+  };
+  assert.equal(await names("", failing, (line) => logged.push(line)), null, "an unreadable default template turns the refresh off");
+  assert.match(logged[0], /o\/\.github pull request template is unreadable/);
+  writeFileSync(join(dir, "pull_request_template.md"), "<!-- ## Hidden -->\nFill this in.\n");
+  assert.deepEqual(await names(""), ORG_SECTIONS, "a base template that names no section falls through to the owner's");
+  writeFileSync(join(dir, "pull_request_template.md"), "## Why\n\n## Verification\n");
+  assert.deepEqual(await names(""), ["Why", "Verification"], "the base's own template outranks the owner's");
+});
+
 test("runRecord pins each offered section's text by SHA-256 and never copies the text", () => {
   const file = { head_sha: HEAD, pr_paths: [], copy_paths: [], threads: [], body_sections: [{ heading: "Verification", text: "\nRan the unit suite.\n" }] };
   const run = JSON.parse(runRecord(file));
@@ -2763,16 +2839,17 @@ test("main select writes the offered sections to the thread file unless pr_body_
   writeFileSync(actors, JSON.stringify({ actors: [{ id: REVIEWER, login: "claude[bot]", kind: "bot" }, { id: HUMAN, login: "kyle-sexton", kind: "human" }] }));
   const pull = join(dir, "pull.json");
   writeFileSync(pull, JSON.stringify({ number: 42, head: { sha: HEAD }, user: { id: APP, type: "Bot" }, labels: [], body: REFRESH_BODY }));
-  const go = async (name, extra) => {
+  const go = async (name, extra, api = fakeApi()) => {
     const env = { GITHUB_TOKEN: "t", GITHUB_REPOSITORY: "o/r", GITHUB_OUTPUT: join(dir, `${name}.out`), PR_NUMBER: "42", HEAD_SHA: HEAD, APP_SENDER_ID: String(APP), THREAD_FILE: join(dir, `${name}.json`), RUN_FILE: join(dir, `${name}.run.json`), TRUSTED_ACTORS: actors, PULL_FILE: pull, ...extra };
-    await main(["select"], env, { api: fakeApi(), log: () => {} });
+    await main(["select"], env, { plan: noPlan, api, log: () => {} });
     return [JSON.parse(readFileSync(env.THREAD_FILE, "utf8")), JSON.parse(readFileSync(env.RUN_FILE, "utf8"))];
   };
   const [threads, run] = await go("on", { BODY_SECTIONS: "Verification" });
   assert.deepEqual(threads.body_sections, [{ heading: "Verification", text: "\nRan the unit suite.\nLeft out: nothing\n" }]);
   assert.deepEqual(run.body_sections.map((section) => section.heading), ["Verification"]);
-  for (const [name, extra] of [["off", { BODY_REFRESH: "false" }]]) {
-    const [offThreads, offRun] = await go(name, extra);
+  const unreadable = { ...fakeApi(), readPath: async () => Promise.reject(Object.assign(new Error("GET returned 502"), { status: 502 })) };
+  for (const [name, extra, api] of [["off", { BODY_REFRESH: "false" }], ["unreadable-template", {}, unreadable]]) {
+    const [offThreads, offRun] = await go(name, extra, api);
     assert.equal("body_sections" in offThreads, false, name);
     assert.equal("body_sections" in offRun, false, name);
   }
@@ -2790,7 +2867,7 @@ test("main select shows every ## section in body_view, a Summary over the refres
   writeFileSync(pull, JSON.stringify({ number: 42, head: { sha: HEAD }, user: { id: APP, type: "Bot" }, labels: [], body }));
   const go = async (name, extra) => {
     const env = { GITHUB_TOKEN: "t", GITHUB_REPOSITORY: "o/r", GITHUB_OUTPUT: join(dir, `${name}.out`), PR_NUMBER: "42", HEAD_SHA: HEAD, APP_SENDER_ID: String(APP), THREAD_FILE: join(dir, `${name}.json`), RUN_FILE: join(dir, `${name}.run.json`), TRUSTED_ACTORS: actors, PULL_FILE: pull, ...extra };
-    await main(["select"], env, { api: fakeApi(), log: () => {} });
+    await main(["select"], env, { plan: noPlan, api: fakeApi(), log: () => {} });
     return [JSON.parse(readFileSync(env.THREAD_FILE, "utf8")), JSON.parse(readFileSync(env.RUN_FILE, "utf8"))];
   };
   const [threads, run] = await go("on", {});
@@ -2886,4 +2963,68 @@ test("a gated PR's fix-request thread proceeds without the comment items", async
 test("an ungated PR's kept thread and a workflow change escalate as before, with the comment ignored", async () => {
   const result = await run(fakeApi({ files: [{ filename: ".github/workflows/ci.yml" }, { filename: "src/a.js" }], issueComments: [reviewMarker, asking(500)] }));
   assert.equal(result.escalationReason, "feedback-protected-path");
+});
+
+const roundsAnswer = (commits, { more = false } = {}) => ({
+  data: {
+    repository: {
+      pullRequest: {
+        commits: {
+          pageInfo: { hasNextPage: more },
+          nodes: commits.map(({ oid, runs = [], suitesMore = false, runsMore = false, repeats = 1 }) => ({
+            commit: { oid, checkSuites: { pageInfo: { hasNextPage: suitesMore }, nodes: Array.from({ length: repeats }, () => ({ checkRuns: { pageInfo: { hasNextPage: runsMore }, nodes: runs } })) } },
+          })),
+        },
+      },
+    },
+  },
+});
+const roundsApi = (answer, rest = {}) => {
+  const urls = [];
+  const fetch = async (url) => {
+    urls.push(url);
+    const data = url === "https://gql" ? answer : rest[url];
+    return { ok: true, status: 200, json: async () => data, headers: { get: () => "" } };
+  };
+  return { urls, api: createGitHubApi({ token: "t", repository: "o/r", apiUrl: "https://api", graphqlUrl: "https://gql", fetch }) };
+};
+const restRuns = (sha) => `https://api/repos/o/r/commits/${sha}/check-runs?check_name=pr-unblock%20%2F%20address-feedback&filter=all&per_page=100`;
+
+test("listModelRounds reads every commit's model runs in one GraphQL query, in listCheckRuns' shape, once each when a suite repeats", async () => {
+  const { urls, api } = roundsApi(
+    roundsAnswer([
+      { oid: "a".repeat(40), runs: [{ databaseId: 1, name: "pr-unblock / address-feedback", conclusion: "SUCCESS", completedAt: "2026-11-21T15:19:12Z" }, { databaseId: 2, name: "pr-unblock / address-feedback", conclusion: null, completedAt: null }], repeats: 2 },
+      { oid: "b".repeat(40) },
+    ]),
+  );
+  assert.deepEqual(await api.listModelRounds(17939, "pr-unblock / address-feedback"), [
+    [
+      { id: 1, name: "pr-unblock / address-feedback", app: { slug: "github-actions" }, conclusion: "success", completed_at: "2026-11-21T15:19:12Z" },
+      { id: 2, name: "pr-unblock / address-feedback", app: { slug: "github-actions" }, conclusion: null, completed_at: null },
+    ],
+    [],
+  ]);
+  assert.deepEqual(urls, ["https://gql"]);
+});
+
+test("listModelRounds reads a commit over REST when its suites or runs run past a page", async () => {
+  const [a, b, c] = ["a", "b", "c"].map((x) => x.repeat(40));
+  const kept = { name: "pr-unblock / address-feedback", app: { slug: "github-actions" }, conclusion: "failure" };
+  const { urls, api } = roundsApi(roundsAnswer([{ oid: a, suitesMore: true }, { oid: b, runsMore: true }, { oid: c }]), {
+    [restRuns(a)]: { check_runs: [kept] },
+    [restRuns(b)]: { check_runs: [] },
+  });
+  assert.deepEqual(await api.listModelRounds(1, "pr-unblock / address-feedback"), [[kept], [], []]);
+  assert.deepEqual(urls, ["https://gql", restRuns(a), restRuns(b)]);
+});
+
+test("listModelRounds reads every commit over REST for a PR past 100 commits", async () => {
+  const shas = ["d", "e"].map((x) => x.repeat(40));
+  const { urls, api } = roundsApi(roundsAnswer([], { more: true }), {
+    "https://api/repos/o/r/pulls/7/commits?per_page=100": shas.map((sha) => ({ sha })),
+    [restRuns(shas[0])]: { check_runs: [{ name: "x" }] },
+    [restRuns(shas[1])]: { check_runs: [] },
+  });
+  assert.deepEqual(await api.listModelRounds(7, "pr-unblock / address-feedback"), [[{ name: "x" }], []]);
+  assert.deepEqual(urls, ["https://gql", "https://api/repos/o/r/pulls/7/commits?per_page=100", restRuns(shas[0]), restRuns(shas[1])]);
 });

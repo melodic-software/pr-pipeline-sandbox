@@ -28,7 +28,7 @@
 // so only its last answer reaches the above; serverFailure tells a caller it
 // still failed.
 
-import { graphqlQuery, retryServerErrors } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
+import { graphqlQuery, retryServerErrors } from "../lib/github-client.mjs";
 import { countsRequests, rateLimitLatch, refusedForLimit, resetLabel } from "../../actions/log-api-budget/rate-guard.mjs";
 
 export function budgetedFetch({
@@ -38,12 +38,12 @@ export function budgetedFetch({
   now = () => Date.now(),
   random,
   latch = rateLimitLatch,
+  floorGraceMs = 0,
 } = {}) {
   const seen = new Map();
   const counts = { rest: 0, notModified: 0, graphql: 0 };
   const last = new Map();
 
-  // One request on the wire, a resend included.
   async function observed(url, init) {
     const response = await rawFetch(url, init);
     const header = (name) => response.headers?.get?.(name) ?? null;
@@ -66,7 +66,7 @@ export function budgetedFetch({
     }
     return response;
   }
-  const fetch = retryServerErrors(observed, { sleep, random, log, now, latch, resendLimited: true });
+  const fetch = retryServerErrors(observed, { sleep, random, log, now, latch, resendLimited: true, floorGraceMs });
 
   async function wrapped(url, init = {}) {
     const method = init.method ?? "GET";
@@ -90,8 +90,6 @@ export function budgetedFetch({
     return Object.assign(response, { rateLimited: true });
   }
 
-  // One line in the pr-merge rate line's shape: counts, then each resource's
-  // last header reading.
   function summary() {
     const readings = [...last].map(([resource, [limit, remaining, used, reset]]) => {
       const at = Number(reset) > 0 ? new Date(Number(reset) * 1000).toISOString().replace(".000Z", "Z") : "unknown";
@@ -100,8 +98,6 @@ export function budgetedFetch({
     return [`api-calls rest=${counts.rest} not-modified=${counts.notModified} graphql=${counts.graphql}`, ...readings].join(" ");
   }
 
-  // retryServerErrors counts each attempt, so a factory handed this fetch
-  // counts nothing more (countRequests).
   return { fetch: countsRequests(wrapped), counts, summary };
 }
 

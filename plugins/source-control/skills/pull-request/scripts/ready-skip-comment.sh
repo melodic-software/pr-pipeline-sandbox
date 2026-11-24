@@ -24,13 +24,12 @@ die() {
   exit 2
 }
 
-# The reason as inert text for a rendered comment.
 neutralize() {
   local s="$1" re
   s="${s//[[:cntrl:]]/ }"
   s="${s//[\`#<>@]/ }"
   shopt -s nocasematch
-  re='^(.*[^[:alnum:]_]|)(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]:]+(.*)$'
+  re='^(.*[^[:alnum:]_])?(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]:]+(.*)$'
   while [[ "$s" =~ $re ]]; do s="${BASH_REMATCH[1]}${BASH_REMATCH[2]}-${BASH_REMATCH[4]}"; done
   re='^(.*)(do(n[^[:space:]]{0,3}t|[[:space:]]+not))[[:space:]]+(merge.*)$'
   while [[ "$s" =~ $re ]]; do s="${BASH_REMATCH[1]}${BASH_REMATCH[2]}-${BASH_REMATCH[4]}"; done

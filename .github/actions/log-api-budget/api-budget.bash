@@ -81,9 +81,6 @@
 #                               API_BUDGET_READ_FLOOR of the planned budget
 #                               left, warns once (unset: no floor; ci-status
 #                               sets it to the read-floor default);
-#                               the plan is the header's limit, at most
-#                               API_BUDGET_LIMIT_CAP (unset: no cap; ci-status
-#                               sets github-token's limit-cap default)
 #   api_budget_emit <token>...  the hub collector's notice for each refused
 #                               (403/429) reading and for the last reading of
 #                               each resource and reset, as one token reads
@@ -170,8 +167,6 @@ api_budget_wrap_gh() {
         # --paginate prints a header block per page, which could not be told
         # from body text that looks like one: no reading, only its requests.
         --silent | --slurp | --paginate) api_budget_pass "$@"; return ;;
-        # The caller reads the headers itself: the guard reads them too, and
-        # the output goes on unchanged.
         -i | --include)
           out=$(mktemp 2>/dev/null) || { api_budget_pass "$@"; return; }
           api_budget_traced "$out" "$@" || rc=$?
@@ -185,7 +180,6 @@ api_budget_wrap_gh() {
       esac
     done
     out=$(mktemp 2>/dev/null) || { api_budget_pass "$@"; return; }
-    # The wrapper under every call, gh_read included: the same call with -i.
     api_budget_traced "$out" api -i "${@:2}" || rc=$?
     api_budget_observe "$out" "$pool" "gh $*" || rc=1
     api_budget_read "$API_BUDGET_GH_TOKEN" "$out" "$route"
@@ -414,11 +408,7 @@ api_budget_fallback() {
 
 api_budget_label() { [[ $1 == '*' || $1 == any ]] && echo API || echo "$1 API"; }
 api_budget_when() { jq -rn --argjson t "$1" '$t | todate'; }
-# How a stop no header timed is named, as rate-guard.mjs's FALLBACK_NOTE.
 API_BUDGET_FALLBACK_NOTE="fallback: GitHub's refusal carried no reset header, so this time is a guess that holds only this job; a re-run works once GitHub's real reset passes"
-# A rate limit's annotation: a notice when the caller holds (API_BUDGET_HOLD=1,
-# outage posture element 2), else an error. The call returns 1 either way, so
-# a gate that does not hold still fails on it.
 api_budget_level() { [[ ${API_BUDGET_HOLD:-} == 1 ]] && echo notice || echo error; }
 
 # api_budget_server_status <pool> <epoch>: the 5xx when the stops of <pool>
@@ -510,8 +500,7 @@ API_BUDGET_CLASSIFY='def num: if type == "string" and test("^[0-9]{1,12}$") then
   | ((if ($b | type) == "object" then ($b.errors // []) else [] end)
       | if type == "array" then any(.[]; type == "object" and .type == "RATE_LIMITED") else false end) as $gql
   | ($rem == 0 or $ra != null or $msg or $gql or $many) as $latched
-  | (if $in.cap != null and $lim != null then ([$lim, $in.cap] | min) else $lim end) as $planned
-  | ($in.floor != null and $lim != null and $lim > 0 and $rem != null and $planned - ($lim - $rem) < $in.floor * $planned) as $low
+  | ($in.floor != null and $lim != null and $lim > 0 and $rem != null and $rem < $in.floor * $lim) as $low
   | if ($latched | not) then {latched: false, low: $low, reset_source: null, reset: null, pool: null}
     else (($in.now / 1000) | floor) as $n
     | [(if $ra != null then [$n + $ra, "retry-after"] else empty end),
@@ -547,11 +536,11 @@ api_budget_observe() {
   start=$(awk 'NR == 1 && !/^HTTP\/[0-9.]+ [0-9][0-9][0-9]/ { exit } { sub(/\r$/, "") } NR > 1 && $0 == "" { print NR; exit }' "$file")
   [[ -n $start ]] || return 0
   verdict=$(jq -rn --rawfile raw "$file" --argjson start "$start" --arg pool "$pool" --argjson now "$(($(date +%s) * 1000))" \
-    --arg floor "${API_BUDGET_READ_FLOOR:-}" --arg cap "${API_BUDGET_LIMIT_CAP:-}" '($raw | split("\n")) as $l
+    --arg floor "${API_BUDGET_READ_FLOOR:-}" '($raw | split("\n")) as $l
     | ($l[0] | split(" ")[1] | tonumber) as $status
     | ([$l[1:$start - 1][] | sub("\r$"; "") | capture("^(?<k>[^:]+):[ \t]*(?<v>.*)$") | {(.k | ascii_downcase): .v}] | add // {}) as $headers
     | {status: $status, headers: $headers, body: ($l[$start:] | join("\n")), now: $now, pool: $pool,
-       floor: ($floor | tonumber? // null), cap: ($cap | tonumber? // null)}
+       floor: ($floor | tonumber? // null)}
     | . as $in | ($in | '"$API_BUDGET_CLASSIFY"') as $v | ($in | '"$API_BUDGET_SERVER_ERROR"') as $s
     | "\($v.latched) \($v.low) \($v.reset_source) \($v.reset) \($v.pool) \(if $s then $in.status else "-" end)"' 2>/dev/null) || return 0
   read -r latched low source reset stop server <<<"$verdict"
@@ -656,8 +645,6 @@ api_budget_emit_routes() {
     file=${RUNNER_TEMP:-}/api-budget/$token
     [[ -n ${RUNNER_TEMP:-} && $token =~ ^[a-z][a-z0-9-]{0,39}$ ]] || continue
     [[ -s $file ]] || file=/dev/null
-    # The route is the last field of a `request` line and the seventh of a
-    # reading; a line without one, or with one not in the route's shape, is other.
     awk "$API_BUDGET_ROUTE"' $1 == 304 { next }
       { r = "other" }
       $1 == "request" && NF >= 2 { r = $NF }

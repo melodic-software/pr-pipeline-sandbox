@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { createRateLimitLatch } from "../../actions/log-api-budget/rate-guard.mjs";
+import { readFileSync } from "node:fs";
+
+import { apiLimits, createRateLimitLatch, DISPATCH_FLOOR_GRACE_MS } from "../../actions/log-api-budget/rate-guard.mjs";
 import { budgetedFetch } from "./request-budget.mjs";
 import { tempDir } from "../../../lib/test-tmp.mjs";
 
-// Each test gets its own latch on its own clock and log, so one test's limit
-// neither stops the next nor fails this process; `fail` sees the latch fail the step.
 const budgeted = ({ fail = () => {}, ...options }) =>
   budgetedFetch({
     latch: createRateLimitLatch({ now: options.now ?? (() => Date.now()), log: options.log ?? (() => {}), fail, hold: false, limits: () => ({}), stopFile: null }),
@@ -112,7 +112,6 @@ test("a 403 with remaining 0 waits past x-ratelimit-reset and is sent once more"
   const response = await budget.fetch("https://api.example/repos/o/r/actions/runs", { headers: {} });
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { ok: true });
-  // 45 s to the reset, plus one second so the retry lands after it.
   assert.deepEqual(time.slept, [46_000]);
   assert.equal(gh.sent.length, 2);
   assert.equal(gh.sent[1].url, gh.sent[0].url);
@@ -131,8 +130,6 @@ test("a 429 with retry-after waits retry-after seconds", async () => {
   assert.equal(gh.sent[1].url, gh.sent[0].url);
 });
 
-// Element 1 of the outage posture (docs/conventions/pr-pipeline/README.md#outage-posture): a
-// non-idempotent write is never sent again, a rate limit included.
 test("a rate-limited write is returned at once, marked rateLimited, and never sent again", async () => {
   const writes = [
     ["https://api.example/repos/o/r/issues/7/comments", { method: "POST", headers: {}, body: '{"body":"x"}' }],
@@ -231,8 +228,6 @@ test("waits are capped across the whole run, not per call", async () => {
   assert.equal(gh.sent.length, 3);
 });
 
-// Element 1 of the outage posture: the guard fails the step only on a
-// rate limit the read is not sent again after.
 test("a rate-limited read it waits out and sends again fails nothing; one past the wait budget fails the step", async () => {
   const graphql = JSON.stringify({ query: "query { viewer { login } }" });
   const reads = [
@@ -260,7 +255,6 @@ test("a second rate limit past the wait budget is returned, with no third reques
 });
 
 test("a rate limit it gives up on is marked rateLimited; a refusal or a success is not", async () => {
-  // Each case gets its own latch: a limit refuses that latch's later calls.
   const pastGh = github([limited({ "x-ratelimit-reset": String(RESET) })]);
   const past = budgeted({ fetch: pastGh.fetch, log: () => {}, ...clock(RESET - 20 * 60) });
   const pastBudget = await past.fetch("https://api.example/repos/o/r/a", { headers: {} });
@@ -302,9 +296,6 @@ test("a permission 403 is not waited on", async () => {
   assert.equal(gh.sent.length, 1);
 });
 
-// A GET answered 5xx is sent again after a backoff, as createGitHub's are
-// (check-trusted-trigger.mjs): run 39788855311 failed the feedback dispatch on
-// one 500 from GET /commits/{sha}/pulls.
 const PULLS = "https://api.example/repos/o/r/commits/db53ee51744631cd5ee03d76bf87873fe1ce59f9/pulls";
 
 test("a GET answered 500 is sent again after a backoff and the next answer returned", async () => {
@@ -343,7 +334,6 @@ test("a GraphQL query answered 502 is sent again; a GraphQL mutation answered 50
   assert.equal((await writes.fetch(graphql, { method: "POST", headers: {}, body: write })).status, 502);
   assert.equal(mutation.sent.length, 1);
 
-  // A mutation behind a comment or a fragment definition is sent once too.
   for (const document of ["# arm it\nmutation { a }", "fragment F on PullRequest { id }\nmutation { a { ...F } }"]) {
     const gh = github([{ status: 502 }, { status: 200 }]);
     const budget = budgeted({ fetch: gh.fetch, log: () => {}, random: () => 0, ...clock(RESET - 3000) });
@@ -386,7 +376,7 @@ test("a POST answered 500 is returned at once", async () => {
 });
 
 test("each response's rate-limit headers are appended as a reading under API_BUDGET_TOKEN", async () => {
-  const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+  const { mkdtempSync, rmSync } = await import("node:fs");
   const { join } = await import("node:path");
   const { tmpdir } = await import("node:os");
   const dir = tempDir("request-budget-");
@@ -411,5 +401,26 @@ test("each response's rate-limit headers are appended as a reading under API_BUD
       else process.env[key] = value;
     }
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("floorGraceMs reaches the latch: a stop-floor reading with the reset inside the grace stops nothing", async () => {
+  const now = Date.parse("2026-11-21T07:45:00Z");
+  const reset = String(Date.parse("2026-11-21T07:51:29Z") / 1000);
+  const floor = { "x-ratelimit-limit": "5000", "x-ratelimit-remaining": "24", "x-ratelimit-reset": reset, "x-ratelimit-resource": "core" };
+  for (const [floorGraceMs, sends] of [[DISPATCH_FLOOR_GRACE_MS, 2], [0, 1]]) {
+    const gh = github([{ status: 200, body: "{}", headers: floor }, { status: 200, body: "{}", headers: floor }]);
+    const latch = createRateLimitLatch({ now: () => now, log: () => {}, fail: () => {}, hold: false, limits: () => apiLimits({ resolvedPath: "" }), stopFile: null });
+    const budget = budgetedFetch({ fetch: gh.fetch, log: () => {}, latch, now: () => now, sleep: async () => {}, floorGraceMs });
+    await budget.fetch("https://api.example/repos/o/r/a");
+    await budget.fetch("https://api.example/repos/o/r/b").catch(() => {});
+    assert.equal(gh.sent.length, sends, `grace ${floorGraceMs} ms`);
+  }
+});
+
+test("both dispatchers hand their budgeted fetch the stop-floor grace", () => {
+  for (const file of ["feedback-dispatch.mjs", "dispatch.mjs"]) {
+    const source = readFileSync(new URL(`./${file}`, import.meta.url), "utf8");
+    assert.match(source, /budgetedFetch\(\{ log, floorGraceMs: DISPATCH_FLOOR_GRACE_MS \}\)/, file);
   }
 });

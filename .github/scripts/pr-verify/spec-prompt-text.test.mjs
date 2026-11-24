@@ -1,5 +1,3 @@
-// spec-prompt.md carries the chunk verifiers' spec rules word for word, so a
-// final judge cannot read the spec more loosely than a chunk does.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
@@ -15,6 +13,17 @@ test("the final judge reads the spec under the chunk verifiers' words", () => {
   ]) {
     assert.ok(chunk.includes(rule), rule);
     assert.ok(spec.includes(rule), rule);
+  }
+});
+
+test("both judges excuse an owner-marked item only through person_checks", () => {
+  for (const rule of [
+    "An issue's `person_checks` lists done-when items of its `body` that the refinement records, or that its owner marks with `Person check:`, as checks a person runs",
+    "An item marked `Person check:` that `person_checks` does not list is judged like any other.",
+    "When an issue's `person_checks` is not empty, return `pass-notes`, never `pass`, with one note per item naming it as a person check and the evidence the pull request body offers for it, or that it offers none.",
+  ]) {
+    assert.ok(chunk.includes(rule), `prompt.md: ${rule}`);
+    assert.ok(spec.includes(rule), `spec-prompt.md: ${rule}`);
   }
 });
 
@@ -39,7 +48,6 @@ test("nothing a chunk reports is cut from the final judge", () => {
 test("a verifier is told every line is readable, so no prose or data part is passed unread", () => {
   assert.match(chunk, /`\\ continued:`/);
   assert.doesNotMatch(chunk, /line cut short/);
-  // A binary lockfile or compiled code still fails; an image does not.
   assert.ok(chunk.includes("a workflow, an action, a script, a hook, compiled code or a library, or a file a workflow, script or hook runs"));
   assert.match(chunk, /takes the side of the line it continues/);
   assert.match(chunk, /a package or plugin manifest, a lockfile, or agent or skill instructions/);
@@ -68,4 +76,13 @@ test("a chunk verifier is told to read across chunks, and no text says it cannot
   assert.doesNotMatch(chunk, /A read of any other path is denied/);
   assert.match(chunk, /a `pass` or `pass-notes` that skips a part, or reads one in pieces, is void/);
   assert.doesNotMatch(flat("./chunk-diff.sh"), /reads only its own parts/);
+});
+
+test("every judge of a chunked head is told a file larger than one chunk comes in pieces", () => {
+  const note = flat("./chunk-note.md");
+  assert.doesNotMatch(note, /each file whole,/);
+  for (const text of [note, spec]) assert.match(text, /cut at its hunks into pieces in different chunks/);
+  for (const text of [note, spec]) assert.ok(text.includes("`piece <i> of <n>`"));
+  for (const text of [note, spec]) assert.match(text, /a hunk larger than one chunk is cut between its lines/);
+  assert.match(note, /the file's other hunks are in the parts its other pieces name/);
 });

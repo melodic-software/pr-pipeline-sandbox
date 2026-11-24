@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Regression tests for check-ready-holds.sh, black-box with a stubbed `gh` on PATH.
+# test-scope: plugins/source-control/.claude-plugin/plugin.json
 
 set -uo pipefail
 
@@ -15,28 +16,64 @@ command -v jq >/dev/null 2>&1 || skip_suite "jq not installed"
 
 STUB_DIR="$TEST_TMPDIR/stubs"
 mkdir -p "$STUB_DIR"
-# The pull request's facts come from $TEST_TMPDIR/pr.json; an issue's state
-# from $TEST_TMPDIR/issue-<n>, and a missing file fails the lookup.
 cat >"$STUB_DIR/gh" <<STUB_EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$TEST_TMPDIR/calls"
+filter=""
+prev=""
+for a in "\$@"; do
+  [[ "\$prev" == --jq ]] && filter="\$a"
+  [[ "\$a" == repos/* ]] && endpoint="\$a"
+  prev="\$a"
+done
+serve() {
+  [[ -f "$TEST_TMPDIR/\$1" ]] || exit 1
+  if [[ -n "\$filter" ]]; then jq -rc "\$filter" "$TEST_TMPDIR/\$1"; else cat "$TEST_TMPDIR/\$1"; fi
+}
 case "\$1 \$2" in
   "pr view") [[ -f "$TEST_TMPDIR/pr.json" ]] || exit 1; cat "$TEST_TMPDIR/pr.json" ;;
   "api "*)
-    for a in "\$@"; do [[ "\$a" == repos/* ]] && n="\${a##*/}"; done
-    [[ -f "$TEST_TMPDIR/issue-\$n" ]] || exit 1
-    cat "$TEST_TMPDIR/issue-\$n"
+    case "\$endpoint" in
+      */events\?*) serve events.json ;;
+      */comments\?*) serve comments.json ;;
+      repos/example-org/standards/git/ref/heads/main) serve standards-head.json ;;
+      repos/example-org/standards/commits/main) serve standards-tag.json ;;
+      repos/example-org/standards/contents/*) serve standards-trusted.json ;;
+      */contents/docs/conventions/source-control.yaml)
+        [[ -f "$TEST_TMPDIR/team.yaml" ]] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+        cat "$TEST_TMPDIR/team.yaml"
+        ;;
+      */contents/*) serve trusted.json ;;
+      *)
+        n="\${endpoint##*/}"
+        [[ -f "$TEST_TMPDIR/issue-\$n" ]] || exit 1
+        cat "$TEST_TMPDIR/issue-\$n"
+        ;;
+    esac
     ;;
   *) echo "gh-stub: unrouted \$*" >&2; exit 1 ;;
 esac
 STUB_EOF
 chmod +x "$STUB_DIR/gh"
 
-# pr <title> <body> [labels-json] [closing-refs-json]
 pr() {
   jq -n --arg t "$1" --arg b "$2" --argjson l "${3:-[]}" --argjson c "${4:-[]}" \
-    '{title: $t, body: $b, labels: $l, closingIssuesReferences: $c}' >"$TEST_TMPDIR/pr.json"
+    '{title: $t, body: $b, labels: $l, closingIssuesReferences: $c, url: "https://github.com/acme/app/pull/7"}' >"$TEST_TMPDIR/pr.json"
 }
+
+comment() {
+  jq -cn --arg t "$1" --arg ty "$2" --argjson id "$3" --arg l "$4" --arg b "$5" \
+    '{created_at: $t, body: $b, user: {type: $ty, id: $id, login: $l}, performed_via_github_app: null}'
+}
+
+comments() {
+  local IFS=,
+  printf '[%s]\n' "$*" >"$TEST_TMPDIR/comments.json"
+}
+
+EVAL_LINE='<!-- pr-hold reason=eval -->'
+LANES_APP='lanes-app[bot]'
+DNM='[{"name":"do-not-merge"}]'
 
 ref() {
   printf '{"number":%s,"url":"https://github.com/acme/app/issues/%s","repository":{"name":"app","owner":{"login":"acme"}}}' "$1" "$1"
@@ -54,6 +91,20 @@ assert_exit "an unheld pull request with an open linked issue exits 0" 0 "$?"
 assert_silent "an unheld pull request prints nothing" "$out"
 assert_contains "the issue state is read over REST" "$(cat "$TEST_TMPDIR/calls")" "repos/acme/app/issues/10 --jq .state"
 
+REAL_JQ=$(command -v jq)
+CRLF_DIR="$TEST_TMPDIR/crlf"
+mkdir -p "$CRLF_DIR"
+printf '#!/usr/bin/env bash
+"%s" "$@" | sed "s/$/\r/"
+' "$REAL_JQ" >"$CRLF_DIR/jq"
+chmod +x "$CRLF_DIR/jq"
+pr "feat(x): add a thing" "Closes #10, closes #11" "[]" "[$(ref 10),$(ref 11)]"
+echo open >"$TEST_TMPDIR/issue-11"
+: >"$TEST_TMPDIR/calls"
+out=$(PATH="$CRLF_DIR:$STUB_DIR:$PATH" bash "$SCRIPT" 7)
+assert_exit "two closing issues read through CRLF jq output exit 0" 0 "$?"
+assert_contains "the first issue is read without a stray carriage return" "$(cat "$TEST_TMPDIR/calls")" "repos/acme/app/issues/10 --jq .state"
+
 pr "feat(x): add a thing" "" '[{"name":"do-not-merge"}]'
 out=$(run 7)
 assert_exit "the do-not-merge label holds the flip" 3 "$?"
@@ -62,6 +113,96 @@ assert_contains "the label hold names the label" "$out" "do-not-merge"
 pr "feat(x): add a thing" "" '[{"name":"Do-Not-Merge"}]'
 run 7 >/dev/null
 assert_exit "the label matches whatever its case" 3 "$?"
+
+printf '{"version":1,"actors":[{"id":101,"login":"owner","kind":"human"},{"id":202,"login":"%s","kind":"bot"}]}\n' "$LANES_APP" >"$TEST_TMPDIR/trusted.json"
+printf '%s\n' '[{"event":"labeled","created_at":"2026-11-21T06:00:00Z","label":{"name":"do-not-merge"}},{"event":"labeled","created_at":"2026-11-21T07:00:00Z","label":{"name":"do-not-merge"}},{"event":"unlabeled","created_at":"2026-11-21T08:00:00Z","label":{"name":"do-not-merge"}}]' >"$TEST_TMPDIR/events.json"
+pr "feat(x): add a thing" "" "$DNM"
+
+comments "$(comment 2026-11-21T07:00:05Z User 101 owner $'Held for the eval.\n\n'"$EVAL_LINE")"
+out=$(run 7 2>/dev/null)
+assert_exit "an eval-only do-not-merge from a listed human lets the flip go on" 0 "$?"
+assert_silent "an eval-only do-not-merge reports no hold" "$out"
+assert_not_contains "the check leaves the label on" "$(cat "$TEST_TMPDIR/calls")" "labels/"
+run 7 --unattended >/dev/null 2>&1
+assert_exit "an unattended run flips an eval-only do-not-merge too" 0 "$?"
+PATH="$CRLF_DIR:$STUB_DIR:$PATH" bash "$SCRIPT" 7 >/dev/null 2>&1
+assert_exit "an eval-only do-not-merge read through CRLF jq output lets the flip go on" 0 "$?"
+
+comments "$(comment 2026-11-21T07:00:05Z User 101 owner '<!-- pr-hold reason=release -->')"
+out=$(run 7 2>/dev/null)
+assert_exit "a do-not-merge with another hold reason holds the flip" 3 "$?"
+assert_contains "the refusal names the other reason" "$out" "reason=release"
+
+comments "$(comment 2026-11-21T07:00:05Z User 101 owner "$EVAL_LINE")" "$(comment 2026-11-21T07:10:00Z User 101 owner '<!-- pr-hold reason=release -->')"
+run 7 >/dev/null 2>&1
+assert_exit "an eval line beside another reason since the label holds the flip" 3 "$?"
+
+comments "$(comment 2026-11-21T07:00:05Z User 101 owner 'Holding this one.')"
+out=$(run 7 2>/dev/null)
+assert_exit "a do-not-merge with no hold reason line holds the flip" 3 "$?"
+assert_contains "the refusal says no reason line was found" "$out" "no pr-hold reason line"
+
+comments "$(comment 2026-11-21T06:30:00Z User 101 owner "$EVAL_LINE")"
+run 7 >/dev/null 2>&1
+assert_exit "an eval line posted before the newest label event holds the flip" 3 "$?"
+
+comments "$(comment 2026-11-21T07:00:05Z User 303 stranger "$EVAL_LINE")"
+run 7 >/dev/null 2>&1
+assert_exit "an eval line from an unlisted account holds the flip" 3 "$?"
+
+comments "$(comment 2026-11-21T07:00:05Z User 101 owner $'```\n'"$EVAL_LINE"$'\n```')"
+run 7 >/dev/null 2>&1
+assert_exit "an eval line inside a fenced block is not a reason line" 3 "$?"
+
+comments "$(comment 2026-11-21T07:00:05Z Bot 202 "$LANES_APP" "$EVAL_LINE")"
+run 7 >/dev/null 2>&1
+assert_exit "an eval line from a bot with no lanes App setting holds the flip" 3 "$?"
+
+APP_PLUGIN="$TEST_TMPDIR/app-plugin"
+mkdir -p "$APP_PLUGIN/skills/pull-request/scripts" "$APP_PLUGIN/skills/babysit-prs/scripts"
+cp "$SCRIPT" "$APP_PLUGIN/skills/pull-request/scripts/"
+printf 'babysit_python() { printf %q; }\n' "{\"issue_status_app_login\":\"$LANES_APP\"}" >"$APP_PLUGIN/skills/babysit-prs/scripts/babysit-python.sh"
+PATH="$STUB_DIR:$PATH" bash "$APP_PLUGIN/skills/pull-request/scripts/check-ready-holds.sh" 7 >/dev/null 2>&1
+assert_exit "an eval line from the lanes App the settings name lets the flip go on" 0 "$?"
+
+comments "$(comment 2026-11-21T07:00:05Z User 101 owner "$EVAL_LINE")"
+mv "$TEST_TMPDIR/trusted.json" "$TEST_TMPDIR/standards-trusted.json"
+printf '{"ref":"refs/heads/main","object":{"sha":"%s"}}\n' "$(printf '5%.0s' {1..40})" >"$TEST_TMPDIR/standards-head.json"
+printf '{"sha":"%s"}\n' "$(printf '6%.0s' {1..40})" >"$TEST_TMPDIR/standards-tag.json"
+printf 'trusted_actors_source: standards\nstandards_repository: example-org/standards\n' >"$TEST_TMPDIR/team.yaml"
+run 7 >/dev/null 2>&1
+assert_exit "an opted-in repository reads the standards list" 0 "$?"
+assert_contains "the standards list is read at main's commit" "$(cat "$TEST_TMPDIR/calls")" "repos/example-org/standards/contents/components/trusted-actors/trusted-actors.json?ref=5555555555555555555555555555555555555555"
+assert_not_contains "the repository copy is not read" "$(cat "$TEST_TMPDIR/calls")" ".github/standards/trusted-actors"
+assert_not_contains "main is read by its full ref, never a same-named tag" "$(cat "$TEST_TMPDIR/calls")" "standards/commits/main"
+rm -f "$TEST_TMPDIR/standards-head.json"
+run 7 >/dev/null 2>&1
+assert_exit "an unresolved standards branch leaves the label holding, a tag named main notwithstanding" 3 "$?"
+rm -f "$TEST_TMPDIR/standards-tag.json"
+for team in 'trusted_actors_source: elsewhere' 'trusted_actors_source: [standards]' \
+  'trusted_actors_source: standards' $'trusted_actors_source: standards\nstandards_repository: not-a-pair' \
+  $'trusted_actors_source: standards\nstandards_repository: [example-org/standards]'; do
+  printf '%s\n' "$team" >"$TEST_TMPDIR/team.yaml"
+  run 7 >/dev/null 2>&1
+  assert_exit "an unreadable source ($team) leaves the label holding" 3 "$?"
+done
+printf 'trusted_actors_source: repository\n' >"$TEST_TMPDIR/team.yaml"
+run 7 >/dev/null 2>&1
+assert_exit "a repository source with no copy leaves the label holding" 3 "$?"
+printf 'standards_repository: example-org/standards\n' >"$TEST_TMPDIR/team.yaml"
+run 7 >/dev/null 2>&1
+assert_exit "a standards_repository without the standards source reads no standards list" 3 "$?"
+mv "$TEST_TMPDIR/standards-trusted.json" "$TEST_TMPDIR/trusted.json"
+run 7 >/dev/null 2>&1
+assert_exit "a standards_repository without the standards source reads the copy" 0 "$?"
+assert_not_contains "the standards list is not read" "$(cat "$TEST_TMPDIR/calls")" "repos/example-org/standards/"
+printf 'trusted_actors_source: repository\n' >"$TEST_TMPDIR/team.yaml"
+run 7 >/dev/null 2>&1
+assert_exit "a repository source reads its own copy" 0 "$?"
+rm -f "$TEST_TMPDIR/team.yaml" "$TEST_TMPDIR/trusted.json"
+run 7 >/dev/null 2>&1
+assert_exit "an unreadable trusted-actors list leaves the label holding" 3 "$?"
+rm -f "$TEST_TMPDIR/events.json" "$TEST_TMPDIR/comments.json"
 
 pr "feat(x): add a thing" "Please do not merge until the release."
 out=$(run 7)

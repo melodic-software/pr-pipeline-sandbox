@@ -75,8 +75,9 @@ from babysit_gh import (
     record_pull_request_total,
     single_attempt,
 )
-from babysit_risk import (
+from diff_risk import (
     FLOOR_ROW_CLASSES,
+    MEDIA_SUFFIXES,
     ChangedFile,
     Floor,
     FloorRowError,
@@ -155,10 +156,21 @@ MAX_ADOPTION_IDLE_HOURS = 720
 # Whose pull requests the pr-merge lane adopts: every account on this list,
 # by id (`trusted_actor_ids`).
 TRUSTED_ACTORS_PATH = ".github/standards/trusted-actors/trusted-actors.json"
+STANDARDS_REPO_KEY = "standards_repository"
+STANDARDS_TRUSTED_ACTORS = "components/trusted-actors/trusted-actors.json"
+STANDARDS_SOURCE_KEY = "trusted_actors_source"
+STANDARDS_SOURCES = ("repository", "standards")
 RUNG_CAP_VARIABLE = "CLAUDE_LANES_MERGE_RUNG_CAP"
 ORG_SWITCH = "CLAUDE_LANES_DISABLED"
 REPO_SWITCH = "CLAUDE_LANES_REPO_DISABLED"
-DEMOTION_MARKER = "<!-- babysit-merge-demotion"
+DEMOTION_KIND = "babysit-merge-demotion"
+FAILURE_KIND = "post-merge-failure"
+RECORD_SIGNALS = ("schedule", "dispatch", "canary", "revert", "read-back")
+_RECORD_LINE = re.compile(
+    rf"<!-- ({DEMOTION_KIND}|{FAILURE_KIND}) sha=([0-9a-f]{{40}}) "
+    rf"signal=({'|'.join(RECORD_SIGNALS)}) -->"
+)
+DEMOTION_MARKER = f"<!-- {DEMOTION_KIND}"
 DEMOTION_FILER = "github-actions[bot]"
 LEASE_MARKER = "<!-- work-item-lease v1 "
 
@@ -483,7 +495,7 @@ def _issue_status_config(text: str) -> IssueStatusConfig | None:
             rows = _records_below(text, ISSUE_STATUS_KEY)
             _ISSUE_STATUS[text] = _issue_status_rows(rows) if rows else None
         except PolicyReadError as exc:
-            _ISSUE_STATUS[text] = IssueStatusConfig(0, (), (), (), (), str(exc))
+            _ISSUE_STATUS[text] = IssueStatusConfig(0, (), (), (), str(exc))
     return _ISSUE_STATUS[text]
 
 
@@ -515,8 +527,12 @@ def _issue_status_rows(rows: Mapping[str, str]) -> IssueStatusConfig:
             raise ValueError("options must map option ids to states")
         if len(set(states)) != len(states):
             raise ValueError("options map two option ids to one state")
-        setters = listed("bot-setters.", ("id", "login"))
-        if not all(ident(s["id"]) for s in setters):
+        setters = (
+            listed("bot-setters.", ("id", "login"))
+            if any(k == "bot-setters" or k.startswith("bot-setters.") for k in rows)
+            else None
+        )
+        if setters is not None and not all(ident(s["id"]) for s in setters):
             raise ValueError("a bot-setters id is not an id")
         if {k.rsplit(".", 1)[0] for k in items("labels.")} - set(states):
             raise ValueError("labels names a state no option maps")
@@ -545,15 +561,17 @@ def _issue_status_rows(rows: Mapping[str, str]) -> IssueStatusConfig:
         holds = holds or HOLD_STATES
         ready = ready or READY_STATE
     except ValueError as exc:
-        return IssueStatusConfig(0, (), (), (), (), f"{ISSUE_STATUS_KEY}: {exc}")
+        return IssueStatusConfig(0, (), (), (), f"{ISSUE_STATUS_KEY}: {exc}")
     return IssueStatusConfig(
         int(field_id),
         options,
-        tuple((int(s["id"]), s["login"]) for s in setters),
         labels,
         order,
         hold_states=holds,
         ready_state=ready,
+        bot_setters=None
+        if setters is None
+        else tuple((int(s["id"]), s["login"]) for s in setters),
     )
 
 
@@ -910,14 +928,16 @@ class PipelineConfig:
     queue_ejection_infra_causes: tuple[str, ...] = QUEUE_EJECTION_INFRA_CAUSES
     # `merge.risk-escalation-minutes`: how long a reasons comment must have
     # stood unchanged at the head before the gate adds the human-gated label
-    # for a reason only a person clears (`babysit_risk.person_reasons`); 0 is
+    # for a reason only a person clears (`diff_risk.person_reasons`); 0 is
     # no minimum. Absent, or anything but a whole number, is
     # `RISK_ESCALATION_MINUTES`.
     risk_escalation_minutes: int = RISK_ESCALATION_MINUTES
     # `merge.max-verify-fails`: counted pr-verify FAILs at distinct heads of
-    # one pull request at which it holds, never to merge unattended, whatever
-    # a later pass says (`babysit_verify_evidence`). Absent is `MAX_VERIFY_FAILS`; anything
-    # but a whole number of at least 1 is 1, so any earlier FAIL holds.
+    # one pull request at which it holds, never to merge unattended, when one
+    # that is not superseded stands at its head (`babysit_verify_evidence`,
+    # https://github.com/melodic-software/claude-code-plugins/issues/17646).
+    # Absent is `MAX_VERIFY_FAILS`; anything but a whole number of at least 1
+    # is 1, so any FAIL standing at the head caps.
     max_verify_fails: int = MAX_VERIFY_FAILS
     # `merge.verify-cap-attempts`: fresh attempts one issue gets after the
     # pr-merge lane closes its pull request at the FAIL cap or as too old
@@ -972,6 +992,7 @@ class PipelineConfig:
     # also held on (`issue_status`). None when the file sets none, which
     # reads labels alone. `stricter_config` takes main's when set.
     issue_status: IssueStatusConfig | None = None
+    baseline_file: str | None = None
 
 
 # The Work status states that hold an issue for a person (read-status.mjs
@@ -991,25 +1012,26 @@ READY_STATE = "agent-ready"
 @dataclass(frozen=True)
 class IssueStatusConfig:
     """`models.issue-status` (`ISSUE_STATUS_KEY`): the field id, each option
-    id with its state, the `bot-setters` (id, login) pairs, each state's
-    labels, and the collapse order. `error` names a malformed block, which
+    id with its state, each state's labels, and the collapse order. `error` names a malformed block, which
     `issue_status` refuses to read. `hold_states` and `ready_state` are the
     block's `hold-states` and `ready-state`, else `HOLD_STATES` and
-    `READY_STATE`."""
+    `READY_STATE`. `bot_setters` is the block's `bot-setters` (id, login)
+    pairs, None when it has none."""
 
     field_id: int
     options: tuple[tuple[str, str], ...]
-    bot_setters: tuple[tuple[int, str], ...]
     labels: tuple[tuple[str, tuple[str, ...]], ...]
     order: tuple[str, ...]
     error: str | None = None
     hold_states: tuple[str, ...] = HOLD_STATES
     ready_state: str = READY_STATE
+    bot_setters: tuple[tuple[int, str], ...] | None = None
 
 
 ISSUE_STATUS_KEY = "models.issue-status"
 # The job token's bot, a bot setter the trusted-actor list does not list.
 ACTIONS_BOT = (41898282, "github-actions[bot]")
+STATUS_LANES_APP = "melodic-automation-lanes[bot]"
 # The one App whose field values count for every state, read only from the
 # operator's settings: https://github.com/melodic-software/claude-code-plugins/blob/main/docs/contracts/hook-config-delivery/README.md
 LANES_APP_LOGIN = merge_settings.load().issue_status_app_login
@@ -1045,9 +1067,14 @@ def enabled_authority(config: PipelineConfig) -> str | None:
     return None
 
 
-def _file_at(owner: str, name: str, path: str, sha: str) -> str | None:
-    """The file's text at `sha`, or None when absent from a readable tree."""
+def _file_at(
+    owner: str, name: str, path: str, sha: str, *, probe: bool = True
+) -> str | None:
+    """The file's text at `sha`, or None when absent from a readable tree;
+    with `probe` False, None on any 404."""
     status, payload = _get(f"repos/{owner}/{name}/contents/{path}?ref={sha}")
+    if status == 404 and not probe:
+        return None
     if status == 404:
         root, _ = _get(f"repos/{owner}/{name}/contents?ref={sha}")
         if root == 200:
@@ -1177,6 +1204,7 @@ def read_config_at(
             ("merge.quarantine-days", False),
             ("red-main.confirm-wait-minutes", False),
             ("merge.lane-prs", False),
+            ("merge.baseline-file", False),
             (ISSUE_HOLDS_KEY, True),
         ],
     )
@@ -1377,6 +1405,7 @@ def read_config_at(
         lane_prs=lane_prs,
         issue_holds=tuple(values[ISSUE_HOLDS_KEY]),
         issue_status=issue_status,
+        baseline_file=scalar("merge.baseline-file") or None,
     )
 
 
@@ -1461,6 +1490,9 @@ def stricter_config(base: PipelineConfig, main: PipelineConfig) -> PipelineConfi
         self_merging_apps=main.self_merging_apps,
         issue_holds=_union(base.issue_holds, main.issue_holds),
         issue_status=main.issue_status or base.issue_status,
+        baseline_file=base.baseline_file
+        if base.baseline_file == main.baseline_file
+        else None,
     )
 
 
@@ -1504,7 +1536,7 @@ def _cached_config(value: Any) -> PipelineConfig | None:
             and c.rung in RUNG_RANK
             and all(
                 v is None or isinstance(v, str)
-                for v in (c.authority, c.agent_identity, c.loop_merge)
+                for v in (c.authority, c.agent_identity, c.loop_merge, c.baseline_file)
             )
             and all(
                 v is None or count(v, 0)
@@ -1588,12 +1620,14 @@ def _cached_issue_status(value: Any) -> IssueStatusConfig | None:
     status = IssueStatusConfig(
         value.get("field_id"),
         pairs(value.get("options"), str, text),
-        pairs(value.get("bot_setters"), int, text),
         pairs(value.get("labels"), str, texts),
         tuple(order) if texts(order) else (),
         value.get("error"),
         tuple(holds) if texts(holds) else (),
         value.get("ready_state"),
+        None
+        if value.get("bot_setters") is None
+        else pairs(value.get("bot_setters"), int, text),
     )
     if (
         type(status.field_id) is not int
@@ -1922,12 +1956,28 @@ DEMOTION_RECORD = (
 )
 # `read_demotion`: records per query, as `babysit_postmerge.read_pins` batches pins.
 DEMOTION_BATCH = 20
-# A record of a red full run on main, the one kind a later green clears
-# (`_recovered_at`). Canary, revert and read-back records lift on their own
-# evidence (`_lift`).
-RED_MAIN_RECORD = re.compile(
-    r"<!-- babysit-merge-demotion sha=([0-9a-f]{40}) signal=(?:schedule|dispatch) -->"
-)
+
+
+def record_marker(kind: str, sha: str, signal: str) -> str:
+    return f"<!-- {kind} sha={sha} signal={signal} -->"
+
+
+def parse_record_marker(line: str) -> tuple[str, str, str] | None:
+    """A record line's kind, SHA and signal; None for any other line."""
+    match = _RECORD_LINE.fullmatch(line)
+    return None if match is None else (match[1], match[2], match[3])
+
+
+def red_main_record(line: str) -> str | None:
+    """The SHA of a record of a red full run on main, the one kind a later
+    green clears (`_recovered_at`). Canary, revert and read-back records lift
+    on their own evidence (`_lift`)."""
+    record = parse_record_marker(line)
+    if record is None or record[0] != DEMOTION_KIND or record[2] not in ("schedule", "dispatch"):
+        return None
+    return record[1]
+
+
 # The holds a red-main record's later green, or a revert or read-back
 # record's lift, clears: how it was closed, never what its edit history or a
 # failed read says.
@@ -1951,13 +2001,25 @@ GREEN_SPANS = 53
 # cut from the one or two cells that cover it.
 GREEN_GRID = datetime(2026, 1, 5, 10, tzinfo=UTC)
 GREEN_CELL_PAGES = 2 * GREEN_PAGES
-# A canary, revert or read-back record, which `_lift` lifts. A canary record
-# may be a post-merge-failure one, which holds nothing but is closed the same
-# way (babysit_lift.py close).
-LIFTABLE_RECORD = re.compile(
-    r"<!-- (babysit-merge-demotion|post-merge-failure) sha=([0-9a-f]{40}) "
-    r"signal=(canary|revert|read-back) -->"
+RECOVERIES_ENV = "BABYSIT_DEMOTION_RECOVERIES"
+RECOVERIES_WRITE_ENV = "BABYSIT_DEMOTION_RECOVERIES_WRITE_ENABLED"
+RECOVERIES_VERSION = 1
+LISTED_MARGIN = timedelta(minutes=1)
+_RECOVERY_KEY = re.compile(
+    r"[1-9][0-9]{0,15}\|[0-9TZ:-]{20}\|(?:OPEN|CLOSED)\|(?:[0-9TZ:-]{20})?\|[0-9a-f]{40}"
 )
+
+
+def liftable_record(line: str) -> tuple[str, str] | None:
+    """The SHA and signal of a canary, revert or read-back record, which
+    `_lift` lifts. A canary record may be a post-merge-failure one, which
+    holds nothing but is closed the same way (babysit_lift.py close)."""
+    record = parse_record_marker(line)
+    if record is None or record[2] not in ("canary", "revert", "read-back"):
+        return None
+    return record[1], record[2]
+
+
 # The content a canary or revert record's lift checks on main: per path, the
 # hash and count of each line the merge deleted (`lift_block`), on one line of
 # the record's body, or of an unedited comment by a filer on a canary record
@@ -2138,6 +2200,9 @@ class _GreenMain:
         self.compares: dict[tuple[str, str], str | None] = {}
         # babysit_postmerge's `_Context` for local ancestry; False: unavailable.
         self.local: Any = None
+        self.carried: dict[str, str] = {}
+        self.proven: dict[str, str] = {}
+        self.first_listed: datetime | None = None
 
     def _read(self, endpoint: str) -> Any:
         """One retry for no answer (a timeout included) or a 5xx, each read a
@@ -2166,6 +2231,7 @@ class _GreenMain:
         begin = max(start, low.replace(microsecond=0))
         listed = self.cells.get((event, cell))
         if listed is None or listed[0] > begin:
+            self.first_listed = self.first_listed or datetime.now(UTC) - LISTED_MARGIN
             created = quote(f"{_stamp(begin)}..{_stamp(start + GREEN_SPAN)}", safe=":")
             found: list[dict[str, Any]] = []
             for page in range(1, GREEN_CELL_PAGES + 1):
@@ -2259,6 +2325,33 @@ class _GreenMain:
             )
         return self.runs[stamp]
 
+    def settled(self, start: datetime, end: datetime) -> bool:
+        """Whether every full run on main created from `start` to `end` has
+        completed, none since the first green listing this read used, so no
+        earlier run can still turn green or did after that listing; any doubt
+        is False."""
+        if self.first_listed is None:
+            return False
+        created = quote(f"{_stamp(start)}..{_stamp(end)}", safe=":")
+        try:
+            answer = json_object(
+                self._read(
+                    f"repos/{self.owner}/{self.name}/actions/workflows/"
+                    f"pr-require-checks.yml/runs?branch=main&created={created}&per_page=100"
+                )
+            )
+        except PolicyReadError:
+            return False
+        runs = [json_object(run) for run in json_array(answer.get("workflow_runs"))]
+        try:
+            return answer.get("total_count") == len(runs) and all(
+                run.get("status") == "completed"
+                and _time(run.get("updated_at")) < self.first_listed
+                for run in runs
+            )
+        except PolicyReadError:
+            return False
+
     def ahead(self, base: str, head: str) -> bool:
         """Whether `head` has `base` in its history and is a later commit:
         from a local full-history clone when one can decide two different
@@ -2320,17 +2413,94 @@ def _recovered_at(
     non-human edited (the SHA comes from its body), or no such run; a failed
     read raises."""
     first = str(issue.get("body") or "").lstrip().split("\n", 1)[0].rstrip()
-    marker = RED_MAIN_RECORD.fullmatch(first)
-    if marker is None or _edits_refusal(issue, human):
+    sha = red_main_record(first)
+    if sha is None or _edits_refusal(issue, human):
         return None
     created = _time(issue.get("createdAt"))
+    key = _recovery_key(issue, created, sha)
+    if key in green.carried:
+        green.proven[key] = green.carried[key]
+        return _time(green.carried[key])
     for run in green.listed(created, now):
         if _time(run.get("created_at")) <= created:
             continue
         head = str(run["head_sha"])
-        if green.ahead(marker[1], head) and green.on_main(head):
-            return _time(run.get("created_at"))
+        if green.ahead(sha, head) and green.on_main(head):
+            recovered = _time(run.get("created_at"))
+            if (
+                key
+                and _writes_recoveries()
+                and green.settled(created, recovered)
+            ):
+                green.proven[key] = _stamp(recovered)
+            return recovered
     return None
+
+
+def _recovery_key(issue: dict[str, Any], created: datetime, sha: str) -> str:
+    """The record's recovery key: number, creation, state, newest close (empty
+    when none) and SHA, so a reopened or re-closed record misses the cache."""
+    closes = json_array(json_object(issue.get("timelineItems")).get("nodes"))
+    closed = json_object(closes[-1]).get("createdAt") if closes else None
+    key = "|".join(
+        [
+            str(issue.get("number")),
+            _stamp(created),
+            str(issue.get("state")),
+            _stamp(_time(closed)) if closed else "",
+            sha,
+        ]
+    )
+    return key if _RECOVERY_KEY.fullmatch(key) else ""
+
+
+def _carried_recoveries(repo: str) -> dict[str, str]:
+    """The recoveries in RECOVERIES_ENV's file for `repo`; any unusable file,
+    or entry, is none."""
+    path = os.environ.get(RECOVERIES_ENV)
+    if not path or not Path(path).is_file():
+        return {}
+    try:
+        data = json_object(json.loads(Path(path).read_text(encoding="utf-8")))
+        if data.get("version") != RECOVERIES_VERSION or data.get("repo") != repo:
+            raise ValueError("another version or repository")
+        return {
+            key: stamp
+            for key, stamp in json_object(data.get("recoveries")).items()
+            if _RECOVERY_KEY.fullmatch(key)
+            and isinstance(stamp, str)
+            and _time(stamp) > _time(key.split("|")[1])
+        }
+    except (OSError, ValueError, PolicyReadError) as exc:
+        text = re.sub(r"[\r\n%]", " ", f"{type(exc).__name__}: {exc}")
+        print(f"demotion recoveries not used: {text[:300]}", file=sys.stderr)
+        return {}
+
+
+def _writes_recoveries() -> bool:
+    """Whether RECOVERIES_WRITE_ENV is `true`, compared without case."""
+    return os.environ.get(RECOVERIES_WRITE_ENV, "").strip().lower() == "true"
+
+
+def _save_recoveries(repo: str, proven: Mapping[str, str]) -> None:
+    """Write `proven` to RECOVERIES_ENV's file when `_writes_recoveries`.
+    Best effort: a failure is logged, and the file is left as it was."""
+    path = os.environ.get(RECOVERIES_ENV)
+    if not path or not _writes_recoveries():
+        return
+    payload = {
+        "version": RECOVERIES_VERSION,
+        "repo": repo,
+        "recoveries": dict(sorted(proven.items())),
+    }
+    try:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        staged = target.with_name(f"{target.name}.tmp")
+        staged.write_text(json.dumps(payload, indent=1) + "\n", encoding="utf-8")
+        os.replace(staged, target)
+    except OSError as exc:
+        print(f"demotion recoveries not written: {type(exc).__name__}", file=sys.stderr)
 
 
 def _read_back_holds(pull: dict[str, Any], identity: str | None) -> bool:
@@ -2523,10 +2693,10 @@ def _lift(
     body or a filer's unedited comment, or no such evidence; a failed read, or
     more than 100 references, raises."""
     body = str(issue.get("body") or "").lstrip()
-    marker = LIFTABLE_RECORD.fullmatch(body.split("\n", 1)[0].rstrip())
+    marker = liftable_record(body.split("\n", 1)[0].rstrip())
     if marker is None or _edits_refusal(issue, human):
         return None
-    sha, signal = marker[2], marker[3]
+    sha, signal = marker
     owner, name = green.owner, green.name
     number = None
     if signal == "read-back":
@@ -2683,8 +2853,10 @@ def read_demotion(
     held: Demotion | None = None
     held_since: datetime | None = None
     green = _GreenMain(owner, name)
+    green.carried = _carried_recoveries(repo)
     # One clock for every record's green-run spans (`_GreenMain.listed`).
     clock = now or datetime.now(UTC)
+    complete = False
     try:
         candidates = sorted(
             {n for f in filers for n in _candidate_issues(owner, name, f)}
@@ -2738,6 +2910,7 @@ def read_demotion(
                 continue
             closes = json_array(json_object(issue.get("timelineItems")).get("nodes"))
             cleared.append(_time(json_object(closes[-1]).get("createdAt")))
+        complete = True
     except PolicyReadError as exc:
         return held or Demotion(True, f"demotion-unreadable: {exc}", tuple(records))
     except Exception:
@@ -2745,6 +2918,10 @@ def read_demotion(
         if held:
             return held
         raise
+    finally:
+        _save_recoveries(
+            repo, green.proven if complete else {**green.carried, **green.proven}
+        )
     if held:
         # The floor in force when the hold began: a later clear would skip
         # the merges the holding record cites.
@@ -3041,15 +3218,37 @@ ISSUE_STATUS_QUERY = (
 FIELD_EVENT_WINDOW = 100
 
 
+def status_bot_setters(
+    actors: Iterable[tuple[int, Any, Any]],
+    explicit: tuple[tuple[int, str], ...] | None = None,
+) -> tuple[tuple[int, str], ...]:
+    """The Work status bot setters as (id, login). With `explicit` (the
+    block's `bot-setters`), each entry that is `ACTIONS_BOT` or that `actors`
+    (`trusted_listing`) lists as a bot with the same id and login; without
+    it, github-actions[bot], then each `kind` bot of `actors` whose login
+    starts with `melodic-`, other than `STATUS_LANES_APP`, in list order."""
+    actors = tuple(actors)
+    if explicit is not None:
+        bots = {(i, login) for i, login, kind in actors if kind == "bot"}
+        return tuple(e for e in explicit if e == ACTIONS_BOT or e in bots)
+    return (ACTIONS_BOT,) + tuple(
+        (i, login)
+        for i, login, kind in actors
+        if kind == "bot"
+        and isinstance(login, str)
+        and login.startswith("melodic-")
+        and login != STATUS_LANES_APP
+    )
+
+
 def issue_status(
     repo: str, ref: str, number: int, config: IssueStatusConfig
 ) -> str | None:
     """The state the newest counted Work status event on issue `number` left
     (`config`), or None when that event removed the value or no event counts.
     An event counts when a listed human or the lanes App on the trusted list
-    at `ref` wrote it, or a `bot-setters` account wrote any state but
-    `config.ready_state`, github-actions[bot] always and any other only while
-    the list holds it as a bot with the same id and login. Unlike
+    at `ref` wrote it, or a `status_bot_setters` account (`config.bot_setters`
+    or that list's) wrote any state but `config.ready_state`. Unlike
     issue-status.mjs issueStatus, which reads the newest event's setter, an
     uncounted later change or removal leaves a counted state standing.
     Raises `PolicyReadError` on a malformed `config`, a failed or malformed
@@ -3088,16 +3287,7 @@ def issue_status(
         for i, login, kind in actors
         if kind == "human" or (LANES_APP_LOGIN and login == LANES_APP_LOGIN)
     }
-    listed_bots = {
-        (i, login)
-        for i, login, kind in actors
-        if kind == "bot" and isinstance(login, str)
-    }
-    bots = {
-        entry[0]
-        for entry in config.bot_setters
-        if entry == ACTIONS_BOT or entry in listed_bots
-    }
+    bots = {i for i, _ in status_bot_setters(actors, config.bot_setters)}
     # An uncounted event neither sets nor clears a counted state: the newest
     # counted one decides, whatever came after it.
     for event in ours_newest_first:
@@ -3292,6 +3482,28 @@ def _lane_authored(pr: dict[str, Any], agent_identity: str | None) -> bool:
         agent_identity
         and author.get("__typename") == "Bot"
         and _login_key(author.get("login")) == _login_key(agent_identity)
+    )
+
+
+def baseline_only(
+    pr: Mapping[str, Any],
+    agent_identity: str | None,
+    baseline_file: str | None,
+    paths: Sequence[str] | None,
+) -> bool:
+    """Whether the REST pull request `pr` is `agent_identity`'s Bot and
+    `paths`, every changed path with renamed-from paths, read whole, is
+    exactly `baseline_file` (`merge.baseline-file`; merge-holds.mjs
+    baselineOnly, which test_merge_holds_sync.py keeps equal). An unset file
+    takes no pull request."""
+    user = json_object(pr.get("user"))
+    return bool(
+        agent_identity
+        and baseline_file
+        and user.get("type") == "Bot"
+        and _login_key(user.get("login")) == _login_key(agent_identity)
+        and paths is not None
+        and list(paths) == [baseline_file]
     )
 
 
@@ -4204,6 +4416,8 @@ CARRY_REFUSES: tuple[str, ...] = (
     "plugins/formal-verification/schemas/**",
     "plugins/code-metrics/scripts/**",
     _skill_scripts("code-metrics:audit"),
+    "plugins/guardrails/git-hooks/reference-verify.sh",
+    "plugins/bash-format/git-hooks/lint-full.sh",
 )
 
 
@@ -4807,8 +5021,8 @@ _TRUSTED_IDS: dict[tuple[str, ...], tuple[tuple[int, ...], tuple[int, ...]]] = {
 def trusted_actors(
     repo: str, ref: str, exclude: Collection[str] = ()
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Every account id on `TRUSTED_ACTORS_PATH` at `ref`, people and Apps
-    alike (whose pull requests the lane adopts), but those whose login
+    """Every account id on the trusted list `trusted_listing` reads for `ref`,
+    people and Apps alike (whose pull requests the lane adopts), but those whose login
     (`_login_key`) is in `exclude`, and the ids of kind `human` (the people;
     a GitHub User may be a model's account). A list that cannot be read or
     does not match its schema is empty, which adopts nothing."""
@@ -4824,15 +5038,144 @@ def trusted_actors(
     return _TRUSTED_IDS[key]
 
 
+_READS_STANDARDS: dict[tuple[str, str, str, str], str | None] = {}
+_STANDARDS_SHA: dict[str, str] = {}
+_STANDARDS_TEXT: dict[tuple[str, str], str | None] = {}
+
+
+def opts_in_to_standards(text: str | None) -> str | None:
+    """The `standards_repository` a team YAML names when it sets
+    `trusted_actors_source: standards`, else None: where the trusted list is
+    read. Raises `PolicyReadError` when the shared reader rejects it, the
+    source is not one of `STANDARDS_SOURCES`, or an opted-in YAML names no
+    owner/repo pair, so nothing is read from either source."""
+    source, repo = _standards_keys(text)
+    return _standards_repo(repo) if source == "standards" else None
+
+
+def names_standards(text: str | None) -> str | None:
+    """The `standards_repository` a team YAML names, whatever its
+    `trusted_actors_source`, else None: where the Dependabot policy is read.
+    Raises `PolicyReadError` as `opts_in_to_standards` does, and when the
+    repository it names is not an owner/repo pair."""
+    source, repo = _standards_keys(text)
+    return _standards_repo(repo) if repo or source == "standards" else None
+
+
+def _standards_keys(text: str | None) -> tuple[str | None, str]:
+    """A team YAML's `trusted_actors_source` and `standards_repository`
+    (None and "" when absent). Raises `PolicyReadError` when the shared
+    reader rejects it, either is not a scalar, or the source is not one of
+    `STANDARDS_SOURCES`."""
+    if text is None:
+        return None, ""
+    keys = (STANDARDS_SOURCE_KEY, STANDARDS_REPO_KEY)
+    values = _concern_values(text, [(k, False) for k in keys])
+    if values is None:
+        raise PolicyReadError(
+            f"{repo_config.YAML_CONFIG_PATH}: the shared YAML reader rejects it"
+        )
+    for key in keys:
+        if not values[key] and (
+            repo_config._yaml_writes(text, key)
+            or (key in text and _records_below(text, key))
+        ):
+            raise PolicyReadError(
+                f"{repo_config.YAML_CONFIG_PATH}: {key} is not a scalar value"
+            )
+    found = values[STANDARDS_SOURCE_KEY]
+    if found and found[0] not in STANDARDS_SOURCES:
+        raise PolicyReadError(
+            f"{repo_config.YAML_CONFIG_PATH}: {STANDARDS_SOURCE_KEY} "
+            f"{found[0]!r} is not one of {STANDARDS_SOURCES}"
+        )
+    return (found[0] if found else None), (values[STANDARDS_REPO_KEY] or [""])[0]
+
+
+def _standards_repo(repo: str) -> str:
+    """`repo` when it is an owner/repo pair; raises `PolicyReadError`."""
+    try:
+        _split_repo(repo)
+    except PolicyReadError as exc:
+        raise PolicyReadError(
+            f"{repo_config.YAML_CONFIG_PATH}: {STANDARDS_REPO_KEY}: {exc}"
+        ) from exc
+    return repo
+
+
+def team_yaml_at(owner: str, name: str, ref: str) -> str | None:
+    """The team YAML at `ref`, from a checkout holding `ref` or the contents
+    API; None on a 404, since a YAML hidden from the token hides the copy it
+    would leave in place too."""
+    text = checkout_file_at(repo_config.YAML_CONFIG_PATH, ref)
+    if text is not None:
+        return text
+    return _file_at(owner, name, repo_config.YAML_CONFIG_PATH, ref, probe=False)
+
+
+def reads_standards(
+    owner: str,
+    name: str,
+    ref: str,
+    choose: Callable[[str | None], str | None] = opts_in_to_standards,
+) -> str | None:
+    """The standards repository `choose` (`opts_in_to_standards` or
+    `names_standards`) finds in the repository's team YAML at `ref`, read
+    once a process per ref and chooser."""
+    key = (owner, name, ref, choose.__name__)
+    if key not in _READS_STANDARDS:
+        _READS_STANDARDS[key] = choose(team_yaml_at(owner, name, ref))
+    return _READS_STANDARDS[key]
+
+
+def standards_sha(repo: str) -> str:
+    """The standards repository `repo`'s main branch tip (`base_tip`, by its
+    full ref) at its first read in this process, so every file a process
+    reads from it comes from one commit."""
+    if repo not in _STANDARDS_SHA:
+        try:
+            _STANDARDS_SHA[repo] = base_tip(*_split_repo(repo), "main")
+        except PolicyReadError as exc:
+            raise PolicyReadError(f"{repo}: {exc}") from exc
+    return _STANDARDS_SHA[repo]
+
+
+def standards_file(repo: str, path: str) -> str | None:
+    """`path` in the standards repository `repo` at `standards_sha`, or None
+    when absent; each path read once a process."""
+    key = (repo, path)
+    if key not in _STANDARDS_TEXT:
+        owner, name = _split_repo(repo)
+        _STANDARDS_TEXT[key] = _file_at(owner, name, path, standards_sha(repo))
+    return _STANDARDS_TEXT[key]
+
+
+def synced_file(
+    owner: str,
+    name: str,
+    copy: str,
+    component: str,
+    ref: str,
+    choose: Callable[[str | None], str | None] = opts_in_to_standards,
+) -> str | None:
+    """A standards-synced file: `component` in the standards repository
+    `choose` finds at `ref` (`reads_standards`), else its copy at `ref`."""
+    standards = reads_standards(owner, name, ref, choose)
+    if standards:
+        return standards_file(standards, component)
+    return _file_at(owner, name, copy, ref)
+
+
 def trusted_listing(repo: str, ref: str) -> tuple[tuple[int, Any, Any], ...]:
-    """Each actor on `TRUSTED_ACTORS_PATH` at `ref` as (id, login, kind).
-    Raises `PolicyReadError` when the list is absent, unreadable or does not
-    match its schema (version 1, every id a positive whole number)."""
+    """Each actor on the trusted list (`synced_file`) at `ref` as (id, login,
+    kind). Raises `PolicyReadError` when the list is absent, unreadable or
+    does not match its schema (version 1, every id a positive whole number)."""
     owner, name = _split_repo(repo)
     try:
-        listing = json_object(
-            json.loads(_file_at(owner, name, TRUSTED_ACTORS_PATH, ref) or "{}")
+        text = synced_file(
+            owner, name, TRUSTED_ACTORS_PATH, STANDARDS_TRUSTED_ACTORS, ref
         )
+        listing = json_object(json.loads(text or "{}"))
     except ValueError as exc:
         raise PolicyReadError(f"{TRUSTED_ACTORS_PATH} at {ref}: {exc}") from exc
     actors = [json_object(a) for a in json_array(listing.get("actors"))]
@@ -5402,6 +5745,7 @@ def _dependabot_content(
     commits: list[dict[str, Any]],
     files: Callable[[str], list[str] | None],
     main_sha: str,
+    lane_identity: str | None = None,
 ) -> tuple[str | None, str | None, list[str] | None]:
     """(content reason, refusal, changed paths). The content reason,
     `dependabot-content:<x>`, names a diff that is not only covered manifests,
@@ -5409,13 +5753,22 @@ def _dependabot_content(
     `.github/dependabot.yml` names at both the base and the default branch
     head, `_dependabot_config`); it sends the pull request to tier
     `review`. A commit that is not Dependabot's (a lanes App fix) must pass
-    the fix rule (`_fix_commit_refusal`), and its paths then count as checked;
+    the fix rule or, as the lanes App (`lane_identity`), be the CDN pins sync
+    (`_fix_commit_refusal`), and its paths then count as checked;
     else `dependabot-fix-content:<why>` is the refusal, as is a commit whose file list cannot be read whole. The changed
     paths (either side of a rename) are None when the files listing was not
     read whole. Raises `PolicyReadError` on a read failure."""
     base_sha = str(json_object(pr.get("base")).get("sha") or "")
+    head_ref = json_object(pr.get("head")).get("ref")
     config = _dependabot_config(owner, name, base_sha, main_sha)
     extra: set[str] = set()
+    read: list[frozenset[str] | None] = []
+
+    def cdn() -> frozenset[str] | None:
+        if not read:
+            read.append(_cdn_paths(owner, name, base_sha))
+        return read[0]
+
     for item in commits:
         if dependabot.is_dependabot_commit(item):
             continue
@@ -5424,7 +5777,9 @@ def _dependabot_content(
         if touched is None:
             # Unreadable (or past the listing cap) is not "touches nothing".
             return None, f"unreadable: commit files {sha[:12]}", None
-        refusal = _fix_commit_refusal(owner, name, sha, config)
+        refusal = _fix_commit_refusal(
+            owner, name, sha, config, lane_identity, cdn, head_ref
+        )
         if refusal:
             return None, f"dependabot-fix-content:{refusal}", None
         extra.update(touched)
@@ -5478,10 +5833,15 @@ def _fix_commit_refusal(
     name: str,
     sha: str,
     config: list[tuple[str, str]] | None,
+    lane_identity: str | None = None,
+    cdn: Callable[[], frozenset[str] | None] | None = None,
+    head_ref: str | None = None,
 ) -> str | None:
     """Why a lanes App commit is not a fix the lane may merge with
-    (`babysit_dependabot.fix_refusal` against its one parent), or None. The commit's files, modes and both sides' text are read here; a
-    read that fails is a refusal."""
+    (`babysit_dependabot.fix_refusal` against its one parent) nor the CDN
+    pins sync (`babysit_dependabot.cdn_sync_refusal` against the base
+    registry `cdn()` reads, on the pull request's `head_ref`), or None. The commit's files, modes and both
+    sides' text are read here; a read that fails is a refusal."""
     status, payload = _get(f"repos/{owner}/{name}/commits/{sha}")
     detail = json_object(payload)
     listing = detail.get("files")
@@ -5496,35 +5856,69 @@ def _fix_commit_refusal(
     parent = str(json_object(parents[0]).get("sha") or "") if parents else ""
     if len(parents) != 1 or not SHA_RE.fullmatch(parent):
         return f"commit-parents:{sha[:12]}"
-    trees: dict[str, list[Any]] = {}
+    trees: dict[tuple[str, str], list[Any]] = {}
 
-    def entry(path: str) -> Any:
+    def entry_at(ref: str, path: str) -> Any:
         folder = posixpath.dirname(path)
-        if folder not in trees:
+        if (ref, folder) not in trees:
             data = _graphql(
-                FIX_TREE, f"{sha[:12]} tree", o=owner, r=name, e=f"{sha}:{folder}"
+                FIX_TREE, f"{ref[:12]} tree", o=owner, r=name, e=f"{ref}:{folder}"
             )
             tree = json_object(json_object(data.get("repository")).get("object"))
-            trees[folder] = json_array(tree.get("entries"))
+            trees[ref, folder] = json_array(tree.get("entries"))
         base = posixpath.basename(path)
         return next(
-            (e for e in trees[folder] if json_object(e).get("name") == base), None
+            (e for e in trees[ref, folder] if json_object(e).get("name") == base),
+            None,
         )
 
     def text(side: str, path: str) -> str | None:
         return _raw_at(owner, name, path, parent if side == "before" else sha)
 
     try:
-        return dependabot.fix_refusal(listing, config, entry, text)
+        fix = dependabot.fix_refusal(
+            listing, config, lambda path: entry_at(sha, path), text
+        )
     except PolicyReadError as exc:
-        return f"fix-unreadable:{str(exc)[:120]}"
+        fix = f"fix-unreadable:{str(exc)[:120]}"
+    if fix is None or cdn is None:
+        return fix
+    try:
+        sync = dependabot.cdn_sync_refusal(
+            detail,
+            lane_identity,
+            cdn,
+            lambda side, path: entry_at(parent if side == "before" else sha, path),
+            head_ref,
+        )
+    except PolicyReadError as exc:
+        sync = f"cdn-sync-unreadable:{str(exc)[:120]}"
+    return f"{fix};{sync}" if sync else None
+
+
+def _cdn_paths(owner: str, name: str, base_sha: str) -> frozenset[str] | None:
+    """The base pins.json's paths (`babysit_dependabot.cdn_sync_paths`), or
+    None when it is absent, invalid or does not read."""
+    try:
+        text = _file_at(owner, name, dependabot.CDN_RECORD, base_sha)
+    except PolicyReadError:
+        return None
+    return dependabot.cdn_sync_paths(text)
 
 
 def _dependabot_policy(owner: str, name: str, sha: str) -> Any:
-    """The standards Dependabot policy at `sha` as parsed JSON, or None when it
-    is absent or not JSON (`review_only` then reports it unreadable). Raises
+    """The standards Dependabot policy (`synced_file`, from the repository
+    `names_standards` finds) at `sha` as parsed JSON, or None when it is
+    absent or not JSON (`review_only` then reports it unreadable). Raises
     `PolicyReadError` on a read failure."""
-    text = _file_at(owner, name, dependabot.POLICY_PATH, sha)
+    text = synced_file(
+        owner,
+        name,
+        dependabot.POLICY_PATH,
+        dependabot.STANDARDS_POLICY,
+        sha,
+        names_standards,
+    )
     try:
         return json.loads(text) if text is not None else None
     except ValueError:
@@ -5723,7 +6117,7 @@ def dependabot_eligibility(
         if refusal:
             return Eligibility(False, refusal, "C2", dependabot=tier)
         content, refusal, paths = _dependabot_content(
-            owner, name, number, pr, commits, files, main_sha
+            owner, name, number, pr, commits, files, main_sha, agent_identity
         )
         if refusal:
             return Eligibility(False, refusal, "C2", dependabot=tier)
@@ -6621,7 +7015,7 @@ def merged_since_floor(
 
 
 def pulumi_dirs_at(repo: str, pr: Mapping[str, Any]) -> tuple[str, ...] | None:
-    """`babysit_risk.RiskInput.pulumi_dirs`: each directory holding a
+    """`diff_risk.RiskInput.pulumi_dirs`: each directory holding a
     Pulumi project file (`Pulumi.yaml`, `Pulumi.yml` or `Pulumi.json`) at
     the base ("" for the root); None when the base tree cannot be listed
     whole."""
@@ -6728,9 +7122,55 @@ def _changed_files(
                 previous_mode=previous_mode,
                 blob=blob,
                 previous_blob=previous_blob,
+                diff_read="patch" not in entry
+                and isinstance(path, str)
+                and not path.casefold().endswith(MEDIA_SUFFIXES)
+                and _diff_read(base_sha, str(head), path),
             )
         )
     return tuple(files), complete
+
+
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def _diff_read(base_sha: str, head: str, path: str) -> bool:
+    """Whether a local clone holding both commits counts `path`'s changed
+    lines as text in `git diff <base_sha>...<head>`, the diff both review
+    lanes read with `--text`, so a review read a change the files API sent
+    no patch for. Git's binary call (`-` counts), no changed line, or a diff
+    no clone can read is False, which holds the file for a person. The
+    attributes come from the empty tree, not the checkout, and no user
+    attributes file is read, so a checked-out `.gitattributes` cannot make a
+    binary file count as text."""
+    if not (SHA_RE.fullmatch(base_sha) and SHA_RE.fullmatch(head)):
+        return False
+    for root in _clones_holding(head):
+        numstat = _git(
+            root,
+            f"--attr-source={EMPTY_TREE}",
+            "-c",
+            f"core.attributesFile={os.devnull}",
+            "diff",
+            "--numstat",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            f"{base_sha}...{head}",
+            "--",
+            f":(literal){path}",
+        )
+        if numstat is None:
+            continue
+        rows = [line.split("\t", 2) for line in numstat.splitlines() if line]
+        return bool(rows) and all(
+            len(row) == 3
+            and row[0].isdigit()
+            and row[1].isdigit()
+            and int(row[0]) + int(row[1]) > 0
+            for row in rows
+        )
+    return False
 
 
 # The most files GitHub's pull request files listing returns

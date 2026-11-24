@@ -378,11 +378,9 @@ RC=$?
 
 assert_exit "renders successfully" 0 "$RC"
 
-# Queues
 assert_contains "queue: needs-triage count" "$OUT" "needs-triage"
 assert_contains "queue: ready count 44" "$OUT" "44"
 
-# Merge-ready — only clean non-drafts, sorted; excludes draft + blocked
 assert_contains "merge-ready keeps clean #10" "$OUT" "#10 clean pr"
 assert_contains "merge-ready keeps clean #13" "$OUT" "#13 approved clean pr"
 assert_contains "merge-ready shows review verdict" "$OUT" "review=APPROVED"
@@ -428,7 +426,6 @@ assert_contains "merge-ready marks a clean PR past the compare cap unverified" "
 assert_contains "merge-ready reports a capped compare read as PARTIAL" "$FRESH_CAP" \
   "PARTIAL: 2 clean PRs; base freshness read for the first 1 only (raise --pr-limit)"
 
-# Decisions — two-tier RECOMMENDED extraction
 assert_contains "decision #100 uppercase marker wins" "$OUT" "Store the root in a userConfig key"
 assert_not_contains "decision #100 ignores 'not recommended'" "$OUT" "not recommended for this profile"
 assert_contains "decision #101 lowercase fallback" "$OUT" "keep the interim surface for now"
@@ -443,7 +440,6 @@ assert_not_contains "decision #105 ignores 'not recommended' rejection" "$OUT" "
 assert_contains "decision #106 uppercase marker beats earlier 'NOT RECOMMENDED'" "$OUT" "choose the managed sync path"
 assert_not_contains "decision #106 ignores 'NOT RECOMMENDED' rejection" "$OUT" "because of drift"
 
-# Telemetry — staleness + flags + skips
 assert_contains "telemetry babysit fresh age" "$OUT" "babysit"
 assert_contains "telemetry babysit not stale" "$OUT" "age=1h 30m"
 assert_contains "telemetry triage stale flagged" "$OUT" "STALE (>6h)"
@@ -1644,6 +1640,39 @@ rm "$FALSE0/$(rest_key "$R/issues?state=open&per_page=100&labels=needs-human").j
 assert_contains "false zero: a REST check that fails is count unavailable too" \
   "$(section "$(MB_GH_FIXTURES="$FALSE0" run_stub gql --merged-json "$TMP/merged-clean.json" --lane-runs-json "$TMP/lanes-empty.json")" "== Queues")" \
   "needs-human              count unavailable"
+
+# --- A split parent with open sub-issues is not counted beside its children ---
+# https://github.com/melodic-software/claude-code-plugins/issues/17859
+PARENTS="$TMP/gql-parents"
+cp -r "$CAPS" "$PARENTS"
+cat >"$PARENTS/issue-list-label-needs-triage.json" <<'EOF'
+[{"number": 10, "subIssuesSummary": {"total": 2, "completed": 0, "percentCompleted": 0}},
+ {"number": 11, "subIssuesSummary": {"total": 0, "completed": 0, "percentCompleted": 0}},
+ {"number": 12, "subIssuesSummary": {"total": 0, "completed": 0, "percentCompleted": 0}}]
+EOF
+QUEUES_PARENTS="$(section "$(MB_GH_FIXTURES="$PARENTS" run_stub gql --merged-json "$TMP/merged-clean.json" --lane-runs-json "$TMP/lanes-empty.json")" "== Queues")"
+assert_contains "parents: one parent and two open children count 2, the parent listed beside them" "$QUEUES_PARENTS" \
+  "$(printf '  %-24s %s' needs-triage '2 (+1 with open sub-issues)')"
+assert_not_contains "parents: the parent is not in the count" "$QUEUES_PARENTS" "$(printf '  %-24s %s' needs-triage 3)"
+jq '.[1:] + [{"number": 13, "subIssuesSummary": {"total": 1, "completed": 1, "percentCompleted": 100}}]' \
+  "$PARENTS/issue-list-label-needs-triage.json" >"$PARENTS/finished.json"
+mv "$PARENTS/finished.json" "$PARENTS/issue-list-label-needs-triage.json"
+assert_contains "parents: a parent whose sub-issues are all completed counts as an open item" \
+  "$(section "$(MB_GH_FIXTURES="$PARENTS" run_stub gql --merged-json "$TMP/merged-clean.json" --lane-runs-json "$TMP/lanes-empty.json")" "== Queues")" \
+  "$(printf '  %-24s %s' needs-triage 3)"
+# Over REST the summary is the snake_case sub_issues_summary field.
+# https://docs.github.com/en/rest/issues/issues#list-repository-issues
+REST_PARENTS="$TMP/rest-parents"
+cp -R "$REST" "$REST_PARENTS"
+cat >"$REST_PARENTS/$(rest_key "$R/issues?state=open&per_page=100&labels=needs-human").json" <<'EOF'
+[{"number": 20, "title": "parent", "sub_issues_summary": {"total": 2, "completed": 0, "percent_completed": 0}},
+ {"number": 21, "title": "child a", "sub_issues_summary": {"total": 0, "completed": 0, "percent_completed": 0}},
+ {"number": 22, "title": "child b"}]
+EOF
+QUEUES_REST_PARENTS="$(section "$(MB_GH_FIXTURES="$REST_PARENTS" run_stub rest)" "== Queues")"
+assert_contains "parents rest: one parent and two open children count 2, the parent listed beside them" "$QUEUES_REST_PARENTS" \
+  "$(printf '  %-24s %s' needs-human '2 (+1 with open sub-issues)')"
+assert_not_contains "parents rest: the parent is not in the count" "$QUEUES_REST_PARENTS" "$(printf '  %-24s %s' needs-human 3)"
 
 # --- Stranded: paging stops at the cutoff; the bookmark widens the window ----
 # Pages are newest-updated first. NOW is 2026-07-20T08:00Z, so the 3-day floor
@@ -3096,6 +3125,20 @@ assert_contains "status parked: the field-only decision carries its RECOMMENDED 
 jq '{model, pages: [.pages[0] | .data.repository.issues.nodes |= [.[] | select(.number == 402)]]}' "$TMP/status.json" >"$TMP/status-held.json"
 assert_contains "status: an issue held only on the field is a needs-human row of 1" \
   "$(section "$(run_status --status-json "$TMP/status-held.json")" "== Queues")" "  needs-human              1"
+
+# A parent with open sub-issues is listed beside its children, not counted with them.
+# #405 (needs-triage label, no field value) becomes the parent of #408 and #409.
+# https://github.com/melodic-software/claude-code-plugins/issues/17859
+jq '{model, pages: [.pages[0] | .data.repository.issues.nodes |= ([.[] | select(.number == 405)][0] as $n
+     | [$n + {subIssuesSummary: {total: 2, completed: 0}}, $n + {number: 408}, $n + {number: 409}])]}' \
+  "$TMP/status.json" >"$TMP/status-parents.json"
+STATUS_PARENTS_Q="$(section "$(run_status --status-json "$TMP/status-parents.json")" "== Queues")"
+assert_contains "status parents: one parent and two open children count 2, the parent listed beside them" "$STATUS_PARENTS_Q" \
+  "$(printf '  %-24s %s' needs-triage '2 (+1 with open sub-issues)')"
+assert_not_contains "status parents: the parent is not in the count" "$STATUS_PARENTS_Q" "$(printf '  %-24s %s' needs-triage 3)"
+jq '.pages[0].data.repository.issues.nodes[0].subIssuesSummary.completed = 2' "$TMP/status-parents.json" >"$TMP/status-parents-done.json"
+assert_contains "status parents: a parent whose sub-issues are all completed counts as an open item" \
+  "$(section "$(run_status --status-json "$TMP/status-parents-done.json")" "== Queues")" "$(printf '  %-24s %s' needs-triage 3)"
 
 printf '{"model": null, "pages": []}\n' >"$TMP/status-none.json"
 assert_eq "status: no model renders exactly as no --status-json" \

@@ -1,10 +1,15 @@
 // verify-cap.mjs: whether pr-verify's FAILs on a pull request are at the
 // merge gate's cap (`verify:repeated-fail`), read by the gate's own reader,
 // babysit_verify_evidence.py `evidence`, so the cap is counted in one place.
-// The cap never clears for the pull request: a fix round's push could never
-// merge, so feedback-dispatch.mjs and fix-ci-dispatch.mjs start no
-// address-feedback or fix-ci round on it and post nothing; the pr-merge lane
-// closes it for a fresh attempt at its issue (owner decision 2026-10-29). A
+// The cap applies only when a FAIL that is not superseded stands at the head
+// (owner decision Q245,
+// https://github.com/melodic-software/claude-code-plugins/issues/17646); FAILs
+// at earlier heads alone never reach it, and a later supersession of the
+// head's FAIL clears it. While it applies, the pr-merge lane closes the pull
+// request for a fresh attempt at its issue (owner decision 2026-10-29), so
+// feedback-dispatch.mjs and fix-ci-dispatch.mjs start no address-feedback or
+// fix-ci round on it and post nothing, and record nothing, so a head whose
+// cap cleared is read again. A
 // FAIL run of another pull request for the same issue that cannot be read
 // (`verify:unreadable` with the reader's SIBLING_UNREADABLE detail), or an
 // artifact listing that does not fit in this caller's limit (a detail that
@@ -126,7 +131,6 @@ export function carrySteps(env) {
   if (env.BABYSIT_RUN_CACHE) {
     steps.push(
       { script: "carry-run-cache.mjs", args: ["read"], env: { ...shared, API_BUDGET_SCRIPT: "carry-run-cache", CARRY_TO: carriedFile } },
-      // No requests. Its outputs are for pr-merge's steps, not the dispatch step's.
       { script: "carry-run-cache.mjs", args: [], env: { CARRY_FROM: carriedFile, CARRY_TO: env.BABYSIT_RUN_CACHE, GITHUB_OUTPUT: "" } },
     );
   }
@@ -136,8 +140,6 @@ export function carrySteps(env) {
   return steps;
 }
 
-// Each carry script warns and writes nothing on its own failures, so the
-// reader then asks GitHub for that part alone; a child that dies is named.
 async function fetchCarry(env) {
   const failed = [];
   for (const step of carrySteps(env)) {
@@ -155,9 +157,6 @@ async function fetchCarry(env) {
   }
 }
 
-// Whether a verifyCapReader answer never clears for the head, so a
-// dispatcher records the head as handled: the cap does, a sibling read that
-// failed may clear next run.
 export const final = (answer) => typeof answer === "string" && answer.startsWith(CAPPED);
 
 // The workflow annotation for a skip because the listing did not fit in the
@@ -171,12 +170,8 @@ export function deadlineWarning(number, answer) {
 
 const oneLine = (text, max = 300) => String(text ?? "").replaceAll(/[\r\n%]/g, " ").trim().slice(0, max);
 
-// Why a child that did not exit 0 failed: its spawn error, else its last
-// stderr line, else its exit status.
 const failureOf = (done) => oneLine(done.error?.message ?? String(done.stderr).trim().split("\n").at(-1)) || `exit ${done.status}`;
 
-// One line for a read's stderr: its line count, then the listing-miss lines,
-// else the last line; null when it wrote nothing.
 function stderrSummary(stderr) {
   const lines = String(stderr ?? "")
     .split("\n")
@@ -193,7 +188,6 @@ function stderrSummary(stderr) {
 // A function of { number, head, base, expected } that returns the reader's cap refusal,
 // `verify:repeated-fail` with its detail (the FAILed heads), the sibling
 // read's or the caller limit's `verify:unreadable` with its detail, or null.
-// Only the first never clears for the head (`final`).
 // `base`: the pull request's base commit, so the reader takes the gate's
 // merge.max-verify-fails (the lower of that commit's and main's).
 // `expected`: refusals the round is sent for, which warn nothing.
@@ -231,8 +225,6 @@ export function verifyReader(env, { spawn = spawnAsync, log = (line) => console.
         .catch((error) => log(`::warning::pr-merge's carried reads were not all fetched (${oneLine(error?.message ?? error)}); the reader asks GitHub for the rest`));
       await carried;
     }
-    // The reader requires the base: its config names the lanes App, without
-    // which every lanes App spec reads untrusted.
     if (!SHA.test(String(base ?? ""))) {
       log(`::warning::#${number}: no base commit to read the verifier at (${oneLine(String(base))}); the round runs under its own caps`);
       return unread();
@@ -257,7 +249,6 @@ export function verifyReader(env, { spawn = spawnAsync, log = (line) => console.
       }
     } catch (error) {
       log(`::warning::#${number}: the verifier reader did not read its FAIL cap (${oneLine(error.message)}); the round runs under its own caps`);
-      // readFailed: no answer at all, which is not "no earlier FAIL".
       return unread();
     }
     const answer = (cap) => ({ cap, supersededAtHead: report[SUPERSEDED_AT_HEAD] === true, earlierFailHeads: [] });

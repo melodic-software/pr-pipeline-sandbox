@@ -4,7 +4,7 @@ import { test } from "node:test";
 
 import { parse, stringify } from "yaml";
 
-import { WIP_DEFAULTS, resolveWip } from "../../scripts/work-resolve-issue/limits.mjs";
+import { LIMIT_DEFAULTS, WIP_DEFAULTS, resolveWip } from "../../scripts/work-resolve-issue/limits.mjs";
 import { LANE_LEVEL_DEFAULTS } from "../../scripts/lib/lane-level.mjs";
 import { LEVEL_VARIABLE } from "../../scripts/lib/lane-level-value.mjs";
 
@@ -389,6 +389,12 @@ const LIMITS = {
 
 test("limits: a config with no limits leaf resolves today's thirteen values", () => {
   assert.deepEqual(run(fixture("valid.yaml")).limits, LIMITS);
+});
+
+test("limits: resolve-config's defaults and LIMIT_DEFAULTS in work-resolve-issue/limits.mjs are one set", () => {
+  const resolved = run(fixture("valid.yaml")).limits;
+  const shared = Object.fromEntries(Object.keys(LIMIT_DEFAULTS).map((key) => [key, resolved[key]]));
+  assert.deepEqual(shared, { ...LIMIT_DEFAULTS });
 });
 
 test("limits: a set leaf overrides its default and leaves the others", () => {
@@ -1926,8 +1932,6 @@ const TIDY = {
   cutoffs: { "max-files": 10, "max-lines": 300, "max-areas": 1, "shared-paths": [".github/"] },
 };
 
-// Only the runner that stages a skill's edit tools grants these, and the read
-// runner does so only for applied-by.patch without ci-context.
 for (const [key, value] of [
   ["checks", ["scripts/check-x.sh"]],
   ["self-checks", ["scripts/check-x.sh"]],
@@ -1943,8 +1947,7 @@ for (const [key, value] of [
     assert.deepEqual(unblock(config)[key], value);
   });
 
-  // ci-context stages base copies of verify-scripts as wrappers, so only that key resolves there.
-  if (key === "verify-scripts") {
+  if (key === "verify-scripts" || key === "self-checks") {
     test(`${key} on a read skill with prepare: ci-context resolves and is carried`, () => {
       assert.deepEqual(unblock(appliedByEdit((doc) => (doc.activities["fix-ci"][key] = value)))[key], value);
     });
@@ -2002,6 +2005,7 @@ const patchRules = (name) => JSON.parse(fixture(name));
 test("patch rules: the shipped registry passes, with a row for each prepare mode, the docs row and the default and issue targets", () => {
   assert.equal(checkPatchRules(PATCH_RULES, PATCH_RULES_SCHEMA), PATCH_RULES);
   assert.deepEqual(Object.keys(PATCH_RULES).sort(), [
+    "cdn-pins-sync",
     "ci-context",
     "default",
     "dependency-relock",
@@ -2012,6 +2016,7 @@ test("patch rules: the shipped registry passes, with a row for each prepare mode
     "merge-base",
     "review-threads",
     "shared-copies",
+    "test-scope",
   ]);
 });
 

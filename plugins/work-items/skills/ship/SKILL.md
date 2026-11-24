@@ -17,7 +17,7 @@ Arguments: `$ARGUMENTS`. The action defaults to `status`. Empty container = disc
 | Action | Does | Steps |
 |---|---|---|
 | `status` (default) | Reads, states the shape's discipline, routes the next step; mutates nothing | Process below |
-| `run` | Runs the container's ready items under its shape, attended only: claims them, hands them to `/implementation:implement-dispatch`, lands them one at a time, closes them | [actions/run.md](actions/run.md), after Process Steps 1 to 3 |
+| `run` | Runs the container's ready items under its shape, or a non-container parent's ready children as per-item PRs, attended only: claims them, hands them to `/implementation:implement-dispatch` (if enabled), lands them one at a time, closes them | [actions/run.md](actions/run.md), after Process Steps 1 to 3 |
 
 ## Shared tracker context
 
@@ -36,7 +36,7 @@ body changes what this skill does.
 
 Answer *where is this spec container's journey, and what's next?* This skill owns the macro map
 (the phases spanning a whole container, with micro cycles inside each item), routes, and with
-`run` runs one container; every mechanic (building an item, PR lifecycle, re-slicing) belongs to
+`run` runs one container or non-container parent; every mechanic (building an item, PR lifecycle, re-slicing) belongs to
 the skill that owns it. Execution shapes, their disciplines, and the journey vocabulary (item /
 checkpoint / phase boundary) are defined in
 [`${CLAUDE_PLUGIN_ROOT}/reference/execution-shape.md`](${CLAUDE_PLUGIN_ROOT}/reference/execution-shape.md);
@@ -53,8 +53,13 @@ From `$ARGUMENTS`:
   container label (`config.container_label`, default `spec-container`. Warn loudly when defaulting) and
   a body with the `**Execution shape:**` line decompose appends to every container it publishes
   (a wayfind map that also carries the container label never writes that line). A labeled item without the line is
-  reported as not a spec container, and only an item without the container label that has a
-  native parent routes to that parent with a note.
+  reported as not a spec container. An item without the container label resolves in this order:
+  - **`run` only: open sub-items make it the run's parent.** When `"$TRACKER" list-sub-items <id>
+    --state open` returns any item, it is a **non-container parent** (such as the source item
+    decompose attaches items to when its container offer is declined): `run` takes it as-is and
+    works its ready children ([actions/run.md](actions/run.md)). `status` stays container-only.
+  - **Otherwise, a native parent routes.** An item with no open sub-items, or any item under
+    `status`, that has a native parent routes to that parent with a note.
 - `<topic-slug>` or empty. Read the topic's PLAN.md (`<memory_dir>/<slug>/PLAN.md`)
   for the `**Spec container:** <qualified-id>` line under `## Brief`. Fallback discovery: query the
   bound adapter for **open** items carrying the resolved container label (body citing the slug when
@@ -120,10 +125,14 @@ every session joining the journey (cloud or local) must hear the same rules:
   carries the journey. This shape is worked on the shared branch directly or by `run`, not
   through `/work-items:work`'s default-branch worktree path.
 - **Line absent** (a container taken from PLAN.md's `**Spec container:**` line, which skips the
-  label test; a `#<number>` parent route, which re-runs no label or shape-line check; or a body
+  label test; a native-parent route from Step 1, which re-runs no label or shape-line check; or a body
   hand-edited after publish). Apply the `per-item PRs` default loudly and offer to record the
   line (an ordinary body edit through the bound adapter, mutation-gated like any tracker write).
   An unrecognized value is reported, not obeyed.
+- **A non-container parent under `run`** (Step 1), with or without a shape line. Only a
+  container's shape line selects a discipline: the parent always runs as `per-item PRs`, stated in
+  the run's item list; a shape line in its body is reported, not obeyed, and no line is offered
+  or written onto it ([actions/run.md](actions/run.md) step 4).
 
 ### 4. Route the next step
 
@@ -137,9 +146,9 @@ when a named plugin is not enabled, state the manual fallback instead.
 | Frontier has items (shared-branch shape) | Work the next checkpoint on the integration branch, but first check the Step 2 rollup for an active sibling claim: one item in flight at a time, so an active claim anywhere in the container means report who holds it and defer, never claim a second item onto the shared branch. Clear → claim via the seam, execute under the project's workflow, close the item, push, this skill states the discipline; the work itself runs in-session, or `run` works the ready items with this session as the single writer |
 | Frontier empty, open items all blocked or claimed | Report who holds what (claims, blockers); stale leases route to `/work-items:track audit` |
 | Vertical slices no longer fit the spec (scope drift, unresolved unknowns) | `/work-items:decompose`, re-slicing and container publish belong to it |
-| All sub-items closed (shared-branch shape) | The journey's terminal step comes first: open the single integration PR from the shared branch (`/source-control:pull-request` when enabled, else the operator's PR flow) and run the full verification gates, closed checkpoints record durable progress, not shipment. Then the close-out below runs at PR time; the container closes only when the PR ships |
-| All sub-items closed (per-item shape, or the integration PR is up) | Close-out: the container close ritual belongs to `/work-items:decompose` ("Container lifecycle, ship ritual", read directly from [`${CLAUDE_PLUGIN_ROOT}/skills/decompose/context/container-lifecycle.md`](${CLAUDE_PLUGIN_ROOT}/skills/decompose/context/container-lifecycle.md), whose close also owns the dossier-branch step), a close-out review of the shipped whole against the container body (`/planning:plan close-out`, plus `/review:quality-gate close-out --container <container-id>` when the `review` plugin is enabled; else a manual pass against the Brief's acceptance criteria), then close with a comment linking the shipping PRs. That mode derives its own cumulative basis from this container's execution shape, the integration PR's range for the shared-branch shape, the set of per-item squash commits for `per-item PRs`, so state the shape when routing to it. Never close without the review; never leave a shipped container open as documentation |
-| Session ending mid-journey (phase boundary) | `/session-flow:handoff` or `/session-flow:clean-stop` when enabled (else: push durable state and record a resume pointer on the claimed item). In shared-branch shape, prefer stopping **at a checkpoint**, an item closed and pushed, over a bare phase boundary |
+| All sub-items closed (shared-branch shape) | The journey's terminal step comes first: open the single integration PR from the shared branch (`/source-control:pull-request` (if enabled), else the operator's PR flow) and run the full verification gates, closed checkpoints record durable progress, not shipment. Then the close-out below runs at PR time; the container closes only when the PR ships |
+| All sub-items closed (per-item shape, or the integration PR is up) | Close-out: the container close ritual belongs to `/work-items:decompose` ("Container lifecycle, ship ritual", read directly from [`${CLAUDE_PLUGIN_ROOT}/skills/decompose/context/container-lifecycle.md`](${CLAUDE_PLUGIN_ROOT}/skills/decompose/context/container-lifecycle.md), whose close also owns the dossier-branch step), a close-out review of the shipped whole against the container body (`/planning:plan close-out` (if enabled), plus `/review:quality-gate close-out --container <container-id>` (if enabled); else a manual pass against the Brief's acceptance criteria), then close with a comment linking the shipping PRs. That mode derives its own cumulative basis from this container's execution shape, the integration PR's range for the shared-branch shape, the set of per-item squash commits for `per-item PRs`, so state the shape when routing to it. Never close without the review; never leave a shipped container open as documentation |
+| Session ending mid-journey (phase boundary) | `/session-flow:handoff` (if enabled) or `/session-flow:clean-stop` (if enabled) (else: push durable state and record a resume pointer on the claimed item). In shared-branch shape, prefer stopping **at a checkpoint**, an item closed and pushed, over a bare phase boundary |
 
 `status` mutates nothing on the happy path. It reads, states, and routes. `run`'s claims, merges
 and closes are listed in [actions/run.md](actions/run.md). The only other offered
@@ -159,15 +168,20 @@ One compact macro map, then the recommendation:
 ## Next
 
 - One item to work next: `/work-items:work`.
-- Several ready items in one container: `/work-items:ship run #<container-id>`.
+- Several ready items in one container, or under one non-container parent: `/work-items:ship run #<id>`.
+
+## Related
+
+- Re-slice items when scope drifts: /work-items:decompose.
+- Audit stale leases on blocked frontier: /work-items:track.
 
 ## What this skill does not do
 
-- Build items itself (`run` hands them to `/implementation:implement-dispatch`; one item is
+- Build items itself (`run` hands them to `/implementation:implement-dispatch` (if enabled); one item is
   `/work-items:work`), create or re-slice items (`/work-items:decompose`), backlog CRUD
   (`/work-items:track`).
 - Run unattended. `run` needs a human present; it has no loop or lane entry point.
-- Own PR mechanics or merge style (`/source-control:pull-request`) or session continuation
+- Own PR mechanics or merge style (`/source-control:pull-request` (if enabled)) or session continuation
   (`session-flow`).
 - Publish containers, choose the shape at publish time, or run the close-out review itself. It
   routes to `/work-items:decompose`'s container lifecycle, which owns all three.

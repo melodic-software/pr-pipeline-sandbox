@@ -27,7 +27,7 @@ import { renameSync, rmSync, writeFileSync } from "node:fs";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
-import { createGitHub } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
+import { createGitHub } from "../lib/github-client.mjs";
 import { onMain } from "./head-ref-map.mjs";
 import { escapeCommand, ghDownload, newestTrustedRun, sharedReads } from "./rotation.mjs";
 
@@ -35,7 +35,6 @@ export const ANSWERS_ARTIFACT = "pr-merge-verify-answers";
 export const SKIP_FILE = "eam-skip.json";
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
-// The newest trusted run holding the artifact, or undefined.
 export async function skipsRun({ repo, runId, actions: client, shared }) {
   const actions = sharedReads(client, shared);
   const accept = (run) => onMain({ repo, actions, sha: run.head_sha });

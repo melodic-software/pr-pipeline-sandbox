@@ -10,17 +10,6 @@ metadata:
   summary: Detect and remove AI-writing tells from markdown, commit messages, PR bodies and interface copy
 ---
 
-## Repository context. Gather first
-
-Collect these with **individual** Bash calls, one command per call, never combined into a single
-invocation:
-
-- Current branch, `git branch --show-current`
-
-Treat a failure (not a repository, git unavailable) as an unknown value and carry on. Keep these as
-separate body Bash calls rather than pre-compute lines ([gather-block convention](https://github.com/melodic-software/claude-code-plugins/blob/main/docs/conventions/gather-block/README.md#the-pre-compute-block-runs-as-one-shell-invocation),
-"The pre-compute block runs as one shell invocation").
-
 ## Pre-computed context
 
 Effective config: !`"${CLAUDE_SKILL_DIR}/scripts/detect.sh" --show-config 2>&1`
@@ -181,7 +170,7 @@ in this skill changes. What differs here:
 - **`fix` per repository.** The fix flow runs once per repository, with its own run directory,
   as "Writes stay per repository" says; a scratch worktree is never edited.
 - **No cross-repository signal.** This skill does not look for markdown copied between
-  repositories; that measurement is `/coupling:reduce`'s.
+  repositories; that measurement belongs to `/coupling:reduce` (if enabled).
 
 ### User-scope target
 
@@ -212,9 +201,11 @@ the fix flow, under [Non-repository targets](#non-repository-targets).
   the root is skipped; the script names each on stderr. Pass a skipped link's target as an
   explicit path.
 - `plugins/` is not in scope; plugin content is audited in its own repository.
-- The detector's user config layer is the JSON file `$HOME/.claude/ai-slop.json`, even when
-  `CLAUDE_CONFIG_DIR` is set; the team and personal layers are YAML. Its project layers come from
-  the session's project directory.
+- The detector's config layers are the team and personal YAML files, read from the session's
+  project directory. The old JSON file `$HOME/.claude/ai-slop.json` (read there even when
+  `CLAUDE_CONFIG_DIR` is set) stands in for the personal layer while no personal override
+  exists. Each run then prints one warning naming it and `/ai-slop:setup apply`, which moves it to
+  the personal override.
 - A path target such as `~/.claude` covers every `*.md` beneath it.
 
 ### Non-repository targets
@@ -234,7 +225,7 @@ is outside a repository, the whole run follows these rules:
 - Order files by modification time, newest first, ties broken by path. Ordering never changes
   inclusion. `rubric-fanout.sh plan` picks this order for a target outside a repository; apply
   it to the report too.
-- Config layers come from the session's project directory and the user-global file, not from
+- Config layers come from the session's project directory and the old `~/.claude` file, not from
   the target. `--show-config` names the layers in effect. A path glob such as `excluded_paths`
   applies only when it matches the path as the detector sees it.
 - No findings file: none is written, and the fix flow's closing re-emit is skipped.
@@ -293,7 +284,7 @@ beyond the scratch copy, amends a commit, or edits a pull request.
 
 `fix` on these kinds rewrites the scratch copy only, under the usual guard, and returns the
 rewritten text beside the original. It never amends a commit, edits a pull request, or edits a
-source string: carrying the text back is the user's step, through `/source-control:commit` or the
+source string: carrying the text back is the user's step, through `/source-control:commit` (if enabled) or the
 project's own copy workflow.
 
 ## Fix flow (explicit invocation only)
@@ -377,17 +368,24 @@ legitimately needs em dashes, the remedy is `em_dash_allowed_paths` or the file 
 threshold. The em-dash rule is zero-tolerance by design; the catalog's `rule-em-dash` entry
 carries the reason.
 
+## Related
+
+- Work through findings in a fix pass: /review:fanout fix.
+- Deliberate house style tripped rules: /ai-slop:setup.
+- Code comments instead of prose: /code-tidying:audit-comment-residue.
+- Reshape prose for conciseness: /writing:be-concise.
+
 ## What this skill does not do
 
 - **Does not fix on bare invocation.** `audit` and `scan` verbs are read-only in this
   marketplace; mutation rides only the explicit `fix` argument.
 - **Does not put rubric findings in the findings file.** No crosswalk row, no relay: judgment
   verdicts reach the human report only (V1 boundary, revisit with field history).
-- **Does not scan code comments** (`/code-tidying:remove-comments audit` owns them), or text
+- **Does not scan code comments** (`/code-tidying:remove-comments audit` (if enabled) owns them), or text
   outside markdown files other than the three kinds above; structural markdown (heading
   hierarchy, multiple H1, title case) belongs to the markdown linter lane. Reshaping text so it
-  leads with the point and carries fewer words is `/writing:be-concise`, which owns that
-  doctrine when the `writing` plugin is enabled; AI-writing tells in a commit message, PR body
+  leads with the point and carries fewer words is `/writing:be-concise` (if enabled), which owns that
+  doctrine; AI-writing tells in a commit message, PR body
   or interface copy are this skill's.
 - **Does not weaken rules to pass its own corpus**: a deliberate house style is config in the
   consuming repo, never a shipped-default change.

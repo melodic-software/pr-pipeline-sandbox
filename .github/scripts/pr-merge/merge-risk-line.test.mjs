@@ -131,7 +131,6 @@ test("the artifact name is prefix, pr and head", () => {
   assert.equal(artifactName(7, HEAD), `${ARTIFACT_PREFIX}-7-${HEAD}`);
 });
 
-// A fake GitHub for the reader: routes by path.
 const runOf = (id, extra = {}) => ({
   id,
   path: RATING_WORKFLOW_PATH,
@@ -142,7 +141,7 @@ const runOf = (id, extra = {}) => ({
   repository: { full_name: REPO },
   head_repository: { full_name: REPO },
   head_sha: "c".repeat(40),
-  display_title: `merge-risk #7 ${HEAD}`,
+  display_title: `PR Rate Merge Risk #7 ${HEAD}`,
   created_at: "2026-11-06T01:00:00Z",
   ...extra,
 });
@@ -184,10 +183,8 @@ test("readRating: no artifact reads the runs for pending, no-rating or no-run", 
   assert.equal((await readRating({ actions: pending.actions, download: () => "", repository: REPO, pr: 7, head: HEAD })).token, "unrated:pending");
   const done = fake({ listing: [runOf(5)] });
   assert.equal((await readRating({ actions: done.actions, download: () => "", repository: REPO, pr: 7, head: HEAD })).token, "unrated:no-rating");
-  const other = fake({ listing: [runOf(5, { display_title: `merge-risk #7 ${OTHER}` })] });
+  const other = fake({ listing: [runOf(5, { display_title: `PR Rate Merge Risk #7 ${OTHER}` })] });
   assert.equal((await readRating({ actions: other.actions, download: () => "", repository: REPO, pr: 7, head: HEAD })).token, "unrated:no-run");
-  const titled = fake({ listing: [runOf(5, { status: "in_progress", conclusion: null, display_title: `PR Rate Merge Risk #7 ${HEAD}` })] });
-  assert.equal((await readRating({ actions: titled.actions, download: () => "", repository: REPO, pr: 7, head: HEAD })).token, "unrated:pending", "the Title Case run-name");
   const near = fake({ listing: [runOf(5, { status: "in_progress", conclusion: null, display_title: `pr rate merge risk #7 ${HEAD}` })] });
   assert.equal((await readRating({ actions: near.actions, download: () => "", repository: REPO, pr: 7, head: HEAD })).token, "unrated:no-run", "the wrong case");
 });
@@ -208,8 +205,6 @@ test("readRating: a bad artifact is invalid, an unreadable one unreadable", asyn
   assert.equal(thrown.token, "unrated:unreadable");
 });
 
-// recordMergeRisk: the arm-side step. It never throws, never touches the
-// pull request body, and lists no comments: it reads only those it is given.
 const BOT = "melodic-automation-lanes";
 const APP = { __typename: "Bot", login: BOT };
 const pull = { number: 7, headRefOid: HEAD };
@@ -282,13 +277,10 @@ test("markerAction reads only the lanes App's newest marker comment", () => {
   const older = appSaid(40, PENDING_COMMENT, "2026-11-12T01:00:00Z");
   const newer = appSaid(41, `<!-- merge-risk-line head=${OTHER} -->\nMerge-Risk: unrated reason=pending`, "2026-11-12T02:00:00Z");
   assert.deepEqual(markerAction([newer, older], { bot: BOT, head: HEAD, line }), { action: "post" });
-  // A person's or another app's look-alike is not the App's record.
   const person = appSaid(50, PENDING_COMMENT, "2026-11-12T03:00:00Z", { __typename: "User", login: BOT });
   const otherApp = appSaid(51, PENDING_COMMENT, "2026-11-12T03:00:00Z", { __typename: "Bot", login: "other-app" });
   assert.deepEqual(markerAction([person, otherApp], { bot: BOT, head: HEAD, line }), { action: "post" });
-  // The marker must be the first line; quoting it lower down is not a record.
   assert.deepEqual(markerAction([appSaid(52, `quoted:\n${PENDING_COMMENT}`)], { bot: BOT, head: HEAD, line }), { action: "post" });
-  // A same-head record with no id to patch is posted again.
   assert.deepEqual(markerAction([{ ...appSaid(53, `<!-- merge-risk-line head=${HEAD} -->\nMerge-Risk: unrated reason=no-run`), databaseId: undefined }], { bot: BOT, head: HEAD, line }), { action: "post" });
 });
 
@@ -328,7 +320,6 @@ test("recordMergeRisk patches pending to rated once, then a re-arm of the same h
   const first = writer();
   await recordMergeRisk({ bot: BOT, pull, comments: [appSaid(41, PENDING_COMMENT)], repository: REPO, actions: reads(), github: first.github, download: () => JSON.stringify(rating()) });
   assert.deepEqual(first.sent.map((call) => `${call.method} ${call.path}`), [`PATCH /repos/${REPO}/issues/comments/41`]);
-  // The comment as GitHub returns it after the App's own PATCH.
   const afterPatch = { ...appSaid(41, first.sent[0].payload.body), lastEditedAt: "2026-11-12T02:00:00Z", editor: APP };
   const again = writer();
   const result = await recordMergeRisk({ bot: BOT, pull, comments: [afterPatch], repository: REPO, actions: reads(), github: again.github, download: () => JSON.stringify(rating()) });
@@ -439,11 +430,6 @@ test("recordMergeRisk survives a throwing download and a malformed pull", async 
   assert.equal(sent.length, before);
 });
 
-// ci-status loads clear-escalations.mjs, which imports enable-auto-merge.mjs,
-// from a sparse checkout of main (pr-require-checks.yml "Check out the base
-// commit's hold config"). Every module that load reaches through static
-// imports must be in that list, so enable-auto-merge.mjs takes
-// merge-risk-line.mjs by a dynamic import inside main.
 test("ci-status's sparse hold config holds every module clear-escalations.mjs loads", async () => {
   const { readFileSync } = await import("node:fs");
   const { dirname, join, relative, resolve } = await import("node:path");

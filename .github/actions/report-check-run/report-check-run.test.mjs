@@ -114,8 +114,6 @@ test("a valid verdict POSTs one completed check run with the contract body", asy
   );
 });
 
-// A record shaped as docs/lane-outcome.md's rate-limit example, for the lane
-// this harness posts (pr-refine / simplify).
 const OUTCOME = {
   v: 1,
   lane: "pr-refine",
@@ -186,7 +184,6 @@ test("the record drops keys it does not know", async () => {
   assert.deepEqual(JSON.parse(output.text.slice("lane-outcome ".length)), { ...OUTCOME, activity: "simplify" });
 });
 
-// The env the retired key=value summary line was built from writes nothing now.
 test("the retired lane-* env writes no summary line and no text", async () => {
   const { calls } = await run({ ACT_OUTCOME: "failure", LANE_CLASS: "rate-limit", LANE_RESETS: "2026-10-17T15:30:00Z", LANE_TURNS: "3", LANE_MAX_TURNS: "30" });
   const { output } = calls[0].body;
@@ -482,8 +479,6 @@ test("an API error exits non-zero", async () => {
   assert.equal(calls.length, 1);
 });
 
-// A bad token's 403, with every header the annotation reads. retry-after
-// latches the rate guard, so the test hands main a latch of its own.
 const REFUSED_BODY = JSON.stringify({ message: "Bad credentials", documentation_url: "https://docs.github.com/rest", pad: "x".repeat(300) });
 const REFUSED_HEADERS = {
   "x-ratelimit-remaining": "4321",

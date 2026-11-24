@@ -33,9 +33,9 @@ canonical with a project-root fallback (see "Adapter resolution"). Direction loc
 
 ## Prerequisites
 
-- `jq` on PATH (all providers). Missing → exit `3` with an actionable message.
-- `gh` on PATH when the bound provider is `github` and the verb shells out. Missing →
-  exit `3`. `capabilities` is the one exception: it reads the adapter manifest and never
+- `jq` on PATH (all providers). When it is missing, the verb exits `3` with an actionable message.
+- `gh` on PATH when the bound provider is `github` and the verb shells out. When it is missing,
+  the verb exits `3`. `capabilities` is the one exception: it reads the adapter manifest and never
   invokes `gh`, so it answers without the binary.
 - `gh` ≥ **2.94** additionally for the paths that use the native sub-issue/dependency
   surface: the `--parent`, `--blocked-by`, `--add-blocked-by` flags and the `blockedBy`,
@@ -55,7 +55,7 @@ canonical with a project-root fallback (see "Adapter resolution"). Direction loc
 
 ### Degradation without `gh` (cloud / MCP-only sessions)
 
-Some execution environments have GitHub access but no `gh` binary: their GitHub surface is MCP
+Some execution environments have GitHub access but no `gh` binary, so their GitHub surface is MCP
 tools (model-plane, not shell-plane). Anthropic-hosted cloud sessions are not that case by
 default, since `gh` is in their
 [installed tools](https://code.claude.com/docs/en/cloud-environments#installed-tools), but their
@@ -193,14 +193,21 @@ value (named by file, key and value; the personal override when it set the value
 - Optional `docs` (either layer): a free-form self-describing pointer naming what the file
   is and where its contract lives, so the binding file explains itself to a teammate who
   finds it. `/work-items:setup` writes it by default; the seam never reads it.
-- Owner/repo are never recorded in the binding. They are derived at runtime by `gh`'s own
-  repository resolution for the working directory (`gh api repos/{owner}/{repo}`): `GH_REPO`
-  first, then the remote `gh repo set-default` recorded, then, with no default and no terminal,
-  the first remote in gh's order by remote name, which is not necessarily `origin`. In a fork
-  checkout (an `origin` fork beside an `upstream` remote), the repo therefore follows the gh
-  default, and a stock `gh repo clone` of a fork records `upstream`; `/work-items:setup check`
-  reports when the remotes name more than one repository. Verbs that need a repo context accept an
-  explicit `--repo <owner>/<repo>` override (conformance, cross-repo tooling). Pointer:
+- Owner/repo are never recorded in the binding. The GitHub adapter derives them at runtime with
+  its copy of the shared `target-repo.sh` (canonical `lib/target-repo.sh`), the resolver
+  `/source-control:pull-request` uses: `GH_REPO` first; then, when the remotes name two or more
+  GitHub repositories, the one you can push to whose parent is the recorded gh default or another
+  remote's repository (so a fork checkout targets the fork, even after a stock `gh repo clone`
+  recorded `upstream` as gh's default); then the remote `gh repo set-default` recorded; then the
+  one GitHub repository the remotes name. Remotes naming two or more GitHub repositories, none a
+  pushable fork of another, with no default recorded exit `3` with the
+  `gh repo set-default <owner>/<repo>` fix, instead of letting gh pick one by remote name. Creating
+  an item, with or without `--repo`, also exits `3` when GitHub reports you cannot push to the
+  repository, so someone else's repository never receives your items (skipped inside GitHub
+  Actions, where a lane's token may file issues without push access). Each
+  resolution prints `target repository: <owner>/<repo>` on stderr. `/work-items:setup check`
+  reports the same cases before any write. Verbs that need a repo context accept an explicit
+  `--repo <owner>/<repo>` override (conformance, cross-repo tooling). Pointer:
   [`gh repo set-default`](https://cli.github.com/manual/gh_repo_set-default); as of 2026-11-11
   (gh 2.103.3); recheck when a gh release changes how commands pick the base repository.
 - No binding found → exit `3` and stderr points here; the seam runs no inline wizard. The
@@ -399,7 +406,9 @@ assignee AND not a container (a container item is never its own frontier item, s
 "Containers and state") AND no label starting with the wayfind prefix (`config.wayfind_label_prefix`,
 default `wayfind:`; a wayfind map item belongs to
 `/planning:wayfind`, never to `/work-items:work`). With `--autonomous`, items labeled
-`needs-human` are additionally excluded, as are items carrying the **human-floor class**
+`needs-human` are additionally excluded, as are items carrying the `session-owned` role label
+(`config.role_labels["session-owned"]`, default `session-owned`), which a local session works itself,
+and items carrying the **human-floor class**
 label `provenance: untrusted` (C5) or the
 `provenance: signal` label, which are human-gated regardless of any other signal, and items carrying a hold label
 (`config.hold_labels`, default the `owner-decision` role label, `needs-reporter-info` and `needs-spec`),
@@ -811,8 +820,8 @@ the TTL.
 
 Reclaim (idempotent, run at session start, no scheduled sweep): when the latest lease is
 expired, check activity (non-lease comments since `renewed_at`; open cross-referenced
-PRs via the issue timeline). Activity → renew the lease in place, `reclaimed: false`.
-No activity → unassign **only the expired lease's `holder`** (a co-assignee added by a
+PRs via the issue timeline). With activity, renew the lease in place, `reclaimed: false`.
+With no activity, unassign **only the expired lease's `holder`** (a co-assignee added by a
 human or a concurrent claimer is left in place, because removing it would strip a live claim and
 leave the frontier treating the item as unassigned), supersede the lease, append an
 explanatory comment, `reclaimed: true`. Ownership is **revalidated immediately before the

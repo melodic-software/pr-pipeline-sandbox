@@ -22,7 +22,7 @@
 import { appendFileSync } from "node:fs";
 
 import { runAsScript } from "../lib/run-main.mjs";
-import { isFault } from "../../actions/check-trusted-trigger/check-trusted-trigger.mjs";
+import { isFault } from "../lib/github-client.mjs";
 import { rateLimitLatch } from "../../actions/log-api-budget/rate-guard.mjs";
 import { createGitHubApi, humanGatedLabelFrom, laneReader, need, positive, withLaneBinding } from "./address-feedback.mjs";
 import { prHold, reviewReader } from "./gate-source.mjs";
@@ -41,8 +41,6 @@ export async function main(env, { api, actions, log = (line) => console.log(line
     throw new Error("ACTIVITY is not an activity name");
   }
   const gateLabel = humanGatedLabelFrom(env.TRACKER_CONFIG || ".base/docs/conventions/work-items.yaml");
-  // The review lanes' hold comments count only when bound to their runs,
-  // read with ARTIFACT_READ_TOKEN (address-feedback.mjs withLaneBinding).
   const client = withLaneBinding(
     api ??
       createGitHubApi({
@@ -50,13 +48,10 @@ export async function main(env, { api, actions, log = (line) => console.log(line
         repository: env.GITHUB_REPOSITORY,
         apiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
         graphqlUrl: env.GITHUB_GRAPHQL_URL ?? "https://api.github.com/graphql",
-        // Each answer's rate-limit reading, for the job-end api-budget notice.
         fetch: rateLimitLatch.guard(globalThis.fetch),
       }),
     actions ?? laneReader(env),
   );
-  // prHold reads a failed review read as a person's hold; a fault there is
-  // kept here, so it holds the step instead.
   let fault = false;
   const readReviews = reviewReader(client, pr);
   let result;
