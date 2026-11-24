@@ -1,2 +1,8 @@
 [default.extend-identifiers]
 abd = "abd"
+
+[files]
+extend-exclude = [
+  # A recorded GitHub API response, byte-copied from claude-code-plugins.
+  ".github/scripts/lib/fixtures/standards-list-commits.json",
+]
