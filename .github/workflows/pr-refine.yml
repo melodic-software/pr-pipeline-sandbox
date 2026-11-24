@@ -138,6 +138,10 @@ jobs:
           path: .base
           persist-credentials: false
 
+      - name: Download standards
+        id: standards
+        uses: melodic-software/ci-workflows/.github/actions/download-standards@main
+
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
@@ -164,6 +168,7 @@ jobs:
           APP_SENDER_ID: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
           CONTEXT_FILE: ${{ runner.temp }}/ci-context/context.json
           BASE_PATH: .base
+          STANDARDS_DIR: ${{ steps.standards.outputs.path }}
         run: |
           mkdir -p "$RUNNER_TEMP/ci-context"
           node .base/.github/scripts/pr-unblock/fix-ci-context.mjs
