@@ -80,7 +80,7 @@ jobs:
       lane: code
       publish: comments
       allowed-bot-sender-ids: ${{ vars.AUTOMATION_LANES_APP_SENDER_ID }}
-      # The `human` entries of .github/standards/trusted-actors/trusted-actors.json.
+      # The `human` entries of https://github.com/melodic-software/standards/blob/main/components/trusted-actors/trusted-actors.json.
       allowed-author-ids: '153232337'
       docs-only-paths: ''
       # A hold adds this label and a `claude-lane-hold` marker comment; ci-status

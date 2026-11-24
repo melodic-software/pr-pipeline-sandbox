@@ -63,8 +63,6 @@ SYNCED=(
   # reads from the base; without it that step fails.
   .github/source-control-settings.json
   .github/standards/dependabot-policy
-  .github/standards/github-actions-conventions
-  .github/standards/trusted-actors
   .github/workflows/pr-dispatch-feedback.yml
   .github/workflows/pr-merge.yml
   .github/workflows/pr-run-activity-read.yml
