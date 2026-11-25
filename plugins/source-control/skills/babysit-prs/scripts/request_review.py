@@ -155,7 +155,6 @@ def existing_trigger(
     recognizer: re.Pattern[str],
     known_comment_ids: set[str] | None = None,
 ) -> dict[str, Any] | None:
-    """Return an exact trigger that durable state cannot already attribute."""
     comments = fetch_paginated_api(
         f"repos/{repo}/issues/{number}/comments?per_page=100", "PR issue comments"
     )
@@ -270,9 +269,6 @@ def record_attempt_problem(
 def run_locked(
     args: argparse.Namespace, state_dir: Path, state_path: Path
 ) -> dict[str, object]:
-    # Parse before the phrase check so a malformed --pr still refuses first,
-    # the same order as before the preamble moved into the helper. The helper
-    # parses again; both calls are pure.
     target_repo, _ = parse_repo_number(args.pr)
     config = build_trigger_config(args, target_repo)
     recognizer = trigger_regex(config.trigger_phrase)
@@ -343,9 +339,6 @@ def run_locked(
         repo, number, expected_head_sha, config, allowed_owners, review_trigger
     )
 
-    # `request_history` / `attempt_history` above are the ledger-merged maps
-    # already written back onto `review_trigger`, so re-reading them off it here
-    # would only re-copy the same entries.
     known_comment_ids = {
         str(entry.get("comment_id"))
         for entry in (*request_history.values(), *attempt_history.values())
@@ -389,8 +382,6 @@ def run_locked(
     state["updated_at"] = attempted_at
     write_state(state_path, state)
 
-    # Every post-attempt failure records against the same PR, state, and head
-    # pin; only the error text and the evidence differ.
     def record_problem(error: str, **evidence: dict[str, Any] | None) -> None:
         record_attempt_problem(
             state_path, state, key, pr_state, expected_head_sha, error, **evidence
@@ -456,10 +447,6 @@ def run_locked(
         error = f"unable to verify trigger uniqueness after posting: {exc}"
         record_problem(error, created_comment=comment)
         raise RuntimeError(error) from exc
-    # Scope to this head before flagging "unexpected" -- otherwise a stale
-    # earlier-head reaction still sitting on the PR (or on an older,
-    # already-attributed trigger comment) would abort an otherwise-clean
-    # post every time, the same staleness bug as the pre-POST guard above.
     unexpected_reactions = [
         signal
         for signal in resolve_associated_reactions(

@@ -306,7 +306,7 @@ jobs:
         run: |
           # dependabot[bot], melodic-release[bot] and
           # melodic-standards-sync[bot], as
-          # .github/standards/trusted-actors/trusted-actors.json lists them.
+          # https://github.com/melodic-software/standards/blob/main/components/trusted-actors/trusted-actors.json lists them.
           exempt_author_ids='49699333 337859524 300666570'
           # Each lane's status job names, `|`-separated: pr-review-cli.yml's
           # status job `Status` under the caller job's display name, the one the
@@ -588,7 +588,6 @@ jobs:
             /docs/conventions/pr-pipeline.yaml
             /docs/conventions/source-control.yaml
             /docs/conventions/work-items.yaml
-            /.github/standards/trusted-actors/trusted-actors.json
             /.github/scripts/pr-merge/merge-holds.mjs
           sparse-checkout-cone-mode: false
       - name: Fail a queued lanes App pull request on its pin, verifier or veto
