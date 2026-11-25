@@ -3,6 +3,40 @@
 All notable changes to the `source-control` plugin are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this plugin uses semantic versioning.
 
+## [13.21.1] - 2026-11-25
+
+### Fixed
+
+- The reviewer-media `redact.py` now redacts the whole value of a bare `sk-ant-oat02-` OAuth
+  token, the same way it redacts `sk-ant-oat01-`. Claude Code 2.1.332 lets
+  `CLAUDE_CODE_OAUTH_TOKEN` start with either prefix
+  ([#18984](https://github.com/melodic-software/claude-code-plugins/issues/18984)).
+
+## [13.21.0] - 2026-11-25
+
+### Changed
+
+- The babysit merge gate reads the Dependabot policy only from the repository `standards_repository` names in `docs/conventions/source-control.yaml`, never from the repository's `.github/standards/dependabot-policy/policy.json` copy. A repository that sets no `standards_repository` gets `dependabot-policy-unreadable`, so the lane merges no Dependabot update there until it names its standards repository.
+
+## [13.20.1] - 2026-11-25
+
+### Fixed
+
+- The pull-request skill's merge preflight (`merge-readiness.sh`) reads every page of a pull request's reviews, check runs and commit statuses (and of the changed files, branch rules, annotations and pr-verify artifacts it reads), not only the first 100 ([#18954](https://github.com/melodic-software/claude-code-plugins/issues/18954)). A change request in a later review, or a failed or pending check past the first 100, now holds the merge, and a list longer than 20 pages is `UNCHECKED`.
+
+## [13.20.0] - 2026-11-25
+
+### Added
+
+- `pull-request` monitor: the poll script's watch prints a `PR-VERIFY <pass|pass-notes|fail> <head-sha>` line once for each pr-verify verdict that lands at the PR's current head, read by exact artifact name only where the base branch holds `.github/workflows/pr-verify.yml`, and counted only when the run behind the artifact is pr-verify's own (the check `merge-readiness.sh` applies, now shared as `scripts/pr-verify-run.jq`); a FAIL line points at the `pr-verify-failed` label and the fail-note review threads. A re-arm snapshot carries the verdicts, so a re-armed watch does not report them again.
+- `pull-request` monitor and `status`: `monitor-poll.sh --verdict` reads the verdict at the head once and prints it, `PR-VERIFY none`, or `PR-VERIFY off`; the per-iteration checklist (B3) and the readiness verdict include it.
+
+## [13.19.1] - 2026-11-24
+
+### Fixed
+
+- The pr-verify evidence reader no longer refuses every pass that records no `trusted_actors_blob` once the repository's `.github/standards/trusted-actors/` copy is gone. Such a pass is now `verify:spec-changed` only when it did not start after the newest standards commit touching the trusted-actor list, as the pr-verify resolver (`resolve-pr.mjs` `specChanged`) judges it, so the gate and the resolver agree and an already-judged pull request no longer sticks.
+
 ## [13.19.0] - 2026-11-24
 
 ### Added

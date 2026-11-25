@@ -93,6 +93,8 @@ SYNCED=(
   scripts/check-affected.sh
   scripts/git-mv-rm.sh
   scripts/lib/checkout-path.sh
+  # check-affected.sh reads the standards org layer (lint configs) through it.
+  lib/org-standards.sh
   # The transcript metrics resolve-config's callers.test.mjs imports.
   scripts/lane-transcripts/store.mjs
 )

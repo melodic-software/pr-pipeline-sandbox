@@ -494,7 +494,7 @@ lanes:
       # In its own job of pr-merge.yml, with its own token.
       - activity: enable-auto-merge
   work-resolve-issue:
-    stage: work
+    stage: build
     slots:
       - activity: resolve-issue
       # Runs after resolve-issue, in its own job with its own token.
@@ -506,7 +506,7 @@ lanes:
           - resolve-issue
           - apply-issue-patch
   pr-unblock:
-    stage: unblock
+    stage: fix
     slots:
       - activity: resolve-conflicts
       # Runs after resolve-conflicts, in its own job with its own token: the
