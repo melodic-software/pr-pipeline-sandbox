@@ -150,7 +150,6 @@ def resolve_self_logins(self_csv: str | None, extra_self_csv: str | None) -> lis
 def resolve_scope_repos(
     args: argparse.Namespace, owners: frozenset[str]
 ) -> tuple[str, ...]:
-    """Validate --repo against the watched-owner set and the queue lease."""
     repo_arg = getattr(args, "repo", None)
     if not repo_arg:
         return ()
@@ -170,14 +169,6 @@ def resolve_scope_repos(
 
 
 def substantive_errors(errors: list[str]) -> list[str]:
-    """Errors that mark the sweep incomplete -- everything but advisory ones.
-
-    An advisory head-ref alias failure leaves every per-PR classification and
-    the persisted state intact, so it neither forces the tight cadence nor
-    holds back full-sweep advancement; only substantive errors (per-PR
-    hydration or discovery failures) do. The single source of truth for the
-    advisory predicate is ``babysit_delta.is_head_ref_alias_error``.
-    """
     return [message for message in errors if not delta.is_head_ref_alias_error(message)]
 
 
@@ -226,8 +217,6 @@ def build_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     for repo, number in targets:
         key = f"{repo}#{number}"
         try:
-            # An unreadable repository config leaves the PR unclassified (never
-            # merge-ready) and is recorded like a hydration failure.
             pr_config = repo_classify_config(config, args, repo)
             trigger_config = pr_config.review_trigger
             pr = gh.view_pr(repo, number)
@@ -298,10 +287,6 @@ def build_snapshot(args: argparse.Namespace) -> dict[str, Any]:
             prs, complete=not errors, errors=errors, previous_prs=previous_prs
         )
 
-    # Persistent-error quarantine: a PR that has errored several consecutive
-    # cycles stops forcing the cadence to "active" (its errors stay visible)
-    # until its quarantine TTL lapses -- one broken PR must not pin the whole
-    # queue at the tightest cadence forever.
     pr_errors, quarantined = state_store.update_error_quarantine(
         state.get("pr_errors"), pr_error_keys, generated_at
     )
