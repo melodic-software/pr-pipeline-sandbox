@@ -52,7 +52,6 @@ SYNCED=(
   # The source-control trust settings the synced workflows' drop-in step
   # reads from the base; without it that step fails.
   .github/source-control-settings.json
-  .github/standards/dependabot-policy
   .github/workflows/pr-dispatch-feedback.yml
   .github/workflows/pr-merge.yml
   .github/workflows/pr-run-activity-read.yml
@@ -128,8 +127,4 @@ ADAPTED=(
 )
 
 # "<path> <commit>": compared against that commit instead of the ref.
-PINNED=(
-  # Sync-manifest-managed files: check-managed-files refuses a hand edit, and
-  # standards-sync lands them.
-  ".github/standards/dependabot-policy/policy.json add8219a557d432d9f4dbd1cac98b0e8a2114b10"
-)
+PINNED=()
