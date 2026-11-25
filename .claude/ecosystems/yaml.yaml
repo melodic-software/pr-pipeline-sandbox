@@ -12,7 +12,9 @@ globs: [".github/**/*.yml", ".github/**/*.yaml"]
 project-discovery: []
 build-cmd: null
 test-cmd: null
-check-cmd: zizmor --persona=regular --offline -- .
+check-cmd: |
+  # standards' .github/zizmor.yml, as CI passes it: STANDARDS_DIR names a standards checkout, else the ghq root (ghq.root, default ~/ghq)
+  zizmor --persona=regular --offline --config "${STANDARDS_DIR:-$(git config --path --get ghq.root || printf '%s' "$HOME/ghq")/github.com/melodic-software/standards}/.github/zizmor.yml" -- .
 fix-cmd: null
 code-fix-cmd: null
 install-hint: |
@@ -20,4 +22,4 @@ install-hint: |
 tool-pin:
   zizmor: "1.32.0"
 gates: []
-notes: "Lint-only. check-cmd fails on any finding, as CI does. --offline is narrower than CI, which runs the online audits with the job token: a local run spends no GitHub API calls, and a finding only an online audit reports shows in CI and not here. zizmor reads .github/zizmor.yml, a copy of standards' zizmor component. No fix-cmd: most files are copies from claude-code-plugins, linted and tested there, and scripts/lanes/check-sync.sh requires the synced ones to stay byte-identical, which a fix-cmd would break."
+notes: "Lint-only. check-cmd fails on any finding, as CI does. --offline is narrower than CI, which runs the online audits with the job token: a local run spends no GitHub API calls, and a finding only an online audit reports shows in CI and not here. The repository keeps no zizmor config, so check-cmd and CI both read standards' .github/zizmor.yml; a finding this repository accepts is suppressed inline with `# zizmor: ignore[<audit>]`. No fix-cmd: most files are copies from claude-code-plugins, linted and tested there, and scripts/lanes/check-sync.sh requires the synced ones to stay byte-identical, which a fix-cmd would break."
