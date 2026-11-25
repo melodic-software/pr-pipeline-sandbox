@@ -75,34 +75,34 @@ differ() {
   fail=1
 }
 
-# "<mode> <blob>" of a path at a commit, or nothing.
-at_ref() {
-  git -C "$repo" ls-tree "$1" -- "$2" | awk '{print $1, $3}'
-}
-
-compare() {
-  local path=$1 commit=$2 want have mode
-  want=$(at_ref "$commit" "$path")
-  if [ ! -f "$root/$path" ]; then
-    [ -z "$want" ] || differ "$path is missing here"
-    return
-  fi
-  if [ -z "$want" ]; then
-    differ "$path is not at $commit"
-    return
-  fi
-  mode=$(git -C "$root" ls-files -s -- "$path" | awk '{print $1}')
-  [ -n "$mode" ] || mode=untracked
-  have="$mode $(git -C "$root" hash-object -- "$root/$path")"
-  [ "$have" = "$want" ] || differ "$path differs from $commit ($have, want $want)"
-}
-
 for path in "${!pinned[@]}"; do
   commit=${pinned[$path]}
   git -C "$repo" rev-parse -q --verify "$commit^{commit}" >/dev/null || commit=$(fetch "$commit")
   pinned[$path]=$commit
 done
 
+# Each lookup below is one git call over every path, not one per file.
+# at["<commit> <path>"]: "<mode> <object>" of the path at that commit.
+declare -A at staged hashed
+load_at() {
+  local commit=$1 entry meta
+  shift
+  while IFS= read -r -d '' entry; do
+    meta=${entry%%$'\t'*}
+    at["$commit ${entry#*$'\t'}"]="${meta%% *} ${meta##* }"
+  done < <(git -C "$repo" ls-tree -r -z "$commit" -- "$@")
+}
+load_at "$ref" "${SYNCED[@]}"
+for path in "${!pinned[@]}"; do load_at "${pinned[$path]}" "$path"; done
+
+# staged[<path>]: the index mode, one line per stage.
+while IFS= read -r -d '' entry; do
+  path=${entry#*$'\t'}
+  staged[$path]=${staged[$path]:+${staged[$path]}$'\n'}${entry%% *}
+done < <(git -C "$root" ls-files -s -z -- "${SYNCED[@]}")
+
+# Every path to compare, in SYNCED order, each group sorted.
+checks=()
 for synced in "${SYNCED[@]}"; do
   files=$({
     git -C "$repo" ls-tree -r --name-only "$ref" -- "$synced"
@@ -115,10 +115,45 @@ for synced in "${SYNCED[@]}"; do
     [ -n "$path" ] || continue
     [ -z "${adapted[$path]:-}" ] || continue
     left_out "$path" && continue
-    compare "$path" "${pinned[$path]:-$ref}"
+    checks+=("$path")
   done <<<"$files"
 done
 
+# hashed[<path>]: the working-tree file's blob, as hash-object computes it.
+hash=()
+for path in "${checks[@]}"; do
+  [ ! -f "$root/$path" ] || [ -n "${hashed[$path]+set}" ] || {
+    hashed[$path]=""
+    hash+=("$path")
+  }
+done
+if [ ${#hash[@]} -gt 0 ]; then
+  i=0
+  while IFS= read -r blob; do
+    hashed[${hash[$i]}]=$blob
+    i=$((i + 1))
+  done < <(printf '%s\n' "${hash[@]/#/$root/}" | git -C "$root" hash-object --stdin-paths)
+fi
+
+for path in "${checks[@]}"; do
+  commit=${pinned[$path]:-$ref}
+  if [ -n "${at["$commit $path"]+set}" ]; then
+    want=${at["$commit $path"]}
+  else
+    # Not a file at the commit: ask for the path itself, which may be a tree.
+    want=$(git -C "$repo" ls-tree "$commit" -- "$path" | awk '{print $1, $3}')
+  fi
+  if [ ! -f "$root/$path" ]; then
+    [ -z "$want" ] || differ "$path is missing here"
+    continue
+  fi
+  if [ -z "$want" ]; then
+    differ "$path is not at $commit"
+    continue
+  fi
+  have="${staged[$path]:-untracked} ${hashed[$path]}"
+  [ "$have" = "$want" ] || differ "$path differs from $commit ($have, want $want)"
+done
 
 if [ "$fail" = 0 ]; then
   echo "check-sync: every synced file matches claude-code-plugins $ref"
