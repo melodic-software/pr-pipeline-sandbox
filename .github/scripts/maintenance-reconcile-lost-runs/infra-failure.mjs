@@ -73,11 +73,9 @@ export const RERUN_DUE_MINUTES = INFRA_BACKOFF_MINUTES + 2 * RECONCILER_TICK_MIN
 // step) waits on nothing else, and neither does a run or field that cannot be
 // read.
 export function reconcilerOwns({ run, jobs }, now) {
-  // A run stuck in flight holds fix-ci off only inside the lookback.
   if (IN_FLIGHT.has(run?.status) && inLookback(run, now)) {
     return `run ${run.id} attempt ${run.run_attempt} is ${run.status}; its result decides`;
   }
-  // Every wait ends at RERUN_DUE_MINUTES: an unreadable time or attempt waits on nothing.
   const due = Date.parse(run?.updated_at) + RERUN_DUE_MINUTES * 60_000;
   if (!(now < due)) {
     return "";
@@ -116,6 +114,18 @@ export function stepsKnown(job) {
   }
   const gap = steps.findIndex((step, i) => step?.number != null && step.number !== i + 1);
   return gap === -1 || steps.slice(gap).every((step) => /^(Post |Complete job$)/.test(String(step?.name ?? "")));
+}
+
+export function setupFailed(job) {
+  const steps = job?.steps;
+  return (
+    job?.status === "completed" &&
+    job.conclusion === "failure" &&
+    Array.isArray(steps) &&
+    steps.length === 1 &&
+    steps[0]?.name === "Set up job" &&
+    steps[0].conclusion === "failure"
+  );
 }
 
 // A runner that dies cuts its job's list as the API can, so it is told apart
