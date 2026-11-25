@@ -26,13 +26,10 @@ SYNCED=(
   .github/actions/report-check-run
   .github/actions/request-lane-token
   .github/actions/resolve-config
-  .github/actions/scan-upload
   .github/actions/seal-lane-output
   .github/actions/select-trusted-text
-  .github/actions/setup-pinned-node
   .github/actions/setup-runner-isolation
   .github/actions/upload-fail-index
-  .github/actions/upload-lane-transcript
   .github/artifact-retention.json
   .github/lane-keys
   .github/scripts/apply-patch
@@ -56,7 +53,6 @@ SYNCED=(
   .github/scripts/maintenance-reconcile-lost-runs/component-status.mjs
   .github/scripts/maintenance-reconcile-lost-runs/infra-failure.mjs
   .github/scripts/pr-dispatch-feedback/rerun-ci-status.sh
-  .github/scripts/pr-review-main/split-diff.py
   .github/scripts/pr-review-main/write-verdict.mjs
   .github/scripts/recurring-schedule/file-due.mjs
   # The source-control trust settings the synced workflows' drop-in step
