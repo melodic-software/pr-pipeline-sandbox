@@ -6,7 +6,9 @@ Base-side line.
 ## Merging a full resync from claude-code-plugins
 
 This rule is for whoever merges a full resync PR, one that copies every
-`scripts/lanes/check-sync.sh` SYNCED path from claude-code-plugins. Lanes do not apply it.
+`scripts/lanes/sync-lists.sh` SYNCED path from claude-code-plugins. Lanes do not apply it.
+Produce the change with `scripts/lanes/resync.sh [<sha>] --repo <claude-code-plugins clone>`: it
+stages the copy, runs `check-sync.sh` and prints the condition 2 evidence; commit and push as usual.
 
 Admin-merge such a PR only when all three of these hold:
 
@@ -20,5 +22,5 @@ Admin-merge such a PR only when all three of these hold:
    repository's callers do not grant.
 
 Before merging, comment on the PR showing that all three hold: link the runs for conditions 1 and
-3, naming each review lane's failure class, and paste the `check-sync.sh` output for condition 2,
-which runs only locally.
+3, naming each review lane's failure class, and paste the evidence `resync.sh` printed (the
+`check-sync.sh` output) for condition 2, which runs only locally.
