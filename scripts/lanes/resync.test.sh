@@ -40,7 +40,7 @@ run_resync() {
   ERR=$(cat "$TMP/err")
 }
 
-U=$TMP/upstream C=$TMP/clone S=$TMP/sandbox
+U=$TMP/upstream C=$TMP/clone
 
 # Upstream: two commits. The second deletes sync/gone.txt and moves the
 # PINNED file on. Its .gitattributes would turn x.cmd's LF into CRLF on any
@@ -72,25 +72,29 @@ git clone -q "$U" "$C"
 # Sandbox: stale and extra files under the SYNCED paths, the adapted and
 # pinned files as this repository keeps them, and run.sh tracked without
 # its executable bit. core.fileMode false proves modes come from the ref.
-git init -q -b main "$S"
-g "$S" config core.fileMode false
-mkdir -p "$S/scripts/lanes"
-cp "$SCRIPT_DIR/check-sync.sh" "$SCRIPT_DIR/resync.sh" "$S/scripts/lanes/"
-cat >"$S/scripts/lanes/sync-lists.sh" <<EOF
+new_sandbox() {
+  S=$(mktemp -d "$TMP/sandbox.XXXXXX")
+  git init -q -b main "$S"
+  g "$S" config core.fileMode false
+  mkdir -p "$S/scripts/lanes"
+  cp "$SCRIPT_DIR/check-sync.sh" "$SCRIPT_DIR/resync.sh" "$S/scripts/lanes/"
+  cat >"$S/scripts/lanes/sync-lists.sh" <<EOF
 SYNCED=(sync single.json)
 LEFT_OUT=(sync/out)
 ADAPTED=(sync/mine.txt)
 PINNED=("sync/pin.txt $FIRST")
 EOF
-put "$S/sync/a.txt" 'stale a\n'
-put "$S/sync/run.sh" 'echo old run\n'
-put "$S/sync/old.txt" 'only here\n'
-put "$S/sync/mine.txt" 'sandbox version\n'
-put "$S/sync/pin.txt" 'pin v1\n'
-put "$S/unrelated.txt" 'not synced\n'
-g "$S" add -A
-g "$S" commit -q -m base
-BASE=$(g "$S" rev-parse HEAD)
+  put "$S/sync/a.txt" 'stale a\n'
+  put "$S/sync/run.sh" 'echo old run\n'
+  put "$S/sync/old.txt" 'only here\n'
+  put "$S/sync/mine.txt" 'sandbox version\n'
+  put "$S/sync/pin.txt" 'pin v1\n'
+  put "$S/unrelated.txt" 'not synced\n'
+  g "$S" add -A
+  g "$S" commit -q -m base
+  BASE=$(g "$S" rev-parse HEAD)
+}
+new_sandbox
 
 echo '# an older ref brings back what the ref holds'
 run_resync "$FIRST" --repo "$C"
@@ -143,6 +147,27 @@ check 'planted: exit 1' 1 "$RC"
 check 'planted: no evidence on stdout' '' "$OUT"
 check 'planted: the difference is named' 1 "$(grep -c '^check-sync: sync/a.txt differs from' <<<"$ERR")"
 check 'planted: the cause is named' 'resync: check-sync.sh reports a difference beyond PINNED' "$(tail -1 <<<"$ERR")"
+
+echo '# a bare --repo works'
+new_sandbox
+git clone -q --bare "$U" "$TMP/bare.git"
+run_resync "$SECOND" --repo "$TMP/bare.git"
+check 'bare repo: exit 0' 0 "$RC"
+check 'bare repo: content from the ref' 'upstream a, second commit' "$(cat "$S/sync/a.txt")"
+check 'bare repo: old.txt removed' '' "$(mode sync/old.txt)"
+
+echo '# a failed copy changes nothing'
+# A repository missing one blob of the ref: its trees list a.txt, so the
+# copy fails only when checking that blob out.
+new_sandbox
+git init -q --bare "$TMP/broken.git"
+git -C "$TMP/broken.git" fetch -q "$U" main
+blob=$(git -C "$U" rev-parse "$SECOND:sync/a.txt")
+rm "$TMP/broken.git/objects/${blob:0:2}/${blob:2}"
+run_resync "$SECOND" --repo "$TMP/broken.git"
+check 'failed copy: nonzero exit' yes "$( ((RC != 0)) && echo yes || echo no)"
+check 'failed copy: git status clean' '' "$(git -C "$S" status --porcelain)"
+check 'failed copy: old.txt still tracked' 100644 "$(mode sync/old.txt)"
 
 echo '# bad usage'
 run_resync no-such-ref --repo "$C"

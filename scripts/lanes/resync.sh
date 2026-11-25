@@ -96,20 +96,27 @@ while IFS= read -r -d '' path; do
   [ -n "${upstream[$path]:-}" ] || remove+=("$path")
 done < <(git --literal-pathspecs -C "$root" ls-files -z -- "${SYNCED[@]}")
 
+# Check the blobs out into a staging tree first, through a throwaway index and
+# work tree (so a bare --repo works), reading no gitattributes, so no eol or
+# filter rule rewrites a byte. Nothing here changes until that succeeds.
+stage=$tmp/stage
+mkdir "$stage"
+if [ ${#write[@]} -gt 0 ]; then
+  empty_tree=$(git -C "$repo" hash-object -t tree /dev/null)
+  GIT_INDEX_FILE=$tmp/index git -C "$repo" read-tree "$sha"
+  printf '%s\0' "${write[@]}" |
+    GIT_INDEX_FILE=$tmp/index git -C "$repo" --work-tree="$stage" --attr-source="$empty_tree" \
+      -c core.autocrlf=false -c core.symlinks=true \
+      checkout-index -f -z --stdin --prefix="$stage/"
+fi
+
 if [ ${#remove[@]} -gt 0 ]; then
   printf '%s\0' "${remove[@]}" |
     git --literal-pathspecs -C "$root" rm -q -f --pathspec-from-file=- --pathspec-file-nul
 fi
 
 if [ ${#write[@]} -gt 0 ]; then
-  # Check the blobs out through a throwaway index, reading no gitattributes, so
-  # no eol or filter rule rewrites a byte.
-  empty_tree=$(git -C "$repo" hash-object -t tree /dev/null)
-  GIT_INDEX_FILE=$tmp/index git -C "$repo" read-tree "$sha"
-  printf '%s\0' "${write[@]}" |
-    GIT_INDEX_FILE=$tmp/index git -C "$repo" --attr-source="$empty_tree" \
-      -c core.autocrlf=false -c core.symlinks=true \
-      checkout-index -f -z --stdin --prefix="$root/"
+  cp -a "$stage/." "$root/"
   printf '%s\0' "${write[@]}" |
     git --literal-pathspecs -C "$root" -c core.autocrlf=false \
       add -f --pathspec-from-file=- --pathspec-file-nul
