@@ -46,7 +46,8 @@ activities:
   # revokes, with one read of the PR. A script, no model.
   check-broker:
     script: scripts/lanes/check-broker.sh
-    effect: publish-artifact
+    # The narrowest effect it may hold: mutate-variable is publish-lane-level's alone.
+    effect: mutate-tracker
     gating: advisory
     reads-untrusted: false
   # The skill activities run a model, so they apply only to PRs that touch

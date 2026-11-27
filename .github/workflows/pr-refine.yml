@@ -107,7 +107,7 @@ jobs:
       dispatcher-run-id: ${{ inputs.dispatcher-run-id }}
 
   # azure-iac's broker re-verification cases 12 and 15 dispatch this: one mint at
-  # publish-artifact, the narrowest effect the broker mints, one API read with the
+  # mutate-tracker (issues write, everything else read), one API read with the
   # token, then the write reusable's revoke. No model runs.
   check-broker:
     name: Check Broker
