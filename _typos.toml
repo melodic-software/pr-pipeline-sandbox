@@ -1,3 +1,10 @@
+[files]
+extend-exclude = [
+  # Synced verbatim from claude-code-plugins (base64 fixture / vendored upstream gitleaks rules).
+  ".github/actions/check-signed-commits/fixtures/compare-paged.json",
+  "plugins/discovery/vendor/gitleaks/gitleaks-rules.json",
+]
+
 [default.extend-identifiers]
 abd = "abd"
 # A GitHub node_id (base64) in the synced fixture
