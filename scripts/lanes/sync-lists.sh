@@ -66,6 +66,7 @@ SYNCED=(
   # the base.
   .github/requirements-ci.txt
   .github/npm-fetch.npmrc
+  .node-version
   .python-version
   lib/publish-gate.mjs
   lib/test-tmp.mjs

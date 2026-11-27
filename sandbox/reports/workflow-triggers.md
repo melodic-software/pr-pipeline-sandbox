@@ -3,7 +3,6 @@
 | Workflow file | Triggers |
 | --- | --- |
 | maintenance-delete-stale-branches.yml | schedule, workflow_dispatch |
-| pr-check-managed-files-hosted.yml | pull_request |
 | pr-check-managed-files.yml | pull_request, merge_group |
 | pr-dispatch-feedback.yml | workflow_run |
 | pr-merge.yml | workflow_run, pull_request_target, workflow_dispatch, schedule |
