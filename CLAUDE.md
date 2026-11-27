@@ -7,6 +7,7 @@ Base-side line.
 
 This rule is for whoever merges a full resync PR, one that copies every
 `scripts/lanes/sync-lists.sh` SYNCED path from claude-code-plugins. Lanes do not apply it.
+Run resyncs on demand right before a sandbox probe needs updated lane files, not proactively.
 Produce the change with `scripts/lanes/resync.sh [<sha>] --repo <claude-code-plugins clone>`: it
 stages the copy, runs `check-sync.sh` and prints the condition 2 evidence; commit and push as usual.
 
