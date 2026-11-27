@@ -54,6 +54,20 @@ jobs:
           fi
           echo ".ci-force-red is absent."
 
+  check-spelling:
+    name: Check Spelling
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Spell-check
+        id: typos
+        uses: melodic-software/ci-workflows/.github/actions/typos@main
+        with:
+          exclude: plugins/*/vendor/gitleaks/gitleaks-rules.json plugins/*/skills/*/vendor/** plugins/*/tools/*/vendor/** sandbox/** probes/**
+
   pr-audit-workflows:
     name: PR Audit Workflows
     permissions:
@@ -74,7 +88,7 @@ jobs:
 
   ci-status:
     name: CI Status
-    needs: [check-force-red, pr-audit-workflows]
+    needs: [check-force-red, check-spelling, pr-audit-workflows]
     # !cancelled(), never a success guard: a failed gate must still run this
     # job so it turns red. A skipped required check reports success.
     if: ${{ !cancelled() }}
@@ -98,11 +112,13 @@ jobs:
       - name: Aggregate lane results
         env:
           FORCE_RED: ${{ needs.check-force-red.result }}
+          SPELLING: ${{ needs.check-spelling.result }}
           AUDIT_WORKFLOWS: ${{ needs.pr-audit-workflows.result }}
         run: |
           echo "check-force-red: $FORCE_RED"
+          echo "check-spelling: $SPELLING"
           echo "pr-audit-workflows: $AUDIT_WORKFLOWS"
-          [ "$FORCE_RED" = success ] && [ "$AUDIT_WORKFLOWS" = success ]
+          [ "$FORCE_RED" = success ] && [ "$SPELLING" = success ] && [ "$AUDIT_WORKFLOWS" = success ]
       # A DRAFT IS NOT REVIEWED. Both review lanes skip a draft, so the
       # review-lane step below skips it too; a draft cannot merge, and the
       # ready_for_review run checks the lanes.
