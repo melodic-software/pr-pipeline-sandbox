@@ -3,6 +3,100 @@
 All notable changes to the `work-items` plugin are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this plugin uses semantic versioning.
 
+## [16.2.6] - 2026-11-27
+
+### Fixed
+
+- `/work-items:triage --ci` follows the repository's form for quoting a recorded decision to the letter, when the repository's rules give one, instead of paraphrasing the decision inline or dropping its first line or link.
+
+## [16.2.5] - 2026-11-27
+
+### Fixed
+
+- `/work-items:triage --ci` quotes a recorded decision and treats what it answers as settled before it looks for what the decision leaves open. A step the decision reserves to a person is stated after the quote with `needs-human`, not listed as an open question, and a point the decision answers is never asked again, even as a recommendation.
+
+## [16.2.4] - 2026-11-27
+
+### Fixed
+
+- `/work-items:triage --ci` reads what a recorded decision opens, not only what it settles. A step the decision reserves to a person (the author runs or approves something first) takes `needs-human` with `needs_human` false, even where a rule says a done-when item a lane run cannot do needs no person. A term the decision adds that leaves a set or value undefined becomes a new open question with a `RECOMMENDED:` answer, never a choice the run makes itself.
+- `/work-items:triage --ci` searches only its checkout and reads the plugin's own files by the paths `ci-mode.md` names, never searching the plugin root or a folder above it, which a lane or eval run may not be granted.
+
+## [16.2.3] - 2026-11-27
+
+### Fixed
+
+- `/work-items:triage --ci` acted on no recorded decision: it cannot make the write-access read the attended steps ask before a comment counts, so it held every `**Decision recorded.**` comment as unverified. CI mode now takes a comment in `issue.json` as passing that test when the repository's `## Triage rules` state that the lane keeps only trusted authors' comments; without that statement every comment stays a claim to verify.
+
+## [16.2.2] - 2026-11-26
+
+### Changed
+
+- Comments outside the necessary posture are removed from this plugin's shared library copies, synced from their canonical sources; no behavior change.
+
+## [16.2.1] - 2026-11-26
+
+### Added
+
+- Ten `tr-ci-*` eval cases grade `/work-items:triage --issue <n> --ci` verdicts on intake issues, first triage and re-entry after a `**Decision recorded.**` comment: labels, `needs_human`, the `Flags:` line, `Blast radius:` and `Reversible:` lines, `RECOMMENDED:` open questions, and, on re-entry, the verbatim quote and link of the decision. They replace the retired intake reentry-eval harness's cases. The shared fixture gains a `ci-intake` mode.
+
+### Fixed
+
+- The triage skill's triage-comment section points at CI mode's comment lines and the repository's `## Triage rules` as the source of the intake lane's lines, in place of `.github/scripts/intake-triage/triage-rubric.txt`, a file that is gone.
+- The `tr-ci-issue-number-mismatch-stops` eval case grades the reply for no verdict object, since CI mode returns its verdict as structured output, not a `triage-verdict.json` file.
+
+## [16.2.0] - 2026-11-26
+
+### Added
+
+- `/work-items:morning-brief` has an Agent-decided section: each issue labeled `agent-decided`
+  since this machine's previous brief, by the labeled event's time, with its number, title and a
+  link to the lanes App's newest `**Agent decision recorded.**` comment, or a note when that
+  comment is missing. It says that a `**Decision recorded.**` comment from the owner sends the
+  issue back to triage. Its window stamp, `agent_decided_at`, sits beside `landed_at` under the
+  plugin data dir and moves only after a full read; a first read covers the last day. The section
+  only reads the tracker, and a test fails if it makes any call beyond its read searches. The
+  brief now has 11 sections, so the header's unreadable count reads `N of 11`.
+
+## [16.1.0] - 2026-11-26
+
+### Changed
+
+- Shared `view-builder.mjs` and `html-escape.mjs` synced: an interactive page's policy adds `img-src data:` and `font-src data:`, and both validator profiles admit a base64 `data:` URL in two places only, a PNG or JPEG as the `.rv-logo` rule's one `background-image`, and a WOFF2, WOFF, TTF or OTF font inside `@font-face`. Every other `url(`, scheme and URL-bearing attribute is still refused. Pages built today look the same; no other change to this plugin.
+
+## [16.0.0] - 2026-11-26
+
+### Changed
+
+- **The shared view resolver takes `--producer`, not `--lane`.** "Lane" now means only a worker
+  that serves one pipeline stage, so a skill or plugin registered with the resolver is a producer:
+  run `view-settings.mjs resolve --producer <id>` (`--lane` is gone, with no alias). The registry
+  exports `PRODUCERS` and `producerOf`, `resolveMedium` takes `producer`, and the view builder's
+  `render` takes a producer id.
+
+## [15.17.1] - 2026-11-26
+
+### Changed
+
+- Shared library copies synced with comments removed; no behavior change.
+
+## [15.17.0] - 2026-11-25
+
+### Added
+
+- `skills/triage/schemas/ci-verdict.schema.json`: the one shape of a `/work-items:triage --ci` verdict, with an optional `type` (the issue's Issue Type). A lane passes it as the run's output schema, narrowing the dimension keys and the type to enums, and `check-ci-verdict.mjs` reads it, so the shape is defined once.
+- `check-ci-verdict.mjs --schema <path>` holds a verdict to a runner's narrowed copy of that schema; a `type` on a copy that leaves `type` out is reported as an unknown field.
+
+### Changed
+
+- `/work-items:triage --issue <n> --ci` returns its verdict as structured output and runs no script: the lane checks it with `check-ci-verdict.mjs` and `set-dimensions.sh --dry-run`. The run reads the open-issue and merged-pull-request lists from `issue.json` for its duplicate and blocker checks, and the repository's `## Triage rules` in `docs/conventions/work-items.md` when present.
+
+- Shared `yaml-subset.awk`, `host.html` and `frames.css` synced where this plugin carries them (comment-only removal); no other change to this plugin.
+
+### Fixed
+
+- The morning brief's owner-touches section reads a pr-unblock escalation's lane code from its `- Lane code:` line as well as the `- Reason:` line, so a hold comment in the new shape no longer counts as `unspecified`.
+
 ## [15.16.0] - 2026-11-25
 
 ### Added
@@ -3834,7 +3928,7 @@ Internal simplification, no behavior change.
 - **`reference/permission-preflight.md` cited the `work` skill by an unresolvable path.** The Step 0
   pointer for the `reclaim` classifier-denial mitigation read `skills/work/SKILL.md`, whose implied
   base is the plugin root while its real base is `reference/`, the defect class
-  [ADR 0018](../../docs/adr/0018-treat-the-plugin-as-the-encapsulation-boundary-for-skill-citation.md)'s
+  retired ADR 0018 (treat the plugin as the encapsulation boundary for skill citation)'s
   correction 1 names. It now reads `${CLAUDE_PLUGIN_ROOT}/skills/work/SKILL.md`, the form the same
   file already uses for `preflight.sh`. Intra-plugin citation, legal under clause 1; clause 3 only,
   so the target is unchanged and no routing moves.

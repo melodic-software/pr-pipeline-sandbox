@@ -1,12 +1,4 @@
 // test-scope: plugins/source-control/.claude-plugin/plugin.json
-// Expected values come from the native-merge plan's arm-merge item and the
-// owner answers on it: a lanes App pull request is armed for native auto-merge (squash, at the head
-// read) with no session, and is never armed, or is disarmed, while it carries
-// a `Hold:` line, do-not-merge or the human-gated label. Its issue link is
-// the gate's own rule (docs/conventions/pr-pipeline/README.md, "Eligibility":
-// one closing issue, or one plain `Refs: #<n>` issue), read through the gate's
-// Python, as is the body hold, babysit_merge_policy.BODY_MERGE_HOLD_RE, so
-// the parity tests read their verdicts from Python.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -137,7 +129,7 @@ const COST_COMMENT = {
   issue_url: `https://api.github.com/repos/${REPO}/issues/1040`,
   user: { login: "kyle-sexton", id: 5, type: "User" },
   performed_via_github_app: null,
-  body: '**Decision recorded.** Cost: approve it for #40.\nRow: https://github.com/melodic-software/architecture/blob/main/docs/owner-decisions.md#L10\nOwner, verbatim: "Approve it."',
+  body: '**Decision recorded.** Cost: approve it for #40.\nOwner, verbatim: "Approve it."',
   node_id: "IC_7",
   created_at: "2026-10-22T12:00:00Z",
 };
@@ -462,9 +454,6 @@ test("a refusal a person must clear, a cost path or a configured denied path, is
   ]);
 });
 
-// GitHub Support's audit item 2: the discussion read lists the changed files
-// too, so a head whose files fit one page and include no rename (whose old
-// path only the REST listing names) reads no files page.
 const filesPages = (calls) => calls.filter(({ path }) => /\/pulls\/[0-9]+\/files\?/.test(path)).length;
 test("the discussion read's file list stands in for the files page, unless a rename or a cut list needs it", async () => {
   const listed = (...nodes) => ({ totalCount: nodes.length, nodes });
@@ -493,12 +482,6 @@ test("an enforcement floor path the gate holds for its security review is a lane
   assert.deepEqual(notes, [{ method: "POST", path: `${ISSUES}/1/comments`, body: { body: laneNote(wrapped.join("\n")) } }]);
 });
 
-// #10908: a `review-path:` hold whose security findings the lanes App
-// resolved clears only on a clean whole review of the head, and under
-// merge.lane-prs native the merge gate, which requests one for its own
-// candidates, never lists a lanes App pull request. The run makes the gate's
-// request (babysit_whole_review.py): its record line goes in the lane's
-// comment first, then the draft toggle starts the whole review.
 const PATH_HOLD = "review-path:.github/scripts/pr-unblock/gate-source.mjs: .github/scripts/pr-unblock/gate-source.mjs; a clean claude-security-review bound to this head clears it";
 const PATH_REASON = `pr-merge's gate holds it on its risk score (${PATH_HOLD})`;
 const PATH_NOTE = [
@@ -667,13 +650,14 @@ test("a floor path no configured glob names is commented on and labeled human-ga
     ".github/scripts/pr-merge/gate-check.mjs",
     ".github/scripts/pr-merge/who.mjs",
     "plugins/source-control/skills/babysit-prs/scripts/babysit_merge.py",
+    "plugins/source-control/skills/babysit-prs/scripts/babysit_verify_evidence.py",
     "docs/conventions/pr-pipeline.yaml",
     ".github/workflows/pr-merge.yml",
     ".github/workflows/pr-require-checks.yml",
   ];
   const { code, writes, notes } = await run([
     ...floor.map((filename, index) => pull(index + 1, { files: [{ filename }] })),
-    pull(98, { files: [{ filename: "plugins/source-control/skills/babysit-prs/scripts/babysit_verify_evidence.py" }] }),
+    pull(98, { files: [{ filename: "plugins/source-control/skills/babysit-prs/scripts/babysit_whole_review.py" }] }),
     pull(99, { files: [{ filename: ".github/scripts/pr-unblock/other.mjs" }] }),
   ]);
   assert.equal(code, 0);
@@ -762,13 +746,15 @@ test("a refusal a lane clears is commented on, with no label", async () => {
   assert.deepEqual(notes, [{ method: "POST", path: `${ISSUES}/1/comments`, body: { body: laneNote(MISSING_REASON) } }]);
 });
 
-test("a listing past the page cap is a person's refusal; one that did not read is a lane's; neither arms", async () => {
-  const exactly = Array.from({ length: 300 }, (_, index) => ({ filename: `docs/${index}.md` }));
-  const full = await run([pull(1, { files: exactly })]);
-  assert.deepEqual(full.writes, [{ mutation: "arm", id: "PR_1", head: HEAD }]);
-  assert.deepEqual(full.notes, []);
-  const files = Array.from({ length: 301 }, (_, index) => ({ filename: `docs/${index}.md` }));
-  const { code, notes, writes } = await run([pull(1, { files })]);
+test("a listing at GitHub's 3000-file cap is a person's refusal; one that did not read is a lane's; neither arms", async () => {
+  const docs = (length) => Array.from({ length }, (_, index) => ({ filename: `docs/${index}.md` }));
+  for (const length of [301, 2999]) {
+    const under = await run([pull(1, { files: docs(length) })]);
+    assert.deepEqual(under.writes, [{ mutation: "arm", id: "PR_1", head: HEAD }], `${length} files are all listed, so the head arms`);
+    assert.deepEqual(under.notes, [], `${length} files leave no refusal note`);
+  }
+  const { code, notes, writes, calls } = await run([pull(1, { files: docs(3000) })]);
+  assert.equal(filesPages(calls), 30, "3000 files read as 30 pages and no 31st, which GitHub never fills");
   assert.equal(code, 0);
   assert.deepEqual(writes, []);
   assert.deepEqual(notes, [
@@ -919,9 +905,6 @@ test("a changed refusal edits the one comment instead of posting another", async
   assert.deepEqual(notes, [{ method: "PATCH", path: `${ISSUES}/comments/77`, body: { body: laneNote(MISSING_REASON) } }]);
 });
 
-// #10224: the owner lifted a hold path, and the next run re-labeled it for a
-// risk-score cost hold that had stood all along behind the first. Every
-// reason a person clears goes in one refusal, so one lift answers them all.
 const RISK = "cost-review-required: infra/main.tf changes a cost path";
 const RISK_REASON = `pr-merge's gate holds it on its risk score (${RISK})`;
 const RISK_HELD = { refusal: null, head: HEAD, ineligible: null, reviews: RISK, reviewsPerson: true, queue: UNEJECTED };
@@ -1050,7 +1033,6 @@ test("a risk hold is a person's only for a security finding, a trusted-actor wid
   };
   const risk = (reviews) => ({ refusal: null, needsHuman: false, head: HEAD, ineligible: null, reviews, reviewsPerson: answer(reviews) });
   const holding = (reviews) => `pr-merge's gate holds it on its risk score (${reviews})`;
-  // A high path is the lanes' (owner decision 2026-10-30, #11020).
   const lane = [
     "evidence-unbound:claude-review: no-marker",
     "manifest-review-required: plugins/a/.claude-plugin/plugin.json: hooks",
@@ -1127,12 +1109,6 @@ test("a lane's refusal over a person's comment still edits it, with no label", (
   assert.deepEqual(writes, { body: laneNote(MISSING_REASON), commentId: 77, label: null });
 });
 
-// Wrapped refusal reasons. GitHub scrolls a code-block line wider than the
-// page, so each reason line is broken at a space to 100 columns, its
-// continuations indented two spaces, and more than 20 lines fold into
-// <details>; the head line stays whole for the readers that take the head
-// from it. LONG_RISK's ";" is its 99th column, so the cut falls right after
-// "; " (hand-counted: the risk prefix is 44 columns, then 17 + 37 + 1).
 const LONG_RISK = `pr-merge's gate holds it on its risk score (evidence-unbound:${"a".repeat(37)}; files-incomplete)`;
 const LONG_RISK_WRAPPED = [`pr-merge's gate holds it on its risk score (evidence-unbound:${"a".repeat(37)};`, "  files-incomplete)"];
 const LONG_PATH = `docs/${"p".repeat(115)}.md`;
@@ -1366,9 +1342,6 @@ test("an armed pull request that now holds is disarmed", async () => {
   ]);
 });
 
-// GitHub checks expectedHeadOid only when the arm is made, and a push by an
-// account with write access leaves the arm on: an arm whose newest pin names
-// another head, or was edited, judged a head the pull request no longer has.
 test("an armed pull request whose head moved off its newest pin is disarmed before any verifier read", async () => {
   const armed = { enabledAt: "2026-10-23T10:00:00Z" };
   const older = { ...lanesSaid(`${pinLine("C2")}\nArmed.`), lastEditedAt: null };
@@ -1466,12 +1439,8 @@ test("a pin whose arm fails on a moved head does not say auto-merge was armed", 
   assert.doesNotMatch(pins[0].body, /\barmed\b/i);
 });
 
-// undici's shape for a dropped socket: a "fetch failed" TypeError whose cause
-// carries the code and the socket's message.
 const reset = () => new TypeError("fetch failed", { cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }) });
 
-// The socket GitHub closed while the connection sat idle: undici's
-// UND_ERR_SOCKET "other side closed".
 const closed = () => new TypeError("fetch failed", { cause: Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" }) });
 
 test("an arm that fails on the network is sent again after a capped wait and arms", async () => {
@@ -1557,8 +1526,6 @@ test("each network trigger alone is sent again, and an error with another code i
 });
 
 test("an arm GitHub answers with a rate limit is never sent again", async () => {
-  // GitHub answers a primary or secondary limit with 403 or 429; sending more
-  // while limited risks the integration's ban.
   for (const status of [403, 429]) {
     const { code, writes, slept } = await run([pull(1)], {}, { armErrors: { PR_1: [new GitHubError(status, "POST /graphql")] } });
     assert.equal(code, 1);
@@ -1881,7 +1848,6 @@ test("a person's later enable or merge-queue add clears their auto-merge disable
   assert.deepEqual(AUTO_MERGE_TYPES, ["AutoMergeDisabledEvent", "AutoMergeEnabledEvent", "AddedToMergeQueueEvent"]);
   assert.equal(decided([autoMergeEvent("AutoMergeEnabledEvent", "kyle-sexton"), off]).reason, "a person turned its auto-merge off");
   assert.equal(decided([off, autoMergeEvent("AutoMergeEnabledEvent", "kyle-sexton")]).action, "arm");
-  // #14799: queued by a person, then removed by the queue on failed checks.
   assert.equal(decided([off, autoMergeEvent("AddedToMergeQueueEvent", "kyle-sexton"), autoMergeEvent("RemovedFromMergeQueueEvent", "github-merge-queue", "Bot")]).action, "arm");
   assert.equal(decided([autoMergeEvent("AutoMergeDisabledEvent", "melodic-automation-lanes", "Bot")]).action, "arm");
 });
@@ -1910,7 +1876,7 @@ test("a pull request whose head now changes a hold path is not armed, or is disa
       autoMergeRequest: {},
       files: [{ filename: "plugins/a/README.md" }, { filename: "docs/a.md", previous_filename: ".github/standards/trusted-actors/trusted-actors.json" }],
     }),
-    pull(3, { files: Array.from({ length: 301 }, (_, index) => ({ filename: `docs/${index}.md` })) }),
+    pull(3, { files: Array.from({ length: 3000 }, (_, index) => ({ filename: `docs/${index}.md` })) }),
     pull(4, { files: [{ filename: "docs/held.md" }] }),
     pull(5),
     pull(6, { files: [{ filename: ".github/workflows/x.yml" }, { filename: ".github/scripts/pr-unblock/other.mjs" }] }),
@@ -1965,10 +1931,6 @@ test("a hold path stays held without a trusted approval of the head", async () =
   assert.deepEqual(writes, [{ mutation: "disarm", id: "PR_55" }]);
 });
 
-// The churn measured on #10224: Kyle approved OLD, then a lane merged the
-// base. The approval carries to the merge, so it arms and is not labeled
-// again; a merge that also edits the hold path is sent back to a person, and
-// a label removal alone lifts nothing (the owner's decision on #10596).
 test("an approval before a base merge, or its stale dismissal, lifts the hold path at the merge, and an evil merge, a dismissal with a message or a label removal does not", async () => {
   const OLD = "a".repeat(40);
   const MAIN = "5".repeat(40);
@@ -2009,9 +1971,6 @@ test("an approval before a base merge, or its stale dismissal, lifts the hold pa
   };
   const removed = await run([pull(62, { headRefName: "fix/held-62", files: HELD, rest: removal })], trustedKyle());
   assert.deepEqual(removed.writes, []);
-  // The owner's decision of 2026-10-28: the approval GitHub dismissed as
-  // stale on the merge's push (a Bot's dismissal with no message, by the
-  // pushed head) still carries; one dismissed with a message does not.
   const dismissedEvent = (message) => ({
     event: "review_dismissed",
     actor: { login: "lanes[bot]", type: "Bot" },
@@ -2821,6 +2780,16 @@ test("at merge.max-in-flight nothing more is armed, counting armed pull requests
   );
 });
 
+test("an unread trusted-actor list still counts an armed, unqueued person's pull request toward merge.max-in-flight", async () => {
+  const person = { __typename: "User", login: "kyle-sexton", databaseId: 153232337 };
+  const unread = { TRUSTED_ACTORS: "/nonexistent/actors.json" };
+  const result = await run([pull(1), pull(2, { author: person, autoMergeRequest: { enabledAt: "2026-10-23T10:00:00Z" } })], unread, {}, { ...ROOM, count: 4, cap: 5 });
+  assert.deepEqual(result.writes, [], "a lanes App pull request is armed past the cap");
+  assert.ok(result.lines.some((line) => /#1 left: merge\.max-in-flight is 5 and 5 merges are in flight/.test(line)), result.lines.join("\n"));
+  const roomy = await run([pull(1), pull(2, { author: person, autoMergeRequest: { enabledAt: "2026-10-23T10:00:00Z" } })], unread, {}, { ...ROOM, count: 3, cap: 5 });
+  assert.deepEqual(roomy.writes, [{ mutation: "arm", id: "PR_1", head: HEAD }], "a free slot arms the lanes App pull request");
+});
+
 test("a room that cannot be read arms nothing and disarms every armed lane pull request", async () => {
   const armed = { enabledAt: "2026-10-23T10:00:00Z" };
   const pulls = [pull(1), pull(2, { autoMergeRequest: armed }), pull(3, { author: { __typename: "User", login: "kyle-sexton" }, autoMergeRequest: armed })];
@@ -3522,10 +3491,6 @@ test("review rounds stopped as not converging at the head close the pull request
   assert.equal(notConverging({ unblockStops: stopped, comments: { nodes: [lanesSaid(stoppedNote())] } }, LANES.login, HEAD), true);
 });
 
-// feedback-stood-open: the finding stood at adjudication and the lane left it
-// open again, so no lane run clears it. It is code work, not a person's stop:
-// the refusal names the reason and the owning session, with no label (#14539,
-// 11:50:40Z).
 test("review rounds stopped as stood-open at the head refuse for the owning session, with no label, and close nothing", async () => {
   const stopped = [unblock("pr-unblock/address-feedback", "failure")];
   const reason = [
@@ -3760,12 +3725,6 @@ test("with path holds off, a standing risk refusal naming only path holds comes 
   }
 });
 
-// GitHub Support's audit item 2, as babysit_merge_skip.py keys the merge
-// gate's skip: an unarmed lanes App pull request whose last reader run left it
-// on a lane's risk hold or a pr-unblock stop, with nothing written, is left on
-// that refusal with no read while its head, update time, labels, check and
-// status rollup and main's code all match. A check or status does not change
-// `updatedAt`, so the rollup is in the key on its own.
 const LANE_RISK = "lines-over: 900 changed lines, over the 800 cap";
 const LANE_RISK_REASON = `pr-merge's gate holds it on its risk score (${LANE_RISK})`;
 const LANE_RISK_HELD = { refusal: null, needsHuman: false, head: HEAD, ineligible: null, reviews: LANE_RISK, reviewsPerson: false, queue: UNEJECTED };
@@ -4018,10 +3977,6 @@ test("a refusal that adds no label reads no queue entry", async () => {
   assert.deepEqual(queueReads(calls), []);
 });
 
-// Owner decision Q3 on #12446: explicit vetoes keep `do-not-merge`. A member's
-// veto comment on a lanes App pull request gets the label, then the lane's
-// VETO_MARKER comment; the label comes off once no member's veto stands, only
-// while it is the lane's own for a veto (vetoLabelOwned).
 const VETO_AT = "2026-10-23T09:00:00Z";
 const LABELED_AT = "2026-10-23T09:30:00Z";
 const NOTED_AT = "2026-10-23T09:30:02Z";

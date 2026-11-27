@@ -163,7 +163,7 @@ test("the base config's adoption section lets fix-ci adopt an idle owner PR", as
   assert.doesNotMatch(without, /^adoption:/m);
   assert.deepEqual(await run(without, [owner]), { code: 0, dispatched: ["40"] });
   const noIdle = LIVE.replace(/^ {2}idle-hours: 2\n/m, "");
-  assert.match(noIdle, /^adoption:\n {2}#/m);
+  assert.match(noIdle, /^adoption:\n {2}spec-from-body-apps:/m);
   assert.deepEqual(await run(noIdle, [owner, release]), { code: 0, dispatched: ["40"] });
 });
 
@@ -222,7 +222,6 @@ test("the base config's limits.fix-docs-per-run turns a PR event's fix-docs on o
     changedFiles: 1,
     additions: lines,
     deletions: 0,
-    // The lane run's one API commit, as GraphQL lists one.
     commits: {
       totalCount: 1,
       nodes: [

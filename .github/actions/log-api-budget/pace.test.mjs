@@ -159,8 +159,6 @@ test("a previous scheduled run that did not finish its work, or none, keeps the 
   assert.match(unnamed.lines[0], /this tick runs: no PACE_WORK_STEP names this lane's work$/);
 });
 
-// The previous run is the highest id below this one, whatever created_at
-// says: on 2026-11-01 runs were stamped an hour ahead (rotation.mjs runOrder).
 test("the previous scheduled run is found by run id, not by its creation time", async () => {
   const skewed = [
     { id: 8, created_at: minutesAgo(-60) },
@@ -338,4 +336,14 @@ test("pr-merge reads the pacer in dispatch-post-merge-runs and skips only the sw
   for (const job of ["merge", "enable-auto-merge"]) {
     assert.doesNotMatch(jobOf(file, job), /steps\.pace\./, `${job} reads no pacer of its own`);
   }
+});
+
+test("an override of pace-pr-merge never reaches the pacer: that share is read from rate-limits.json alone", async () => {
+  const resolved = join(tempDir("pace-override-"), "resolved.json");
+  writeFileSync(resolved, JSON.stringify({ limits: { api: { "github-token": { "pace-pr-merge": 0.9 } } } }));
+  const headers = { "x-ratelimit-limit": "5000", "x-ratelimit-remaining": "4000", "x-ratelimit-reset": String(NOW + 1800) };
+  const fetchImpl = async () => new Response(JSON.stringify({ workflow_runs: PAIR }), { headers });
+  const got = await run({ RESOLVED_CONFIG: resolved, GITHUB_WORKFLOW_REF: "o/r/.github/workflows/pr-merge.yml@refs/heads/main" }, fetchImpl);
+  assert.equal(got.output, "paced=false\n");
+  assert.match(got.lines[0], /projected=0\.6 pace=0\.3 paced=false/);
 });
