@@ -44,6 +44,13 @@ activities:
     reads-untrusted: false
   # The skill activities run a model, so they apply only to PRs that touch
   # their fixtures.
+  # azure-iac cases 12 and 15: proves the broker mints and the write reusable
+  # revokes, with one read of the PR. A script, no model.
+  broker-probe:
+    script: scripts/lanes/probe-broker.sh
+    effect: publish-artifact
+    gating: advisory
+    reads-untrusted: false
   fix-marker:
     skill: sandbox-marker:fix-marker
     # A skill runs with no write token: its edit leaves as a patch that
@@ -562,6 +569,7 @@ lanes:
     stage: refine
     slots:
       - activity: fix-marker
+      - activity: broker-probe
       # Sandbox-only probe of fix-ci's subscription fallback (claude-code-
       # plugins Phase 5b, probe P2): pr-refine.yml's fix-ci-fallback dispatch
       # passes an unset key. A new lane would need a lane-rules.json row, which
