@@ -20,11 +20,11 @@ on:
         description: >-
           refine runs nothing; fix-marker runs the fix-marker probe; fix-ci-fallback runs only
           the Phase 5b fallback probe below; fix-docs runs main's fix-docs, and
-          fix-docs-no-key runs it with an empty key (Phase 7.1 probes); broker-probe mints and
+          fix-docs-no-key runs it with an empty key (Phase 7.1 probes); check-broker mints and
           revokes one broker token and runs no model (azure-iac cases 12 and 15).
         required: false
         type: choice
-        options: [refine, fix-marker, fix-ci-fallback, fix-docs, fix-docs-no-key, broker-probe]
+        options: [refine, fix-marker, fix-ci-fallback, fix-docs, fix-docs-no-key, check-broker]
         default: refine
       dispatcher-run-id:
         description: The dispatcher run that sent this dispatch; empty for a human dispatch.
@@ -109,9 +109,9 @@ jobs:
   # azure-iac's broker re-verification cases 12 and 15 dispatch this: one mint at
   # publish-artifact, the narrowest effect the broker mints, one API read with the
   # token, then the write reusable's revoke. No model runs.
-  broker-probe:
-    name: Broker Probe
-    if: github.event_name == 'workflow_dispatch' && inputs.activity == 'broker-probe'
+  check-broker:
+    name: Check Broker
+    if: github.event_name == 'workflow_dispatch' && inputs.activity == 'check-broker'
     permissions:
       actions: read # the write runner's run job reads the review lanes' comment records
       contents: read
@@ -126,7 +126,7 @@ jobs:
     with:
       role: automations
       lane: pr-refine
-      activity: broker-probe
+      activity: check-broker
       pr-number: ${{ inputs.pr-number }}
 
   # Sandbox-only probe of fix-ci's subscription fallback (claude-code-plugins
