@@ -42,6 +42,14 @@ activities:
     effect: read
     gating: advisory
     reads-untrusted: false
+  # azure-iac cases 12 and 15: proves the broker mints and the write reusable
+  # revokes, with one read of the PR. A script, no model.
+  check-broker:
+    script: scripts/lanes/check-broker.sh
+    # The narrowest effect it may hold: mutate-variable is publish-lane-level's alone.
+    effect: mutate-tracker
+    gating: advisory
+    reads-untrusted: false
   # The skill activities run a model, so they apply only to PRs that touch
   # their fixtures.
   fix-marker:
@@ -562,6 +570,7 @@ lanes:
     stage: refine
     slots:
       - activity: fix-marker
+      - activity: check-broker
       # Sandbox-only probe of fix-ci's subscription fallback (claude-code-
       # plugins Phase 5b, probe P2): pr-refine.yml's fix-ci-fallback dispatch
       # passes an unset key. A new lane would need a lane-rules.json row, which
