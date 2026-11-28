@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Case 6: a read activity in pr-run-activity-read.yml can request no OIDC
-# token, holds no GitHub token, and cannot push. Prints variable names only,
-# never values, and exits 0 only when all three hold.
 set -uo pipefail
 
 failed=0

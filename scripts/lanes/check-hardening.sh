@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# A read activity runs after "Remove sudo and docker access": sudo, the docker
-# socket and `docker info` must all fail. Exits 0 only when every one fails.
-# Also reports, without failing on it, whether this process can read the
-# Runner.Worker process's memory; it prints byte counts only, never contents.
 set -uo pipefail
 
 open=0

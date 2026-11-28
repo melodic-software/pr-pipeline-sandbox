@@ -1,4 +1,3 @@
-# Fails the schema: an activity sets both skill and script.
 version: 1
 
 activities:

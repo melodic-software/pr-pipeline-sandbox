@@ -1,11 +1,5 @@
 name: PR Run Checks
 
-# Lane caller for pr-run-checks: its file stem is the lane, so the lanes token
-# broker's check endpoint accepts its read activity (a caller whose stem
-# differs is denied lane-mismatch). No Claude secret; only the scan-carrier
-# key the read runner requires. Runs only on PRs that touch
-# sandbox/kill-switch/**.
-
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -23,7 +17,7 @@ jobs:
   check-read-token:
     name: Check Read Token
     permissions:
-      actions: read # the read runner's key-credit gate lists the credit-stop markers
+      actions: read
       contents: read
       pull-requests: write
       checks: write
