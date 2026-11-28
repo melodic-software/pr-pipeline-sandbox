@@ -1,11 +1,5 @@
 name: PR Run Activity Read Probe
 
-# Test caller of pr-run-activity-read.yml. It passes only the scan-carrier
-# key, which the read runner requires and its scan job alone reads, so no App
-# key or OAuth token reaches the run. Runs only on PRs that touch
-# sandbox/read-split/**.
-#   check-read-token: case 6, a read script activity; expected success.
-
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -23,7 +17,7 @@ jobs:
   check-read-token:
     name: Check Read Token
     permissions:
-      actions: read # the read runner's key-credit gate lists the credit-stop markers
+      actions: read
       contents: read
       pull-requests: write
       checks: write

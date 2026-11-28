@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# A read activity must get no token: GH_TOKEN unset, no extraheader in
-# .git/config, and a push that fails. Exits with the push's status.
 set -uo pipefail
 
 echo "== env"

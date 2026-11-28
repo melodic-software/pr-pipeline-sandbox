@@ -1,12 +1,7 @@
 name: PR Refine
 
-# Lane caller for pr-refine: its file stem is the lane, so the lanes token
-# broker accepts its write activities. No App key; the run job's OIDC token is
-# exchanged at LANES_BROKER_URL for audience LANES_BROKER_AUDIENCE.
-
-# fix-docs-dispatch.mjs reads this title to skip a second dispatch while one
-# for the same activity and PR is still queued or going. Quoted: unquoted,
-# " #" would start a YAML comment and drop the PR number.
+# Quoted: unquoted, " #" would start a YAML comment and drop the PR number.
+# https://yaml.org/spec/1.2.2/#733-plain-style
 run-name: "${{ github.event_name == 'workflow_dispatch' && format('PR Refine {0} #{1}', inputs.activity, inputs.pr-number) || 'PR Refine' }}"
 
 on:
@@ -35,15 +30,6 @@ on:
 permissions: {}
 
 jobs:
-  # fix-marker is a read skill: the read runner runs it with no write token
-  # and uploads its uncommitted edit as a patch, and apply-marker-patch pushes
-  # it under patch-rules.json's default row. It runs on a dispatch from main,
-  # as claude-code-plugins' pr-refine does, because the scan job's
-  # pr-pipeline-scan-carrier environment admits main only; fix-docs-head
-  # reads the head the patch is made on, which no head code wrote.
-  # pr-unblock-dispatch.yml's refine job sends that dispatch on a listed
-  # human's PR event (refine-dispatch.activities), naming itself as
-  # dispatcher-run-id, which both jobs pass to the trusted-trigger gate.
   fix-marker:
     name: Fix Marker
     needs: fix-docs-head
@@ -52,14 +38,13 @@ jobs:
       && format('{0}', github.event.sender.id) != vars.AUTOMATION_LANES_APP_SENDER_ID
       && needs.fix-docs-head.outputs.held == 'false'
     permissions:
-      actions: read # the read runner's key-credit gate lists the credit-stop markers
+      actions: read
       contents: read
       pull-requests: write
       checks: write
       issues: write
       id-token: write
     concurrency:
-      # One per-PR queue shared by every write lane: it queues, never cancels.
       group: pr-pipeline-write-${{ inputs.pr-number }}
       queue: max
     uses: ./.github/workflows/pr-run-activity-read.yml # zizmor: ignore[self-repository]
@@ -67,7 +52,6 @@ jobs:
       role: automations
       lane: pr-refine
       activity: fix-marker
-      # No API key is passed, so the run takes the OAuth-token leg.
       fallback: no-key
       pr-number: ${{ inputs.pr-number }}
       head-sha: ${{ needs.fix-docs-head.outputs.head-sha }}
@@ -76,14 +60,12 @@ jobs:
       claude-code-oauth-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
       scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
 
-  # fix-marker's push job, on a written patch only; every input is the scan
-  # job's, never the run job's, since the run job runs head code.
   apply-marker-patch:
     name: Apply Marker Patch
     needs: [fix-docs-head, fix-marker]
     if: ${{ !cancelled() && needs.fix-marker.outputs.scan-patch-state == 'written' }}
     permissions:
-      actions: read # the write runner's run job reads the review lanes' comment records
+      actions: read
       contents: read
       pull-requests: write
       checks: write
@@ -106,14 +88,11 @@ jobs:
       reply-attempt: ${{ needs.fix-marker.outputs.scan-reply-attempt }}
       dispatcher-run-id: ${{ inputs.dispatcher-run-id }}
 
-  # azure-iac's broker re-verification cases 12 and 15 dispatch this: one mint at
-  # mutate-tracker (issues write, everything else read), one API read with the
-  # token, then the write reusable's revoke. No model runs.
   check-broker:
     name: Check Broker
     if: github.event_name == 'workflow_dispatch' && inputs.activity == 'check-broker'
     permissions:
-      actions: read # the write runner's run job reads the review lanes' comment records
+      actions: read
       contents: read
       pull-requests: write
       checks: write
@@ -129,13 +108,6 @@ jobs:
       activity: check-broker
       pr-number: ${{ inputs.pr-number }}
 
-  # Sandbox-only probe of fix-ci's subscription fallback (claude-code-plugins
-  # Phase 5b, probe P2): pr-unblock.yml's fix-ci jobs on lane pr-refine,
-  # except that the first call passes a key secret that is never set, so it
-  # reports credential-present=false and hands off, and fix-ci-subscription
-  # runs the activity on AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN. A credit stop
-  # cannot be forced. On main because a dispatch runs there and the broker
-  # refuses a caller that differs from main's tip. Remove after the probe.
   fix-ci-context:
     name: Fix CI Context
     if: >-
@@ -144,10 +116,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: read # check out main
-      pull-requests: read # the PR's head and commits
-      checks: read # the head's check runs and their annotations
-      actions: read # each failing job's workflow file and log
+      contents: read
+      pull-requests: read
+      checks: read
+      actions: read
     outputs:
       proceed: ${{ steps.context.outputs.proceed }}
       head-sha: ${{ steps.context.outputs.head-sha }}
@@ -212,7 +184,7 @@ jobs:
     needs: fix-ci-context
     if: ${{ !cancelled() && needs.fix-ci-context.outputs.proceed == 'true' }}
     permissions:
-      actions: read # the read runner's key-credit gate lists the credit-stop markers
+      actions: read
       contents: read
       pull-requests: write
       checks: write
@@ -234,7 +206,6 @@ jobs:
       head-sha: ${{ needs.fix-ci-context.outputs.head-sha }}
       timeout-minutes: 60
     secrets:
-      # Never set, in the sandbox or the org.
       claude-api-key: ${{ secrets.AUTOMATIONS_CLAUDE_API_KEY_PROBE_UNSET }}
       scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
 
@@ -246,7 +217,7 @@ jobs:
       && (needs.fix-ci.outputs.lane-class == 'credit-stop'
       || needs.fix-ci.outputs.credential-present == 'false') }}
     permissions:
-      actions: read # the read runner's key-credit gate lists the credit-stop markers
+      actions: read
       contents: read
       pull-requests: write
       checks: write
@@ -279,7 +250,7 @@ jobs:
       ${{ !cancelled() && ((needs.fix-ci-subscription.outputs.patch-state || needs.fix-ci.outputs.patch-state) == 'written'
       || (needs.fix-ci-subscription.outputs.patch-state || needs.fix-ci.outputs.patch-state) == 'empty') }}
     permissions:
-      actions: read # the write runner's run job reads the review lanes' comment records
+      actions: read
       contents: read
       pull-requests: write
       checks: write
@@ -301,21 +272,9 @@ jobs:
       patch-attempt: ${{ needs.fix-ci-subscription.outputs.patch-attempt || needs.fix-ci.outputs.patch-attempt }}
       patch-activity: fix-ci
       patch-prepare: ci-context
-      # The head fix-ci-context gated, from a job that ran no head code, as in
-      # pr-unblock.yml.
       patch-head-sha: ${{ needs.fix-ci-context.outputs.head-sha }}
       reply-attempt: ${{ needs.fix-ci-subscription.outputs.reply-attempt || needs.fix-ci.outputs.reply-attempt }}
 
-  # main's fix-docs jobs at claude-code-plugins 60278a764f (Phase 7.1 probes
-  # P1-P3), on dispatch only, on the automations role. fix-docs-no-key passes
-  # an empty key, so the first call hands off and fix-docs-subscription runs
-  # on the OAuth token (P2).
-  # The PR head fix-docs's report posts its check on, read by a job that runs
-  # no head code, as fix-ci-context's is for fix-ci. Without it the report
-  # trusts only the head read at report time, so a push mid-run posts failure
-  # on the new head.
-  # It also reads whether the human-gated label holds fix-docs: only when a
-  # lane escalation did not put it on (lane-hold.mjs); a held PR runs nothing.
   fix-docs-head:
     name: Fix Docs Head
     if: >-
@@ -324,7 +283,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
-      contents: read # check out main
+      contents: read
       pull-requests: read
     outputs:
       head-sha: ${{ steps.head.outputs.sha }}
@@ -364,12 +323,6 @@ jobs:
           ACTIVITY: fix-docs
         run: node .base/.github/scripts/pr-unblock/lane-hold.mjs
 
-  # fix-docs is four jobs, so no model ever holds a write token. The model
-  # job: a read activity with no write token and no OIDC token in the job that
-  # runs head code. The skill fixes the changed Markdown files; the runner
-  # uploads its uncommitted edits as a patch. It runs on the pr-unblock
-  # role's API key alone (automations here). Drafts and do-not-merge PRs skip in the config's
-  # applies-when, a human-gated hold in fix-docs-head, before any model turn.
   fix-docs:
     name: Fix Docs
     needs: fix-docs-head
@@ -378,7 +331,7 @@ jobs:
       && format('{0}', github.event.sender.id) != vars.AUTOMATION_LANES_APP_SENDER_ID
       && needs.fix-docs-head.outputs.held == 'false'
     permissions:
-      actions: read # the read runner's key-credit gate lists the credit-stop markers
+      actions: read
       contents: read
       pull-requests: write
       checks: write
@@ -402,13 +355,6 @@ jobs:
       claude-api-key: ${{ inputs.activity != 'fix-docs-no-key' && secrets.AUTOMATIONS_CLAUDE_API_KEY || '' }}
       scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
 
-  # Whether fix-docs's report job posted its check, and whether the broker
-  # allowed the call, read from this run's jobs through the Actions API, as
-  # pr-unblock.yml's fix-ci-handoff reads them for fix-ci: never from a
-  # fix-docs output, since fix-docs's run job runs head code and can forge
-  # handed-off, lane-class or credential-present. A failed read leaves both
-  # empty, which starts no fallback; with no check posted,
-  # fix-docs-dispatch.mjs dispatches the PR again.
   fix-docs-handoff:
     name: Fix Docs Handoff
     needs: [fix-docs-head, fix-docs]
@@ -416,8 +362,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      actions: read # this run's jobs and their steps
-      contents: read # the default branch tip's handoff-evidence.sh
+      actions: read
+      contents: read
     outputs:
       posted: ${{ steps.posted.outputs.posted }}
       allowed: ${{ steps.posted.outputs.allowed }}
@@ -438,15 +384,6 @@ jobs:
           CALLS: fix-docs
         run: bash .base/.github/scripts/lib/handoff-evidence.sh posted allowed
 
-  # The subscription fallback, as fix-ci-subscription is for fix-ci: it runs
-  # only when the broker allowed fix-docs and fix-docs posted no check, which
-  # a credit stop or an empty key leaves as a handoff with no upload, lane
-  # record or check. fix-docs posts nothing on a decline (post-decline: false),
-  # so the broker's allow keeps a kill switch or a refusal from starting a
-  # second leg. Its start reads only fix-docs-handoff, and it holds the OAuth
-  # token alone. fallback: handoff labels the lane record without reading a
-  # fix-docs output: only the run job knows whether it was a credit stop or an
-  # empty key, and head code can forge that.
   fix-docs-subscription:
     name: Fix Docs Subscription
     needs: [fix-docs-head, fix-docs, fix-docs-handoff]
@@ -455,7 +392,7 @@ jobs:
       && needs.fix-docs-handoff.outputs.posted != 'true'
       && needs.fix-docs-handoff.outputs.allowed == 'true' }}
     permissions:
-      actions: read # the read runner's key-credit gate lists the credit-stop markers
+      actions: read
       contents: read
       pull-requests: write
       checks: write
@@ -480,15 +417,6 @@ jobs:
       claude-code-oauth-token: ${{ secrets.AUTOMATIONS_CLAUDE_CODE_OAUTH_TOKEN }}
       scan-carrier-private-key: ${{ secrets.SCAN_CARRIER_PRIVATE_KEY }}
 
-  # fix-docs's push job: the apply-patch activity under patch-rules.json's
-  # default row (fix-docs has no prepare mode). It runs only on a written
-  # patch: no change is the common case and needs no one. The lane has no
-  # escalation job, so a refused patch posts the pr-refine / apply-patch
-  # check neutral and labels nothing. One leg answers, as for pr-unblock.yml's
-  # apply-patch: the fallback call when it ran, else the first, and every
-  # input is that leg's scan job's, never a run job's, since the run job runs
-  # head code. The head is fix-docs-head's, read by a job that ran no head
-  # code; apply-patch still applies onto the head its own gate reads.
   apply-docs-patch:
     name: Apply Docs Patch
     needs: [fix-docs-head, fix-docs, fix-docs-subscription]
@@ -496,7 +424,7 @@ jobs:
       ${{ !cancelled()
       && (needs.fix-docs-subscription.result != 'skipped' && needs.fix-docs-subscription.outputs.scan-patch-state || needs.fix-docs-subscription.result == 'skipped' && needs.fix-docs.outputs.scan-patch-state || '') == 'written' }}
     permissions:
-      actions: read # the write runner's run job reads the review lanes' comment records
+      actions: read
       contents: read
       pull-requests: write
       checks: write
@@ -519,7 +447,5 @@ jobs:
       patch-activity: fix-docs
       patch-prepare: docs
       patch-head-sha: ${{ needs.fix-docs-head.outputs.head-sha }}
-      # lane-escalation drops the human-gated label from the holds while the
-      # write runner reads it again as a lane escalation (lane-hold.mjs).
       patch-human-gate: ${{ needs.fix-docs-head.outputs.lane-escalated == 'true' && 'lane-escalation' || '' }}
       reply-attempt: ${{ needs.fix-docs-subscription.result != 'skipped' && needs.fix-docs-subscription.outputs.scan-reply-attempt || needs.fix-docs-subscription.result == 'skipped' && needs.fix-docs.outputs.scan-reply-attempt || '' }}
