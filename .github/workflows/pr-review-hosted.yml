@@ -74,6 +74,7 @@ jobs:
                     # job reads them for cost decisions
       checks: read # the reusable's status job reads its earlier runs' cost notices
       contents: read
+      issues: read # read closing issues on private repositories
       pull-requests: write # the review, its comments, the marker and the hold label
     uses: melodic-software/ci-workflows/.github/workflows/pr-review-cli.yml@main
     with:
